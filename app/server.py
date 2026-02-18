@@ -21,7 +21,7 @@ from mss import mss
 from mss.tools import to_png
 
 START_TIME = time.time()
-app = FastAPI(title="Codrex Remote UI", version="1.2.0")
+app = FastAPI(title="Codrex Remote UI", version="1.3.0")
 
 WSL_DISTRO = os.environ.get("CODEX_WSL_DISTRO", "Ubuntu")
 WSL_EXE = os.environ.get("CODEX_WSL_EXE", "wsl")

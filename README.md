@@ -1,5 +1,10 @@
 # Codrex
 
+![Version](https://img.shields.io/badge/version-1.3.0-0b7285)
+![Python](https://img.shields.io/badge/python-3.11%2B-3776AB)
+![Platform](https://img.shields.io/badge/platform-Windows%20%2B%20WSL-2D7D9A)
+![FastAPI](https://img.shields.io/badge/api-FastAPI-009688)
+
 Codrex is a Windows + WSL remote control panel for managing Codex CLI sessions, tmux panes, and desktop actions from a browser.
 
 It is designed for:
@@ -7,6 +12,37 @@ It is designed for:
 - Mobile/tablet control through a compact UI (`/mobile`)
 - Secure pairing via short-lived QR code links
 - Optional startup + watchdog automation on Windows
+
+## Release Assets
+
+- Current version: `1.3.0` (see `VERSION`)
+- Changelog: `CHANGELOG.md`
+- Runtime dependencies: `requirements.txt`
+
+## One-Command Installer (Desktop)
+
+From PowerShell in `C:\codrex-remote-ui`:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\setup.ps1 -OpenFirewall
+```
+
+What this does:
+- Creates `.venv` if missing
+- Installs/updates Python dependencies
+- Starts Codrex with your selected config
+- Optionally opens firewall access for the configured port
+
+## Quick Start (Fresh Machine)
+
+```powershell
+git clone git@github.com:meghamsh738/Codrex.git C:\codrex-remote-ui
+Set-Location C:\codrex-remote-ui
+powershell -NoProfile -ExecutionPolicy Bypass -File .\setup.ps1 -OpenFirewall
+```
+
+Then open:
+- `http://127.0.0.1:8787`
 
 ## Screenshots
 
@@ -26,6 +62,7 @@ It is designed for:
 
 - `app/server.py`: FastAPI server and web UI
 - `tests/test_run_wsl_bash.py`: unit tests for Windows/WSL command behavior
+- `setup.ps1`: one-command bootstrap (venv, deps, startup)
 - `start-controller.ps1`: starts the Codrex service
 - `stop-controller.ps1`: stops the service
 - `controller-launcher.ps1`: WinForms launcher for quick access + pairing
@@ -33,6 +70,18 @@ It is designed for:
 - `uninstall-autostart.ps1`: removes scheduled tasks
 - `watchdog-controller.ps1`: health check + restart loop
 - `controller.config.json`: runtime config (port, distro, workdir, token)
+
+## Versioning Policy
+
+Codrex follows Semantic Versioning:
+- `MAJOR`: incompatible behavior changes
+- `MINOR`: new backward-compatible features
+- `PATCH`: bug fixes and doc-only corrections
+
+Release housekeeping:
+1. Update `VERSION`
+2. Update `CHANGELOG.md`
+3. Align API metadata in `app/server.py` (`FastAPI(... version=...)`)
 
 ## Prerequisites
 
@@ -50,7 +99,7 @@ It is designed for:
 - Phone/tablet on same LAN or reachable through Tailscale
 - Browser with camera support (for QR scan flow)
 
-## Desktop Setup (First Time)
+## Desktop Setup (Manual Path)
 
 1. Place the project at:
    - `C:\codrex-remote-ui`
@@ -97,7 +146,7 @@ Or double-click:
 
 ## Mobile Setup and Pairing Tutorial
 
-1. Start Codrex from desktop (`start-controller.ps1`).
+1. Start Codrex from desktop (`start-controller.ps1` or `setup.ps1`).
 2. From desktop browser, open:
    - `http://<desktop-ip>:8787`
 3. In the **Pair** section:
