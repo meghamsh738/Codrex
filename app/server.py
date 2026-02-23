@@ -4,6 +4,7 @@ import asyncio
 import json
 import time
 import os
+import shutil
 import subprocess
 import socket
 import io
@@ -16,6 +17,7 @@ import secrets
 import ctypes
 from ctypes import wintypes
 from typing import List, Dict, Any, Optional, Tuple
+from urllib.parse import quote
 
 from mss import mss
 from mss.tools import to_png
@@ -69,13 +71,39 @@ def _tailscale_exe_path() -> str:
         return ""
     pf = os.environ.get("ProgramFiles", r"C:\Program Files")
     pf86 = os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
+    local_app_data = os.environ.get("LocalAppData", "")
     candidates = [
         os.path.join(pf, "Tailscale", "tailscale.exe"),
         os.path.join(pf86, "Tailscale", "tailscale.exe"),
+        os.path.join(local_app_data, "Tailscale", "tailscale.exe"),
     ]
     for p in candidates:
-        if os.path.exists(p):
+        if p and os.path.exists(p):
             return p
+
+    # Per-user installs can be available via PATH but not under Program Files.
+    for cmd in ("tailscale.exe", "tailscale"):
+        try:
+            exe = shutil.which(cmd)
+        except Exception:
+            exe = ""
+        if exe and os.path.exists(exe):
+            return exe
+
+    # Last fallback for Windows shells where PATH lookup is odd in service contexts.
+    try:
+        out = subprocess.check_output(
+            ["where", "tailscale"],
+            text=True,
+            timeout=5,
+            stderr=subprocess.DEVNULL,
+        )
+        for line in out.splitlines():
+            candidate = line.strip()
+            if candidate and os.path.exists(candidate):
+                return candidate
+    except Exception:
+        pass
     return ""
 
 def get_tailscale_ipv4() -> str:
@@ -90,7 +118,43 @@ def get_tailscale_ipv4() -> str:
         if re.match(r"^\d+\.\d+\.\d+\.\d+$", ip):
             return ip
     except Exception:
-        return ""
+        pass
+    try:
+        out = subprocess.check_output(
+            [exe, "status", "--json"],
+            text=True,
+            timeout=5,
+            stderr=subprocess.DEVNULL,
+        )
+        data = json.loads(out)
+        if isinstance(data, dict):
+            candidates: List[str] = []
+            self_obj = data.get("Self")
+            if isinstance(self_obj, dict):
+                self_ips = self_obj.get("TailscaleIPs")
+                if isinstance(self_ips, list):
+                    candidates.extend(str(v) for v in self_ips)
+            top_ips = data.get("TailscaleIPs")
+            if isinstance(top_ips, list):
+                candidates.extend(str(v) for v in top_ips)
+            for ip in candidates:
+                if re.match(r"^\d+\.\d+\.\d+\.\d+$", ip.strip()):
+                    return ip.strip()
+    except Exception:
+        pass
+    try:
+        out = subprocess.check_output(
+            [exe, "status"],
+            text=True,
+            timeout=5,
+            stderr=subprocess.DEVNULL,
+        )
+        for line in out.splitlines():
+            m = re.match(r"^\s*(\d+\.\d+\.\d+\.\d+)\s+", line)
+            if m:
+                return m.group(1)
+    except Exception:
+        pass
     return ""
 
 def guess_lan_ipv4() -> str:
@@ -2306,8 +2370,8 @@ async function logoutAuth() {
   setAuthGate(true, "Logged out.");
 }
 
-async function _fetchNetInfo() {
-  if (netInfo) return netInfo;
+async function _fetchNetInfo(force = false) {
+  if (netInfo && !force) return netInfo;
   try {
     const r = await apiFetch('/net/info');
     const j = await r.json();
@@ -2435,12 +2499,18 @@ async function toggleTailscaleOnly() {
   pairTailscaleOnly = !pairTailscaleOnly;
   _storageSetBool(PAIR_TS_ONLY_KEY, pairTailscaleOnly);
   _syncTailscaleOnlyBtn();
-  _syncPairRouteUi();
   if (pairTailscaleOnly) {
-    _setPairStatus("Tailscale-only enabled.");
+    await useTailscaleBase();
+    const kind = _pairRouteKind(pairBaseUrlEl ? pairBaseUrlEl.value : "", netInfo);
+    if (kind === "tailscale") {
+      _setPairStatus("Tailscale-only enabled. Using Tailscale base URL.");
+    } else {
+      _setPairStatus("Tailscale-only enabled, but Tailscale IP is not detected yet.");
+    }
   } else {
     _setPairStatus("Tailscale-only disabled.");
   }
+  _syncPairRouteUi();
 }
 
 function _startPairCountdown(seconds) {
@@ -2464,7 +2534,7 @@ function _startPairCountdown(seconds) {
 
 async function useTailscaleBase() {
   _setPairStatus("Detecting Tailscale IP…");
-  const info = await _fetchNetInfo();
+  const info = await _fetchNetInfo(true);
   if (!info || !info.tailscale_ip) {
     _setPairStatus("Tailscale IP not detected on this laptop.");
     _syncPairRouteUi();
@@ -2478,7 +2548,7 @@ async function useTailscaleBase() {
 
 async function useLanBase() {
   _setPairStatus("Detecting LAN IP…");
-  const info = await _fetchNetInfo();
+  const info = await _fetchNetInfo(true);
   if (!info || !info.lan_ip) {
     _setPairStatus("LAN IP not detected.");
     _syncPairRouteUi();
@@ -2493,15 +2563,20 @@ async function useLanBase() {
 async function generatePairQr() {
   if (!pairBaseUrlEl || !pairQrImgEl || !pairLinkEl) return;
 
-  const base = _normalizeBaseUrl(pairBaseUrlEl.value || window.location.origin);
+  let base = _normalizeBaseUrl(pairBaseUrlEl.value || window.location.origin);
   if (!base) {
     _setPairStatus("Base URL is required.");
     return;
   }
-  const routeKind = _pairRouteKind(base, netInfo);
+  let routeKind = _pairRouteKind(base, netInfo);
+  if (pairTailscaleOnly && routeKind !== "tailscale") {
+    await useTailscaleBase();
+    base = _normalizeBaseUrl(pairBaseUrlEl.value || base);
+    routeKind = _pairRouteKind(base, netInfo);
+  }
   if (pairTailscaleOnly && routeKind !== "tailscale") {
     _syncPairRouteUi();
-    _setPairStatus("Blocked by Tailscale-only mode. Tap 'Use Tailscale' first.");
+    _setPairStatus("Blocked by Tailscale-only mode. Tailscale IP is not ready.");
     return;
   }
   if (routeKind === "local") {
@@ -3828,7 +3903,7 @@ def auth_pair_exchange(payload: Dict[str, Any] = Body(...)):
 
 
 @app.get("/auth/pair/consume")
-def auth_pair_consume(code: str = "", pair: str = ""):
+def auth_pair_consume(request: Request, code: str = "", pair: str = "", direct: str = ""):
     """
     Pairing endpoint designed for QR scanning.
 
@@ -3845,6 +3920,119 @@ def auth_pair_consume(code: str = "", pair: str = ""):
         return Response(status_code=303, headers={"Location": "/"})
 
     c = (code or pair or "").strip()
+    if not c:
+        return HTMLResponse(
+            content="""
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Pairing Missing Code</title>
+  </head>
+  <body style="font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; padding: 18px;">
+    <h2>Pairing Link Missing Code</h2>
+    <p>This pairing link is incomplete. Generate a new QR code from an already-authenticated device.</p>
+    <p><a href="/">Open controller</a></p>
+  </body>
+</html>
+            """.strip(),
+            status_code=400,
+            headers={"Cache-Control": "no-store"},
+        )
+
+    # QR scanners often prefetch GET links (or open previews) before launching the real browser.
+    # To avoid burning one-time codes early, the default GET serves a small HTML page that
+    # exchanges the code via JS only when the page actually renders.
+    is_direct = str(direct or "").strip().lower() in {"1", "true", "yes", "on"}
+    if not is_direct:
+        code_js = json.dumps(c)
+        direct_href = f"/auth/pair/consume?code={quote(c)}&direct=1"
+        return HTMLResponse(
+            content=f"""
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Pairing Phone</title>
+    <style>
+      body {{
+        font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+        padding: 18px;
+        line-height: 1.35;
+      }}
+      .card {{
+        max-width: 520px;
+        border: 1px solid #dbe3ee;
+        border-radius: 12px;
+        padding: 14px 16px;
+        background: #fff;
+      }}
+      .muted {{ color: #475569; }}
+      .ok {{ color: #166534; }}
+      .warn {{ color: #92400e; }}
+      .err {{ color: #b91c1c; }}
+      .btn {{
+        display: inline-block;
+        padding: 10px 14px;
+        border-radius: 8px;
+        border: 1px solid #cbd5e1;
+        background: #0f766e;
+        color: #fff;
+        text-decoration: none;
+        font-weight: 600;
+      }}
+      .btn.alt {{
+        background: #fff;
+        color: #0f172a;
+      }}
+      .row {{ display: flex; gap: 10px; flex-wrap: wrap; margin-top: 12px; }}
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <h2 style="margin: 0 0 8px 0;">Pairing This Phone</h2>
+      <p id="status" class="muted" style="margin: 0;">Finishing secure sign-in…</p>
+      <div class="row">
+        <a class="btn alt" href="/">Open controller</a>
+        <a class="btn alt" href="{html_std.escape(direct_href, quote=True)}">Try direct pairing</a>
+      </div>
+      <p class="muted" style="margin-top: 12px;">If this page stays blank in a scanner preview, open the link in your browser app (Chrome/Safari).</p>
+    </div>
+    <script>
+      (async () => {{
+        const statusEl = document.getElementById("status");
+        try {{
+          const r = await fetch("/auth/pair/exchange", {{
+            method: "POST",
+            headers: {{ "Content-Type": "application/json" }},
+            credentials: "same-origin",
+            body: JSON.stringify({{ code: {code_js} }})
+          }});
+          let j = null;
+          try {{ j = await r.json(); }} catch (_e) {{}}
+          if (j && j.ok) {{
+            statusEl.className = "ok";
+            statusEl.textContent = "Paired successfully. Opening controller…";
+            window.location.replace("/");
+            return;
+          }}
+          statusEl.className = "err";
+          statusEl.textContent = (j && (j.detail || j.error)) ? String(j.detail || j.error) : "Pairing failed or expired. Generate a new QR code.";
+        }} catch (_e) {{
+          statusEl.className = "err";
+          statusEl.textContent = "Could not contact the controller. Verify Tailscale is connected, then try again.";
+        }}
+      }})();
+    </script>
+  </body>
+</html>
+            """.strip(),
+            status_code=200,
+            headers={"Cache-Control": "no-store"},
+        )
+
     if not pairing_consume_code(c):
         return HTMLResponse(
             content="""
@@ -3866,6 +4054,9 @@ def auth_pair_consume(code: str = "", pair: str = ""):
             headers={"Cache-Control": "no-store"},
         )
 
+    # Some camera preview browsers can render a blank page on bare redirects.
+    # The default GET path above serves HTML + JS and avoids consuming the code early.
+    # `direct=1` keeps this no-JS redirect path as a fallback.
     resp = Response(status_code=303, headers={"Location": "/"})
     resp.set_cookie(
         key=CODEX_AUTH_COOKIE,

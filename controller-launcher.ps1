@@ -54,21 +54,76 @@ function Get-LanIPv4 {
 function Get-TailscaleIPv4 {
   $pf = $env:ProgramFiles
   $pf86 = ${env:ProgramFiles(x86)}
+  $localAppData = $env:LocalAppData
   $candidates = @()
   if ($pf) { $candidates += (Join-Path $pf "Tailscale\\tailscale.exe") }
   if ($pf86) { $candidates += (Join-Path $pf86 "Tailscale\\tailscale.exe") }
+  if ($localAppData) { $candidates += (Join-Path $localAppData "Tailscale\\tailscale.exe") }
   $exe = $candidates | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
   if (-not $exe) {
     try {
       $exe = (Get-Command tailscale.exe -ErrorAction Stop).Source
     } catch {
-      return ""
+      try {
+        $whereOut = & where.exe tailscale 2>$null
+        $exe = ($whereOut | Select-Object -First 1)
+      } catch {
+        return ""
+      }
     }
   }
+  if (-not $exe -or -not (Test-Path $exe)) { return "" }
   try {
     $out = & $exe ip -4 2>$null
     $ip = ($out | Select-Object -First 1).Trim()
-    if ($ip -match "^\\d+\\.\\d+\\.\\d+\\.\\d+$") { return $ip }
+    if ($ip -match "^\d+\.\d+\.\d+\.\d+$") { return $ip }
+  } catch {}
+  try {
+    $jsonLines = & $exe status --json 2>$null
+    if ($jsonLines) {
+      $jsonText = (@($jsonLines) -join [Environment]::NewLine)
+      $statusObj = $jsonText | ConvertFrom-Json -ErrorAction Stop
+      $candidates = @()
+      if ($statusObj -and $statusObj.Self -and $statusObj.Self.TailscaleIPs) {
+        $candidates += @($statusObj.Self.TailscaleIPs)
+      }
+      if ($statusObj -and $statusObj.TailscaleIPs) {
+        $candidates += @($statusObj.TailscaleIPs)
+      }
+      foreach ($candidate in $candidates) {
+        $ip = [string]$candidate
+        if ($ip -match "^\d+\.\d+\.\d+\.\d+$") { return $ip }
+      }
+    }
+  } catch {}
+  try {
+    $statusLines = & $exe status 2>$null
+    foreach ($line in @($statusLines)) {
+      $s = [string]$line
+      if ($s -match "^\s*(\d+\.\d+\.\d+\.\d+)\s+") {
+        return [string]$matches[1]
+      }
+    }
+  } catch {}
+  try {
+    $tsIp = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction Stop |
+      Where-Object {
+        $_.IPAddress -match "^\d+\.\d+\.\d+\.\d+$" -and
+        $_.IPAddress -like "100.*" -and
+        ($_.InterfaceAlias -like "*Tailscale*")
+      } |
+      Select-Object -First 1 -ExpandProperty IPAddress
+    if ($tsIp) { return [string]$tsIp }
+  } catch {}
+  try {
+    $tsIp = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction Stop |
+      Where-Object {
+        $_.IPAddress -match "^\d+\.\d+\.\d+\.\d+$" -and
+        $_.IPAddress -like "100.*" -and
+        $_.IPAddress -ne "100.64.0.1"
+      } |
+      Select-Object -First 1 -ExpandProperty IPAddress
+    if ($tsIp) { return [string]$tsIp }
   } catch {}
   return ""
 }
@@ -231,25 +286,25 @@ function Get-BaseRouteKind([string]$Base, [string]$LanUrl, [string]$TsUrl) {
   $b = Normalize-BaseUrl $Base
   if (-not $b) { return "unknown" }
   try {
-    $host = ([Uri]$b).Host.ToLowerInvariant()
+    $hostName = ([Uri]$b).Host.ToLowerInvariant()
   } catch {
     return "unknown"
   }
-  if ($host -eq "localhost" -or $host -eq "127.0.0.1") { return "local" }
+  if ($hostName -eq "localhost" -or $hostName -eq "127.0.0.1") { return "local" }
   if ($TsUrl) {
     try {
       $tsHost = ([Uri]$TsUrl).Host.ToLowerInvariant()
-      if ($host -eq $tsHost) { return "tailscale" }
+      if ($hostName -eq $tsHost) { return "tailscale" }
     } catch {}
   }
   if ($LanUrl) {
     try {
       $lanHost = ([Uri]$LanUrl).Host.ToLowerInvariant()
-      if ($host -eq $lanHost) { return "lan" }
+      if ($hostName -eq $lanHost) { return "lan" }
     } catch {}
   }
-  if ($host -like "100.*" -or $host -like "*.ts.net") { return "tailscale" }
-  if ($host -like "192.168.*" -or $host -like "10.*" -or $host -match "^172\.(1[6-9]|2\d|3[01])\.") {
+  if ($hostName -like "100.*" -or $hostName -like "*.ts.net") { return "tailscale" }
+  if ($hostName -like "192.168.*" -or $hostName -like "10.*" -or $hostName -match "^172\.(1[6-9]|2\d|3[01])\.") {
     return "lan"
   }
   return "unknown"
@@ -724,6 +779,20 @@ function Update-ActionAvailability {
 
 function Update-NetworkAndRoute {
   $urls = Base-Urls
+  $currentBase = Normalize-BaseUrl $txtBase.Text
+  $currentKind = Get-BaseRouteKind -Base $txtBase.Text -LanUrl $urls.lan -TsUrl $urls.tailscale
+
+  # Keep the base URL phone-reachable by default without overriding a deliberate LAN/Tailscale choice.
+  if ((-not $currentBase) -or $currentKind -eq "local") {
+    if ($urls.tailscale -and ((Normalize-BaseUrl $urls.tailscale) -ne $currentBase)) {
+      $txtBase.Text = $urls.tailscale
+      return
+    }
+    if ($urls.lan -and ((Normalize-BaseUrl $urls.lan) -ne $currentBase)) {
+      $txtBase.Text = $urls.lan
+      return
+    }
+  }
 
   $lanText = "not detected"
   if ($urls.lan) {
@@ -879,13 +948,16 @@ function Run-Stop {
 }
 
 function Ensure-BaseUrl {
+  $urls = Base-Urls
   $b = Normalize-BaseUrl $txtBase.Text
-  if (-not $b) {
-    $urls = Base-Urls
+  $kind = Get-BaseRouteKind -Base $b -LanUrl $urls.lan -TsUrl $urls.tailscale
+  if ((-not $b) -or $kind -eq "local") {
     if ($urls.tailscale) { $b = $urls.tailscale }
     elseif ($urls.lan) { $b = $urls.lan }
     else { $b = $urls.local }
-    $txtBase.Text = $b
+    if ((Normalize-BaseUrl $txtBase.Text) -ne (Normalize-BaseUrl $b)) {
+      $txtBase.Text = $b
+    }
   }
   Update-NetworkAndRoute
   return $b
@@ -986,7 +1058,13 @@ $btnUseLan.Add_Click({
 })
 $btnUseTs.Add_Click({
   $urls = Base-Urls
-  if ($urls.tailscale) { $txtBase.Text = $urls.tailscale }
+  if ($urls.tailscale) {
+    $txtBase.Text = $urls.tailscale
+  } else {
+    $lblPairStatus.Text = "Tailscale IP not detected. Verify Tailscale is connected, then click Refresh."
+    $lblPairStatus.ForeColor = $script:Theme.WarnText
+    Show-Toast -Message "Tailscale IP not detected." -Kind "warn"
+  }
   Update-NetworkAndRoute
 })
 $btnGenQr.Add_Click({ Generate-Qr })
