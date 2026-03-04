@@ -440,17 +440,17 @@ describe("app shell tabs", () => {
 
     await waitFor(() => {
       expect((screen.getByTestId("pair-link-text") as HTMLTextAreaElement).value).toBe(
-        "http://192.168.1.15:8787/auth/pair/consume?code=abc123",
+        "http://100.64.0.9:8787/auth/pair/consume?code=abc123",
       );
     });
 
     fireEvent.change(screen.getByTestId("pair-route-hint-select"), {
-      target: { value: "tailscale" },
+      target: { value: "lan" },
     });
 
     await waitFor(() => {
       expect((screen.getByTestId("pair-link-text") as HTMLTextAreaElement).value).toBe(
-        "http://100.64.0.9:8787/auth/pair/consume?code=abc123",
+        "http://192.168.1.15:8787/auth/pair/consume?code=abc123",
       );
     });
   });

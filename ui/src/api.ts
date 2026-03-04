@@ -223,9 +223,6 @@ export function buildSuggestedControllerUrl(
     if (netInfo?.tailscale_ip) {
       return `http://${netInfo.tailscale_ip}:${port}`;
     }
-    if (netInfo?.lan_ip) {
-      return `http://${netInfo.lan_ip}:${port}`;
-    }
   }
   return `http://${hostname}:${port}`;
 }

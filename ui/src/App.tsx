@@ -223,6 +223,11 @@ function getAdjacentTab(current: MainTab, direction: 1 | -1): MainTab {
   return TAB_ORDER[nextIndex] || TAB_ORDER[0];
 }
 
+function isLocalHostName(hostname: string): boolean {
+  const host = (hostname || "").trim().toLowerCase();
+  return host === "localhost" || host === "127.0.0.1" || host === "::1";
+}
+
 function parseInitialTab(): MainTab {
   if (typeof window === "undefined") {
     return "sessions";
@@ -571,7 +576,7 @@ export default function App() {
   const [authBusy, setAuthBusy] = useState(false);
 
   const [netInfo, setNetInfo] = useState<NetInfo | null>(null);
-  const [routeHint, setRouteHint] = useState<RouteHint>("lan");
+  const [routeHint, setRouteHint] = useState<RouteHint>("tailscale");
   const [controllerBase, setControllerBase] = useState(() => {
     const saved = safeStorageGet(CONTROLLER_BASE_STORAGE);
     return saved || "";
@@ -729,6 +734,8 @@ export default function App() {
   const localBootstrapAttemptedRef = useRef(false);
 
   const backendPort = useMemo(parsePort, []);
+  const browserHostname = typeof window !== "undefined" ? window.location.hostname || "127.0.0.1" : "127.0.0.1";
+  const isLocalBrowser = isLocalHostName(browserHostname);
   const selectedSessionPaneId = useMemo(() => {
     const match = sessions.find((session) => session.session === selectedSession);
     return match?.pane_id || "";
@@ -2036,17 +2043,25 @@ export default function App() {
   }, [auth, authLoading, onBootstrapLocalAuth]);
 
   const onRouteHintChange = useCallback((nextRoute: RouteHint) => {
+    if ((nextRoute === "lan" || nextRoute === "current") && !isLocalBrowser) {
+      setError("LAN/current routes are disabled on remote browsers. Keep route hint on Tailscale.");
+      return;
+    }
     setRouteHint(nextRoute);
     const suggested = buildSuggestedControllerUrl(
-      window.location.hostname || "127.0.0.1",
+      browserHostname,
       backendPort,
       netInfo,
       nextRoute,
     );
     setControllerBase(suggested);
-  }, [backendPort, netInfo]);
+  }, [backendPort, browserHostname, isLocalBrowser, netInfo, setError]);
 
   const onGeneratePairing = useCallback(async () => {
+    if ((routeHint === "lan" || routeHint === "current") && !isLocalBrowser) {
+      setError("LAN/current pairing is allowed only from localhost browser. Switch to Tailscale route.");
+      return;
+    }
     setPairBusy(true);
     try {
       const response = await createPairCode();
@@ -2076,7 +2091,7 @@ export default function App() {
     } finally {
       setPairBusy(false);
     }
-  }, [controllerBase, setError, setStatus]);
+  }, [controllerBase, isLocalBrowser, routeHint, setError, setStatus]);
 
   const onPairExchange = useCallback(async () => {
     if (!pairCode.trim()) {
@@ -4157,11 +4172,20 @@ export default function App() {
                     value={routeHint}
                     onChange={(event) => onRouteHintChange(event.target.value as RouteHint)}
                   >
-                    <option value="lan">{prettyRouteLabel("lan")}</option>
-                    <option value="tailscale">{prettyRouteLabel("tailscale")}</option>
-                    <option value="current">{prettyRouteLabel("current")}</option>
+                    <option value="tailscale">{prettyRouteLabel("tailscale")} (default)</option>
+                    <option value="lan" disabled={!isLocalBrowser}>
+                      {prettyRouteLabel("lan")}{!isLocalBrowser ? " (localhost only)" : ""}
+                    </option>
+                    <option value="current" disabled={!isLocalBrowser}>
+                      {prettyRouteLabel("current")}{!isLocalBrowser ? " (localhost only)" : ""}
+                    </option>
                   </select>
                 </label>
+                {!isLocalBrowser ? (
+                  <p className="small warn">
+                    For safety, LAN/current pairing routes are disabled outside localhost browser sessions.
+                  </p>
+                ) : null}
 
                 <label className="field">
                   <span>Controller Base URL</span>

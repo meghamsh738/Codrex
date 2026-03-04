@@ -38,14 +38,14 @@ describe("base URL suggestions", () => {
     expect(suggested).toBe("http://192.168.1.120:8787");
   });
 
-  it("falls back to LAN when tailscale route is selected but unavailable", () => {
+  it("falls back to current host when tailscale route is selected but unavailable", () => {
     const suggested = buildSuggestedControllerUrl(
       "localhost",
       8787,
       { ok: true, lan_ip: "192.168.1.120", tailscale_ip: "" },
       "tailscale",
     );
-    expect(suggested).toBe("http://192.168.1.120:8787");
+    expect(suggested).toBe("http://localhost:8787");
   });
 
   it("falls back to current host", () => {

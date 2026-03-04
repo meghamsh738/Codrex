@@ -42,6 +42,10 @@ The format follows Keep a Changelog and the project uses Semantic Versioning.
 - Action-heavy controls across Sessions/Threads/Remote/Pair/Debug now use compact pill-style buttons to reduce large text-box UI density.
 - Added lightweight tab deep-link support via `?tab=<name>` for direct navigation and documentation screenshots.
 - Refreshed screenshot assets in `screenshots/` and updated README with complete A-to-Z setup + security hardening guidance.
+- Pairing route defaults are now Tailscale-first in WebUI, and LAN/current route hints are restricted to localhost browser context.
+- Screenshot assets were split into:
+  - new WebUI screenshots in `screenshots/`
+  - legacy UI archive screenshots in `screenshots/legacy/`
 
 ### Security
 - Sanitized tracked `controller.config.json` token value to empty default so a real auth token is generated locally on first run, not committed in git.

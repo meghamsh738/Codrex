@@ -15,17 +15,23 @@ It includes:
 
 ## Screenshots
 
-### Desktop UI
+### Laptop WebUI (React)
 
-![Codrex Desktop](screenshots/codrex-desktop.png)
+![Codrex Laptop WebUI](screenshots/webui-laptop.png)
 
-### Mobile UI
+### Mobile WebUI (React/PWA)
 
-![Codrex Mobile](screenshots/codrex-mobile.png)
+![Codrex Mobile WebUI](screenshots/webui-mobile.png)
 
-### Pairing Panel
+### Pairing Tab (WebUI)
 
-![Codrex Pairing](screenshots/codrex-pairing.png)
+![Codrex Pairing WebUI](screenshots/webui-pair.png)
+
+### Legacy UI Archive
+
+![Legacy Desktop UI](screenshots/legacy/codrex-desktop.png)
+![Legacy Mobile UI](screenshots/legacy/codrex-mobile.png)
+![Legacy Pairing UI](screenshots/legacy/codrex-pairing.png)
 
 ## A-to-Z Setup (Fresh Clone)
 
@@ -89,13 +95,14 @@ Expected URLs:
 On laptop browser:
 1. Open `http://127.0.0.1:4312`
 2. Go to **Pair** tab
-3. Choose LAN or Tailscale route
+3. Keep **Tailscale** route (default and recommended)
 4. Generate QR
 5. Scan on phone/tablet
 
 Important:
 - `controller.config.json` ships with empty token; `start-controller.ps1` auto-generates a strong token on first run.
 - Pair QR uses short-lived one-time code exchange and does not place the long token in URL.
+- LAN/current pairing routes are intentionally restricted for localhost browser sessions only.
 
 ### 7) Telegram delivery (optional)
 
@@ -204,4 +211,3 @@ npm run test
 
 - Current release metadata: `VERSION` and `CHANGELOG.md`
 - Changelog format: Keep a Changelog
-
