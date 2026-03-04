@@ -104,6 +104,7 @@ Important:
 - Generated token is stored in untracked `controller.config.local.json` (not in the tracked main config).
 - Pair QR uses short-lived one-time code exchange and does not place the long token in URL.
 - LAN/current pairing routes are intentionally restricted for localhost browser sessions only.
+- `/docs`, `/redoc`, and `/openapi.json` are auth-protected whenever auth is enabled.
 
 ### 7) Telegram delivery (optional)
 
@@ -177,6 +178,7 @@ Desktop launcher:
 4. Keep `Telegram bot/key.txt` local only (it is gitignored).
 5. Rotate token if machine is shared or token was exposed.
 6. Keep firewall rules scoped to trusted network profiles.
+7. Keep `CODEX_COOKIE_SECURE=auto` (default). Use `always` behind HTTPS reverse proxies; avoid `never` except local HTTP testing.
 
 ## Known Security Risks
 
@@ -184,12 +186,14 @@ Desktop launcher:
 - If someone gets local filesystem access, they can read local runtime secrets and logs.
 - Pair links are short-lived but still sensitive while valid; share only in trusted context.
 - Telegram delivery sends files to the configured chat ID; treat bot token as a secret.
+- If `CODEX_COOKIE_SECURE=never` is used on untrusted networks, auth-cookie interception risk increases.
 
 ## Feature Notes
 
 - Reasoning options are model-aware (Codex-family models only support `low|medium|high`).
 - Remote stream profiles include `Extreme` for very low bandwidth.
 - `?tab=<name>` deep-link is supported for direct opening of tabs (`sessions`, `threads`, `remote`, `pair`, `settings`, `debug`).
+- Desktop mode is server-enforced globally; when disabled, desktop stream, screenshots, and input endpoints are all blocked.
 
 ## Development
 

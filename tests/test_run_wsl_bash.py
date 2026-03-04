@@ -1,3 +1,4 @@
+import asyncio
 import sys
 import tempfile
 import unittest
@@ -884,6 +885,14 @@ class DesktopModeTests(unittest.TestCase):
         )
         self.assertTrue(server_mod._desktop_enabled_from_request(req))
 
+    def test_desktop_mode_global_off_overrides_query_and_cookie(self):
+        req = SimpleNamespace(
+            query_params={"desktop": "on"},
+            cookies={server_mod.CODEX_DESKTOP_MODE_COOKIE: "1"},
+        )
+        with mock.patch.object(server_mod, "DESKTOP_MODE_ENABLED", False):
+            self.assertFalse(server_mod._desktop_enabled_from_request(req))
+
     def test_require_desktop_enabled_rejects_when_off(self):
         req = SimpleNamespace(
             query_params={},
@@ -916,6 +925,39 @@ class DesktopModeTests(unittest.TestCase):
         self.assertIn("Desktop control is disabled", str(ctx.exception))
         click_mock.assert_not_called()
 
+    def test_desktop_shot_blocked_when_mode_off(self):
+        req = SimpleNamespace(
+            query_params={},
+            cookies={server_mod.CODEX_DESKTOP_MODE_COOKIE: "off"},
+        )
+        with mock.patch.object(server_mod, "_ensure_windows_host"):
+            with self.assertRaises(Exception) as ctx:
+                server_mod.desktop_shot(req)
+        self.assertIn("Desktop control is disabled", str(ctx.exception))
+
+    def test_desktop_mode_endpoint_sets_global_flag(self):
+        req = SimpleNamespace(url=SimpleNamespace(scheme="http"), headers={})
+
+        class _Resp:
+            def __init__(self, payload):
+                self.payload = payload
+                self.cookies = {}
+
+            def set_cookie(self, key, value, **kwargs):
+                self.cookies[key] = {"value": value, "kwargs": kwargs}
+
+        with mock.patch.object(server_mod, "JSONResponse", side_effect=lambda payload: _Resp(payload)), \
+             mock.patch.object(server_mod, "CODEX_COOKIE_SECURE_MODE", "never"), \
+             mock.patch.object(server_mod, "DESKTOP_MODE_ENABLED", True):
+            out = server_mod.desktop_mode(req, {"enabled": "0"})
+            self.assertFalse(server_mod.DESKTOP_MODE_ENABLED)
+
+        self.assertTrue(out.payload["ok"])
+        self.assertFalse(out.payload["enabled"])
+        cookie = out.cookies.get(server_mod.CODEX_DESKTOP_MODE_COOKIE)
+        self.assertEqual(cookie["value"], "0")
+        self.assertFalse(cookie["kwargs"].get("secure"))
+
     def test_downsample_rgb_nearest_reduces_size(self):
         # 2x2 image: R, G, B, W
         rgb = bytes([
@@ -936,6 +978,64 @@ class DesktopModeTests(unittest.TestCase):
         self.assertEqual(gray[1], gray[2])
         self.assertEqual(gray[3], gray[4])
         self.assertEqual(gray[4], gray[5])
+
+
+class SecurityPolicyTests(unittest.TestCase):
+    def test_cookie_secure_auto_uses_https_scheme(self):
+        req = SimpleNamespace(url=SimpleNamespace(scheme="https"), headers={})
+        with mock.patch.object(server_mod, "CODEX_COOKIE_SECURE_MODE", "auto"):
+            self.assertTrue(server_mod._cookie_secure_for_request(req))
+
+    def test_cookie_secure_auto_honors_forwarded_proto(self):
+        req = SimpleNamespace(
+            url=SimpleNamespace(scheme="http"),
+            headers={"x-forwarded-proto": "https, http"},
+        )
+        with mock.patch.object(server_mod, "CODEX_COOKIE_SECURE_MODE", "auto"):
+            self.assertTrue(server_mod._cookie_secure_for_request(req))
+
+    def test_cookie_secure_never_forces_insecure(self):
+        req = SimpleNamespace(url=SimpleNamespace(scheme="https"), headers={})
+        with mock.patch.object(server_mod, "CODEX_COOKIE_SECURE_MODE", "never"):
+            self.assertFalse(server_mod._cookie_secure_for_request(req))
+
+    def test_auth_middleware_blocks_docs_when_auth_enabled(self):
+        req = SimpleNamespace(url=SimpleNamespace(path="/docs"), headers={}, cookies={})
+        calls = {"next": 0}
+
+        async def call_next(_request):
+            calls["next"] += 1
+            return {"ok": True}
+
+        class _Resp:
+            def __init__(self, status_code=200, content=None):
+                self.status_code = status_code
+                self.content = content
+                self.headers = {}
+
+        with mock.patch.object(server_mod, "CODEX_AUTH_REQUIRED", True), \
+             mock.patch.object(server_mod, "CODEX_AUTH_TOKEN", "secret"), \
+             mock.patch.object(server_mod, "JSONResponse", side_effect=lambda status_code=200, content=None: _Resp(status_code=status_code, content=content)):
+            out = asyncio.run(server_mod.auth_middleware(req, call_next))
+
+        self.assertEqual(calls["next"], 0)
+        self.assertEqual(out.status_code, 401)
+        self.assertEqual(out.content.get("error"), "unauthorized")
+
+    def test_auth_middleware_keeps_auth_status_public(self):
+        req = SimpleNamespace(url=SimpleNamespace(path="/auth/status"), headers={}, cookies={})
+        calls = {"next": 0}
+
+        async def call_next(_request):
+            calls["next"] += 1
+            return {"ok": True}
+
+        with mock.patch.object(server_mod, "CODEX_AUTH_REQUIRED", True), \
+             mock.patch.object(server_mod, "CODEX_AUTH_TOKEN", "secret"):
+            out = asyncio.run(server_mod.auth_middleware(req, call_next))
+
+        self.assertEqual(calls["next"], 1)
+        self.assertEqual(out, {"ok": True})
 
 
 class SharedOutboxTests(unittest.TestCase):
@@ -1265,7 +1365,11 @@ class LegacyFallbackTests(unittest.TestCase):
         with mock.patch.object(server_mod, "_legacy_result_page", side_effect=fake_page), \
              mock.patch.object(server_mod, "CODEX_AUTH_REQUIRED", True), \
              mock.patch.object(server_mod, "CODEX_AUTH_TOKEN", "secret"):
-            out = server_mod.legacy_auth_login(token="wrong", next="/")
+            out = server_mod.legacy_auth_login(
+                request=SimpleNamespace(url=SimpleNamespace(scheme="http"), headers={}),
+                token="wrong",
+                next="/",
+            )
 
         self.assertEqual(out["status_code"], 401)
         self.assertFalse(out["payload"]["ok"])

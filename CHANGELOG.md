@@ -46,12 +46,15 @@ The format follows Keep a Changelog and the project uses Semantic Versioning.
 - Screenshot assets were split into:
   - new WebUI screenshots in `screenshots/`
   - legacy UI archive screenshots in `screenshots/legacy/`
+- Desktop mode is now server-enforced globally (toggle state blocks desktop stream, screenshot, and input APIs when off).
 
 ### Security
 - Sanitized tracked `controller.config.json` token value to empty default so a real auth token is generated locally on first run, not committed in git.
 - `/auth/bootstrap/local` now requires a loopback client address, reducing risk from Host/Origin header spoofing.
 - `start-controller.ps1` now stores runtime auth token in untracked `controller.config.local.json` and masks token in console output.
 - `/telegram/status` no longer exposes local secret-file paths.
+- Auth cookies now use configurable secure policy via `CODEX_COOKIE_SECURE` (`auto`/`always`/`never`) with HTTPS auto-detection.
+- `/docs`, `/redoc`, and `/openapi.json` are no longer public when auth is required.
 
 ## [1.4.1] - 2026-03-04
 

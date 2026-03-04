@@ -267,6 +267,13 @@ MAX_DESKTOP_TEXT = 2000
 SHOW_CURSOR_OVERLAY = os.environ.get("CODEX_SHOW_CURSOR_OVERLAY", "1").strip().lower() not in {"0", "false", "no"}
 DESKTOP_STREAM_FPS_DEFAULT = float(os.environ.get("CODEX_DESKTOP_STREAM_FPS", "3.0") or "3.0")
 DESKTOP_STREAM_PNG_LEVEL_DEFAULT = int(os.environ.get("CODEX_DESKTOP_STREAM_PNG_LEVEL", "3") or "3")
+DESKTOP_MODE_LOCK = threading.Lock()
+DESKTOP_MODE_ENABLED = str(os.environ.get("CODEX_DESKTOP_MODE_DEFAULT", "1") or "1").strip().lower() not in {"0", "false", "no", "off"}
+_cookie_secure_raw = str(os.environ.get("CODEX_COOKIE_SECURE", "auto") or "auto").strip().lower()
+if _cookie_secure_raw in {"auto", "always", "never", "on", "off", "true", "false", "1", "0", "yes", "no"}:
+    CODEX_COOKIE_SECURE_MODE = _cookie_secure_raw
+else:
+    CODEX_COOKIE_SECURE_MODE = "auto"
 
 # -------------------------
 # Thread transcript store
@@ -1594,7 +1601,61 @@ def _truthy_flag(v: Any) -> bool:
 def _falsy_flag(v: Any) -> bool:
     return str(v or "").strip().lower() in {"0", "false", "no", "off"}
 
+
+def _request_is_https(request: Optional[Request]) -> bool:
+    if request is None:
+        return False
+    try:
+        scheme = (getattr(getattr(request, "url", None), "scheme", "") or "").strip().lower()
+        if scheme == "https":
+            return True
+    except Exception:
+        pass
+    try:
+        xf_proto = (request.headers.get("x-forwarded-proto") or "").strip().lower()
+    except Exception:
+        xf_proto = ""
+    if xf_proto:
+        # Proxy chains can include comma-separated values.
+        if xf_proto.split(",", 1)[0].strip() == "https":
+            return True
+    try:
+        forwarded = (request.headers.get("forwarded") or "").strip()
+    except Exception:
+        forwarded = ""
+    if forwarded:
+        m = re.search(r"proto=([^;,\s]+)", forwarded, flags=re.IGNORECASE)
+        if m and m.group(1).strip().strip('"').lower() == "https":
+            return True
+    return False
+
+
+def _cookie_secure_for_request(request: Optional[Request]) -> bool:
+    mode = (CODEX_COOKIE_SECURE_MODE or "auto").strip().lower()
+    if mode in {"always", "on", "true", "1", "yes"}:
+        return True
+    if mode in {"never", "off", "false", "0", "no"}:
+        return False
+    return _request_is_https(request)
+
+
+def _desktop_global_enabled() -> bool:
+    with DESKTOP_MODE_LOCK:
+        return bool(DESKTOP_MODE_ENABLED)
+
+
+def _set_desktop_global_enabled(enabled: bool) -> bool:
+    global DESKTOP_MODE_ENABLED
+    value = bool(enabled)
+    with DESKTOP_MODE_LOCK:
+        DESKTOP_MODE_ENABLED = value
+    return value
+
+
 def _desktop_enabled_from_request(request: Request) -> bool:
+    if not _desktop_global_enabled():
+        return False
+
     # Query param can temporarily override cookie value on this request.
     q = ""
     try:
@@ -1674,9 +1735,6 @@ async def auth_middleware(request: Request, call_next):
         "/legacy/auth",
         "/legacy/auth/login",
         "/legacy/auth/logout",
-        "/docs",
-        "/redoc",
-        "/openapi.json",
     }
     if path in public_paths:
         return await call_next(request)
@@ -4961,7 +5019,7 @@ def auth_status(request: Request):
     }
 
 @app.post("/auth/login")
-def auth_login(payload: Dict[str, Any] = Body(...)):
+def auth_login(request: Request, payload: Dict[str, Any] = Body(...)):
     token = (payload.get("token") or "").strip()
     if not _is_valid_auth_token(token):
         return {"ok": False, "error": "unauthorized", "detail": "Invalid token."}
@@ -4970,7 +5028,7 @@ def auth_login(payload: Dict[str, Any] = Body(...)):
         key=CODEX_AUTH_COOKIE,
         value=token,
         httponly=True,
-        secure=False,
+        secure=_cookie_secure_for_request(request),
         samesite="lax",
         max_age=60 * 60 * 12,
     )
@@ -5022,7 +5080,7 @@ def auth_bootstrap_local(request: Request):
         key=CODEX_AUTH_COOKIE,
         value=CODEX_AUTH_TOKEN,
         httponly=True,
-        secure=False,
+        secure=_cookie_secure_for_request(request),
         samesite="lax",
         max_age=60 * 60 * 12,
     )
@@ -5082,7 +5140,7 @@ def legacy_auth_page():
     )
 
 @app.post("/legacy/auth/login")
-def legacy_auth_login(token: str = Form(""), next: str = Form("/")):
+def legacy_auth_login(request: Request, token: str = Form(""), next: str = Form("/")):
     t = (token or "").strip()
     if not _is_valid_auth_token(t):
         return _legacy_result_page(
@@ -5095,7 +5153,7 @@ def legacy_auth_login(token: str = Form(""), next: str = Form("/")):
         key=CODEX_AUTH_COOKIE,
         value=t if CODEX_AUTH_REQUIRED else "",
         httponly=True,
-        secure=False,
+        secure=_cookie_secure_for_request(request),
         samesite="lax",
         max_age=60 * 60 * 12,
     )
@@ -5132,7 +5190,7 @@ def auth_pair_create(request: Request):
 
 
 @app.post("/auth/pair/exchange")
-def auth_pair_exchange(payload: Dict[str, Any] = Body(...)):
+def auth_pair_exchange(request: Request, payload: Dict[str, Any] = Body(...)):
     if not CODEX_AUTH_REQUIRED:
         return {"ok": True, "auth_required": False}
 
@@ -5146,7 +5204,7 @@ def auth_pair_exchange(payload: Dict[str, Any] = Body(...)):
         key=CODEX_AUTH_COOKIE,
         value=CODEX_AUTH_TOKEN,
         httponly=True,
-        secure=False,
+        secure=_cookie_secure_for_request(request),
         samesite="lax",
         max_age=60 * 60 * 12,
     )
@@ -5317,7 +5375,7 @@ def auth_pair_consume(request: Request, code: str = "", pair: str = "", direct: 
         key=CODEX_AUTH_COOKIE,
         value=CODEX_AUTH_TOKEN,
         httponly=True,
-        secure=False,
+        secure=_cookie_secure_for_request(request),
         samesite="lax",
         max_age=60 * 60 * 12,
     )
@@ -5386,8 +5444,9 @@ def desktop_info(request: Request):
     return {"ok": True, "enabled": _desktop_enabled_from_request(request), **mon}
 
 @app.get("/desktop/shot")
-def desktop_shot(level: Optional[int] = None, scale: Optional[int] = None, bw: Optional[str] = None):
+def desktop_shot(request: Request, level: Optional[int] = None, scale: Optional[int] = None, bw: Optional[str] = None):
     _ensure_windows_host()
+    _require_desktop_enabled(request)
     png_level = _clamp(int(level if level is not None else DESKTOP_STREAM_PNG_LEVEL_DEFAULT), 0, 9)
     scale_factor = _parse_stream_scale(scale, default=1)
     grayscale = _truthy_flag(bw)
@@ -5428,6 +5487,7 @@ async def desktop_stream(
     This keeps updating even when client-side JS is disabled or broken.
     """
     _ensure_windows_host()
+    _require_desktop_enabled(request)
     try:
         fps_val = float(fps if fps is not None else DESKTOP_STREAM_FPS_DEFAULT)
     except Exception:
@@ -5482,14 +5542,14 @@ async def desktop_stream(
     )
 
 @app.post("/desktop/mode")
-def desktop_mode(payload: Dict[str, Any] = Body(...)):
-    enabled = _truthy_flag(payload.get("enabled"))
+def desktop_mode(request: Request, payload: Dict[str, Any] = Body(...)):
+    enabled = _set_desktop_global_enabled(_truthy_flag(payload.get("enabled")))
     resp = JSONResponse({"ok": True, "enabled": enabled})
     resp.set_cookie(
         key=CODEX_DESKTOP_MODE_COOKIE,
         value="1" if enabled else "0",
         httponly=True,
-        secure=False,
+        secure=_cookie_secure_for_request(request),
         samesite="lax",
         max_age=60 * 60 * 24 * 30,
     )
@@ -6379,14 +6439,14 @@ def _legacy_error_payload(exc: Exception) -> Dict[str, Any]:
     return {"ok": False, "error": "exception", "detail": f"{type(exc).__name__}: {exc}"}
 
 @app.post("/legacy/desktop/mode")
-def legacy_desktop_mode(enabled: str = Form(""), next: str = Form("/")):
-    on = _truthy_flag(enabled)
+def legacy_desktop_mode(request: Request, enabled: str = Form(""), next: str = Form("/")):
+    on = _set_desktop_global_enabled(_truthy_flag(enabled))
     resp = Response(status_code=303, headers={"Location": _safe_next_path(next)})
     resp.set_cookie(
         key=CODEX_DESKTOP_MODE_COOKIE,
         value="1" if on else "0",
         httponly=True,
-        secure=False,
+        secure=_cookie_secure_for_request(request),
         samesite="lax",
         max_age=60 * 60 * 24 * 30,
     )
