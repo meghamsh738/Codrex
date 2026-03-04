@@ -5446,7 +5446,6 @@ def desktop_info(request: Request):
 @app.get("/desktop/shot")
 def desktop_shot(request: Request, level: Optional[int] = None, scale: Optional[int] = None, bw: Optional[str] = None):
     _ensure_windows_host()
-    _require_desktop_enabled(request)
     png_level = _clamp(int(level if level is not None else DESKTOP_STREAM_PNG_LEVEL_DEFAULT), 0, 9)
     scale_factor = _parse_stream_scale(scale, default=1)
     grayscale = _truthy_flag(bw)
@@ -5487,7 +5486,6 @@ async def desktop_stream(
     This keeps updating even when client-side JS is disabled or broken.
     """
     _ensure_windows_host()
-    _require_desktop_enabled(request)
     try:
         fps_val = float(fps if fps is not None else DESKTOP_STREAM_FPS_DEFAULT)
     except Exception:

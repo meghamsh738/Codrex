@@ -13,7 +13,9 @@ import json
 import os
 import pathlib
 import re
+import shutil
 import sys
+import time
 import urllib.error
 import urllib.request
 from typing import Any, Dict, List, Optional, Tuple
@@ -29,6 +31,10 @@ def _default_config_path() -> pathlib.Path:
     script_real = pathlib.Path(__file__).resolve()
     repo_root = script_real.parent.parent
     return repo_root / "controller.config.json"
+
+
+def _local_config_path_for(config_path: pathlib.Path) -> pathlib.Path:
+    return config_path.with_name("controller.config.local.json")
 
 
 def _win_to_wsl_path(path: str) -> str:
@@ -52,6 +58,22 @@ def _read_controller_config(config_path: pathlib.Path) -> Dict[str, Any]:
     except Exception:
         return {}
     return data if isinstance(data, dict) else {}
+
+
+def _merge_controller_configs(primary: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
+    merged: Dict[str, Any] = {}
+    if isinstance(primary, dict):
+        merged.update(primary)
+    if isinstance(override, dict):
+        for key, value in override.items():
+            # Treat empty-string override as "ignore" so blank local fields do not
+            # accidentally erase a usable main config value.
+            if isinstance(value, str) and not value.strip():
+                continue
+            if value is None:
+                continue
+            merged[key] = value
+    return merged
 
 
 def _normalize_base_url(raw: str) -> str:
@@ -140,7 +162,7 @@ def _build_controller_candidates(env_base: str, cfg: Dict[str, Any], port: int) 
     return candidates
 
 
-def _get_controller_defaults() -> Tuple[str, str]:
+def _get_controller_defaults() -> Tuple[str, str, Dict[str, Any]]:
     # Priority:
     # 1) explicit env
     # 2) controller.config.json (port + token)
@@ -152,8 +174,11 @@ def _get_controller_defaults() -> Tuple[str, str]:
         config_path = pathlib.Path(_win_to_wsl_path(config_env)).expanduser()
     else:
         config_path = _default_config_path()
+    local_config_path = _local_config_path_for(config_path)
 
-    cfg = _read_controller_config(config_path)
+    cfg_main = _read_controller_config(config_path)
+    cfg_local = _read_controller_config(local_config_path)
+    cfg = _merge_controller_configs(cfg_main, cfg_local)
 
     port = 8787
     try:
@@ -170,7 +195,38 @@ def _get_controller_defaults() -> Tuple[str, str]:
         if _controller_reachable(candidate, token):
             base = candidate
             break
-    return base, token
+    return base, token, cfg
+
+
+def _path_within_root(path_value: pathlib.Path, root_value: pathlib.Path) -> bool:
+    try:
+        path_value.resolve().relative_to(root_value.resolve())
+        return True
+    except Exception:
+        return False
+
+
+def _resolve_share_root(cfg: Dict[str, Any]) -> pathlib.Path:
+    for key in ("fileRoot", "file_root", "workdir", "cwd"):
+        raw = str(cfg.get(key) or "").strip()
+        if raw:
+            converted = _win_to_wsl_path(raw)
+            root = pathlib.Path(converted).expanduser()
+            if root.is_absolute():
+                return root
+    return pathlib.Path("/home/megha/codrex-work")
+
+
+def _stage_file_into_share_root(source_path: pathlib.Path, share_root: pathlib.Path) -> pathlib.Path:
+    staging_dir = share_root / "output" / ".codrex-share-staging"
+    staging_dir.mkdir(parents=True, exist_ok=True)
+    stamp = int(time.time())
+    safe_name = source_path.name or "file.bin"
+    dest = staging_dir / f"{stamp}_{safe_name}"
+    if dest.exists():
+        dest = staging_dir / f"{stamp}_{os.getpid()}_{safe_name}"
+    shutil.copy2(source_path, dest)
+    return dest
 
 
 def _request_json(base_url: str, method: str, path: str, payload: Optional[Dict[str, Any]], token: str) -> Dict[str, Any]:
@@ -220,10 +276,21 @@ def main(argv: list[str]) -> int:
     if not wsl_path.is_absolute():
         wsl_path = (pathlib.Path.cwd() / wsl_path).resolve()
 
-    base_url, token = _get_controller_defaults()
+    if not wsl_path.exists():
+        _die(f"Source file not found: {wsl_path}", code=2)
+    if not wsl_path.is_file():
+        _die(f"Source path is not a regular file: {wsl_path}", code=2)
+
+    base_url, token, cfg = _get_controller_defaults()
+
+    share_path = wsl_path
+    share_root = _resolve_share_root(cfg)
+    if share_root and not _path_within_root(share_path, share_root):
+        share_path = _stage_file_into_share_root(share_path, share_root)
+        print(f"Staged outside-root file into: {share_path}")
 
     share_payload: Dict[str, Any] = {
-        "path": str(wsl_path),
+        "path": str(share_path),
         "expires_hours": max(1, int(args.expires or 24)),
         "created_by": (args.created_by or "codex-cli").strip()[:64],
     }

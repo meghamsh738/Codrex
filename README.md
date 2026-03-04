@@ -193,7 +193,7 @@ Desktop launcher:
 - Reasoning options are model-aware (Codex-family models only support `low|medium|high`).
 - Remote stream profiles include `Extreme` for very low bandwidth.
 - `?tab=<name>` deep-link is supported for direct opening of tabs (`sessions`, `threads`, `remote`, `pair`, `settings`, `debug`).
-- Desktop mode is server-enforced globally; when disabled, desktop stream, screenshots, and input endpoints are all blocked.
+- Desktop control mode is server-enforced globally; when disabled, input endpoints are blocked while live stream remains available in view-only mode.
 
 ## Development
 

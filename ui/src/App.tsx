@@ -142,8 +142,8 @@ const DESKTOP_PROFILE_STREAM: Record<DesktopStreamProfile, { fps: number; level:
   responsive: { fps: 8, level: 1, scale: 1, bw: false },
   balanced: { fps: 6, level: 2, scale: 2, bw: false },
   saver: { fps: 4, level: 3, scale: 3, bw: false },
-  ultra: { fps: 3, level: 4, scale: 4, bw: true },
-  extreme: { fps: 1.5, level: 6, scale: 6, bw: true },
+  ultra: { fps: 3, level: 2, scale: 3, bw: true },
+  extreme: { fps: 2, level: 3, scale: 4, bw: true },
 };
 const FALLBACK_MODELS = ["gpt-5-codex", "gpt-5", "gpt-5-mini", "gpt-4.1", "o4-mini"];
 const FALLBACK_REASONING_EFFORTS: ReasoningEffort[] = ["minimal", "low", "medium", "high", "xhigh"];
@@ -671,11 +671,10 @@ export default function App() {
 
   const [desktopInfo, setDesktopInfo] = useState<DesktopInfoResult | null>(null);
   const [desktopEnabled, setDesktopEnabled] = useState(false);
-  const [desktopProfile, setDesktopProfile] = useState<DesktopStreamProfile>("ultra");
+  const [desktopProfile, setDesktopProfile] = useState<DesktopStreamProfile>("balanced");
   const [desktopKeyInput, setDesktopKeyInput] = useState("enter");
   const [desktopTextInput, setDesktopTextInput] = useState("");
   const [desktopStatus, setDesktopStatus] = useState("");
-  const [desktopShotUrl, setDesktopShotUrl] = useState(() => buildDesktopShotUrl(DESKTOP_PROFILE_STREAM.ultra));
   const [desktopFocusPoint, setDesktopFocusPoint] = useState<{ x: number; y: number } | null>(null);
 
   const [execPrompt, setExecPrompt] = useState("");
@@ -1830,11 +1829,6 @@ export default function App() {
     }
   }, [outputFeedState, streamEnabled]);
 
-  useEffect(() => {
-    const profile = DESKTOP_PROFILE_STREAM[desktopProfile];
-    setDesktopShotUrl(buildDesktopShotUrl(profile));
-  }, [desktopProfile]);
-
   const projectOptions = useMemo(() => {
     const unique = new Set<string>();
     sessions.forEach((session) => {
@@ -2807,7 +2801,11 @@ export default function App() {
       }
       const enabled = !!response.enabled;
       setDesktopEnabled(enabled);
-      setDesktopStatus(enabled ? "Desktop control enabled." : "Desktop control disabled.");
+      setDesktopStatus(
+        enabled
+          ? "Desktop control enabled. Stream remains live."
+          : "Desktop control disabled. View-only live stream remains active.",
+      );
       if (!enabled) {
         setDesktopFocusPoint(null);
       }
@@ -2985,12 +2983,6 @@ export default function App() {
       setError(`Desktop key failed: ${(error as Error).message}`);
     }
   }, [desktopEnabled, desktopKeyInput, setError]);
-
-  const onRefreshDesktopShot = useCallback(() => {
-    const profile = DESKTOP_PROFILE_STREAM[desktopProfile];
-    setDesktopShotUrl(buildDesktopShotUrl(profile));
-    setStatus("Desktop shot refreshed.");
-  }, [desktopProfile, setStatus]);
 
   const onRunExec = useCallback(async () => {
     const prompt = execPrompt.trim();
@@ -3620,7 +3612,7 @@ export default function App() {
                         <span className="btn-text">Close</span>
                       </button>
                       <button type="button" className="button soft compact" data-short={consoleFocusMode ? "EXIT" : "FOC"} onClick={() => setConsoleFocusMode((current) => !current)}>
-                        <span className="btn-text">{consoleFocusMode ? "Exit Focus" : "Focus"}</span>
+                        <span className="btn-text">{consoleFocusMode ? "Exit Focus Mode" : "Focus Console"}</span>
                       </button>
                     </div>
 
@@ -4012,7 +4004,7 @@ export default function App() {
               <h2>Remote Control</h2>
               <div className="row">
                 <span className="badge">desktop + capture</span>
-                <span className="badge muted">{desktopEnabled ? "desktop: on" : "desktop: off"}</span>
+                <span className="badge muted">{desktopEnabled ? "control: on" : "control: off (view-only)"}</span>
               </div>
             </div>
 
@@ -4022,7 +4014,7 @@ export default function App() {
                   <h3>Desktop Remote</h3>
                   <div className="row">
                     <button type="button" className={`button ${desktopEnabled ? "warn" : ""}`} onClick={() => void onToggleDesktopMode()}>
-                      {desktopEnabled ? "Disable Desktop" : "Enable Desktop"}
+                      {desktopEnabled ? "Disable Control" : "Enable Control"}
                     </button>
                     <span className="small">
                       {desktopInfo?.width && desktopInfo?.height
@@ -4039,8 +4031,8 @@ export default function App() {
                       <option value="responsive">Responsive</option>
                       <option value="balanced">Balanced</option>
                       <option value="saver">Saver</option>
-                      <option value="ultra">Ultra (B/W, low data)</option>
-                      <option value="extreme">Extreme (very low bandwidth)</option>
+                      <option value="ultra">Ultra (readable low-data)</option>
+                      <option value="extreme">Extreme (lowest bandwidth, readable)</option>
                     </select>
                   </label>
                   <p className="small">
@@ -4055,12 +4047,14 @@ export default function App() {
                     <img
                       ref={desktopFrameRef}
                       className="desktop-frame"
-                      src={desktopEnabled ? desktopStreamUrl : desktopShotUrl}
+                      src={desktopStreamUrl}
                       alt="Desktop stream"
                       onClick={(event) => void onDesktopFrameTap(event)}
                     />
                   </div>
-                  <p className="small">Tap/click the stream to focus target window before sending text or keys.</p>
+                  <p className="small">
+                    Live stream stays on in both modes. Enable control to click/type; disable control for safe view-only monitoring.
+                  </p>
                   <div className="row remote-mouse-controls">
                     <button type="button" className="button soft compact" data-short="L" onClick={() => void onDesktopClick("left")} disabled={desktopInteractionDisabled}>
                       <span className="btn-text">Left Click</span>
@@ -4120,9 +4114,6 @@ export default function App() {
                     </select>
                     <button type="button" className="button soft compact" data-short="KEY" onClick={() => void onDesktopSendKey()} disabled={desktopInteractionDisabled}>
                       <span className="btn-text">Send Key</span>
-                    </button>
-                    <button type="button" className="button soft compact" data-short="SHOT" onClick={() => onRefreshDesktopShot()}>
-                      <span className="btn-text">Refresh Shot</span>
                     </button>
                   </div>
                 </div>

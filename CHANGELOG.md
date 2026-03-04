@@ -46,7 +46,12 @@ The format follows Keep a Changelog and the project uses Semantic Versioning.
 - Screenshot assets were split into:
   - new WebUI screenshots in `screenshots/`
   - legacy UI archive screenshots in `screenshots/legacy/`
-- Desktop mode is now server-enforced globally (toggle state blocks desktop stream, screenshot, and input APIs when off).
+- Desktop mode is now server-enforced globally for control actions (input APIs blocked when off).
+- Desktop remote mode behavior now preserves view-only live stream when control is disabled; input actions remain blocked until control is re-enabled.
+- Remote low-bandwidth profiles were re-tuned for readability:
+  - `Ultra`: 3 FPS, scale x3, grayscale
+  - `Extreme`: 2 FPS, scale x4, grayscale
+- Compact control buttons now keep full-text labels on small/mobile viewports (no cryptic short-code badges).
 
 ### Security
 - Sanitized tracked `controller.config.json` token value to empty default so a real auth token is generated locally on first run, not committed in git.
@@ -55,6 +60,9 @@ The format follows Keep a Changelog and the project uses Semantic Versioning.
 - `/telegram/status` no longer exposes local secret-file paths.
 - Auth cookies now use configurable secure policy via `CODEX_COOKIE_SECURE` (`auto`/`always`/`never`) with HTTPS auto-detection.
 - `/docs`, `/redoc`, and `/openapi.json` are no longer public when auth is required.
+
+### Fixed
+- `codrex-send` now resolves auth defaults from untracked `controller.config.local.json` (merged over tracked config), fixing `Share failed: Login required` in WSL/manual send flows.
 
 ## [1.4.1] - 2026-03-04
 

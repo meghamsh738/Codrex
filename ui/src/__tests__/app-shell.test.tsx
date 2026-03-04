@@ -324,6 +324,8 @@ describe("app shell tabs", () => {
 
     expect(screen.getByRole("button", { name: "Send Text" })).toBeDisabled();
     expect(screen.getByRole("button", { name: "Send Key" })).toBeDisabled();
+    const streamImage = screen.getByAltText("Desktop stream") as HTMLImageElement;
+    expect(streamImage.src).toContain("/desktop/stream");
   });
 
   it("sends remote text to telegram from remote tab", async () => {
@@ -340,7 +342,7 @@ describe("app shell tabs", () => {
     render(<App />);
 
     fireEvent.click(await screen.findByTestId("tab-remote"));
-    await screen.findByRole("button", { name: "Disable Desktop" });
+    await screen.findByRole("button", { name: "Disable Control" });
 
     fireEvent.change(screen.getByPlaceholderText("Type text on desktop"), {
       target: { value: "Remote quick note" },

@@ -925,15 +925,32 @@ class DesktopModeTests(unittest.TestCase):
         self.assertIn("Desktop control is disabled", str(ctx.exception))
         click_mock.assert_not_called()
 
-    def test_desktop_shot_blocked_when_mode_off(self):
+    def test_desktop_shot_allowed_when_mode_off(self):
         req = SimpleNamespace(
             query_params={},
             cookies={server_mod.CODEX_DESKTOP_MODE_COOKIE: "off"},
         )
-        with mock.patch.object(server_mod, "_ensure_windows_host"):
-            with self.assertRaises(Exception) as ctx:
-                server_mod.desktop_shot(req)
-        self.assertIn("Desktop control is disabled", str(ctx.exception))
+        class _MSSCtx:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            @property
+            def monitors(self):
+                return [None, {"left": 0, "top": 0, "width": 1, "height": 1}]
+
+            def grab(self, _mon):
+                return SimpleNamespace(rgb=b"\x00\x00\x00", size=(1, 1))
+
+        with mock.patch.object(server_mod, "_ensure_windows_host"), \
+             mock.patch.object(server_mod, "SHOW_CURSOR_OVERLAY", False), \
+             mock.patch.object(server_mod, "mss", return_value=_MSSCtx()), \
+             mock.patch.object(server_mod, "to_png", return_value=b"png-bytes"), \
+             mock.patch.object(server_mod, "_require_desktop_enabled", side_effect=RuntimeError("should-not-be-called")):
+            out = server_mod.desktop_shot(req)
+        self.assertIsNotNone(out)
 
     def test_desktop_mode_endpoint_sets_global_flag(self):
         req = SimpleNamespace(url=SimpleNamespace(scheme="http"), headers={})
