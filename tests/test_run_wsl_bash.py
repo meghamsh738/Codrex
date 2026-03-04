@@ -820,7 +820,10 @@ class CodexSessionConfigTests(unittest.TestCase):
         self.assertNotIn("codex_demo", fake_sessions)
 
     def test_auth_bootstrap_local_rejects_non_localhost(self):
-        req = SimpleNamespace(headers={"host": "100.64.0.9:8787", "origin": "http://100.64.0.9:8787"})
+        req = SimpleNamespace(
+            headers={"host": "100.64.0.9:8787", "origin": "http://100.64.0.9:8787"},
+            client=SimpleNamespace(host="100.64.0.9"),
+        )
         with mock.patch.object(server_mod, "CODEX_AUTH_REQUIRED", True), \
              mock.patch.object(server_mod, "CODEX_AUTH_TOKEN", "secret"):
             out = server_mod.auth_bootstrap_local(req)
@@ -828,7 +831,10 @@ class CodexSessionConfigTests(unittest.TestCase):
         self.assertEqual(out["error"], "forbidden")
 
     def test_auth_bootstrap_local_sets_cookie_for_localhost(self):
-        req = SimpleNamespace(headers={"host": "localhost:8787", "origin": "http://localhost:8787"})
+        req = SimpleNamespace(
+            headers={"host": "localhost:8787", "origin": "http://localhost:8787"},
+            client=SimpleNamespace(host="127.0.0.1"),
+        )
 
         class _Resp:
             def __init__(self, payload):
@@ -845,6 +851,18 @@ class CodexSessionConfigTests(unittest.TestCase):
 
         self.assertTrue(out.payload["ok"])
         self.assertEqual(out.cookies.get(server_mod.CODEX_AUTH_COOKIE), "secret")
+
+    def test_auth_bootstrap_local_rejects_host_header_spoof_from_remote_client(self):
+        req = SimpleNamespace(
+            headers={"host": "localhost:8787", "origin": "http://localhost:8787"},
+            client=SimpleNamespace(host="100.120.36.41"),
+        )
+        with mock.patch.object(server_mod, "CODEX_AUTH_REQUIRED", True), \
+             mock.patch.object(server_mod, "CODEX_AUTH_TOKEN", "secret"):
+            out = server_mod.auth_bootstrap_local(req)
+        self.assertFalse(out["ok"])
+        self.assertEqual(out["error"], "forbidden")
+        self.assertIn("loopback", out["detail"])
 
 
 class DesktopModeTests(unittest.TestCase):

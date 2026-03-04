@@ -17,6 +17,7 @@ import uuid
 import posixpath
 import secrets
 import ctypes
+import ipaddress
 from ctypes import wintypes
 from typing import List, Dict, Any, Optional, Tuple
 from urllib.parse import quote, urlparse
@@ -1550,6 +1551,18 @@ def _is_valid_auth_token(token: str) -> bool:
 def _is_localhost_label(host: str) -> bool:
     h = (host or "").strip().lower().strip("[]")
     return h in {"localhost", "127.0.0.1", "::1"}
+
+
+def _is_loopback_ip(value: str) -> bool:
+    host = (value or "").strip().lower().strip("[]")
+    if not host:
+        return False
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except Exception:
+        return False
 
 
 def _host_from_host_header(host_header: str) -> str:
@@ -4970,6 +4983,7 @@ def auth_bootstrap_local(request: Request):
     Local-host bootstrap for laptop-first usage.
 
     Security model:
+    - Only allowed when TCP client address is loopback.
     - Only allowed when request Host is localhost/127.0.0.1.
     - If Origin/Referer are present, they must also be localhost.
     - Never exposes token in response body; only sets auth cookie.
@@ -4977,9 +4991,21 @@ def auth_bootstrap_local(request: Request):
     if not CODEX_AUTH_REQUIRED:
         return {"ok": True, "auth_required": False, "method": "local_bootstrap"}
 
+    client_host = ""
+    try:
+        client = getattr(request, "client", None)
+        client_host = str(getattr(client, "host", "") or "").strip()
+    except Exception:
+        client_host = ""
     host = _host_from_host_header(request.headers.get("host") or "")
     origin_host = _host_from_url_header(request.headers.get("origin") or "")
     referer_host = _host_from_url_header(request.headers.get("referer") or "")
+    if not _is_loopback_ip(client_host):
+        return {
+            "ok": False,
+            "error": "forbidden",
+            "detail": "Local bootstrap is only allowed from loopback client addresses.",
+        }
     if not _is_localhost_label(host):
         return {
             "ok": False,
@@ -6894,8 +6920,6 @@ def telegram_status():
         "bot_token_masked": _mask_sensitive(token) if token else "",
         "api_base": TELEGRAM_API_BASE,
         "max_file_mb": max(1, TELEGRAM_MAX_FILE_MB),
-        "secret_file": TELEGRAM_SECRET_FILE,
-        "chat_id_file": TELEGRAM_CHAT_FILE,
     }
 
 

@@ -17,6 +17,17 @@ function New-SecureToken([int]$ByteCount = 32) {
   return ([Convert]::ToBase64String($bytes)).TrimEnd("=").Replace("+", "-").Replace("/", "_")
 }
 
+function Mask-Secret {
+  param(
+    [string]$Value
+  )
+  if (-not $Value) { return "" }
+  if ($Value.Length -le 12) { return ("*" * $Value.Length) }
+  $head = $Value.Substring(0, 6)
+  $tail = $Value.Substring($Value.Length - 4)
+  return "$head...$tail"
+}
+
 function Convert-ToBoolean {
   param(
     [object]$Value,
@@ -109,6 +120,7 @@ function Test-ControllerReady {
 
 $root = Split-Path -Parent $PSCommandPath
 $configPath = Join-Path $root "controller.config.json"
+$localConfigPath = Join-Path $root "controller.config.local.json"
 $logsDir = Join-Path $root "logs"
 $outLog = Join-Path $logsDir "controller.out.log"
 $errLog = Join-Path $logsDir "controller.err.log"
@@ -117,21 +129,46 @@ if (-not (Test-Path $logsDir)) {
   New-Item -Path $logsDir -ItemType Directory -Force | Out-Null
 }
 
-# Load or initialize persisted controller config.
+# Load persisted controller config. Sensitive values are stored in local override file.
 $cfg = [ordered]@{}
+function Apply-LoadedConfig {
+  param(
+    [object]$Loaded
+  )
+  if ($null -eq $Loaded) { return }
+  try {
+    if ($Loaded.port) { $cfg.port = [int]$Loaded.port }
+  } catch {}
+  try {
+    if ($Loaded.distro) { $cfg.distro = [string]$Loaded.distro }
+  } catch {}
+  try {
+    if ($Loaded.workdir) { $cfg.workdir = [string]$Loaded.workdir }
+  } catch {}
+  try {
+    if ($Loaded.fileRoot) { $cfg.fileRoot = [string]$Loaded.fileRoot }
+  } catch {}
+  try {
+    if ($Loaded.token) { $cfg.token = [string]$Loaded.token }
+  } catch {}
+  try {
+    $cfg.telegramDefaultSend = Convert-ToBoolean -Value $Loaded.telegramDefaultSend -Default $true
+  } catch {}
+}
+
 if (Test-Path $configPath) {
   try {
     $raw = Get-Content $configPath -Raw
     if ($raw.Trim()) {
-      $loaded = $raw | ConvertFrom-Json
-      if ($null -ne $loaded) {
-        $cfg.port = [int]$loaded.port
-        $cfg.distro = [string]$loaded.distro
-        $cfg.workdir = [string]$loaded.workdir
-        $cfg.fileRoot = [string]$loaded.fileRoot
-        $cfg.token = [string]$loaded.token
-        $cfg.telegramDefaultSend = Convert-ToBoolean -Value $loaded.telegramDefaultSend -Default $true
-      }
+      Apply-LoadedConfig -Loaded ($raw | ConvertFrom-Json)
+    }
+  } catch {}
+}
+if (Test-Path $localConfigPath) {
+  try {
+    $rawLocal = Get-Content $localConfigPath -Raw
+    if ($rawLocal.Trim()) {
+      Apply-LoadedConfig -Loaded ($rawLocal | ConvertFrom-Json)
     }
   } catch {}
 }
@@ -148,7 +185,19 @@ if (-not $cfg.fileRoot) { $cfg.fileRoot = $cfg.workdir }
 if (-not $cfg.token -or $cfg.token.Length -lt 24) { $cfg.token = New-SecureToken }
 $cfg.telegramDefaultSend = Convert-ToBoolean -Value $cfg.telegramDefaultSend -Default $true
 
-$cfg | ConvertTo-Json | Set-Content -Path $configPath -Encoding UTF8
+$persistMain = [ordered]@{
+  port = [int]$cfg.port
+  distro = [string]$cfg.distro
+  workdir = [string]$cfg.workdir
+  fileRoot = [string]$cfg.fileRoot
+  token = ""
+  telegramDefaultSend = [bool]$cfg.telegramDefaultSend
+}
+$persistLocal = [ordered]@{
+  token = [string]$cfg.token
+}
+$persistMain | ConvertTo-Json | Set-Content -Path $configPath -Encoding UTF8
+$persistLocal | ConvertTo-Json | Set-Content -Path $localConfigPath -Encoding UTF8
 
 # Ensure `codrex-send` helper exists inside WSL for Codex sessions.
 Ensure-CodrexSendHelper -RepoRoot $root -Distro $cfg.distro
@@ -236,6 +285,7 @@ Write-Host ("URL: http://{0}:{1}" -f $ip, $cfg.port)
 if ($readyHost) {
   Write-Host ("Readiness probe: http://{0}:{1}/auth/status" -f $readyHost, $cfg.port)
 }
-Write-Host "Token: $($cfg.token)"
+Write-Host ("Token: {0}" -f (Mask-Secret -Value ([string]$cfg.token)))
+Write-Host ("Token file: {0}" -f $localConfigPath)
 Write-Host "PID: $($proc.Id)"
 Write-Host "Logs: $outLog"

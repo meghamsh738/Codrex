@@ -49,6 +49,9 @@ The format follows Keep a Changelog and the project uses Semantic Versioning.
 
 ### Security
 - Sanitized tracked `controller.config.json` token value to empty default so a real auth token is generated locally on first run, not committed in git.
+- `/auth/bootstrap/local` now requires a loopback client address, reducing risk from Host/Origin header spoofing.
+- `start-controller.ps1` now stores runtime auth token in untracked `controller.config.local.json` and masks token in console output.
+- `/telegram/status` no longer exposes local secret-file paths.
 
 ## [1.4.1] - 2026-03-04
 

@@ -101,6 +101,7 @@ On laptop browser:
 
 Important:
 - `controller.config.json` ships with empty token; `start-controller.ps1` auto-generates a strong token on first run.
+- Generated token is stored in untracked `controller.config.local.json` (not in the tracked main config).
 - Pair QR uses short-lived one-time code exchange and does not place the long token in URL.
 - LAN/current pairing routes are intentionally restricted for localhost browser sessions only.
 
@@ -170,7 +171,7 @@ Desktop launcher:
 
 ## Security Checklist (Recommended)
 
-1. Keep auth enabled (`token` should be non-empty after first start).
+1. Keep auth enabled (`controller.config.local.json` should contain a non-empty `token` after first start).
 2. Prefer Tailscale/private LAN; do not expose controller/UI ports directly to public internet.
 3. Use Pair QR from an authenticated laptop session only.
 4. Keep `Telegram bot/key.txt` local only (it is gitignored).
