@@ -6,7 +6,10 @@ import {
   buildSuggestedControllerUrl,
   createSharedFile,
   deleteSharedFile,
+  getTelegramStatus,
   listSharedFiles,
+  sendTelegramText,
+  sendSharedFileToTelegram,
 } from "../api";
 
 describe("pairing URL helpers", () => {
@@ -161,5 +164,61 @@ describe("shared files API", () => {
     const out = await deleteSharedFile("shr_123");
     expect(out.ok).toBe(true);
     expect(fetchMock).toHaveBeenCalledWith("/shares/shr_123", expect.objectContaining({ method: "DELETE" }));
+  });
+
+  it("reads telegram status", async () => {
+    fetchMock.mockResolvedValue({
+      ok: true,
+      status: 200,
+      text: async () => JSON.stringify({ ok: true, configured: false }),
+    });
+    const out = await getTelegramStatus();
+    expect(out.ok).toBe(true);
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/telegram/status",
+      expect.objectContaining({
+        credentials: "include",
+      }),
+    );
+  });
+
+  it("sends shared file to telegram by id", async () => {
+    fetchMock.mockResolvedValue({
+      ok: true,
+      status: 200,
+      text: async () => JSON.stringify({ ok: true, detail: "Sent to Telegram." }),
+    });
+    const out = await sendSharedFileToTelegram("shr_abc", "Result");
+    expect(out.ok).toBe(true);
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/shares/shr_abc/telegram",
+      expect.objectContaining({
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ caption: "Result" }),
+      }),
+    );
+  });
+
+  it("sends arbitrary text to telegram", async () => {
+    fetchMock.mockResolvedValue({
+      ok: true,
+      status: 200,
+      text: async () => JSON.stringify({ ok: true, detail: "Sent to Telegram." }),
+    });
+    const out = await sendTelegramText("hello from remote");
+    expect(out.ok).toBe(true);
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/telegram/send-text",
+      expect.objectContaining({
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ text: "hello from remote" }),
+      }),
+    );
   });
 });

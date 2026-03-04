@@ -3,5 +3,6 @@
   "distro": "Ubuntu",
   "workdir": "/home/megha/codrex-work",
   "fileRoot": "/home/megha/codrex-work",
-  "token": ""
+  "token": "",
+  "telegramDefaultSend": true
 }

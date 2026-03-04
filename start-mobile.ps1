@@ -112,6 +112,27 @@ function Ensure-FirewallRuleForPort {
   }
 }
 
+function Resolve-LogTargetPath {
+  param(
+    [string]$Path
+  )
+  if (-not $Path) {
+    return ""
+  }
+  if (-not (Test-Path $Path)) {
+    return $Path
+  }
+  try {
+    Remove-Item $Path -Force -ErrorAction Stop
+    return $Path
+  } catch {
+    $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
+    $alt = "{0}.{1}.run.log" -f $Path, $stamp
+    Write-Host "Warning: log file '$Path' is locked. Using '$alt' for this run."
+    return $alt
+  }
+}
+
 $root = Split-Path -Parent $PSCommandPath
 $uiRoot = Join-Path $root "ui"
 $logsDir = Join-Path $root "logs"
@@ -167,16 +188,16 @@ if ($existingUiOwners.Count -gt 0) {
     throw "npm.cmd not found. Install Node.js/npm on Windows first."
   }
 
-  if (Test-Path $uiOutLog) { Remove-Item $uiOutLog -Force }
-  if (Test-Path $uiErrLog) { Remove-Item $uiErrLog -Force }
+  $uiOutTarget = Resolve-LogTargetPath -Path $uiOutLog
+  $uiErrTarget = Resolve-LogTargetPath -Path $uiErrLog
 
   Write-Host "Starting mobile UI on port $UiPort..."
   $uiProc = Start-Process -FilePath $npmCmd `
     -ArgumentList @("run", "dev", "--", "--host", "0.0.0.0", "--port", [string]$UiPort) `
     -WorkingDirectory $uiRoot `
     -WindowStyle Hidden `
-    -RedirectStandardOutput $uiOutLog `
-    -RedirectStandardError $uiErrLog `
+    -RedirectStandardOutput $uiOutTarget `
+    -RedirectStandardError $uiErrTarget `
     -PassThru
   $uiPid = [int]$uiProc.Id
 
@@ -194,8 +215,8 @@ if ($existingUiOwners.Count -gt 0) {
   if (-not $uiReady) {
     try { Stop-Process -Id $uiPid -Force -ErrorAction SilentlyContinue } catch {}
     Write-Host "UI failed to start. Recent logs:"
-    if (Test-Path $uiErrLog) { Get-Content $uiErrLog -Tail 80 }
-    if (Test-Path $uiOutLog) { Get-Content $uiOutLog -Tail 80 }
+    if (Test-Path $uiErrTarget) { Get-Content $uiErrTarget -Tail 80 }
+    if (Test-Path $uiOutTarget) { Get-Content $uiOutTarget -Tail 80 }
     throw "UI startup failed."
   }
 }

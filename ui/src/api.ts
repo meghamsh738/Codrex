@@ -17,6 +17,7 @@ import type {
   SessionScreenResult,
   SessionsResult,
   SharedFilesResult,
+  TelegramStatusResult,
   TmuxHealthResult,
   TmuxPaneScreenResult,
   TmuxPanesResult,
@@ -418,6 +419,26 @@ export function createSharedFile(payload: {
 export function deleteSharedFile(shareId: string): Promise<SharedFilesResult> {
   return requestJson<SharedFilesResult>(`/shares/${encodeURIComponent(shareId)}`, {
     method: "DELETE",
+  });
+}
+
+export function getTelegramStatus(): Promise<TelegramStatusResult> {
+  return requestJson<TelegramStatusResult>("/telegram/status");
+}
+
+export function sendSharedFileToTelegram(shareId: string, caption = ""): Promise<BasicResult> {
+  return requestJson<BasicResult>(`/shares/${encodeURIComponent(shareId)}/telegram`, {
+    method: "POST",
+    headers: JSON_HEADERS,
+    body: JSON.stringify(caption.trim() ? { caption: caption.trim() } : {}),
+  });
+}
+
+export function sendTelegramText(text: string): Promise<BasicResult> {
+  return requestJson<BasicResult>("/telegram/send-text", {
+    method: "POST",
+    headers: JSON_HEADERS,
+    body: JSON.stringify({ text }),
   });
 }
 

@@ -20,17 +20,37 @@ export interface SharedFileInfo {
   download_url: string;
 }
 
+export interface TelegramDeliveryResult {
+  ok: boolean;
+  error?: string;
+  detail?: string;
+  message_id?: number;
+  chat_id?: string;
+  file_name?: string;
+  size_bytes?: number;
+}
+
 export interface BasicResult {
   ok: boolean;
   error?: string;
   detail?: string;
   shared_file?: SharedFileInfo;
+  telegram?: TelegramDeliveryResult | null;
 }
 
 export interface SharedFilesResult extends BasicResult {
   items?: SharedFileInfo[];
   item?: SharedFileInfo;
   share_id?: string;
+}
+
+export interface TelegramStatusResult extends BasicResult {
+  configured?: boolean;
+  default_send?: boolean;
+  chat_id_masked?: string;
+  bot_token_masked?: string;
+  api_base?: string;
+  max_file_mb?: number;
 }
 
 export interface NetInfo {
@@ -133,6 +153,7 @@ export interface TmuxPaneScreenResult extends BasicResult {
 }
 
 export interface DesktopInfoResult extends BasicResult {
+  enabled?: boolean;
   left?: number;
   top?: number;
   width?: number;

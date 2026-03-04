@@ -31,6 +31,7 @@ import {
   getCodexRuns,
   getNetInfo,
   listSharedFiles,
+  getTelegramStatus,
   getThreadStore,
   getTmuxHealth,
   getTmuxPaneScreen,
@@ -42,6 +43,8 @@ import {
   login,
   logout,
   reportIpcEvent,
+  sendSharedFileToTelegram,
+  sendTelegramText,
   deleteSharedFile,
   sendSessionImage,
   sendToPane,
@@ -218,6 +221,20 @@ function getAdjacentTab(current: MainTab, direction: 1 | -1): MainTab {
   }
   const nextIndex = Math.max(0, Math.min(TAB_ORDER.length - 1, index + direction));
   return TAB_ORDER[nextIndex] || TAB_ORDER[0];
+}
+
+function parseInitialTab(): MainTab {
+  if (typeof window === "undefined") {
+    return "sessions";
+  }
+  try {
+    const url = new URL(window.location.href);
+    const raw = (url.searchParams.get("tab") || "").trim().toLowerCase();
+    if (raw === "sessions" || raw === "threads" || raw === "remote" || raw === "pair" || raw === "settings" || raw === "debug") {
+      return raw;
+    }
+  } catch {}
+  return "sessions";
 }
 
 function parsePort(): number {
@@ -544,7 +561,7 @@ function compactAssistantSnapshot(text: string): string {
 }
 
 export default function App() {
-  const [activeTab, setActiveTab] = useState<MainTab>("sessions");
+  const [activeTab, setActiveTab] = useState<MainTab>(() => parseInitialTab());
   const [tabTransitionClass, setTabTransitionClass] = useState<TabTransitionClass>("tab-still");
   const previousTabRef = useRef<MainTab>("sessions");
 
@@ -597,7 +614,10 @@ export default function App() {
   );
   const [sharedFiles, setSharedFiles] = useState<SharedFileInfo[]>([]);
   const [sharesLoading, setSharesLoading] = useState(true);
+  const [telegramConfigured, setTelegramConfigured] = useState(false);
+  const [telegramStatusLoading, setTelegramStatusLoading] = useState(true);
   const [shareBusy, setShareBusy] = useState(false);
+  const [telegramTextBusy, setTelegramTextBusy] = useState(false);
   const [sharePathInput, setSharePathInput] = useState("");
   const [shareTitleInput, setShareTitleInput] = useState("");
   const [shareExpiresHours, setShareExpiresHours] = useState("24");
@@ -700,6 +720,7 @@ export default function App() {
   const [selectedRun, setSelectedRun] = useState<CodexRunDetail | null>(null);
   const [selectedRunLoading, setSelectedRunLoading] = useState(false);
   const screenShellRef = useRef<HTMLElement | null>(null);
+  const sessionOutputRef = useRef<HTMLPreElement | null>(null);
   const desktopFrameRef = useRef<HTMLImageElement | null>(null);
   const threadLastAssistantAtRef = useRef<Record<string, number>>({});
   const localThreadsRef = useRef<ChatThread[]>([]);
@@ -717,6 +738,7 @@ export default function App() {
     const profile = DESKTOP_PROFILE_STREAM[desktopProfile];
     return buildDesktopStreamUrl(profile);
   }, [desktopProfile]);
+  const desktopInteractionDisabled = !desktopEnabled;
   const sessionAllowedReasoningOptions = useMemo(() => {
     return allowedReasoningForModel(selectedModel, reasoningEffortOptions);
   }, [reasoningEffortOptions, selectedModel]);
@@ -1042,6 +1064,17 @@ export default function App() {
     }
   }, [addEvent]);
 
+  const refreshTelegramStatus = useCallback(async () => {
+    try {
+      const response = await getTelegramStatus();
+      setTelegramConfigured(Boolean(response.ok && response.configured));
+    } catch {
+      setTelegramConfigured(false);
+    } finally {
+      setTelegramStatusLoading(false);
+    }
+  }, []);
+
   const refreshThreads = useCallback(async () => {
     try {
       let response = await getThreadStore();
@@ -1174,6 +1207,12 @@ export default function App() {
         throw new Error(response.detail || response.error || "Desktop info unavailable.");
       }
       setDesktopInfo(response);
+      if (typeof response.enabled === "boolean") {
+        setDesktopEnabled(response.enabled);
+        if (!response.enabled) {
+          setDesktopFocusPoint(null);
+        }
+      }
     } catch (error) {
       setDesktopInfo(null);
       setDesktopStatus(`Desktop unavailable: ${(error as Error).message}`);
@@ -1224,6 +1263,7 @@ export default function App() {
         refreshNet(),
         refreshSessions(),
         refreshSharedFiles(),
+        refreshTelegramStatus(),
         refreshThreads(),
         refreshDebugRuns(),
         refreshTmuxState(),
@@ -1231,7 +1271,7 @@ export default function App() {
       ]);
       setStatus("Connected. Ready.");
     })();
-  }, [refreshAuth, refreshCodexOptions, refreshDebugRuns, refreshDesktopState, refreshNet, refreshSessions, refreshSharedFiles, refreshThreads, refreshTmuxState, setStatus]);
+  }, [refreshAuth, refreshCodexOptions, refreshDebugRuns, refreshDesktopState, refreshNet, refreshSessions, refreshSharedFiles, refreshTelegramStatus, refreshThreads, refreshTmuxState, setStatus]);
 
   useEffect(() => {
     if (typeof window === "undefined") {
@@ -1307,6 +1347,14 @@ export default function App() {
       setIpcObserver(null);
     };
   }, [addIpc]);
+
+  useEffect(() => {
+    const node = sessionOutputRef.current;
+    if (!node) {
+      return;
+    }
+    node.scrollTop = node.scrollHeight;
+  }, [screenText, selectedSession]);
 
   useEffect(() => {
     safeStorageSet(THREADS_STORAGE, JSON.stringify(threads));
@@ -1891,6 +1939,7 @@ export default function App() {
       refreshNet(),
       refreshSessions(),
       refreshSharedFiles(),
+      refreshTelegramStatus(),
       refreshThreads(),
       refreshDebugRuns(),
       refreshTmuxState(),
@@ -1906,7 +1955,7 @@ export default function App() {
       await refreshRunDetail(selectedRunId);
     }
     setStatus("Synced.");
-  }, [refreshAuth, refreshCodexOptions, refreshDebugRuns, refreshDesktopState, refreshNet, refreshRunDetail, refreshScreen, refreshSessions, refreshSharedFiles, refreshThreads, refreshTmuxScreen, refreshTmuxState, selectedRunId, selectedSession, selectedTmuxPane, setStatus]);
+  }, [refreshAuth, refreshCodexOptions, refreshDebugRuns, refreshDesktopState, refreshNet, refreshRunDetail, refreshScreen, refreshSessions, refreshSharedFiles, refreshTelegramStatus, refreshThreads, refreshTmuxScreen, refreshTmuxState, selectedRunId, selectedSession, selectedTmuxPane, setStatus]);
 
   const onLogin = useCallback(async () => {
     if (!tokenInput.trim()) {
@@ -1922,6 +1971,7 @@ export default function App() {
       setTokenInput("");
       await refreshAuth();
       await refreshSessions();
+      await refreshTelegramStatus();
       await refreshThreads();
       setStatus("Logged in.");
       setActiveTab("sessions");
@@ -1930,7 +1980,7 @@ export default function App() {
     } finally {
       setAuthBusy(false);
     }
-  }, [refreshAuth, refreshSessions, refreshThreads, setError, setStatus, tokenInput]);
+  }, [refreshAuth, refreshSessions, refreshTelegramStatus, refreshThreads, setError, setStatus, tokenInput]);
 
   const onBootstrapLocalAuth = useCallback(async () => {
     setAuthBusy(true);
@@ -1941,6 +1991,7 @@ export default function App() {
       }
       await refreshAuth();
       await refreshSessions();
+      await refreshTelegramStatus();
       await refreshThreads();
       setStatus("Local laptop authentication is active.");
       setActiveTab("sessions");
@@ -1949,13 +2000,14 @@ export default function App() {
     } finally {
       setAuthBusy(false);
     }
-  }, [refreshAuth, refreshSessions, refreshThreads, setError, setStatus]);
+  }, [refreshAuth, refreshSessions, refreshTelegramStatus, refreshThreads, setError, setStatus]);
 
   const onLogout = useCallback(async () => {
     setAuthBusy(true);
     try {
       await logout();
       await refreshAuth();
+      setTelegramConfigured(false);
       setStatus("Logged out.");
       setActiveTab("settings");
     } catch (error) {
@@ -2126,7 +2178,7 @@ export default function App() {
       }
       if (response.shared_file) {
         setPromptText("");
-        setStatus(`Shared ${response.shared_file.file_name} to mobile inbox.`);
+        setStatus(response.detail || `Shared ${response.shared_file.file_name} to mobile inbox.`);
         await refreshSharedFiles();
         await refreshSessions();
         return;
@@ -2362,28 +2414,62 @@ export default function App() {
     }
   }, [refreshSharedFiles, setError, setStatus]);
 
-  const onCopyShareCommand = useCallback(async () => {
-    const path = sharePathInput.trim();
-    if (!path) {
-      setError("Enter a path first to build command.");
+  const onSendSharedToTelegram = useCallback(async (item: SharedFileInfo) => {
+    if (!item?.id) {
       return;
     }
-    const parts: string[] = [`codrex-send "${path.replace(/"/g, '\\"')}"`];
-    if (shareTitleInput.trim()) {
-      parts.push(`--title "${shareTitleInput.trim().replace(/"/g, '\\"')}"`);
+    setShareBusy(true);
+    try {
+      const response = await sendSharedFileToTelegram(item.id, item.title || item.file_name);
+      if (!response.ok) {
+        throw new Error(response.detail || response.error || "Telegram send failed.");
+      }
+      setStatus(response.detail || `Sent ${item.file_name} to Telegram.`);
+    } catch (error) {
+      setError(`Telegram send failed: ${(error as Error).message}`);
+    } finally {
+      setShareBusy(false);
+    }
+  }, [setError, setStatus]);
+
+  const buildCodrexSendCommand = useCallback((includeTelegram: boolean) => {
+    const path = sharePathInput.trim();
+    if (!path) {
+      return { ok: false as const, detail: "Enter a file path first to build command." };
+    }
+    const title = shareTitleInput.trim();
+    const escapedPath = path.replace(/"/g, '\\"');
+    const escapedTitle = title.replace(/"/g, '\\"');
+    const parts: string[] = [`codrex-send "${escapedPath}"`];
+    if (title) {
+      parts.push(`--title "${escapedTitle}"`);
     }
     const expires = Number.parseInt(shareExpiresHours, 10);
     if (Number.isFinite(expires) && expires > 0) {
       parts.push(`--expires ${expires}`);
     }
-    const cmd = parts.join(" ");
+    if (includeTelegram) {
+      parts.push("--telegram");
+      if (title) {
+        parts.push(`--caption "${escapedTitle}"`);
+      }
+    }
+    return { ok: true as const, cmd: parts.join(" ") };
+  }, [shareExpiresHours, sharePathInput, shareTitleInput]);
+
+  const onCopyShareCommand = useCallback(async () => {
+    const built = buildCodrexSendCommand(false);
+    if (!built.ok) {
+      setError(built.detail);
+      return;
+    }
     try {
-      await navigator.clipboard.writeText(cmd);
+      await navigator.clipboard.writeText(built.cmd);
       setStatus("Share command copied.");
     } catch (error) {
       setError(`Could not copy command: ${(error as Error).message}`);
     }
-  }, [setError, setStatus, shareExpiresHours, sharePathInput, shareTitleInput]);
+  }, [buildCodrexSendCommand, setError, setStatus]);
 
   const onCopyShareLink = useCallback(async (item: SharedFileInfo) => {
     const base = (controllerBase || "").trim() || (typeof window !== "undefined" ? window.location.origin : "");
@@ -2707,6 +2793,9 @@ export default function App() {
       const enabled = !!response.enabled;
       setDesktopEnabled(enabled);
       setDesktopStatus(enabled ? "Desktop control enabled." : "Desktop control disabled.");
+      if (!enabled) {
+        setDesktopFocusPoint(null);
+      }
       if (enabled) {
         await refreshDesktopState();
       }
@@ -2716,6 +2805,10 @@ export default function App() {
   }, [desktopEnabled, refreshDesktopState, setError]);
 
   const onDesktopClick = useCallback(async (button: "left" | "right", double = false) => {
+    if (!desktopEnabled) {
+      setError("Desktop control is disabled. Enable Desktop first.");
+      return;
+    }
     try {
       const response = await desktopClick({ button, double });
       if (!response.ok) {
@@ -2725,9 +2818,13 @@ export default function App() {
     } catch (error) {
       setError(`Desktop click failed: ${(error as Error).message}`);
     }
-  }, [setError]);
+  }, [desktopEnabled, setError]);
 
   const onDesktopScroll = useCallback(async (delta: number) => {
+    if (!desktopEnabled) {
+      setError("Desktop control is disabled. Enable Desktop first.");
+      return;
+    }
     try {
       const response = await desktopScroll(delta);
       if (!response.ok) {
@@ -2737,9 +2834,13 @@ export default function App() {
     } catch (error) {
       setError(`Desktop scroll failed: ${(error as Error).message}`);
     }
-  }, [setError]);
+  }, [desktopEnabled, setError]);
 
   const onDesktopSendText = useCallback(async () => {
+    if (!desktopEnabled) {
+      setError("Desktop control is disabled. Enable Desktop first.");
+      return;
+    }
     const text = desktopTextInput;
     if (!text) {
       setError("Desktop text is empty.");
@@ -2758,9 +2859,13 @@ export default function App() {
     } catch (error) {
       setError(`Desktop text failed: ${(error as Error).message}`);
     }
-  }, [desktopFocusPoint, desktopTextInput, setError]);
+  }, [desktopEnabled, desktopFocusPoint, desktopTextInput, setError]);
 
   const onDesktopPasteClipboard = useCallback(async () => {
+    if (!desktopEnabled) {
+      setError("Desktop control is disabled. Enable Desktop first.");
+      return;
+    }
     let text = "";
     try {
       if (typeof navigator !== "undefined" && navigator.clipboard && navigator.clipboard.readText) {
@@ -2790,9 +2895,37 @@ export default function App() {
     } catch (error) {
       setError(`Desktop paste failed: ${(error as Error).message}`);
     }
-  }, [desktopFocusPoint, desktopTextInput, setError]);
+  }, [desktopEnabled, desktopFocusPoint, desktopTextInput, setError]);
+
+  const onSendRemoteTextToTelegram = useCallback(async () => {
+    const text = desktopTextInput.trim();
+    if (!text) {
+      setError("Type text first.");
+      return;
+    }
+    if (!telegramConfigured) {
+      setError("Telegram delivery is not configured.");
+      return;
+    }
+    setTelegramTextBusy(true);
+    try {
+      const response = await sendTelegramText(text);
+      if (!response.ok) {
+        throw new Error(response.detail || response.error || "Telegram send failed.");
+      }
+      setStatus(response.detail || "Sent to Telegram.");
+    } catch (error) {
+      setError(`Telegram send failed: ${(error as Error).message}`);
+    } finally {
+      setTelegramTextBusy(false);
+    }
+  }, [desktopTextInput, setError, setStatus, telegramConfigured]);
 
   const onDesktopFrameTap = useCallback(async (event: React.MouseEvent<HTMLImageElement>) => {
+    if (!desktopEnabled) {
+      setDesktopStatus("Desktop control is disabled. Enable Desktop first.");
+      return;
+    }
     if (!desktopInfo?.width || !desktopInfo?.height) {
       return;
     }
@@ -2820,9 +2953,13 @@ export default function App() {
     } catch (error) {
       setError(`Desktop tap failed: ${(error as Error).message}`);
     }
-  }, [desktopInfo?.height, desktopInfo?.width, setError]);
+  }, [desktopEnabled, desktopInfo?.height, desktopInfo?.width, setError]);
 
   const onDesktopSendKey = useCallback(async () => {
+    if (!desktopEnabled) {
+      setError("Desktop control is disabled. Enable Desktop first.");
+      return;
+    }
     try {
       const response = await desktopSendKey(desktopKeyInput);
       if (!response.ok) {
@@ -2832,7 +2969,7 @@ export default function App() {
     } catch (error) {
       setError(`Desktop key failed: ${(error as Error).message}`);
     }
-  }, [desktopKeyInput, setError]);
+  }, [desktopEnabled, desktopKeyInput, setError]);
 
   const onRefreshDesktopShot = useCallback(() => {
     const profile = DESKTOP_PROFILE_STREAM[desktopProfile];
@@ -3039,12 +3176,12 @@ export default function App() {
         </div>
 
         <div className="row top-actions">
-          <button type="button" className="button soft" onClick={() => void onHardRefresh()}>
+          <button type="button" className="button soft compact" onClick={() => void onHardRefresh()}>
             Sync Now
           </button>
           <button
             type="button"
-            className="button soft"
+            className="button soft compact"
             data-testid="install-app-button"
             onClick={() => void onInstallCta()}
             disabled={installState === "installed" || installState === "prompting"}
@@ -3108,7 +3245,7 @@ export default function App() {
             </p>
             <button
               type="button"
-              className="button soft"
+              className="button soft compact"
               data-testid="dismiss-swipe-hint"
               onClick={() => setShowSwipeHint(false)}
             >
@@ -3251,7 +3388,7 @@ export default function App() {
                       </span>
                       <button
                         type="button"
-                        className="button soft"
+                        className="button soft compact"
                         data-testid="toggle-live-output"
                         onClick={() => setStreamEnabled((current) => !current)}
                       >
@@ -3272,7 +3409,7 @@ export default function App() {
                       </label>
                       <button
                         type="button"
-                        className="button soft"
+                        className="button soft compact"
                         data-testid="toggle-console-focus"
                         onClick={() => setConsoleFocusMode((current) => !current)}
                       >
@@ -3283,12 +3420,29 @@ export default function App() {
                     <div className="prompt-composer">
                       <label className="field">
                         <span>Prompt Composer</span>
-                        <textarea
-                          value={promptText}
-                          onChange={(event) => setPromptText(event.target.value)}
-                          rows={5}
-                          placeholder="Type your prompt. Codrex will send Enter + Enter to submit."
-                        />
+                        <div className="composer-input-wrap">
+                          <textarea
+                            value={promptText}
+                            onChange={(event) => setPromptText(event.target.value)}
+                            rows={5}
+                            placeholder="Type your prompt. Codrex will send Enter + Enter to submit."
+                          />
+                          <button
+                            type="button"
+                            className="composer-send-btn"
+                            data-testid="composer-send-prompt"
+                            aria-label={sessionBusy ? "Sending prompt" : "Send prompt"}
+                            onClick={() => void onSendPrompt()}
+                            disabled={sessionBusy || !canSendPrompt}
+                          >
+                            <svg viewBox="0 0 24 24" aria-hidden="true">
+                              <path
+                                d="M3 11.8 20.6 4.3a1 1 0 0 1 1.3 1.3L14.4 23.2a1 1 0 0 1-1.9-.3l-1-6-6-1a1 1 0 0 1-.3-1.9Z"
+                                fill="currentColor"
+                              />
+                            </svg>
+                          </button>
+                        </div>
                       </label>
                     </div>
 
@@ -3318,7 +3472,7 @@ export default function App() {
                             <option value="session_path">Send path as message</option>
                           </select>
                         </label>
-                        <button type="button" className="button soft" onClick={() => void onSendSessionImage()} disabled={sessionBusy || !sessionImageFile}>
+                        <button type="button" className="button soft compact" onClick={() => void onSendSessionImage()} disabled={sessionBusy || !sessionImageFile}>
                           Send Image
                         </button>
                       </div>
@@ -3331,130 +3485,127 @@ export default function App() {
                       </p>
                     </div>
 
-                    <div className="quick-open-card" data-testid="shared-files-card">
-                      <h3>Shared Files Inbox</h3>
-                      <p className="small">
-                        Deterministic route: send `codrex-send` command instead of relying on model memory.
-                      </p>
-                      <div className="row">
-                        <input
-                          type="text"
-                          data-testid="share-path-input"
-                          value={sharePathInput}
-                          onChange={(event) => setSharePathInput(event.target.value)}
-                          placeholder="/home/megha/codrex-work/output/result.png"
-                        />
-                        <input
-                          type="text"
-                          data-testid="share-title-input"
-                          value={shareTitleInput}
-                          onChange={(event) => setShareTitleInput(event.target.value)}
-                          placeholder="Optional title"
-                        />
-                        <label className="field inline">
-                          <span>Expires</span>
-                          <select
-                            data-testid="share-expiry-select"
-                            value={shareExpiresHours}
-                            onChange={(event) => setShareExpiresHours(event.target.value)}
-                          >
-                            <option value="1">1h</option>
-                            <option value="24">24h</option>
-                            <option value="72">72h</option>
-                            <option value="168">7d</option>
-                          </select>
-                        </label>
-                      </div>
-                      <div className="row">
-                        <button type="button" className="button soft" onClick={() => void onCopyShareCommand()}>
-                          Copy `codrex-send`
-                        </button>
-                        <button type="button" className="button soft" onClick={() => void onCreateSharedFile()} disabled={shareBusy || !sharePathInput.trim()}>
-                          Share Now
-                        </button>
-                        <button type="button" className="button soft" onClick={() => void refreshSharedFiles()}>
-                          Refresh Inbox
-                        </button>
-                      </div>
-                      <p className="small">
-                        Example: <code>codrex-send "/home/megha/codrex-work/output/result.png" --title "Result" --expires 24</code>
-                      </p>
-                      {sharesLoading ? <p className="small">Loading shared files...</p> : null}
-                      {!sharesLoading && sharedFiles.length === 0 ? (
-                        <div className="empty-state panel-empty">
-                          <h3>No shared files yet</h3>
-                          <p>Run `codrex-send` from prompt composer or use Share Now above.</p>
+                    {!telegramStatusLoading && !telegramConfigured ? (
+                      <div className="quick-open-card" data-testid="shared-files-card">
+                        <h3>Shared Files Inbox</h3>
+                        <p className="small">
+                          Deterministic route: send `codrex-send` command instead of relying on model memory.
+                        </p>
+                        <div className="row">
+                          <input
+                            type="text"
+                            data-testid="share-path-input"
+                            value={sharePathInput}
+                            onChange={(event) => setSharePathInput(event.target.value)}
+                            placeholder="/home/megha/codrex-work/output/result.png"
+                          />
+                          <input
+                            type="text"
+                            data-testid="share-title-input"
+                            value={shareTitleInput}
+                            onChange={(event) => setShareTitleInput(event.target.value)}
+                            placeholder="Optional title"
+                          />
+                          <label className="field inline">
+                            <span>Expires</span>
+                            <select
+                              data-testid="share-expiry-select"
+                              value={shareExpiresHours}
+                              onChange={(event) => setShareExpiresHours(event.target.value)}
+                            >
+                              <option value="1">1h</option>
+                              <option value="24">24h</option>
+                              <option value="72">72h</option>
+                              <option value="168">7d</option>
+                            </select>
+                          </label>
                         </div>
-                      ) : null}
-                      {!sharesLoading && sharedFiles.length > 0 ? (
-                        <div className="run-list" role="list" aria-label="Shared files inbox">
-                          {sharedFiles.map((item) => (
-                            <div key={item.id} className="run-item">
-                              <div className="session-row">
-                                <strong>{item.title || item.file_name}</strong>
-                                <span className="badge muted">{formatFileSize(item.size_bytes)}</span>
-                              </div>
-                              <p>{item.file_name}</p>
-                              <small>
-                                Added {formatClock(item.created_at)} | Expires {new Date(item.expires_at).toLocaleString()}
-                              </small>
-                              <div className="row">
-                                <button
-                                  type="button"
-                                  className="button soft"
-                                  onClick={() => window.open(item.download_url, "_blank", "noopener,noreferrer")}
-                                >
-                                  Open
-                                </button>
-                                <button type="button" className="button soft" onClick={() => void onCopyShareLink(item)}>
-                                  Copy Link
-                                </button>
-                                <button type="button" className="button danger" onClick={() => void onDeleteSharedFile(item.id)} disabled={shareBusy}>
-                                  Remove
-                                </button>
-                              </div>
-                            </div>
-                          ))}
+                        <div className="row">
+                          <button type="button" className="button soft compact" onClick={() => void onCopyShareCommand()}>
+                            Copy `codrex-send`
+                          </button>
+                          <button type="button" className="button soft compact" onClick={() => void onCreateSharedFile()} disabled={shareBusy || !sharePathInput.trim()}>
+                            Share Now
+                          </button>
+                          <button type="button" className="button soft compact" onClick={() => void refreshSharedFiles()}>
+                            Refresh Inbox
+                          </button>
                         </div>
-                      ) : null}
-                    </div>
+                        <p className="small">
+                          Example: <code>codrex-send "/home/megha/codrex-work/output/result.png" --title "Result" --expires 24</code>
+                        </p>
+                        {sharesLoading ? <p className="small">Loading shared files...</p> : null}
+                        {!sharesLoading && sharedFiles.length === 0 ? (
+                          <div className="empty-state panel-empty">
+                            <h3>No shared files yet</h3>
+                            <p>Run `codrex-send` from prompt composer or use Share Now above.</p>
+                          </div>
+                        ) : null}
+                        {!sharesLoading && sharedFiles.length > 0 ? (
+                          <div className="run-list" role="list" aria-label="Shared files inbox">
+                            {sharedFiles.map((item) => (
+                              <div key={item.id} className="run-item">
+                                <div className="session-row">
+                                  <strong>{item.title || item.file_name}</strong>
+                                  <span className="badge muted">{formatFileSize(item.size_bytes)}</span>
+                                </div>
+                                <p>{item.file_name}</p>
+                                <small>
+                                  Added {formatClock(item.created_at)} | Expires {new Date(item.expires_at).toLocaleString()}
+                                </small>
+                                <div className="row">
+                                  <button
+                                    type="button"
+                                    className="button soft compact"
+                                    onClick={() => window.open(item.download_url, "_blank", "noopener,noreferrer")}
+                                  >
+                                    Open
+                                  </button>
+                                  <button type="button" className="button soft compact" onClick={() => void onSendSharedToTelegram(item)} disabled={shareBusy}>
+                                    Send Telegram
+                                  </button>
+                                  <button type="button" className="button soft compact" onClick={() => void onCopyShareLink(item)}>
+                                    Copy Link
+                                  </button>
+                                  <button type="button" className="button danger compact" onClick={() => void onDeleteSharedFile(item.id)} disabled={shareBusy}>
+                                    Remove
+                                  </button>
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+                        ) : null}
+                      </div>
+                    ) : null}
 
                     <label className="field">
                       <span>Live screen output</span>
-                      <pre className="console">{screenText || "(No screen output captured yet)"}</pre>
+                      <pre ref={sessionOutputRef} className="console">{screenText || "(No screen output captured yet)"}</pre>
                     </label>
 
                     <div className="session-action-dock" data-testid="session-action-dock">
                       <button
                         type="button"
-                        className="button soft"
+                        className="button soft compact"
+                        data-short="REF"
                         onClick={() => void refreshScreen(selectedSessionInfo.session)}
                       >
-                        Refresh
+                        <span className="btn-text">Refresh</span>
                       </button>
-                      <button type="button" className="button soft" onClick={() => void onSendEnter()} disabled={sessionBusy}>
-                        Enter
+                      <button type="button" className="button soft compact" data-short="ENT" onClick={() => void onSendEnter()} disabled={sessionBusy}>
+                        <span className="btn-text">Enter</span>
                       </button>
-                      <button type="button" className="button warn" onClick={() => void onInterrupt()} disabled={sessionBusy}>
-                        Interrupt
+                      <button type="button" className="button warn compact" data-short="INT" onClick={() => void onInterrupt()} disabled={sessionBusy}>
+                        <span className="btn-text">Interrupt</span>
                       </button>
-                      <button type="button" className="button danger" onClick={() => void onCtrlC()} disabled={sessionBusy}>
-                        Ctrl+C
+                      <button type="button" className="button danger compact" data-short="C^C" onClick={() => void onCtrlC()} disabled={sessionBusy}>
+                        <span className="btn-text">Ctrl+C</span>
                       </button>
-                      <button type="button" className="button danger" onClick={() => void onCloseSession()} disabled={sessionBusy}>
-                        Close
+                      <button type="button" className="button danger compact" data-short="CLS" onClick={() => void onCloseSession()} disabled={sessionBusy}>
+                        <span className="btn-text">Close</span>
                       </button>
-                      <button type="button" className="button soft" onClick={() => setConsoleFocusMode((current) => !current)}>
-                        {consoleFocusMode ? "Exit Focus" : "Focus"}
-                      </button>
-                      <button
-                        type="button"
-                        className="button"
-                        data-testid="dock-send-prompt"
-                        onClick={() => void onSendPrompt()}
-                        disabled={sessionBusy || !canSendPrompt}
-                      >
-                        {sessionBusy ? "Working..." : "Send"}
+                      <button type="button" className="button soft compact" data-short={consoleFocusMode ? "EXIT" : "FOC"} onClick={() => setConsoleFocusMode((current) => !current)}>
+                        <span className="btn-text">{consoleFocusMode ? "Exit Focus" : "Focus"}</span>
                       </button>
                     </div>
 
@@ -3492,7 +3643,7 @@ export default function App() {
                         </label>
                         <button
                           type="button"
-                          className="button soft"
+                          className="button soft compact"
                           onClick={() => void onApplySessionProfile()}
                           disabled={sessionBusy || !selectedSession}
                         >
@@ -3525,7 +3676,7 @@ export default function App() {
                     Track tmux panes and run Ubuntu, PowerShell, or CMD commands from one monitor.
                   </p>
                   <div className="row">
-                    <button type="button" className="button soft" onClick={() => void refreshTmuxState()}>
+                    <button type="button" className="button soft compact" onClick={() => void refreshTmuxState()}>
                       Refresh
                     </button>
                     <span className="small">Sessions: {tmuxSessions.length}</span>
@@ -3565,13 +3716,13 @@ export default function App() {
                     <p className="small">No shell-only panes yet. Codex panes are hidden in this tab.</p>
                   ) : null}
                   <div className="row">
-                    <button type="button" className="button soft" onClick={() => void refreshTmuxScreen(selectedTmuxPane)} disabled={!selectedTmuxPane}>
+                    <button type="button" className="button soft compact" onClick={() => void refreshTmuxScreen(selectedTmuxPane)} disabled={!selectedTmuxPane}>
                       Pull Pane
                     </button>
-                    <button type="button" className="button warn" onClick={() => void onInterruptTmuxPane()} disabled={tmuxBusy || !selectedTmuxPane}>
+                    <button type="button" className="button warn compact" onClick={() => void onInterruptTmuxPane()} disabled={tmuxBusy || !selectedTmuxPane}>
                       Interrupt
                     </button>
-                    <button type="button" className="button danger" onClick={() => void onCloseTmuxSession()} disabled={tmuxBusy || !selectedTmuxPaneInfo}>
+                    <button type="button" className="button danger compact" onClick={() => void onCloseTmuxSession()} disabled={tmuxBusy || !selectedTmuxPaneInfo}>
                       Close Session
                     </button>
                   </div>
@@ -3615,7 +3766,7 @@ export default function App() {
                         onChange={(event) => setWslDownloadPath(event.target.value)}
                         placeholder="Relative file path to download"
                       />
-                      <button type="button" className="button soft" onClick={onDownloadWslFile}>
+                      <button type="button" className="button soft compact" onClick={onDownloadWslFile}>
                         Download
                       </button>
                     </div>
@@ -3627,7 +3778,7 @@ export default function App() {
                         onChange={(event) => setWslUploadDest(event.target.value)}
                         placeholder="Upload destination path (optional)"
                       />
-                      <button type="button" className="button soft" onClick={() => void onUploadWslFile()} disabled={!wslUploadFile}>
+                      <button type="button" className="button soft compact" onClick={() => void onUploadWslFile()} disabled={!wslUploadFile}>
                         Upload
                       </button>
                     </div>
@@ -3680,10 +3831,10 @@ export default function App() {
                     <button type="button" className="button" onClick={onCreateThread} disabled={!threadSessionInput}>
                       New Thread
                     </button>
-                    <button type="button" className="button soft" onClick={onRenameThread} disabled={!activeThread || !threadTitleInput.trim()}>
+                    <button type="button" className="button soft compact" onClick={onRenameThread} disabled={!activeThread || !threadTitleInput.trim()}>
                       Rename
                     </button>
-                    <button type="button" className="button danger" onClick={onDeleteThread} disabled={!activeThread}>
+                    <button type="button" className="button danger compact" onClick={onDeleteThread} disabled={!activeThread}>
                       Delete
                     </button>
                   </div>
@@ -3700,7 +3851,7 @@ export default function App() {
                 <div className="row">
                   <button
                     type="button"
-                    className="button soft"
+                    className="button soft compact"
                     onClick={() => {
                       if (activeThread?.session) {
                         setSelectedSession(activeThread.session);
@@ -3713,7 +3864,7 @@ export default function App() {
                   </button>
                   <button
                     type="button"
-                    className="button soft"
+                    className="button soft compact"
                     onClick={() => void onCaptureThreadSnapshot()}
                     disabled={!activeThread && !threadSessionInput}
                   >
@@ -3807,12 +3958,12 @@ export default function App() {
                       <button type="button" className="button" onClick={() => void onSendThreadPrompt()} disabled={threadBusy || !activeThread}>
                         {threadBusy ? "Sending..." : "Send Message"}
                       </button>
-                      <button type="button" className="button soft" onClick={() => setThreadPrompt("")} disabled={threadBusy || !threadPrompt.trim()}>
+                      <button type="button" className="button soft compact" onClick={() => setThreadPrompt("")} disabled={threadBusy || !threadPrompt.trim()}>
                         Clear
                       </button>
                       <button
                         type="button"
-                        className="button soft"
+                        className="button soft compact"
                         onClick={() => {
                           if (activeThread.session) {
                             setSelectedSession(activeThread.session);
@@ -3895,39 +4046,49 @@ export default function App() {
                     />
                   </div>
                   <p className="small">Tap/click the stream to focus target window before sending text or keys.</p>
-                  <div className="row">
-                    <button type="button" className="button soft" onClick={() => void onDesktopClick("left")}>
-                      Left Click
+                  <div className="row remote-mouse-controls">
+                    <button type="button" className="button soft compact" data-short="L" onClick={() => void onDesktopClick("left")} disabled={desktopInteractionDisabled}>
+                      <span className="btn-text">Left Click</span>
                     </button>
-                    <button type="button" className="button soft" onClick={() => void onDesktopClick("right")}>
-                      Right Click
+                    <button type="button" className="button soft compact" data-short="R" onClick={() => void onDesktopClick("right")} disabled={desktopInteractionDisabled}>
+                      <span className="btn-text">Right Click</span>
                     </button>
-                    <button type="button" className="button soft" onClick={() => void onDesktopClick("left", true)}>
-                      Double
+                    <button type="button" className="button soft compact" data-short="2X" onClick={() => void onDesktopClick("left", true)} disabled={desktopInteractionDisabled}>
+                      <span className="btn-text">Double</span>
                     </button>
-                    <button type="button" className="button soft" onClick={() => void onDesktopScroll(-240)}>
-                      Scroll Up
+                    <button type="button" className="button soft compact" data-short="UP" onClick={() => void onDesktopScroll(-240)} disabled={desktopInteractionDisabled}>
+                      <span className="btn-text">Scroll Up</span>
                     </button>
-                    <button type="button" className="button soft" onClick={() => void onDesktopScroll(240)}>
-                      Scroll Down
+                    <button type="button" className="button soft compact" data-short="DN" onClick={() => void onDesktopScroll(240)} disabled={desktopInteractionDisabled}>
+                      <span className="btn-text">Scroll Down</span>
                     </button>
                   </div>
-                  <div className="row">
+                  <div className="row remote-text-controls">
                     <input
                       type="text"
                       value={desktopTextInput}
                       onChange={(event) => setDesktopTextInput(event.target.value)}
                       placeholder="Type text on desktop"
+                      disabled={desktopInteractionDisabled}
                     />
-                    <button type="button" className="button soft" onClick={() => void onDesktopSendText()} disabled={!desktopTextInput}>
-                      Send Text
+                    <button type="button" className="button soft compact" data-short="SEND" onClick={() => void onDesktopSendText()} disabled={desktopInteractionDisabled || !desktopTextInput}>
+                      <span className="btn-text">Send Text</span>
                     </button>
-                    <button type="button" className="button soft" onClick={() => void onDesktopPasteClipboard()}>
-                      Paste Clipboard
+                    <button type="button" className="button soft compact" data-short="PASTE" onClick={() => void onDesktopPasteClipboard()} disabled={desktopInteractionDisabled}>
+                      <span className="btn-text">Paste Clipboard</span>
+                    </button>
+                    <button
+                      type="button"
+                      className="button soft compact"
+                      data-short="TG"
+                      onClick={() => void onSendRemoteTextToTelegram()}
+                      disabled={!telegramConfigured || telegramTextBusy || !desktopTextInput.trim()}
+                    >
+                      <span className="btn-text">Send Telegram</span>
                     </button>
                   </div>
-                  <div className="row">
-                    <select value={desktopKeyInput} onChange={(event) => setDesktopKeyInput(event.target.value)}>
+                  <div className="row remote-key-controls">
+                    <select value={desktopKeyInput} onChange={(event) => setDesktopKeyInput(event.target.value)} disabled={desktopInteractionDisabled}>
                       <option value="enter">Enter</option>
                       <option value="backspace">Backspace</option>
                       <option value="delete">Delete</option>
@@ -3942,11 +4103,11 @@ export default function App() {
                       <option value="ctrl+c">Ctrl+C</option>
                       <option value="ctrl+v">Ctrl+V</option>
                     </select>
-                    <button type="button" className="button soft" onClick={() => void onDesktopSendKey()}>
-                      Send Key
+                    <button type="button" className="button soft compact" data-short="KEY" onClick={() => void onDesktopSendKey()} disabled={desktopInteractionDisabled}>
+                      <span className="btn-text">Send Key</span>
                     </button>
-                    <button type="button" className="button soft" onClick={() => onRefreshDesktopShot()}>
-                      Refresh Shot
+                    <button type="button" className="button soft compact" data-short="SHOT" onClick={() => onRefreshDesktopShot()}>
+                      <span className="btn-text">Refresh Shot</span>
                     </button>
                   </div>
                 </div>
@@ -3954,7 +4115,7 @@ export default function App() {
                 <div className="debug-block">
                   <h3>Screenshot Capture</h3>
                   <p className="small">Capture one desktop frame using current stream profile (including low-data mode).</p>
-                  <button type="button" className="button soft" onClick={onCaptureLatestShot}>
+                  <button type="button" className="button soft compact" onClick={onCaptureLatestShot}>
                     Capture Latest
                   </button>
                   {latestCaptureUrl ? (
@@ -4025,12 +4186,12 @@ export default function App() {
                   <button type="button" className="button" onClick={() => void onGeneratePairing()} disabled={pairBusy}>
                     {pairBusy ? "Generating..." : "Generate QR"}
                   </button>
-                  <button type="button" className="button soft" onClick={() => void refreshNet()}>
+                  <button type="button" className="button soft compact" onClick={() => void refreshNet()}>
                     Refresh Routes
                   </button>
                   <button
                     type="button"
-                    className="button soft"
+                    className="button soft compact"
                     onClick={() => void onPairExchange()}
                     disabled={pairBusy || !pairCode}
                   >
@@ -4048,10 +4209,10 @@ export default function App() {
                     </p>
                     <textarea data-testid="pair-link-text" readOnly value={pairLink} rows={3} />
                     <div className="row">
-                      <button type="button" className="button soft" onClick={() => void onCopyPairLink()}>
+                      <button type="button" className="button soft compact" onClick={() => void onCopyPairLink()}>
                         Copy Link
                       </button>
-                      <button type="button" className="button soft" onClick={onOpenPairLink}>
+                      <button type="button" className="button soft compact" onClick={onOpenPairLink}>
                         Open Link
                       </button>
                     </div>
@@ -4117,7 +4278,7 @@ export default function App() {
                       <button type="button" className="button" onClick={() => void refreshAuth()}>
                         Recheck
                       </button>
-                      <button type="button" className="button danger" onClick={() => void onLogout()} disabled={authBusy}>
+                      <button type="button" className="button danger compact" onClick={() => void onLogout()} disabled={authBusy}>
                         Logout
                       </button>
                     </div>
@@ -4129,7 +4290,7 @@ export default function App() {
                     <div className="row">
                       <button
                         type="button"
-                        className="button soft"
+                        className="button soft compact"
                         data-testid="toggle-touch-comfort"
                         onClick={() => setTouchComfortMode((current) => !current)}
                       >
@@ -4137,7 +4298,7 @@ export default function App() {
                       </button>
                       <button
                         type="button"
-                        className="button soft"
+                        className="button soft compact"
                         data-testid="toggle-compact-transcript"
                         onClick={() => setCompactTranscript((current) => !current)}
                       >
@@ -4173,10 +4334,10 @@ export default function App() {
                     <p className="small">Tailscale: <strong>{netInfo?.tailscale_ip || "n/a"}</strong></p>
                     <p className="small">Browser origin: <code>{typeof window !== "undefined" ? window.location.origin : "n/a"}</code></p>
                     <div className="row">
-                      <button type="button" className="button soft" onClick={() => void refreshNet()}>
+                      <button type="button" className="button soft compact" onClick={() => void refreshNet()}>
                         Refresh Network
                       </button>
-                      <button type="button" className="button soft" onClick={() => void refreshAuth()}>
+                      <button type="button" className="button soft compact" onClick={() => void refreshAuth()}>
                         Refresh Auth
                       </button>
                     </div>
@@ -4204,7 +4365,7 @@ export default function App() {
               <div className="row">
                 <span className="badge">Events {totalEvents}</span>
                 <span className="badge muted">Runs {debugRuns.length}</span>
-                <button type="button" className="button soft" onClick={() => void refreshDebugRuns()}>
+                <button type="button" className="button soft compact" onClick={() => void refreshDebugRuns()}>
                   Refresh Runs
                 </button>
               </div>
@@ -4284,10 +4445,10 @@ export default function App() {
                       onChange={(event) => setIpcSearch(event.target.value)}
                       placeholder="Search path, detail, payload..."
                     />
-                    <button type="button" className="button soft" onClick={onExportIpcHistory} disabled={ipcHistory.length === 0}>
+                    <button type="button" className="button soft compact" onClick={onExportIpcHistory} disabled={ipcHistory.length === 0}>
                       Export JSON
                     </button>
-                    <button type="button" className="button soft" onClick={onClearIpcHistory} disabled={ipcHistory.length === 0}>
+                    <button type="button" className="button soft compact" onClick={onClearIpcHistory} disabled={ipcHistory.length === 0}>
                       Clear
                     </button>
                   </div>
@@ -4322,7 +4483,7 @@ export default function App() {
                     <div className="quick-open-card">
                       <div className="detail-head">
                         <h3>Selected IPC Event</h3>
-                        <button type="button" className="button soft" onClick={() => void onCopySelectedIpc()}>
+                        <button type="button" className="button soft compact" onClick={() => void onCopySelectedIpc()}>
                           Copy
                         </button>
                       </div>

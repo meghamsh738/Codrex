@@ -60,7 +60,8 @@ export default defineConfig({
       "/tmux": backendOrigin,
       "/wsl": backendOrigin,
       "/shares": backendOrigin,
-      "/share": backendOrigin
+      "/share": backendOrigin,
+      "/telegram": backendOrigin
     }
   },
   preview: {
@@ -73,7 +74,8 @@ export default defineConfig({
       "/tmux": backendOrigin,
       "/wsl": backendOrigin,
       "/shares": backendOrigin,
-      "/share": backendOrigin
+      "/share": backendOrigin,
+      "/telegram": backendOrigin
     }
   },
   test: {

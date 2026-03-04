@@ -12,17 +12,39 @@ The format follows Keep a Changelog and the project uses Semantic Versioning.
   - `POST /shares`
   - `DELETE /shares/{share_id}`
   - `GET /share/file/{share_id}`
+- Telegram delivery support for shared files:
+  - `GET /telegram/status`
+  - `POST /shares/{share_id}/telegram`
+  - `codrex-send ... --telegram [--caption ...]` command option.
+  - automatic token loading from `Telegram bot/key.txt`
+  - automatic chat-id resolution via Telegram updates (or `Telegram bot/chat_id.txt`).
+- New WSL helper script:
+  - `tools/codrex-send.py`
+  - auto-linked to `~/.local/bin/codrex-send` on controller startup.
 - Codex session command interception for share commands:
-  - `codrex-send <path> [--title ...] [--expires <hours>]`
-  - aliases: `/codrex-send`, `/send-file`, `/share-file`
+  - `codrex-send <path> [--title ...] [--expires <hours>] [--telegram] [--caption ...]`
+  - aliases: `/codrex-send`, `/send-file`, `/share-file`, `tgsend`, `/tgsend`
+  - optional override flag: `--no-telegram`
 - New **Shared Files Inbox** panel in Sessions tab with:
   - direct share creation,
   - command copy helper,
-  - open/copy-link/remove actions.
+  - open/copy-link/remove actions,
+  - one-click **Send Telegram** action.
+- Config-driven Telegram default-send toggle via `controller.config.json`:
+  - `"telegramDefaultSend": true|false`
+  - exported to backend as `CODEX_TELEGRAM_DEFAULT_SEND`.
 
 ### Changed
-- Vite dev/preview proxy now includes `/shares` and `/share` routes.
-- Expanded backend/unit and UI/API test coverage for the outbox flow.
+- Vite dev/preview proxy now includes `/shares`, `/share`, and `/telegram` routes.
+- Expanded backend/unit and UI/API test coverage for outbox + Telegram flows.
+- Codex session launch now prepends `~/.local/bin` to PATH so helper commands are available from Codex.
+- Sessions UI now hides Shared Files Inbox when Telegram is configured, keeping file-share UX focused on direct command flow.
+- Action-heavy controls across Sessions/Threads/Remote/Pair/Debug now use compact pill-style buttons to reduce large text-box UI density.
+- Added lightweight tab deep-link support via `?tab=<name>` for direct navigation and documentation screenshots.
+- Refreshed screenshot assets in `screenshots/` and updated README with complete A-to-Z setup + security hardening guidance.
+
+### Security
+- Sanitized tracked `controller.config.json` token value to empty default so a real auth token is generated locally on first run, not committed in git.
 
 ## [1.4.1] - 2026-03-04
 
