@@ -1,0 +1,194 @@
+export type SessionState = "starting" | "idle" | "busy";
+
+export interface AuthStatus {
+  ok: boolean;
+  auth_required: boolean;
+  authenticated: boolean;
+}
+
+export interface BasicResult {
+  ok: boolean;
+  error?: string;
+  detail?: string;
+}
+
+export interface NetInfo {
+  ok: boolean;
+  lan_ip: string;
+  tailscale_ip: string;
+}
+
+export interface PairCreateResult extends BasicResult {
+  code?: string;
+  expires_in?: number;
+}
+
+export interface SessionInfo {
+  session: string;
+  pane_id: string;
+  current_command: string;
+  cwd: string;
+  state: SessionState;
+  updated_at: number;
+  snippet: string;
+  model?: string;
+  reasoning_effort?: string;
+}
+
+export interface SessionsResult extends BasicResult {
+  sessions?: SessionInfo[];
+}
+
+export interface SessionCreateResult extends BasicResult {
+  session?: string;
+  cwd?: string;
+  model?: string;
+  reasoning_effort?: string;
+}
+
+export interface SessionProfileApplyResult extends BasicResult {
+  session?: string;
+  model?: string;
+  reasoning_effort?: string;
+  applied_command?: string;
+}
+
+export interface CodexOptionsResult extends BasicResult {
+  models?: string[];
+  default_model?: string;
+  reasoning_efforts?: string[];
+  default_reasoning_effort?: string;
+}
+
+export interface SessionCloseResult extends BasicResult {
+  session?: string;
+}
+
+export interface SessionImageResult extends BasicResult {
+  session?: string;
+  saved_path?: string;
+  paste_attempted?: boolean;
+  paste_ok?: boolean;
+  paste_error?: string;
+  delivery_mode?: "desktop_clipboard" | "session_path" | "insert_path";
+}
+
+export interface SessionScreenResult extends BasicResult {
+  session?: string;
+  pane_id?: string;
+  current_command?: string;
+  state?: SessionState;
+  text?: string;
+}
+
+export interface TmuxHealthResult extends BasicResult {
+  state?: "ok" | "empty" | "no_server";
+  count?: number;
+  sessions?: string[];
+}
+
+export interface TmuxSessionResult extends BasicResult {
+  name?: string | null;
+  session?: string;
+}
+
+export interface TmuxPaneInfo {
+  session: string;
+  window_index: string;
+  pane_index: string;
+  pane_id: string;
+  active: boolean;
+  current_command: string;
+  current_path: string;
+}
+
+export interface TmuxPanesResult extends BasicResult {
+  panes?: TmuxPaneInfo[];
+}
+
+export interface TmuxPaneScreenResult extends BasicResult {
+  pane_id?: string;
+  text?: string;
+}
+
+export interface DesktopInfoResult extends BasicResult {
+  left?: number;
+  top?: number;
+  width?: number;
+  height?: number;
+}
+
+export interface DesktopModeResult extends BasicResult {
+  enabled?: boolean;
+}
+
+export interface DesktopInputResult extends BasicResult {
+  x?: number;
+  y?: number;
+  sent?: number;
+  key?: string;
+  delta?: number;
+}
+
+export interface WslUploadResult extends BasicResult {
+  saved_path?: string;
+}
+
+export type ThreadRole = "user" | "assistant" | "system";
+
+export interface ThreadInfo {
+  id: string;
+  title: string;
+  session: string;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface ThreadMessageInfo {
+  id: string;
+  thread_id: string;
+  role: ThreadRole;
+  text: string;
+  at: number;
+}
+
+export interface ThreadsStoreResult extends BasicResult {
+  threads?: ThreadInfo[];
+  messages?: Record<string, ThreadMessageInfo[]>;
+}
+
+export interface ThreadRecordResult extends BasicResult {
+  thread?: ThreadInfo;
+}
+
+export interface ThreadDeleteResult extends BasicResult {
+  thread_id?: string;
+}
+
+export interface ThreadMessageResult extends BasicResult {
+  message?: ThreadMessageInfo;
+}
+
+export type CodexRunStatus = "running" | "done" | "error";
+
+export interface CodexRunSummary {
+  id: string;
+  status: CodexRunStatus;
+  duration_s?: number | null;
+  prompt?: string;
+}
+
+export interface CodexRunsResult extends BasicResult {
+  runs?: CodexRunSummary[];
+}
+
+export interface CodexRunDetail extends BasicResult, CodexRunSummary {
+  created_at?: number;
+  output?: string;
+  exit_code?: number | null;
+  finished_at?: number | null;
+}
+
+export interface CodexExecStartResult extends BasicResult {
+  id?: string;
+}

@@ -1,0 +1,50 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="Codrex maskable icon">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0f766e" />
+      <stop offset="55%" stop-color="#0f5f88" />
+      <stop offset="100%" stop-color="#0b3b63" />
+    </linearGradient>
+    <radialGradient id="glow" cx="0.2" cy="0.1" r="1">
+      <stop offset="0%" stop-color="#7dd3fc" stop-opacity="0.35" />
+      <stop offset="100%" stop-color="#7dd3fc" stop-opacity="0" />
+    </radialGradient>
+    <linearGradient id="screen" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#f8fdff" />
+      <stop offset="100%" stop-color="#e5f4ff" />
+    </linearGradient>
+  </defs>
+
+  <rect width="512" height="512" fill="url(#bg)" />
+  <circle cx="120" cy="90" r="180" fill="url(#glow)" />
+  <circle cx="428" cy="436" r="150" fill="#19a7d5" opacity="0.08" />
+
+  <rect x="120" y="96" width="272" height="200" rx="34" fill="url(#screen)" />
+  <rect x="136" y="116" width="240" height="164" rx="22" fill="#f8fcff" stroke="#b7d8eb" stroke-width="3" />
+  <rect x="162" y="144" width="180" height="16" rx="8" fill="#155e75" opacity="0.3" />
+  <rect x="162" y="176" width="128" height="16" rx="8" fill="#155e75" opacity="0.4" />
+  <rect x="162" y="208" width="170" height="16" rx="8" fill="#155e75" opacity="0.24" />
+
+  <rect x="156" y="286" width="200" height="132" rx="34" fill="#06263f" />
+  <rect x="174" y="308" width="164" height="84" rx="16" fill="#0b3554" />
+  <rect x="174" y="308" width="164" height="11" rx="6" fill="#19a7d5" opacity="0.4" />
+  <circle cx="256" cy="414" r="14" fill="#2dd4bf" />
+  <circle cx="256" cy="414" r="27" fill="none" stroke="#2dd4bf" stroke-opacity="0.3" stroke-width="6" />
+
+  <path
+    d="M208 332a52 52 0 0 1 96 0"
+    fill="none"
+    stroke="#67e8f9"
+    stroke-linecap="round"
+    stroke-width="10"
+    stroke-opacity="0.9"
+  />
+  <path
+    d="M226 349a34 34 0 0 1 60 0"
+    fill="none"
+    stroke="#67e8f9"
+    stroke-linecap="round"
+    stroke-width="10"
+    stroke-opacity="0.75"
+  />
+</svg>

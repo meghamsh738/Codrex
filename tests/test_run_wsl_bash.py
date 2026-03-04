@@ -1,4 +1,5 @@
 import sys
+import tempfile
 import unittest
 from contextlib import ExitStack
 from pathlib import Path
@@ -175,6 +176,79 @@ class RunWslBashTests(unittest.TestCase):
         self.assertEqual(result["stdout"], "ready")
         self.assertEqual(result["exit_code"], 0)
         self.assertEqual(result["attempts"], 2)
+
+
+class TailscaleDetectionTests(unittest.TestCase):
+    def test_tailscale_exe_path_uses_path_lookup(self):
+        exe_path = r"C:\tools\tailscale.exe"
+        exists = lambda p: p == exe_path
+        which = lambda cmd: exe_path if cmd == "tailscale.exe" else ""
+
+        with mock.patch.object(server_mod.os, "name", "nt"), \
+             mock.patch.dict(server_mod.os.environ, {}, clear=True), \
+             mock.patch.object(server_mod.os.path, "exists", side_effect=exists), \
+             mock.patch.object(server_mod.shutil, "which", side_effect=which):
+            out = server_mod._tailscale_exe_path()
+
+        self.assertEqual(out, exe_path)
+
+    def test_tailscale_exe_path_uses_where_fallback(self):
+        exe_path = r"C:\Users\me\AppData\Local\Tailscale\tailscale.exe"
+        exists = lambda p: p == exe_path
+
+        with mock.patch.object(server_mod.os, "name", "nt"), \
+             mock.patch.dict(server_mod.os.environ, {}, clear=True), \
+             mock.patch.object(server_mod.os.path, "exists", side_effect=exists), \
+             mock.patch.object(server_mod.shutil, "which", return_value=""), \
+             mock.patch.object(server_mod.subprocess, "check_output", return_value=exe_path + "\n") as where_mock:
+            out = server_mod._tailscale_exe_path()
+
+        self.assertEqual(out, exe_path)
+        where_mock.assert_called_once()
+
+    def test_get_tailscale_ipv4_falls_back_to_ipconfig_without_exe(self):
+        ipconfig_out = """
+Windows IP Configuration
+
+Ethernet adapter Tailscale:
+
+   Connection-specific DNS Suffix  . :
+   IPv4 Address. . . . . . . . . . . : 100.90.80.70
+""".strip()
+        with mock.patch.object(server_mod.os, "name", "nt"), \
+             mock.patch.object(server_mod, "_tailscale_exe_path", return_value=""), \
+             mock.patch.object(server_mod.subprocess, "check_output", return_value=ipconfig_out):
+            out = server_mod.get_tailscale_ipv4()
+
+        self.assertEqual(out, "100.90.80.70")
+
+    def test_get_tailscale_ipv4_falls_back_to_ipconfig_after_cli_failures(self):
+        exe = r"C:\Program Files\Tailscale\tailscale.exe"
+        ipconfig_out = """
+Windows IP Configuration
+
+Ethernet adapter Tailscale:
+
+   IPv4 Address. . . . . . . . . . . : 100.64.12.34
+""".strip()
+
+        def fake_check_output(args, **_kwargs):
+            if args == [exe, "ip", "-4"]:
+                raise RuntimeError("ip command failed")
+            if args == [exe, "status", "--json"]:
+                raise RuntimeError("json status failed")
+            if args == [exe, "status"]:
+                return ""
+            if args == ["ipconfig"]:
+                return ipconfig_out
+            raise AssertionError(f"unexpected command: {args}")
+
+        with mock.patch.object(server_mod.os, "name", "nt"), \
+             mock.patch.object(server_mod, "_tailscale_exe_path", return_value=exe), \
+             mock.patch.object(server_mod.subprocess, "check_output", side_effect=fake_check_output):
+            out = server_mod.get_tailscale_ipv4()
+
+        self.assertEqual(out, "100.64.12.34")
 
 
 class TmuxPanesTests(unittest.TestCase):
@@ -376,6 +450,237 @@ class ProgressAndAuthTests(unittest.TestCase):
             self.assertFalse(server_mod._is_valid_auth_token(""))
 
 
+class CodexSessionConfigTests(unittest.TestCase):
+    def test_reasoning_efforts_for_codex_family_model(self):
+        out = server_mod._reasoning_efforts_for_model("gpt-5-codex")
+        self.assertEqual(out, ["low", "medium", "high"])
+
+    def test_codex_options_exposes_defaults(self):
+        out = server_mod.codex_options()
+        self.assertTrue(out["ok"])
+        self.assertIn("models", out)
+        self.assertIn("default_model", out)
+        self.assertIn("reasoning_efforts", out)
+        self.assertIn("default_reasoning_effort", out)
+        self.assertTrue(out["models"])
+        self.assertTrue(out["reasoning_efforts"])
+
+    def test_codex_session_create_uses_model_and_reasoning(self):
+        with mock.patch.object(server_mod, "run_wsl_bash", return_value={
+            "exit_code": 0,
+            "stdout": "",
+            "stderr": "",
+        }) as run_mock:
+            out = server_mod.codex_session_create({
+                "name": "demo",
+                "cwd": "/home/megha/work",
+                "model": "gpt-5",
+                "reasoning_effort": "high",
+            })
+
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["model"], "gpt-5")
+        self.assertEqual(out["reasoning_effort"], "high")
+        cmd = run_mock.call_args.args[0]
+        self.assertIn("tmux new-session", cmd)
+        self.assertIn("model=gpt-5", cmd)
+        self.assertIn("model_reasoning_effort=high", cmd)
+
+    def test_codex_session_create_clamps_reasoning_for_codex_prefixed_models(self):
+        with mock.patch.object(server_mod, "run_wsl_bash", return_value={
+            "exit_code": 0,
+            "stdout": "",
+            "stderr": "",
+        }) as run_mock:
+            out = server_mod.codex_session_create({
+                "name": "demo",
+                "cwd": "/home/megha/work",
+                "model": "codex-1p-q-20251024-ev3",
+                "reasoning_effort": "xhigh",
+            })
+
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["model"], "codex-1p-q-20251024-ev3")
+        self.assertEqual(out["reasoning_effort"], "high")
+        cmd = run_mock.call_args.args[0]
+        self.assertIn("model=codex-1p-q-20251024-ev3", cmd)
+        self.assertIn("model_reasoning_effort=high", cmd)
+
+    def test_codex_session_create_clamps_reasoning_for_codex_family_model(self):
+        with mock.patch.object(server_mod, "run_wsl_bash", return_value={
+            "exit_code": 0,
+            "stdout": "",
+            "stderr": "",
+        }) as run_mock:
+            out = server_mod.codex_session_create({
+                "name": "demo",
+                "cwd": "/home/megha/work",
+                "model": "gpt-5-codex",
+                "reasoning_effort": "xhigh",
+            })
+
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["model"], "gpt-5-codex")
+        self.assertEqual(out["reasoning_effort"], "high")
+        cmd = run_mock.call_args.args[0]
+        self.assertIn("model=gpt-5-codex", cmd)
+        self.assertIn("model_reasoning_effort=high", cmd)
+
+    def test_codex_session_apply_profile_sends_model_command(self):
+        fake_sessions = {"codex_demo": {"session": "codex_demo"}}
+        with mock.patch.object(server_mod, "_session_pane", return_value={"pane_id": "%9"}), \
+             mock.patch.object(server_mod, "_tmux_send_text", return_value={
+                 "exit_code": 0,
+                 "stdout": "",
+                 "stderr": "",
+             }) as send_mock, \
+             mock.patch.object(server_mod, "SESSIONS", fake_sessions):
+            out = server_mod.codex_session_apply_profile(
+                "codex_demo",
+                {"model": "gpt-5", "reasoning_effort": "xhigh"},
+            )
+
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["model"], "gpt-5")
+        self.assertEqual(out["reasoning_effort"], "xhigh")
+        self.assertEqual(out["applied_command"], "/model gpt-5 xhigh")
+        send_mock.assert_called_once_with("%9", "/model gpt-5 xhigh", codex_mode=True, timeout_s=20)
+        self.assertEqual(fake_sessions["codex_demo"]["model"], "gpt-5")
+        self.assertEqual(fake_sessions["codex_demo"]["reasoning_effort"], "xhigh")
+
+    def test_codex_session_apply_profile_clamps_reasoning_for_codex_prefixed_models(self):
+        fake_sessions = {"codex_demo": {"session": "codex_demo"}}
+        with mock.patch.object(server_mod, "_session_pane", return_value={"pane_id": "%9"}), \
+             mock.patch.object(server_mod, "_tmux_send_text", return_value={
+                 "exit_code": 0,
+                 "stdout": "",
+                 "stderr": "",
+             }) as send_mock, \
+             mock.patch.object(server_mod, "SESSIONS", fake_sessions):
+            out = server_mod.codex_session_apply_profile(
+                "codex_demo",
+                {"model": "codex-1p-q-20251024-ev3", "reasoning_effort": "xhigh"},
+            )
+
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["model"], "codex-1p-q-20251024-ev3")
+        self.assertEqual(out["reasoning_effort"], "high")
+        self.assertEqual(out["applied_command"], "/model codex-1p-q-20251024-ev3 high")
+        send_mock.assert_called_once_with("%9", "/model codex-1p-q-20251024-ev3 high", codex_mode=True, timeout_s=20)
+        self.assertEqual(fake_sessions["codex_demo"]["reasoning_effort"], "high")
+
+    def test_codex_session_apply_profile_requires_session_pane(self):
+        with mock.patch.object(server_mod, "_session_pane", return_value=None):
+            out = server_mod.codex_session_apply_profile(
+                "codex_demo",
+                {"model": "gpt-5", "reasoning_effort": "high"},
+            )
+        self.assertFalse(out["ok"])
+        self.assertEqual(out["error"], "not_found")
+
+    def test_maybe_repair_codex_session_reasoning_clamps_xhigh(self):
+        fake_sessions = {
+            "codex_demo": {
+                "session": "codex_demo",
+                "model": "codex-1p-q-20251024-ev3",
+                "reasoning_effort": "xhigh",
+            }
+        }
+        with mock.patch.object(server_mod, "SESSIONS", fake_sessions), \
+             mock.patch.object(server_mod, "_tmux_send_text", return_value={
+                 "exit_code": 0,
+                 "stdout": "",
+                 "stderr": "",
+             }) as send_mock:
+            out = server_mod._maybe_repair_codex_session_reasoning("codex_demo", "%9")
+
+        self.assertTrue(out["ok"])
+        self.assertTrue(out["applied"])
+        self.assertEqual(out["reasoning_effort"], "high")
+        self.assertEqual(fake_sessions["codex_demo"]["reasoning_effort"], "high")
+        send_mock.assert_called_once_with(
+            "%9",
+            "/model codex-1p-q-20251024-ev3 high",
+            codex_mode=True,
+            timeout_s=20,
+        )
+
+    def test_maybe_repair_codex_session_reasoning_for_codex_family_model(self):
+        fake_sessions = {
+            "codex_demo": {
+                "session": "codex_demo",
+                "model": "gpt-5-codex",
+                "reasoning_effort": "xhigh",
+            }
+        }
+        with mock.patch.object(server_mod, "SESSIONS", fake_sessions), \
+             mock.patch.object(server_mod, "_tmux_send_text", return_value={
+                 "exit_code": 0,
+                 "stdout": "",
+                 "stderr": "",
+             }) as send_mock:
+            out = server_mod._maybe_repair_codex_session_reasoning("codex_demo", "%9")
+
+        self.assertTrue(out["ok"])
+        self.assertTrue(out["applied"])
+        self.assertEqual(out["reasoning_effort"], "high")
+        self.assertEqual(fake_sessions["codex_demo"]["reasoning_effort"], "high")
+        send_mock.assert_called_once_with(
+            "%9",
+            "/model gpt-5-codex high",
+            codex_mode=True,
+            timeout_s=20,
+        )
+
+    def test_codex_session_send_reports_profile_repaired(self):
+        with mock.patch.object(server_mod, "_session_pane", return_value={"pane_id": "%9"}), \
+             mock.patch.object(server_mod, "_maybe_repair_codex_session_reasoning", return_value={
+                 "ok": True,
+                 "applied": True,
+                 "model": "codex-1p-q-20251024-ev3",
+                 "reasoning_effort": "high",
+             }), \
+             mock.patch.object(server_mod, "_tmux_send_text", return_value={
+                 "exit_code": 0,
+                 "stdout": "",
+                 "stderr": "",
+             }) as send_mock:
+            out = server_mod.codex_session_send("codex_demo", "hello")
+
+        self.assertTrue(out["ok"])
+        self.assertTrue(out["profile_repaired"])
+        self.assertEqual(out["profile_model"], "codex-1p-q-20251024-ev3")
+        self.assertEqual(out["profile_reasoning_effort"], "high")
+        send_mock.assert_called_once_with("%9", "hello", codex_mode=True, timeout_s=20)
+
+    def test_auth_bootstrap_local_rejects_non_localhost(self):
+        req = SimpleNamespace(headers={"host": "100.64.0.9:8787", "origin": "http://100.64.0.9:8787"})
+        with mock.patch.object(server_mod, "CODEX_AUTH_REQUIRED", True), \
+             mock.patch.object(server_mod, "CODEX_AUTH_TOKEN", "secret"):
+            out = server_mod.auth_bootstrap_local(req)
+        self.assertFalse(out["ok"])
+        self.assertEqual(out["error"], "forbidden")
+
+    def test_auth_bootstrap_local_sets_cookie_for_localhost(self):
+        req = SimpleNamespace(headers={"host": "localhost:8787", "origin": "http://localhost:8787"})
+
+        class _Resp:
+            def __init__(self, payload):
+                self.payload = payload
+                self.cookies = {}
+
+            def set_cookie(self, key, value, **_kwargs):
+                self.cookies[key] = value
+
+        with mock.patch.object(server_mod, "CODEX_AUTH_REQUIRED", True), \
+             mock.patch.object(server_mod, "CODEX_AUTH_TOKEN", "secret"), \
+             mock.patch.object(server_mod, "JSONResponse", side_effect=lambda payload: _Resp(payload)):
+            out = server_mod.auth_bootstrap_local(req)
+
+        self.assertTrue(out.payload["ok"])
+        self.assertEqual(out.cookies.get(server_mod.CODEX_AUTH_COOKIE), "secret")
+
+
 class DesktopModeTests(unittest.TestCase):
     def test_desktop_mode_default_on(self):
         req = SimpleNamespace(query_params={}, cookies={})
@@ -394,6 +699,27 @@ class DesktopModeTests(unittest.TestCase):
             cookies={server_mod.CODEX_DESKTOP_MODE_COOKIE: "off"},
         )
         self.assertTrue(server_mod._desktop_enabled_from_request(req))
+
+    def test_downsample_rgb_nearest_reduces_size(self):
+        # 2x2 image: R, G, B, W
+        rgb = bytes([
+            255, 0, 0,
+            0, 255, 0,
+            0, 0, 255,
+            255, 255, 255,
+        ])
+        out_rgb, out_size = server_mod._downsample_rgb_nearest(rgb, (2, 2), 2)
+        self.assertEqual(out_size, (1, 1))
+        self.assertEqual(out_rgb, bytes([255, 0, 0]))
+
+    def test_rgb_to_grayscale_equal_channels(self):
+        rgb = bytes([10, 20, 30, 100, 120, 140])
+        gray = server_mod._rgb_to_grayscale(rgb)
+        self.assertEqual(len(gray), len(rgb))
+        self.assertEqual(gray[0], gray[1])
+        self.assertEqual(gray[1], gray[2])
+        self.assertEqual(gray[3], gray[4])
+        self.assertEqual(gray[4], gray[5])
 
 
 class CompactModeTests(unittest.TestCase):
@@ -536,6 +862,79 @@ class LegacyFallbackTests(unittest.TestCase):
         self.assertEqual(out["status_code"], 401)
         self.assertFalse(out["payload"]["ok"])
         self.assertEqual(out["payload"]["error"], "unauthorized")
+
+
+class ThreadStoreTests(unittest.TestCase):
+    def _reset_threads_store(self):
+        server_mod.THREADS_LOADED = False
+        server_mod.THREADS_DATA = {"threads": [], "messages": {}}
+
+    def test_thread_create_message_and_read(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store_path = str(Path(tmp) / "threads-store.json")
+            with mock.patch.object(server_mod, "THREADS_FILE", store_path):
+                self._reset_threads_store()
+
+                created = server_mod.thread_create({"session": "codex_demo", "title": "Release Prep"})
+                self.assertTrue(created["ok"])
+                thread = created["thread"]
+                self.assertEqual(thread["session"], "codex_demo")
+                self.assertEqual(thread["title"], "Release Prep")
+
+                msg = server_mod.thread_add_message(thread["id"], {"role": "user", "text": "Summarize blockers"})
+                self.assertTrue(msg["ok"])
+                self.assertEqual(msg["message"]["thread_id"], thread["id"])
+
+                snap = server_mod.threads_store_get()
+                self.assertTrue(snap["ok"])
+                self.assertEqual(len(snap["threads"]), 1)
+                self.assertEqual(len(snap["messages"].get(thread["id"], [])), 1)
+                self.assertTrue(Path(store_path).exists())
+
+    def test_thread_update_and_delete(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store_path = str(Path(tmp) / "threads-store.json")
+            with mock.patch.object(server_mod, "THREADS_FILE", store_path):
+                self._reset_threads_store()
+
+                created = server_mod.thread_create({"session": "codex_demo", "title": "Initial"})
+                tid = created["thread"]["id"]
+
+                updated = server_mod.thread_update(tid, {"title": "Renamed Thread"})
+                self.assertTrue(updated["ok"])
+                self.assertEqual(updated["thread"]["title"], "Renamed Thread")
+
+                deleted = server_mod.thread_delete(tid)
+                self.assertTrue(deleted["ok"])
+
+                snap = server_mod.threads_store_get()
+                self.assertEqual(snap["threads"], [])
+                self.assertEqual(snap["messages"], {})
+
+    def test_thread_message_dedup_by_id(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store_path = str(Path(tmp) / "threads-store.json")
+            with mock.patch.object(server_mod, "THREADS_FILE", store_path):
+                self._reset_threads_store()
+
+                created = server_mod.thread_create({"session": "codex_demo", "title": "Dedup"})
+                tid = created["thread"]["id"]
+
+                first = server_mod.thread_add_message(
+                    tid,
+                    {"id": "msg_fixed_1", "role": "user", "text": "First"},
+                )
+                second = server_mod.thread_add_message(
+                    tid,
+                    {"id": "msg_fixed_1", "role": "user", "text": "Second"},
+                )
+                self.assertTrue(first["ok"])
+                self.assertTrue(second["ok"])
+                self.assertEqual(first["message"]["id"], second["message"]["id"])
+                self.assertEqual(first["message"]["text"], "First")
+
+                snap = server_mod.threads_store_get()
+                self.assertEqual(len(snap["messages"].get(tid, [])), 1)
 
 
 if __name__ == "__main__":

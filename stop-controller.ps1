@@ -29,6 +29,11 @@ foreach ($p in $procs) {
     Stop-Process -Id $p.ProcessId -Force -ErrorAction Stop
     Write-Host "Stopped PID $($p.ProcessId)."
   } catch {
-    Write-Host "Failed to stop PID $($p.ProcessId): $($_.Exception.Message)"
+    $msg = [string]$_.Exception.Message
+    if ($msg -like "*Cannot find a process with the process identifier*") {
+      Write-Host "PID $($p.ProcessId) already exited."
+    } else {
+      Write-Host "Failed to stop PID $($p.ProcessId): $msg"
+    }
   }
 }

@@ -1,6 +1,6 @@
 # Codrex
 
-![Version](https://img.shields.io/badge/version-1.3.0-0b7285)
+![Version](https://img.shields.io/badge/version-1.4.0-0b7285)
 ![Python](https://img.shields.io/badge/python-3.11%2B-3776AB)
 ![Platform](https://img.shields.io/badge/platform-Windows%20%2B%20WSL-2D7D9A)
 ![FastAPI](https://img.shields.io/badge/api-FastAPI-009688)
@@ -15,7 +15,7 @@ It is designed for:
 
 ## Release Assets
 
-- Current version: `1.3.0` (see `VERSION`)
+- Current version: `1.4.0` (see `VERSION`)
 - Changelog: `CHANGELOG.md`
 - Runtime dependencies: `requirements.txt`
 
@@ -44,6 +44,139 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\setup.ps1 -OpenFirewall
 Then open:
 - `http://127.0.0.1:8787`
 
+## Experimental Mobile UI (React/PWA)
+
+Codrex now includes an incremental mobile-first frontend in `ui/` that runs side-by-side with the existing FastAPI-rendered page.
+
+Current slice focuses on:
+- Auth status/login/logout
+- Pairing QR generation and exchange
+- Codex session list/create/send/interrupt/ctrl-c
+- Live session screen polling
+- Debug timeline (app events + `/codex/runs` history inspector)
+- Prompt control profiles (Direct / Plan First / Build Focus + Reasoning depth)
+- Session organization (project grouping, search, filter)
+- Live output feed controls (SSE stream with polling fallback profiles)
+- Android install flow (Install App button + fallback install guide)
+- Connectivity chip (online/offline + install readiness)
+- Quick action chips for common prompt workflows
+- Scan-to-open app QR (LAN/Tailscale route-aware launch link)
+- Console focus mode (full-screen terminal view on mobile)
+- Sticky session action dock (Pull/Interrupt/Ctrl+C/Send for one-hand use)
+- Swipe gestures for tab switching (left/right on content area)
+- Touch feedback animation on tap targets (haptic-like visual press)
+- One-time swipe hint banner (auto-dismiss on first swipe or manual "Got it")
+- Bottom navigation with icons + larger touch targets
+- Directional tab transition animations (subtle left/right slide)
+- Refined visual system (cleaner typography, spacing rhythm, and card hierarchy)
+- Unified branding via app icon in header + install surfaces
+- Android PWA icon set (any + maskable + apple-touch) for native-style install polish
+
+Run it:
+
+```bash
+cd ui
+npm install
+npm run dev
+```
+
+Open:
+- `http://127.0.0.1:4312`
+
+Notes:
+- This UI proxies to backend `http://127.0.0.1:8787` by default.
+- Set `VITE_BACKEND_ORIGIN` if your backend is running on another host/port.
+- Legacy UI remains available at `http://127.0.0.1:8787/?compact=1`.
+- If the app was already installed before icon updates, uninstall/reinstall once so Android refreshes cached manifest assets.
+
+### One-Command Mobile Start (Windows)
+
+Start backend + mobile UI together:
+
+```powershell
+Set-Location C:\codex-remote-ui
+.\start-mobile.ps1
+```
+
+Or double-click:
+- `Start Mobile.cmd`
+
+Stop both:
+
+```powershell
+Set-Location C:\codex-remote-ui
+.\stop-mobile.ps1
+```
+
+Or double-click:
+- `Stop Mobile.cmd`
+
+Notes:
+- `start-mobile.ps1` reads backend port from `controller.config.json`.
+- UI defaults to port `4312` (override with `-UiPort`).
+- Add `-OpenFirewall` on first run if you need LAN access (opens both controller `8787` and UI `4312` rules).
+
+### Mobile App Launcher (Windows, Recommended)
+
+Use the app-style launcher window instead of tray menus:
+
+```powershell
+Set-Location C:\codex-remote-ui
+.\mobile-launcher.ps1
+```
+
+Or double-click:
+- `Start Mobile App.cmd`
+
+Features in the launcher window:
+- Start/Stop Mobile Stack
+- Open app locally or on network
+- Generate pair QR for phone/tablet login
+- Copy/open pair link
+- Live status + event log
+- Localhost auth bootstrap (no manual token entry in launcher)
+
+### System Tray Launcher (Windows)
+
+Run a tray app with one-click Start/Stop and quick links:
+
+```powershell
+Set-Location C:\codex-remote-ui
+.\mobile-tray.ps1
+```
+
+Or double-click:
+- `Mobile Tray.cmd`
+
+Tray menu actions:
+- Start Mobile Stack
+- Stop Mobile Stack
+- Show Pair QR (mobile login without typing token)
+- Open Mobile UI (local/network)
+- Open Controller UI
+- Open Logs Folder
+
+## Security Model for Remote Access
+
+Recommended setup for phone/tablet:
+- Enable token auth in `controller.config.json` by setting a strong `token`.
+- Keep Codrex reachable only through Tailscale (or another private VPN).
+- Use short-lived QR pairing from an already-authenticated device.
+
+Launcher auth behavior:
+- The Windows launcher first attempts `/auth/bootstrap/local` on `localhost`.
+- If local bootstrap is not available, it falls back to token login using `controller.config.json`.
+- QR generation does not expose the long token in the mobile/browser URL.
+
+Behavior details:
+- `/auth/pair/create` requires an authenticated request when token auth is enabled.
+- `/auth/pair/exchange` is public by design, but only accepts valid one-time, short-lived codes.
+- Pairing links do not expose the long auth token to the browser.
+
+Avoid:
+- Exposing port `8787` directly to the public internet.
+- Running no-token mode on untrusted networks.
+
 ## Screenshots
 
 ### Desktop UI
@@ -57,6 +190,26 @@ Then open:
 ### Pairing Panel
 
 ![Codrex Pairing](screenshots/codrex-pairing.png)
+
+## 1.4.0 Highlights
+
+- Modern mobile/PWA web UI added under `ui/` with tabbed Sessions, Threads, Remote, Pair, Settings, and Debug views.
+- Image upload flow supports three delivery modes:
+  - insert local path into composer (no auto-send),
+  - desktop clipboard paste (`Ctrl+V`),
+  - send path as immediate session message.
+- Codex model/reasoning guardrails:
+  - codex-family models are clamped to supported reasoning levels,
+  - stale sessions auto-repair profile before sends to avoid `unsupported_value` errors.
+- Android-first UX improvements:
+  - stronger dark theme polish,
+  - larger touch targets and improved panel layout,
+  - pairing and route diagnostics improvements.
+- Remote desktop improvements:
+  - faster default stream behavior and lower background polling load,
+  - tap-to-focus before typing,
+  - low-data `Ultra` stream profile (grayscale + downscale),
+  - Remote screenshot capture now uses desktop frame capture path.
 
 ## Project Layout
 
@@ -229,7 +382,12 @@ The tests include stubs for FastAPI and MSS, so they validate command logic with
 
 - Mobile cannot reach desktop URL:
   - Use LAN IP (not localhost) or Tailscale IP.
-  - Open firewall on chosen port.
+  - Open firewall on both ports: controller (`8787`) and UI (`4312`).
+
+- Pair tab shows `Tailscale: n/a`:
+  - Make sure Tailscale is connected on this laptop.
+  - Click `Refresh Routes` in Pair tab after login.
+  - If Tailscale is unavailable, LAN route is used as fallback for app-open QR.
 
 - Pairing code fails:
   - Codes are short-lived and one-time use.

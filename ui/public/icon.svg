@@ -1,0 +1,50 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="Codrex icon">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0f766e" />
+      <stop offset="55%" stop-color="#0f5f88" />
+      <stop offset="100%" stop-color="#0b3b63" />
+    </linearGradient>
+    <radialGradient id="glow" cx="0.2" cy="0.1" r="1">
+      <stop offset="0%" stop-color="#7dd3fc" stop-opacity="0.45" />
+      <stop offset="100%" stop-color="#7dd3fc" stop-opacity="0" />
+    </radialGradient>
+    <linearGradient id="screen" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#f8fdff" />
+      <stop offset="100%" stop-color="#e5f4ff" />
+    </linearGradient>
+  </defs>
+
+  <rect width="512" height="512" rx="112" fill="url(#bg)" />
+  <rect x="32" y="32" width="448" height="448" rx="96" fill="none" stroke="rgba(255,255,255,0.2)" stroke-width="2" />
+  <circle cx="120" cy="82" r="170" fill="url(#glow)" />
+
+  <rect x="116" y="88" width="280" height="206" rx="34" fill="url(#screen)" />
+  <rect x="132" y="108" width="248" height="170" rx="24" fill="#f8fcff" stroke="#b7d8eb" stroke-width="3" />
+  <rect x="158" y="136" width="188" height="16" rx="8" fill="#155e75" opacity="0.3" />
+  <rect x="158" y="168" width="132" height="16" rx="8" fill="#155e75" opacity="0.4" />
+  <rect x="158" y="200" width="170" height="16" rx="8" fill="#155e75" opacity="0.25" />
+
+  <rect x="150" y="282" width="212" height="142" rx="36" fill="#06263f" />
+  <rect x="169" y="306" width="174" height="90" rx="16" fill="#0b3554" />
+  <rect x="169" y="306" width="174" height="12" rx="6" fill="#19a7d5" opacity="0.42" />
+  <circle cx="256" cy="420" r="16" fill="#2dd4bf" />
+  <circle cx="256" cy="420" r="29" fill="none" stroke="#2dd4bf" stroke-opacity="0.35" stroke-width="7" />
+
+  <path
+    d="M205 332a56 56 0 0 1 102 0"
+    fill="none"
+    stroke="#67e8f9"
+    stroke-linecap="round"
+    stroke-width="10"
+    stroke-opacity="0.9"
+  />
+  <path
+    d="M224 350a36 36 0 0 1 64 0"
+    fill="none"
+    stroke="#67e8f9"
+    stroke-linecap="round"
+    stroke-width="10"
+    stroke-opacity="0.75"
+  />
+</svg>

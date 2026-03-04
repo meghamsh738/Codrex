@@ -12,6 +12,9 @@ venv/
 # Runtime artifacts
 logs/
 *.log
+backup/
+test-results/
+ui/test-results/
 
 # OS/editor
 .DS_Store
@@ -21,3 +24,9 @@ Thumbs.db
 
 # Optional local overrides
 controller.config.local.json
+
+# Frontend workspace
+ui/node_modules/
+ui/dist/
+ui/.vite/
+ui/coverage/

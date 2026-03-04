@@ -1,5 +1,6 @@
 param(
   [int]$Port = 8787,
+  [int]$UiPort = 4312,
   [string]$Distro = "Ubuntu",
   [string]$Workdir = "/home/megha/codrex-work",
   [string]$FileRoot = "/home/megha/codrex-work",
@@ -34,6 +35,23 @@ function Get-PrimaryIPv4 {
     if ($line -match ":\s*([0-9\.]+)\s*$") { return $matches[1] }
   } catch {}
   return "127.0.0.1"
+}
+
+function Test-ControllerReady {
+  param(
+    [string]$ProbeHost,
+    [int]$Port,
+    [string]$Token
+  )
+  $headers = @{}
+  if ($Token) {
+    $headers["x-auth-token"] = $Token
+  }
+  try {
+    $resp = Invoke-WebRequest -UseBasicParsing -Headers $headers -Uri ("http://{0}:{1}/auth/status" -f $ProbeHost, $Port) -TimeoutSec 2
+    return ($resp.StatusCode -eq 200)
+  } catch {}
+  return $false
 }
 
 $root = Split-Path -Parent $PSCommandPath
@@ -97,23 +115,47 @@ $env:CODEX_AUTH_TOKEN = [string]$cfg.token
 $env:CODEX_WSL_DISTRO = [string]$cfg.distro
 $env:CODEX_WORKDIR = [string]$cfg.workdir
 $env:CODEX_FILE_ROOT = [string]$cfg.fileRoot
+$env:CODEX_MOBILE_UI_PORT = [string]$UiPort
 
 $args = @("-m", "uvicorn", "app.server:app", "--host", "0.0.0.0", "--port", [string]$cfg.port)
 $proc = Start-Process -FilePath $python -ArgumentList $args -WorkingDirectory $root -WindowStyle Hidden -RedirectStandardOutput $outLog -RedirectStandardError $errLog -PassThru
 
 # Wait until endpoint responds.
 $ok = $false
-for ($i = 0; $i -lt 20; $i++) {
+$readyHost = ""
+$probeHosts = @("127.0.0.1", "localhost")
+$primaryIp = Get-PrimaryIPv4
+if ($primaryIp -and $primaryIp -ne "127.0.0.1") {
+  $probeHosts += $primaryIp
+}
+$probeHosts = $probeHosts | Select-Object -Unique
+for ($i = 0; $i -lt 30; $i++) {
   Start-Sleep -Milliseconds 300
-  try {
-    $resp = Invoke-WebRequest -UseBasicParsing "http://127.0.0.1:$($cfg.port)/auth/status" -TimeoutSec 2
-    if ($resp.StatusCode -eq 200) { $ok = $true; break }
-  } catch {}
+  foreach ($h in $probeHosts) {
+    if (Test-ControllerReady -ProbeHost $h -Port $cfg.port -Token $cfg.token) {
+      $ok = $true
+      $readyHost = $h
+      break
+    }
+  }
+  if ($ok) { break }
 }
 
 if (-not $ok) {
   Write-Host "Controller failed to start. Last error log:"
   if (Test-Path $errLog) { Get-Content $errLog -Tail 80 }
+  try {
+    $listeners = Get-NetTCPConnection -LocalPort $cfg.port -State Listen -ErrorAction SilentlyContinue
+    if ($listeners) {
+      Write-Host "Port listeners on $($cfg.port):"
+      foreach ($l in $listeners | Sort-Object LocalAddress, OwningProcess) {
+        $p = Get-CimInstance Win32_Process -Filter ("ProcessId = {0}" -f $l.OwningProcess) -ErrorAction SilentlyContinue
+        $pname = if ($p) { $p.Name } else { "unknown" }
+        Write-Host ("  {0}:{1} PID={2} ({3})" -f $l.LocalAddress, $l.LocalPort, $l.OwningProcess, $pname)
+      }
+      Write-Host "Tip: another app on 127.0.0.1:$($cfg.port) can break localhost checks. Either stop it or use a different port for Codrex."
+    }
+  } catch {}
   throw "Startup failed."
 }
 
@@ -132,6 +174,9 @@ if ($OpenFirewall) {
 $ip = Get-PrimaryIPv4
 Write-Host "Controller started."
 Write-Host ("URL: http://{0}:{1}" -f $ip, $cfg.port)
+if ($readyHost) {
+  Write-Host ("Readiness probe: http://{0}:{1}/auth/status" -f $readyHost, $cfg.port)
+}
 Write-Host "Token: $($cfg.token)"
 Write-Host "PID: $($proc.Id)"
 Write-Host "Logs: $outLog"
