@@ -71,7 +71,7 @@ type StreamProfile = "fast" | "balanced" | "battery";
 type TmuxShellProfile = "ubuntu" | "powershell" | "cmd";
 type OutputFeedState = "off" | "polling" | "connecting" | "live" | "error";
 type TabTransitionClass = "tab-still" | "tab-slide-left" | "tab-slide-right";
-type DesktopStreamProfile = "responsive" | "balanced" | "saver" | "ultra";
+type DesktopStreamProfile = "responsive" | "balanced" | "saver" | "ultra" | "extreme";
 type SessionImageDeliveryMode = "insert_path" | "desktop_clipboard" | "session_path";
 
 type AppEventLevel = "info" | "error";
@@ -136,6 +136,7 @@ const DESKTOP_PROFILE_STREAM: Record<DesktopStreamProfile, { fps: number; level:
   balanced: { fps: 6, level: 2, scale: 2, bw: false },
   saver: { fps: 4, level: 3, scale: 3, bw: false },
   ultra: { fps: 3, level: 4, scale: 4, bw: true },
+  extreme: { fps: 1.5, level: 6, scale: 6, bw: true },
 };
 const FALLBACK_MODELS = ["gpt-5-codex", "gpt-5", "gpt-5-mini", "gpt-4.1", "o4-mini"];
 const FALLBACK_REASONING_EFFORTS: ReasoningEffort[] = ["minimal", "low", "medium", "high", "xhigh"];
@@ -3648,6 +3649,7 @@ export default function App() {
                       <option value="balanced">Balanced</option>
                       <option value="saver">Saver</option>
                       <option value="ultra">Ultra (B/W, low data)</option>
+                      <option value="extreme">Extreme (very low bandwidth)</option>
                     </select>
                   </label>
                   <p className="small">

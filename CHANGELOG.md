@@ -4,6 +4,23 @@ All notable changes to this project are documented in this file.
 
 The format follows Keep a Changelog and the project uses Semantic Versioning.
 
+## [1.4.1] - 2026-03-04
+
+### Added
+- New `Extreme` remote stream profile in the mobile UI for very weak connections:
+  - ~1.5 FPS target
+  - max stream downscale (`scale=6`)
+  - grayscale rendering (`bw=1`)
+
+### Changed
+- Remote stream profile selector now includes:
+  - `Responsive`
+  - `Balanced`
+  - `Saver`
+  - `Ultra`
+  - `Extreme`
+- Release metadata updated to `1.4.1`.
+
 ## [1.4.0] - 2026-03-04
 
 ### Added

@@ -1,6 +1,6 @@
 # Codrex
 
-![Version](https://img.shields.io/badge/version-1.4.0-0b7285)
+![Version](https://img.shields.io/badge/version-1.4.1-0b7285)
 ![Python](https://img.shields.io/badge/python-3.11%2B-3776AB)
 ![Platform](https://img.shields.io/badge/platform-Windows%20%2B%20WSL-2D7D9A)
 ![FastAPI](https://img.shields.io/badge/api-FastAPI-009688)
@@ -15,7 +15,7 @@ It is designed for:
 
 ## Release Assets
 
-- Current version: `1.4.0` (see `VERSION`)
+- Current version: `1.4.1` (see `VERSION`)
 - Changelog: `CHANGELOG.md`
 - Runtime dependencies: `requirements.txt`
 
@@ -210,6 +210,14 @@ Avoid:
   - tap-to-focus before typing,
   - low-data `Ultra` stream profile (grayscale + downscale),
   - Remote screenshot capture now uses desktop frame capture path.
+
+## 1.4.1 Incremental Update
+
+- Added `Extreme` stream profile for unstable links:
+  - very low frame rate,
+  - maximum downscale,
+  - grayscale mode.
+- Intended for "see enough to navigate" use cases where responsiveness is more important than visual fidelity.
 
 ## Project Layout
 
