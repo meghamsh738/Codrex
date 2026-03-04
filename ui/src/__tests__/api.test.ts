@@ -8,6 +8,7 @@ import {
   deleteSharedFile,
   getTelegramStatus,
   listSharedFiles,
+  sendSessionKey,
   sendTelegramText,
   sendSharedFileToTelegram,
 } from "../api";
@@ -91,6 +92,28 @@ describe("session profile apply API", () => {
           model: "gpt-5",
           reasoning_effort: "xhigh",
         }),
+      }),
+    );
+  });
+
+  it("posts arrow key payload to session key endpoint", async () => {
+    fetchMock.mockResolvedValue({
+      ok: true,
+      status: 200,
+      text: async () => JSON.stringify({ ok: true }),
+    });
+
+    const out = await sendSessionKey("codex_demo", "up");
+    expect(out.ok).toBe(true);
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/codex/session/codex_demo/key",
+      expect.objectContaining({
+        method: "POST",
+        credentials: "include",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ key: "up" }),
       }),
     );
   });

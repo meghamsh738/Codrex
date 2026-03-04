@@ -53,6 +53,7 @@ vi.mock("../api", async (importOriginal) => {
     addThreadRecordMessage: vi.fn(),
     createThreadRecord: vi.fn(),
     deleteThreadRecord: vi.fn(),
+    sendSessionKey: vi.fn(),
     sendToPane: vi.fn(),
     sendToSession: vi.fn(),
     setDesktopMode: vi.fn(),
@@ -88,6 +89,7 @@ const createPairCodeMock = vi.mocked(api.createPairCode);
 const exchangePairCodeMock = vi.mocked(api.exchangePairCode);
 const interruptSessionMock = vi.mocked(api.interruptSession);
 const ctrlcSessionMock = vi.mocked(api.ctrlcSession);
+const sendSessionKeyMock = vi.mocked(api.sendSessionKey);
 const sendToSessionMock = vi.mocked(api.sendToSession);
 const getTmuxHealthMock = vi.mocked(api.getTmuxHealth);
 const getTmuxPanesMock = vi.mocked(api.getTmuxPanes);
@@ -141,8 +143,8 @@ function setupDefaultMocks(): void {
     ok: true,
     models: ["gpt-5-codex", "gpt-5"],
     default_model: "gpt-5-codex",
-    reasoning_efforts: ["minimal", "medium", "xhigh"],
-    default_reasoning_effort: "xhigh",
+    reasoning_efforts: ["low", "medium", "high"],
+    default_reasoning_effort: "high",
   });
   getCodexRunMock.mockResolvedValue({
     ok: true,
@@ -218,6 +220,7 @@ function setupDefaultMocks(): void {
   exchangePairCodeMock.mockResolvedValue({ ok: true });
   interruptSessionMock.mockResolvedValue({ ok: true });
   ctrlcSessionMock.mockResolvedValue({ ok: true });
+  sendSessionKeyMock.mockResolvedValue({ ok: true });
   sendToSessionMock.mockResolvedValue({ ok: true });
   setDesktopModeMock.mockResolvedValue({ ok: true, enabled: false });
   desktopClickMock.mockResolvedValue({ ok: true });
@@ -362,7 +365,7 @@ describe("app shell tabs", () => {
         name: "review-session",
         cwd: "",
         model: "gpt-5-codex",
-        reasoning_effort: "medium",
+        reasoning_effort: "high",
       });
     });
   });
@@ -522,6 +525,31 @@ describe("app shell tabs", () => {
     expect(latestCall?.[1]).toBe("Create a release checklist");
   });
 
+  it("sends arrow key to session from action dock", async () => {
+    getSessionsMock.mockResolvedValue({
+      ok: true,
+      sessions: [
+        {
+          session: "codex_demo",
+          pane_id: "%1",
+          current_command: "codex",
+          cwd: "/home/megha/work",
+          state: "idle",
+          updated_at: Date.now(),
+          snippet: "",
+        },
+      ],
+    });
+
+    render(<App />);
+    const actionDock = await screen.findByTestId("session-action-dock");
+    fireEvent.click(within(actionDock).getByRole("button", { name: "Up" }));
+
+    await waitFor(() => {
+      expect(sendSessionKeyMock).toHaveBeenCalledWith("codex_demo", "up");
+    });
+  });
+
   it("creates a shared file from sessions panel", async () => {
     getSessionsMock.mockResolvedValue({
       ok: true,
@@ -660,7 +688,7 @@ describe("app shell tabs", () => {
         name: "auto-live-session",
         cwd: "",
         model: "gpt-5-codex",
-        reasoning_effort: "medium",
+        reasoning_effort: "high",
       });
     });
 

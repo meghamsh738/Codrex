@@ -24,6 +24,7 @@ import {
   ctrlcSession,
   exchangePairCode,
   enterSession,
+  sendSessionKey,
   getDesktopInfo,
   getAuthStatus,
   getCodexOptions,
@@ -287,6 +288,16 @@ function parseReasoningEffort(raw: string): ReasoningEffort {
     return raw;
   }
   return "xhigh";
+}
+
+function reasoningEffortRank(value: ReasoningEffort): number {
+  const order: ReasoningEffort[] = ["minimal", "low", "medium", "high", "xhigh"];
+  const index = order.indexOf(value);
+  return index >= 0 ? index : order.length - 1;
+}
+
+function strongerReasoningEffort(a: ReasoningEffort, b: ReasoningEffort): ReasoningEffort {
+  return reasoningEffortRank(a) >= reasoningEffortRank(b) ? a : b;
 }
 
 function allowedReasoningForModel(model: string, allOptions: ReasoningEffort[]): ReasoningEffort[] {
@@ -1012,7 +1023,8 @@ export default function App() {
       const defaultEffort = nextEfforts.includes(responseEffort) ? responseEffort : nextEfforts[nextEfforts.length - 1];
       setSelectedReasoningEffort((current) => {
         if (nextEfforts.includes(current)) {
-          return current;
+          // Upgrade older stored defaults (for example "medium") to the strongest controller default.
+          return strongerReasoningEffort(current, defaultEffort);
         }
         return defaultEffort;
       });
@@ -1021,7 +1033,7 @@ export default function App() {
       setModelOptions(FALLBACK_MODELS);
       setReasoningEffortOptions(FALLBACK_REASONING_EFFORTS);
       setSelectedModel((current) => current || FALLBACK_MODELS[0]);
-      setSelectedReasoningEffort((current) => (FALLBACK_REASONING_EFFORTS.includes(current) ? current : "xhigh"));
+      setSelectedReasoningEffort("xhigh");
     }
   }, [addEvent]);
 
@@ -2221,6 +2233,27 @@ export default function App() {
       await refreshSessions();
     } catch (error) {
       setError(`Enter failed: ${(error as Error).message}`);
+    } finally {
+      setSessionBusy(false);
+    }
+  }, [refreshScreen, refreshSessions, selectedSession, setError, setStatus]);
+
+  const onSendArrowKey = useCallback(async (key: "up" | "down" | "left" | "right") => {
+    if (!selectedSession) {
+      setError("Select a session first.");
+      return;
+    }
+    setSessionBusy(true);
+    try {
+      const response = await sendSessionKey(selectedSession, key);
+      if (!response.ok) {
+        throw new Error(response.detail || response.error || "Arrow key failed.");
+      }
+      setStatus(`Sent ${key} arrow to ${selectedSession}.`);
+      await refreshScreen(selectedSession);
+      await refreshSessions();
+    } catch (error) {
+      setError(`Arrow key failed: ${(error as Error).message}`);
     } finally {
       setSessionBusy(false);
     }
@@ -3556,6 +3589,18 @@ export default function App() {
                       </button>
                       <button type="button" className="button soft compact" data-short="ENT" onClick={() => void onSendEnter()} disabled={sessionBusy}>
                         <span className="btn-text">Enter</span>
+                      </button>
+                      <button type="button" className="button soft compact" data-short="UP" onClick={() => void onSendArrowKey("up")} disabled={sessionBusy}>
+                        <span className="btn-text">Up</span>
+                      </button>
+                      <button type="button" className="button soft compact" data-short="DN" onClick={() => void onSendArrowKey("down")} disabled={sessionBusy}>
+                        <span className="btn-text">Down</span>
+                      </button>
+                      <button type="button" className="button soft compact" data-short="LT" onClick={() => void onSendArrowKey("left")} disabled={sessionBusy}>
+                        <span className="btn-text">Left</span>
+                      </button>
+                      <button type="button" className="button soft compact" data-short="RT" onClick={() => void onSendArrowKey("right")} disabled={sessionBusy}>
+                        <span className="btn-text">Right</span>
                       </button>
                       <button type="button" className="button warn compact" data-short="INT" onClick={() => void onInterrupt()} disabled={sessionBusy}>
                         <span className="btn-text">Interrupt</span>

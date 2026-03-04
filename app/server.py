@@ -6154,6 +6154,37 @@ def codex_session_enter(session: str):
         return {"ok": False, "error": "enter_failed", "raw": p}
     return {"ok": True, "session": session}
 
+@app.post("/codex/session/{session}/key")
+def codex_session_key(session: str, payload: Dict[str, Any] = Body(...)):
+    """
+    Send a single navigation key to the Codex pane.
+    Supported keys: up, down, left, right.
+    """
+    session = _validate_session_name(session)
+    pane = _session_pane(session)
+    if not pane:
+        return {"ok": False, "error": "not_found", "detail": f"Session '{session}' has no panes."}
+
+    raw_key = str((payload or {}).get("key") or "").strip().lower()
+    key_map = {
+        "up": "Up",
+        "down": "Down",
+        "left": "Left",
+        "right": "Right",
+        "arrowup": "Up",
+        "arrowdown": "Down",
+        "arrowleft": "Left",
+        "arrowright": "Right",
+    }
+    tmux_key = key_map.get(raw_key)
+    if not tmux_key:
+        raise HTTPException(status_code=400, detail="Unsupported key. Use: up, down, left, right.")
+
+    p = run_wsl_bash(f"tmux send-keys -t {pane['pane_id']} {tmux_key}", timeout_s=20)
+    if p.get("exit_code") != 0:
+        return {"ok": False, "error": "key_failed", "raw": p}
+    return {"ok": True, "session": session, "key": raw_key}
+
 @app.get("/codex/session/{session}/screen")
 def codex_session_screen(session: str):
     session = _validate_session_name(session)
