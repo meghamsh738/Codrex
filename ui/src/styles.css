@@ -1140,6 +1140,20 @@ button:active,
   width: 100%;
 }
 
+.remote-text-controls {
+  align-items: stretch;
+}
+
+.remote-text-controls input {
+  flex: 2 1 320px;
+  min-width: 220px;
+}
+
+.remote-text-controls .button {
+  flex: 1 1 160px;
+  min-width: 160px;
+}
+
 @media (max-width: 760px) {
   .app-shell {
     padding: calc(env(safe-area-inset-top) + 10px) calc(env(safe-area-inset-right) + 6px)
@@ -1219,6 +1233,16 @@ button:active,
   .desktop-frame {
     min-height: 34vh;
     max-height: 66vh;
+  }
+
+  .remote-text-controls input {
+    flex: 1 1 100%;
+    min-width: 0;
+  }
+
+  .remote-text-controls .button {
+    flex: 1 1 calc(50% - 5px);
+    min-width: 0;
   }
 }
 

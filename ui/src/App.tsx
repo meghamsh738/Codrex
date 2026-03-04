@@ -44,7 +44,6 @@ import {
   logout,
   reportIpcEvent,
   sendSharedFileToTelegram,
-  sendTelegramText,
   deleteSharedFile,
   sendSessionImage,
   sendToPane,
@@ -622,7 +621,6 @@ export default function App() {
   const [telegramConfigured, setTelegramConfigured] = useState(false);
   const [telegramStatusLoading, setTelegramStatusLoading] = useState(true);
   const [shareBusy, setShareBusy] = useState(false);
-  const [telegramTextBusy, setTelegramTextBusy] = useState(false);
   const [sharePathInput, setSharePathInput] = useState("");
   const [shareTitleInput, setShareTitleInput] = useState("");
   const [shareExpiresHours, setShareExpiresHours] = useState("24");
@@ -2899,30 +2897,6 @@ export default function App() {
     }
   }, [desktopEnabled, desktopFocusPoint, desktopTextInput, setError]);
 
-  const onSendRemoteTextToTelegram = useCallback(async () => {
-    const text = desktopTextInput.trim();
-    if (!text) {
-      setError("Type text first.");
-      return;
-    }
-    if (!telegramConfigured) {
-      setError("Telegram delivery is not configured.");
-      return;
-    }
-    setTelegramTextBusy(true);
-    try {
-      const response = await sendTelegramText(text);
-      if (!response.ok) {
-        throw new Error(response.detail || response.error || "Telegram send failed.");
-      }
-      setStatus(response.detail || "Sent to Telegram.");
-    } catch (error) {
-      setError(`Telegram send failed: ${(error as Error).message}`);
-    } finally {
-      setTelegramTextBusy(false);
-    }
-  }, [desktopTextInput, setError, setStatus, telegramConfigured]);
-
   const onDesktopFrameTap = useCallback(async (event: React.MouseEvent<HTMLImageElement>) => {
     if (!desktopEnabled) {
       setDesktopStatus("Desktop control is disabled. Enable Desktop first.");
@@ -4063,15 +4037,6 @@ export default function App() {
                     </button>
                     <button type="button" className="button soft compact" data-short="PASTE" onClick={() => void onDesktopPasteClipboard()} disabled={desktopInteractionDisabled}>
                       <span className="btn-text">Paste Clipboard</span>
-                    </button>
-                    <button
-                      type="button"
-                      className="button soft compact"
-                      data-short="TG"
-                      onClick={() => void onSendRemoteTextToTelegram()}
-                      disabled={!telegramConfigured || telegramTextBusy || !desktopTextInput.trim()}
-                    >
-                      <span className="btn-text">Send Telegram</span>
                     </button>
                   </div>
                   <div className="row remote-key-controls">

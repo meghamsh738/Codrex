@@ -77,7 +77,6 @@ const createSharedFileMock = vi.mocked(api.createSharedFile);
 const deleteSharedFileMock = vi.mocked(api.deleteSharedFile);
 const listSharedFilesMock = vi.mocked(api.listSharedFiles);
 const sendSharedFileToTelegramMock = vi.mocked(api.sendSharedFileToTelegram);
-const sendTelegramTextMock = vi.mocked(api.sendTelegramText);
 const createThreadRecordMock = vi.mocked(api.createThreadRecord);
 const updateThreadRecordMock = vi.mocked(api.updateThreadRecord);
 const deleteThreadRecordMock = vi.mocked(api.deleteThreadRecord);
@@ -163,10 +162,6 @@ function setupDefaultMocks(): void {
     items: [],
   });
   sendSharedFileToTelegramMock.mockResolvedValue({
-    ok: true,
-    detail: "Sent to Telegram.",
-  });
-  sendTelegramTextMock.mockResolvedValue({
     ok: true,
     detail: "Sent to Telegram.",
   });
@@ -328,11 +323,7 @@ describe("app shell tabs", () => {
     expect(streamImage.src).toContain("/desktop/stream");
   });
 
-  it("sends remote text to telegram from remote tab", async () => {
-    getTelegramStatusMock.mockResolvedValue({
-      ok: true,
-      configured: true,
-    });
+  it("sends remote text from remote tab via direct typing", async () => {
     getDesktopInfoMock.mockResolvedValue({
       ok: true,
       enabled: true,
@@ -347,11 +338,13 @@ describe("app shell tabs", () => {
     fireEvent.change(screen.getByPlaceholderText("Type text on desktop"), {
       target: { value: "Remote quick note" },
     });
-    fireEvent.click(screen.getByRole("button", { name: "Send Telegram" }));
+    fireEvent.click(screen.getByRole("button", { name: "Send Text" }));
 
     await waitFor(() => {
-      expect(sendTelegramTextMock).toHaveBeenCalledWith("Remote quick note");
+      expect(desktopSendTextMock).toHaveBeenCalledWith("Remote quick note");
     });
+    expect(desktopSendKeyMock).not.toHaveBeenCalled();
+    expect(screen.queryByRole("button", { name: "Send Telegram" })).not.toBeInTheDocument();
   });
 
   it("creates a session from sessions tab", async () => {

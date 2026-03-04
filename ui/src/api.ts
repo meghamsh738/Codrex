@@ -579,8 +579,8 @@ export function desktopScroll(delta: number): Promise<DesktopInputResult> {
 }
 
 export function desktopSendText(text: string): Promise<DesktopInputResult> {
-  // Use clipboard+Ctrl+V path for better reliability with native desktop apps.
-  return requestJson<DesktopInputResult>("/desktop/input/type", {
+  // Real typing path (no clipboard paste, no Enter key submit).
+  return requestJson<DesktopInputResult>("/desktop/input/text", {
     method: "POST",
     headers: JSON_HEADERS,
     body: JSON.stringify({ text }),
