@@ -17,6 +17,59 @@ function New-SecureToken([int]$ByteCount = 32) {
   return ([Convert]::ToBase64String($bytes)).TrimEnd("=").Replace("+", "-").Replace("/", "_")
 }
 
+function Convert-ToBoolean {
+  param(
+    [object]$Value,
+    [bool]$Default = $false
+  )
+  if ($null -eq $Value) { return $Default }
+  if ($Value -is [bool]) { return [bool]$Value }
+  $text = "$Value"
+  if ($null -eq $text) { return $Default }
+  $norm = $text.Trim().ToLowerInvariant()
+  if ($norm -in @("1", "true", "yes", "on")) { return $true }
+  if ($norm -in @("0", "false", "no", "off")) { return $false }
+  return $Default
+}
+
+function Convert-WindowsPathToWsl {
+  param(
+    [string]$WindowsPath
+  )
+  if (-not $WindowsPath) { return "" }
+  $norm = $WindowsPath -replace '\\', '/'
+  if ($norm -match '^([A-Za-z]):/(.*)$') {
+    $drive = $matches[1].ToLower()
+    $rest = $matches[2]
+    return "/mnt/$drive/$rest"
+  }
+  return $norm
+}
+
+function Ensure-CodrexSendHelper {
+  param(
+    [string]$RepoRoot,
+    [string]$Distro
+  )
+  try {
+    $repoWsl = Convert-WindowsPathToWsl -WindowsPath $RepoRoot
+    if (-not $repoWsl) { return }
+    $helperWsl = "$repoWsl/tools/codrex-send.py"
+    $installCmd = @"
+set -e
+if [ ! -f '$helperWsl' ]; then
+  exit 0
+fi
+mkdir -p ~/.local/bin
+ln -sf '$helperWsl' ~/.local/bin/codrex-send
+chmod +x '$helperWsl' ~/.local/bin/codrex-send
+"@
+    & wsl.exe -d $Distro -- bash -lc $installCmd | Out-Null
+  } catch {
+    Write-Host "Warning: could not install codrex-send helper in WSL ($($_.Exception.Message))."
+  }
+}
+
 function Get-PrimaryIPv4 {
   try {
     $route = Get-NetRoute -DestinationPrefix "0.0.0.0/0" -ErrorAction Stop |
@@ -77,6 +130,7 @@ if (Test-Path $configPath) {
         $cfg.workdir = [string]$loaded.workdir
         $cfg.fileRoot = [string]$loaded.fileRoot
         $cfg.token = [string]$loaded.token
+        $cfg.telegramDefaultSend = Convert-ToBoolean -Value $loaded.telegramDefaultSend -Default $true
       }
     }
   } catch {}
@@ -92,8 +146,12 @@ if (-not $cfg.distro) { $cfg.distro = "Ubuntu" }
 if (-not $cfg.workdir) { $cfg.workdir = "/home/megha/codrex-work" }
 if (-not $cfg.fileRoot) { $cfg.fileRoot = $cfg.workdir }
 if (-not $cfg.token -or $cfg.token.Length -lt 24) { $cfg.token = New-SecureToken }
+$cfg.telegramDefaultSend = Convert-ToBoolean -Value $cfg.telegramDefaultSend -Default $true
 
 $cfg | ConvertTo-Json | Set-Content -Path $configPath -Encoding UTF8
+
+# Ensure `codrex-send` helper exists inside WSL for Codex sessions.
+Ensure-CodrexSendHelper -RepoRoot $root -Distro $cfg.distro
 
 # Stop old controller processes on this port.
 $pattern = "--port\s+$($cfg.port)\b"
@@ -116,6 +174,7 @@ $env:CODEX_WSL_DISTRO = [string]$cfg.distro
 $env:CODEX_WORKDIR = [string]$cfg.workdir
 $env:CODEX_FILE_ROOT = [string]$cfg.fileRoot
 $env:CODEX_MOBILE_UI_PORT = [string]$UiPort
+$env:CODEX_TELEGRAM_DEFAULT_SEND = if ($cfg.telegramDefaultSend) { "1" } else { "0" }
 
 $args = @("-m", "uvicorn", "app.server:app", "--host", "0.0.0.0", "--port", [string]$cfg.port)
 $proc = Start-Process -FilePath $python -ArgumentList $args -WorkingDirectory $root -WindowStyle Hidden -RedirectStandardOutput $outLog -RedirectStandardError $errLog -PassThru

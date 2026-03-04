@@ -24,6 +24,7 @@ Thumbs.db
 
 # Optional local overrides
 controller.config.local.json
+Telegram bot/
 
 # Frontend workspace
 ui/node_modules/

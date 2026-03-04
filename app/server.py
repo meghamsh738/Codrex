@@ -9,6 +9,8 @@ import subprocess
 import socket
 import io
 import re
+import shlex
+import mimetypes
 import html as html_std
 import threading
 import uuid
@@ -18,6 +20,8 @@ import ctypes
 from ctypes import wintypes
 from typing import List, Dict, Any, Optional, Tuple
 from urllib.parse import quote, urlparse
+import urllib.request
+import urllib.error
 
 from mss import mss
 from mss.tools import to_png
@@ -283,6 +287,105 @@ THREADS_DATA: Dict[str, Any] = {
     "messages": {},
 }
 
+# -------------------------
+# Shared file outbox store
+# -------------------------
+DEFAULT_SHARED_OUTBOX_FILE = os.path.abspath(
+    os.environ.get(
+        "CODEX_SHARED_OUTBOX_FILE",
+        os.path.join(os.path.dirname(__file__), "..", "logs", "shared-outbox.json"),
+    )
+)
+SHARED_OUTBOX_FILE = DEFAULT_SHARED_OUTBOX_FILE
+SHARED_OUTBOX_LOCK = threading.Lock()
+SHARED_OUTBOX_LOADED = False
+SHARED_OUTBOX_MAX_KEEP = int(os.environ.get("CODEX_SHARED_OUTBOX_MAX_KEEP", "200") or "200")
+SHARED_OUTBOX_DEFAULT_EXPIRES_HOURS = int(os.environ.get("CODEX_SHARED_OUTBOX_DEFAULT_EXPIRES_HOURS", "24") or "24")
+SHARED_OUTBOX_MAX_EXPIRES_HOURS = int(os.environ.get("CODEX_SHARED_OUTBOX_MAX_EXPIRES_HOURS", "168") or "168")
+SHARED_OUTBOX_MAX_FILE_MB = int(os.environ.get("CODEX_SHARED_OUTBOX_MAX_FILE_MB", "200") or "200")
+SHARED_OUTBOX_DATA: Dict[str, Any] = {
+    "items": [],
+}
+
+# -------------------------
+# Telegram delivery (optional)
+# -------------------------
+DEFAULT_TELEGRAM_SECRETS_DIR = os.path.abspath(
+    os.environ.get(
+        "CODEX_TELEGRAM_SECRETS_DIR",
+        os.path.join(os.path.dirname(__file__), "..", "Telegram bot"),
+    )
+)
+DEFAULT_TELEGRAM_SECRET_FILE = os.path.join(DEFAULT_TELEGRAM_SECRETS_DIR, "key.txt")
+DEFAULT_TELEGRAM_CHAT_FILE = os.path.join(DEFAULT_TELEGRAM_SECRETS_DIR, "chat_id.txt")
+TELEGRAM_SECRET_FILE = os.path.abspath(os.environ.get("CODEX_TELEGRAM_SECRET_FILE", DEFAULT_TELEGRAM_SECRET_FILE))
+TELEGRAM_CHAT_FILE = os.path.abspath(os.environ.get("CODEX_TELEGRAM_CHAT_FILE", DEFAULT_TELEGRAM_CHAT_FILE))
+TELEGRAM_API_BASE = os.environ.get("CODEX_TELEGRAM_API_BASE", "https://api.telegram.org").strip() or "https://api.telegram.org"
+TELEGRAM_TIMEOUT_SECONDS = float(os.environ.get("CODEX_TELEGRAM_TIMEOUT_SECONDS", "30") or "30")
+TELEGRAM_MAX_FILE_MB = int(os.environ.get("CODEX_TELEGRAM_MAX_FILE_MB", "45") or "45")
+CODEX_TELEGRAM_DEFAULT_SEND = str(os.environ.get("CODEX_TELEGRAM_DEFAULT_SEND", "0") or "0").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _read_text_file(path: str) -> str:
+    p = str(path or "").strip()
+    if not p:
+        return ""
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            return f.read()
+    except Exception:
+        return ""
+
+
+def _parse_telegram_secret_text(raw: str) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    for raw_line in (raw or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith("#") or line.startswith(";"):
+            continue
+        if "=" in line:
+            key, value = line.split("=", 1)
+            norm_key = key.strip().lower().replace("-", "_")
+            norm_value = value.strip().strip('"').strip("'")
+            if not norm_value:
+                continue
+            if norm_key in {"token", "bot_token", "telegram_bot_token", "codex_telegram_bot_token"}:
+                out["token"] = norm_value
+                continue
+            if norm_key in {"chat", "chat_id", "telegram_chat_id", "codex_telegram_chat_id"}:
+                out["chat_id"] = norm_value
+                continue
+            continue
+        # Common direct-value forms:
+        # - bot token: 123456:AbC...
+        # - chat id: 123456789 or -1001234567890
+        if "token" not in out and re.fullmatch(r"\d{5,}:[A-Za-z0-9_-]{10,}", line):
+            out["token"] = line
+            continue
+        if "chat_id" not in out and re.fullmatch(r"-?\d{5,20}", line):
+            out["chat_id"] = line
+            continue
+    return out
+
+
+def _load_telegram_file_values(secret_file: str, chat_file: str) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    out.update(_parse_telegram_secret_text(_read_text_file(secret_file)))
+    secret_abs = os.path.abspath(secret_file or "")
+    chat_abs = os.path.abspath(chat_file or "")
+    if chat_abs and chat_abs != secret_abs:
+        chat_values = _parse_telegram_secret_text(_read_text_file(chat_file))
+        if chat_values.get("chat_id"):
+            out["chat_id"] = chat_values["chat_id"]
+    return out
+
+
+_TELEGRAM_FILE_VALUES = _load_telegram_file_values(TELEGRAM_SECRET_FILE, TELEGRAM_CHAT_FILE)
+TELEGRAM_BOT_TOKEN = os.environ.get("CODEX_TELEGRAM_BOT_TOKEN", "").strip() or _TELEGRAM_FILE_VALUES.get("token", "")
+TELEGRAM_CHAT_ID = os.environ.get("CODEX_TELEGRAM_CHAT_ID", "").strip() or _TELEGRAM_FILE_VALUES.get("chat_id", "")
+
 
 def _now_ms() -> int:
     return int(time.time() * 1000)
@@ -482,6 +585,612 @@ def _find_thread_unlocked(thread_id: str) -> Optional[Dict[str, Any]]:
         if thread.get("id") == thread_id:
             return thread
     return None
+
+
+def _normalize_share_title(raw: Any, fallback_name: str) -> str:
+    text = re.sub(r"\s+", " ", str(raw or "").strip())
+    if text:
+        return text[:120]
+    return (fallback_name or "Shared file")[:120]
+
+
+def _normalize_share_expires_hours(raw: Any) -> int:
+    try:
+        value = int(raw if raw is not None else SHARED_OUTBOX_DEFAULT_EXPIRES_HOURS)
+    except Exception:
+        value = SHARED_OUTBOX_DEFAULT_EXPIRES_HOURS
+    value = max(1, value)
+    return min(value, max(1, SHARED_OUTBOX_MAX_EXPIRES_HOURS))
+
+
+def _share_expired(item: Dict[str, Any], now_ms: Optional[int] = None) -> bool:
+    current = int(now_ms if now_ms is not None else _now_ms())
+    expires_at = _coerce_ms(item.get("expires_at"), 0)
+    return expires_at > 0 and expires_at <= current
+
+
+def _shared_item_from_raw(raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    item_id = _clean_entity_id(raw.get("id"))
+    wsl_path = str(raw.get("wsl_path") or "").strip()
+    file_name = str(raw.get("file_name") or "").strip()
+    if not item_id or not wsl_path.startswith("/") or not file_name:
+        return None
+    now_ms = _now_ms()
+    created_at = _coerce_ms(raw.get("created_at"), now_ms)
+    expires_at = _coerce_ms(raw.get("expires_at"), created_at)
+    mime_type = str(raw.get("mime_type") or "").strip() or "application/octet-stream"
+    try:
+        size_bytes = max(0, int(raw.get("size_bytes") or 0))
+    except Exception:
+        size_bytes = 0
+    created_by = str(raw.get("created_by") or "").strip()[:64]
+    is_image = bool(raw.get("is_image")) or mime_type.startswith("image/")
+    return {
+        "id": item_id,
+        "title": _normalize_share_title(raw.get("title"), file_name),
+        "wsl_path": wsl_path,
+        "file_name": file_name[:180],
+        "mime_type": mime_type[:120],
+        "size_bytes": size_bytes,
+        "created_at": created_at,
+        "expires_at": expires_at,
+        "created_by": created_by,
+        "is_image": is_image,
+    }
+
+
+def _sort_and_trim_shared_outbox_unlocked() -> None:
+    items = SHARED_OUTBOX_DATA.get("items") or []
+    now_ms = _now_ms()
+    cleaned: List[Dict[str, Any]] = []
+    seen_ids = set()
+    for raw in items:
+        if not isinstance(raw, dict):
+            continue
+        item = _shared_item_from_raw(raw)
+        if not item:
+            continue
+        item_id = item["id"]
+        if item_id in seen_ids:
+            continue
+        if _share_expired(item, now_ms=now_ms):
+            continue
+        seen_ids.add(item_id)
+        cleaned.append(item)
+    cleaned.sort(key=lambda x: int(x.get("created_at") or 0), reverse=True)
+    SHARED_OUTBOX_DATA["items"] = cleaned[: max(1, SHARED_OUTBOX_MAX_KEEP)]
+
+
+def _persist_shared_outbox_unlocked() -> None:
+    _sort_and_trim_shared_outbox_unlocked()
+    parent = os.path.dirname(SHARED_OUTBOX_FILE)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    payload = {"items": SHARED_OUTBOX_DATA.get("items") or []}
+    temp_path = SHARED_OUTBOX_FILE + ".tmp"
+    with open(temp_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    os.replace(temp_path, SHARED_OUTBOX_FILE)
+
+
+def _load_shared_outbox_unlocked() -> None:
+    global SHARED_OUTBOX_LOADED
+    if SHARED_OUTBOX_LOADED:
+        return
+    SHARED_OUTBOX_LOADED = True
+    SHARED_OUTBOX_DATA["items"] = []
+    if not os.path.exists(SHARED_OUTBOX_FILE):
+        return
+    try:
+        with open(SHARED_OUTBOX_FILE, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+    except Exception:
+        return
+    if not isinstance(raw, dict):
+        return
+    items = raw.get("items")
+    if isinstance(items, list):
+        SHARED_OUTBOX_DATA["items"] = items
+    _sort_and_trim_shared_outbox_unlocked()
+
+
+def _shared_outbox_snapshot_unlocked() -> Dict[str, Any]:
+    _sort_and_trim_shared_outbox_unlocked()
+    return {"items": json.loads(json.dumps(SHARED_OUTBOX_DATA.get("items") or []))}
+
+
+def _find_shared_item_unlocked(item_id: str) -> Optional[Dict[str, Any]]:
+    item_id = _clean_entity_id(item_id)
+    if not item_id:
+        return None
+    for item in SHARED_OUTBOX_DATA.get("items") or []:
+        if (item or {}).get("id") == item_id:
+            return item
+    return None
+
+
+def _public_shared_item(item: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "id": item.get("id"),
+        "title": item.get("title"),
+        "file_name": item.get("file_name"),
+        "mime_type": item.get("mime_type"),
+        "size_bytes": item.get("size_bytes"),
+        "created_at": item.get("created_at"),
+        "expires_at": item.get("expires_at"),
+        "created_by": item.get("created_by"),
+        "is_image": bool(item.get("is_image")),
+        "wsl_path": item.get("wsl_path"),
+        "download_url": f"/share/file/{item.get('id')}",
+    }
+
+
+def _create_shared_outbox_item(
+    path: str,
+    *,
+    title: str = "",
+    expires_hours: Optional[int] = None,
+    created_by: str = "",
+) -> Dict[str, Any]:
+    wsl_abs = _resolve_wsl_path(path)
+    unc = _wsl_unc_path(wsl_abs)
+    if not os.path.exists(unc):
+        raise HTTPException(status_code=404, detail="File not found.")
+    if os.path.isdir(unc):
+        raise HTTPException(status_code=400, detail="Path is a directory. Provide a file path.")
+    try:
+        size_bytes = int(os.path.getsize(unc))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not stat file: {type(e).__name__}: {e}")
+    max_bytes = max(1, SHARED_OUTBOX_MAX_FILE_MB) * 1024 * 1024
+    if size_bytes > max_bytes:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File too large ({size_bytes} bytes). Limit is {max_bytes} bytes.",
+        )
+    file_name = os.path.basename(wsl_abs.rstrip("/")) or "shared.bin"
+    claimed_mime = (mimetypes.guess_type(file_name)[0] or "application/octet-stream").strip() or "application/octet-stream"
+    detected_mime = ""
+    try:
+        with open(unc, "rb") as f:
+            detected_mime = _detect_mime_from_bytes(f.read(512))
+    except Exception:
+        detected_mime = ""
+    mime_type = detected_mime or claimed_mime
+    now_ms = _now_ms()
+    expires_h = _normalize_share_expires_hours(expires_hours)
+    expires_at = now_ms + int(expires_h * 3600 * 1000)
+    item = {
+        "id": f"shr_{uuid.uuid4().hex[:12]}",
+        "title": _normalize_share_title(title, file_name),
+        "wsl_path": wsl_abs,
+        "file_name": file_name,
+        "mime_type": mime_type,
+        "size_bytes": size_bytes,
+        "created_at": now_ms,
+        "expires_at": expires_at,
+        "created_by": (created_by or "manual")[:64],
+        "is_image": mime_type.startswith("image/"),
+    }
+    with SHARED_OUTBOX_LOCK:
+        _load_shared_outbox_unlocked()
+        SHARED_OUTBOX_DATA["items"].insert(0, item)
+        _persist_shared_outbox_unlocked()
+    return item
+
+
+def _telegram_get_updates(token: str) -> Dict[str, Any]:
+    endpoint = f"{TELEGRAM_API_BASE.rstrip('/')}/bot{token}/getUpdates?limit=20"
+    req = urllib.request.Request(
+        endpoint,
+        method="GET",
+        headers={"Accept": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=max(5.0, TELEGRAM_TIMEOUT_SECONDS)) as resp:
+        raw = resp.read().decode("utf-8", errors="replace")
+    try:
+        parsed = json.loads(raw) if raw else {}
+    except Exception:
+        return {}
+    if not isinstance(parsed, dict):
+        return {}
+    return parsed
+
+
+def _telegram_extract_chat_id_from_update(update: Dict[str, Any]) -> str:
+    if not isinstance(update, dict):
+        return ""
+    msg_keys = (
+        "message",
+        "edited_message",
+        "channel_post",
+        "edited_channel_post",
+        "my_chat_member",
+        "chat_member",
+        "chat_join_request",
+    )
+    for key in msg_keys:
+        obj = update.get(key)
+        if not isinstance(obj, dict):
+            continue
+        chat = obj.get("chat")
+        if isinstance(chat, dict) and chat.get("id") is not None:
+            return str(chat.get("id")).strip()
+
+    callback = update.get("callback_query")
+    if isinstance(callback, dict):
+        msg = callback.get("message")
+        if isinstance(msg, dict):
+            chat = msg.get("chat")
+            if isinstance(chat, dict) and chat.get("id") is not None:
+                return str(chat.get("id")).strip()
+        from_user = callback.get("from")
+        if isinstance(from_user, dict) and from_user.get("id") is not None:
+            return str(from_user.get("id")).strip()
+
+    inline_query = update.get("inline_query")
+    if isinstance(inline_query, dict):
+        from_user = inline_query.get("from")
+        if isinstance(from_user, dict) and from_user.get("id") is not None:
+            return str(from_user.get("id")).strip()
+    return ""
+
+
+def _telegram_discover_chat_id(token: str) -> str:
+    if not token:
+        return ""
+    try:
+        parsed = _telegram_get_updates(token)
+    except Exception:
+        return ""
+    if not parsed.get("ok"):
+        return ""
+    items = parsed.get("result")
+    if not isinstance(items, list):
+        return ""
+    for raw in reversed(items):
+        cid = _telegram_extract_chat_id_from_update(raw if isinstance(raw, dict) else {})
+        if cid:
+            return cid
+    return ""
+
+
+def _persist_telegram_chat_id(chat_id: str) -> None:
+    cid = str(chat_id or "").strip()
+    if not cid:
+        return
+    chat_path = os.path.abspath(TELEGRAM_CHAT_FILE or "")
+    key_path = os.path.abspath(TELEGRAM_SECRET_FILE or "")
+    # Never overwrite the token file with chat id.
+    if not chat_path or (key_path and chat_path == key_path):
+        return
+    try:
+        parent = os.path.dirname(chat_path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(chat_path, "w", encoding="utf-8") as f:
+            f.write(f"{cid}\n")
+    except Exception:
+        return
+
+
+def _telegram_resolve_chat_id(allow_discovery: bool = True) -> str:
+    cid = str(TELEGRAM_CHAT_ID or "").strip()
+    if cid:
+        return cid
+    # Read chat id file dynamically so once discovered/persisted it works after restart.
+    file_values = _parse_telegram_secret_text(_read_text_file(TELEGRAM_CHAT_FILE))
+    cid = str(file_values.get("chat_id") or "").strip()
+    if cid:
+        return cid
+    if not allow_discovery:
+        return ""
+    discovered = _telegram_discover_chat_id(str(TELEGRAM_BOT_TOKEN or "").strip())
+    if discovered:
+        _persist_telegram_chat_id(discovered)
+    return discovered
+
+
+def _telegram_enabled() -> bool:
+    token = str(TELEGRAM_BOT_TOKEN or "").strip()
+    return bool(token and _telegram_resolve_chat_id(allow_discovery=True))
+
+
+def _mask_sensitive(text: str) -> str:
+    value = str(text or "").strip()
+    if len(value) <= 4:
+        return "*" * len(value)
+    return f"{value[:2]}{'*' * (len(value) - 4)}{value[-2:]}"
+
+
+def _normalize_telegram_caption(raw: Any) -> str:
+    text = re.sub(r"\s+", " ", str(raw or "").strip())
+    if not text:
+        return ""
+    # Telegram caption max is 1024 chars.
+    return text[:1024]
+
+
+def _detect_mime_from_bytes(sample: bytes) -> str:
+    head = bytes(sample or b"")
+    if not head:
+        return ""
+    if head.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if head.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if head.startswith(b"GIF87a") or head.startswith(b"GIF89a"):
+        return "image/gif"
+    if head.startswith(b"RIFF") and len(head) >= 12 and head[8:12] == b"WEBP":
+        return "image/webp"
+    if head.startswith(b"%PDF-"):
+        return "application/pdf"
+    if head.startswith(b"PK\x03\x04"):
+        return "application/zip"
+    if b"\x00" not in head:
+        printable = 0
+        for b in head:
+            if b in (9, 10, 13) or 32 <= b <= 126:
+                printable += 1
+        if printable >= int(len(head) * 0.95):
+            return "text/plain"
+    return ""
+
+
+def _mime_preferred_extension(mime_type: str) -> str:
+    m = str(mime_type or "").strip().lower()
+    mapping = {
+        "image/png": ".png",
+        "image/jpeg": ".jpg",
+        "image/gif": ".gif",
+        "image/webp": ".webp",
+        "application/pdf": ".pdf",
+        "text/plain": ".txt",
+        "application/zip": ".zip",
+    }
+    return mapping.get(m, "")
+
+
+def _build_multipart_form_data(
+    fields: Dict[str, str],
+    *,
+    file_field: str,
+    file_name: str,
+    content_type: str,
+    file_bytes: bytes,
+) -> Tuple[bytes, str]:
+    boundary = f"----codrex{uuid.uuid4().hex}"
+    chunks: List[bytes] = []
+    for k, v in fields.items():
+        chunks.append(f"--{boundary}\r\n".encode("utf-8"))
+        chunks.append(f'Content-Disposition: form-data; name="{k}"\r\n\r\n'.encode("utf-8"))
+        chunks.append(str(v).encode("utf-8"))
+        chunks.append(b"\r\n")
+
+    safe_name = (file_name or "upload.bin").replace('"', "_")
+    mime = (content_type or "application/octet-stream").strip() or "application/octet-stream"
+    chunks.append(f"--{boundary}\r\n".encode("utf-8"))
+    chunks.append(
+        (
+            f'Content-Disposition: form-data; name="{file_field}"; filename="{safe_name}"\r\n'
+            f"Content-Type: {mime}\r\n\r\n"
+        ).encode("utf-8")
+    )
+    chunks.append(file_bytes)
+    chunks.append(b"\r\n")
+    chunks.append(f"--{boundary}--\r\n".encode("utf-8"))
+    body = b"".join(chunks)
+    return body, f"multipart/form-data; boundary={boundary}"
+
+
+def _telegram_send_shared_item(item: Dict[str, Any], caption_override: str = "") -> Dict[str, Any]:
+    token = str(TELEGRAM_BOT_TOKEN or "").strip()
+    if not token:
+        return {
+            "ok": False,
+            "error": "telegram_not_configured",
+            "detail": "Telegram bot token is missing. Put token in `Telegram bot/key.txt` or set CODEX_TELEGRAM_BOT_TOKEN.",
+        }
+    chat_id = _telegram_resolve_chat_id(allow_discovery=True)
+    if not chat_id:
+        return {
+            "ok": False,
+            "error": "telegram_chat_not_found",
+            "detail": "Telegram chat id is not available yet. Open your bot chat in Telegram, press Start, then retry.",
+        }
+
+    wsl_path = str(item.get("wsl_path") or "").strip()
+    if not wsl_path:
+        return {"ok": False, "error": "telegram_missing_path", "detail": "Shared item has no source path."}
+
+    wsl_abs = _resolve_wsl_path(wsl_path)
+    unc = _wsl_unc_path(wsl_abs)
+    if not os.path.exists(unc):
+        return {"ok": False, "error": "telegram_file_missing", "detail": "Shared file is no longer available."}
+    if os.path.isdir(unc):
+        return {"ok": False, "error": "telegram_is_directory", "detail": "Shared path is a directory."}
+
+    try:
+        size_bytes = int(os.path.getsize(unc))
+    except Exception as e:
+        return {"ok": False, "error": "telegram_stat_failed", "detail": f"Could not read file size: {type(e).__name__}: {e}"}
+    max_bytes = max(1, TELEGRAM_MAX_FILE_MB) * 1024 * 1024
+    if size_bytes > max_bytes:
+        return {
+            "ok": False,
+            "error": "telegram_file_too_large",
+            "detail": f"File too large for Telegram relay ({size_bytes} bytes). Limit is {max_bytes} bytes.",
+            "size_bytes": size_bytes,
+            "max_bytes": max_bytes,
+        }
+
+    file_name_raw = str(item.get("file_name") or os.path.basename(wsl_abs.rstrip("/")) or "shared.bin")
+    claimed_mime = str(item.get("mime_type") or mimetypes.guess_type(file_name_raw)[0] or "application/octet-stream")
+
+    try:
+        with open(unc, "rb") as f:
+            file_bytes = f.read()
+    except Exception as e:
+        return {"ok": False, "error": "telegram_read_failed", "detail": f"Could not read file: {type(e).__name__}: {e}"}
+
+    detected_mime = _detect_mime_from_bytes(file_bytes[:512])
+    effective_mime = detected_mime or claimed_mime
+    effective_file_name = file_name_raw
+    preferred_ext = _mime_preferred_extension(effective_mime)
+    if preferred_ext:
+        stem, old_ext = os.path.splitext(file_name_raw)
+        if old_ext.lower() != preferred_ext:
+            effective_file_name = f"{stem or file_name_raw}{preferred_ext}"
+    caption = _normalize_telegram_caption(caption_override or item.get("title") or effective_file_name)
+
+    payload, content_type = _build_multipart_form_data(
+        {
+            "chat_id": chat_id,
+            **({"caption": caption} if caption else {}),
+        },
+        file_field="document",
+        file_name=effective_file_name,
+        content_type=effective_mime,
+        file_bytes=file_bytes,
+    )
+
+    endpoint = f"{TELEGRAM_API_BASE.rstrip('/')}/bot{token}/sendDocument"
+    req = urllib.request.Request(
+        endpoint,
+        data=payload,
+        method="POST",
+        headers={
+            "Content-Type": content_type,
+            "Accept": "application/json",
+        },
+    )
+
+    status_code = 0
+    raw_body = ""
+    try:
+        with urllib.request.urlopen(req, timeout=max(5.0, TELEGRAM_TIMEOUT_SECONDS)) as resp:
+            status_code = int(getattr(resp, "status", 200) or 200)
+            raw_body = resp.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as e:
+        status_code = int(getattr(e, "code", 0) or 0)
+        try:
+            raw_body = e.read().decode("utf-8", errors="replace")
+        except Exception:
+            raw_body = str(e)
+    except Exception as e:
+        return {"ok": False, "error": "telegram_request_failed", "detail": f"Telegram request failed: {type(e).__name__}: {e}"}
+
+    try:
+        parsed = json.loads(raw_body) if raw_body else {}
+    except Exception:
+        parsed = {}
+
+    if status_code != 200:
+        detail = ""
+        if isinstance(parsed, dict):
+            detail = str(parsed.get("description") or "").strip()
+        if not detail:
+            detail = f"Telegram API returned HTTP {status_code}."
+        return {"ok": False, "error": "telegram_http_error", "detail": detail, "status_code": status_code}
+
+    if not isinstance(parsed, dict) or not parsed.get("ok"):
+        detail = "Telegram API did not accept the file."
+        if isinstance(parsed, dict):
+            detail = str(parsed.get("description") or detail)
+        return {"ok": False, "error": "telegram_api_error", "detail": detail, "status_code": status_code}
+
+    result = parsed.get("result") if isinstance(parsed, dict) else {}
+    if not isinstance(result, dict):
+        result = {}
+    return {
+        "ok": True,
+        "chat_id": chat_id,
+        "message_id": result.get("message_id"),
+        "file_name": effective_file_name,
+        "claimed_mime_type": claimed_mime,
+        "mime_type": effective_mime,
+        "mime_corrected": bool(detected_mime and detected_mime != claimed_mime),
+        "size_bytes": size_bytes,
+    }
+
+
+def _telegram_send_text(text: str) -> Dict[str, Any]:
+    token = str(TELEGRAM_BOT_TOKEN or "").strip()
+    if not token:
+        return {
+            "ok": False,
+            "error": "telegram_not_configured",
+            "detail": "Telegram bot token is missing. Put token in `Telegram bot/key.txt` or set CODEX_TELEGRAM_BOT_TOKEN.",
+        }
+    chat_id = _telegram_resolve_chat_id(allow_discovery=True)
+    if not chat_id:
+        return {
+            "ok": False,
+            "error": "telegram_chat_not_found",
+            "detail": "Telegram chat id is not available yet. Open your bot chat in Telegram, press Start, then retry.",
+        }
+
+    message = str(text or "").strip()
+    if not message:
+        return {"ok": False, "error": "telegram_empty_message", "detail": "Text is required."}
+    if len(message) > 4096:
+        return {"ok": False, "error": "telegram_message_too_long", "detail": "Text is too long for Telegram (max 4096 characters)."}
+
+    endpoint = f"{TELEGRAM_API_BASE.rstrip('/')}/bot{token}/sendMessage"
+    payload = json.dumps({"chat_id": chat_id, "text": message}, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(
+        endpoint,
+        data=payload,
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        },
+    )
+
+    status_code = 0
+    raw_body = ""
+    try:
+        with urllib.request.urlopen(req, timeout=max(5.0, TELEGRAM_TIMEOUT_SECONDS)) as resp:
+            status_code = int(getattr(resp, "status", 200) or 200)
+            raw_body = resp.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as e:
+        status_code = int(getattr(e, "code", 0) or 0)
+        try:
+            raw_body = e.read().decode("utf-8", errors="replace")
+        except Exception:
+            raw_body = str(e)
+    except Exception as e:
+        return {"ok": False, "error": "telegram_request_failed", "detail": f"Telegram request failed: {type(e).__name__}: {e}"}
+
+    try:
+        parsed = json.loads(raw_body) if raw_body else {}
+    except Exception:
+        parsed = {}
+
+    if status_code != 200:
+        detail = ""
+        if isinstance(parsed, dict):
+            detail = str(parsed.get("description") or "").strip()
+        if not detail:
+            detail = f"Telegram API returned HTTP {status_code}."
+        return {"ok": False, "error": "telegram_http_error", "detail": detail, "status_code": status_code}
+
+    if not isinstance(parsed, dict) or not parsed.get("ok"):
+        detail = "Telegram API did not accept the message."
+        if isinstance(parsed, dict):
+            detail = str(parsed.get("description") or detail)
+        return {"ok": False, "error": "telegram_api_error", "detail": detail, "status_code": status_code}
+
+    result = parsed.get("result") if isinstance(parsed, dict) else {}
+    if not isinstance(result, dict):
+        result = {}
+    return {
+        "ok": True,
+        "chat_id": chat_id,
+        "message_id": result.get("message_id"),
+        "length": len(message),
+    }
 
 
 def _overlay_cursor_rgb(rgb_bytes: bytes, size: Tuple[int, int], x: int, y: int) -> bytes:
@@ -890,6 +1599,12 @@ def _desktop_enabled_from_request(request: Request) -> bool:
     if _falsy_flag(c):
         return False
     return True
+
+
+def _require_desktop_enabled(request: Request) -> None:
+    if _desktop_enabled_from_request(request):
+        return
+    raise HTTPException(409, "Desktop control is disabled. Enable Desktop to continue.")
 
 
 def _compact_enabled_from_request(request: Request) -> bool:
@@ -4639,10 +5354,10 @@ def auth_pair_qr_png(data: str = ""):
 # Desktop endpoints
 # -------------------------
 @app.get("/desktop/info")
-def desktop_info():
+def desktop_info(request: Request):
     _ensure_windows_host()
     mon = _desktop_monitor()
-    return {"ok": True, **mon}
+    return {"ok": True, "enabled": _desktop_enabled_from_request(request), **mon}
 
 @app.get("/desktop/shot")
 def desktop_shot(level: Optional[int] = None, scale: Optional[int] = None, bw: Optional[str] = None):
@@ -4755,8 +5470,9 @@ def desktop_mode(payload: Dict[str, Any] = Body(...)):
     return resp
 
 @app.post("/desktop/input/move")
-def desktop_input_move(payload: Dict[str, Any] = Body(...)):
+def desktop_input_move(request: Request, payload: Dict[str, Any] = Body(...)):
     _ensure_windows_host()
+    _require_desktop_enabled(request)
     x = int(payload.get("x", 0))
     y = int(payload.get("y", 0))
     p = _desktop_point(x, y)
@@ -4764,8 +5480,9 @@ def desktop_input_move(payload: Dict[str, Any] = Body(...)):
     return {"ok": True, "x": p["rel_x"], "y": p["rel_y"]}
 
 @app.post("/desktop/input/click")
-def desktop_input_click(payload: Dict[str, Any] = Body(...)):
+def desktop_input_click(request: Request, payload: Dict[str, Any] = Body(...)):
     _ensure_windows_host()
+    _require_desktop_enabled(request)
     x = payload.get("x")
     y = payload.get("y")
     button = (payload.get("button") or "left").strip().lower()
@@ -4777,8 +5494,9 @@ def desktop_input_click(payload: Dict[str, Any] = Body(...)):
     return {"ok": True, "button": button, "double": double}
 
 @app.post("/desktop/input/scroll")
-def desktop_input_scroll(payload: Dict[str, Any] = Body(...)):
+def desktop_input_scroll(request: Request, payload: Dict[str, Any] = Body(...)):
     _ensure_windows_host()
+    _require_desktop_enabled(request)
     delta = int(payload.get("delta", 0))
     if delta == 0:
         raise HTTPException(status_code=400, detail="delta is required.")
@@ -4786,8 +5504,9 @@ def desktop_input_scroll(payload: Dict[str, Any] = Body(...)):
     return {"ok": True, "delta": delta}
 
 @app.post("/desktop/input/type")
-def desktop_input_type(payload: Dict[str, Any] = Body(...)):
+def desktop_input_type(request: Request, payload: Dict[str, Any] = Body(...)):
     _ensure_windows_host()
+    _require_desktop_enabled(request)
     text = (payload.get("text") or "")
     if not text:
         raise HTTPException(status_code=400, detail="text is required.")
@@ -4797,11 +5516,12 @@ def desktop_input_type(payload: Dict[str, Any] = Body(...)):
     return {"ok": True}
 
 @app.post("/desktop/input/text")
-def desktop_input_text(payload: Dict[str, Any] = Body(...)):
+def desktop_input_text(request: Request, payload: Dict[str, Any] = Body(...)):
     """
     Real-time typing endpoint (does not touch clipboard).
     """
     _ensure_windows_host()
+    _require_desktop_enabled(request)
     text = payload.get("text")
     if not isinstance(text, str):
         raise HTTPException(status_code=400, detail="text must be a string.")
@@ -4813,13 +5533,14 @@ def desktop_input_text(payload: Dict[str, Any] = Body(...)):
     return {"ok": True, "sent": len(text)}
 
 @app.post("/desktop/input/edit")
-def desktop_input_edit(payload: Dict[str, Any] = Body(...)):
+def desktop_input_edit(request: Request, payload: Dict[str, Any] = Body(...)):
     """
     Atomic edit operation for the Live Keyboard:
     - send N backspaces
     - then send a text chunk
     """
     _ensure_windows_host()
+    _require_desktop_enabled(request)
     backspace = int(payload.get("backspace", 0) or 0)
     text = payload.get("text") or ""
     if not isinstance(text, str):
@@ -4838,8 +5559,9 @@ def desktop_input_edit(payload: Dict[str, Any] = Body(...)):
     return {"ok": True, "backspace": backspace, "sent": len(text)}
 
 @app.post("/desktop/input/key")
-def desktop_input_key(payload: Dict[str, Any] = Body(...)):
+def desktop_input_key(request: Request, payload: Dict[str, Any] = Body(...)):
     _ensure_windows_host()
+    _require_desktop_enabled(request)
     key = (payload.get("key") or "").strip()
     if not key:
         raise HTTPException(status_code=400, detail="key is required.")
@@ -5124,6 +5846,84 @@ def _tmux_send_text(pane_id: str, text: str, *, codex_mode: Optional[bool] = Non
         )
     return run_wsl_bash(cmd, timeout_s=timeout_s)
 
+
+def _parse_share_command(raw_text: str) -> Dict[str, Any]:
+    text = str(raw_text or "").strip()
+    if not text:
+        return {"is_command": False}
+    try:
+        parts = shlex.split(text, posix=True)
+    except Exception as e:
+        return {"is_command": True, "ok": False, "detail": f"Could not parse command: {type(e).__name__}: {e}"}
+    if not parts:
+        return {"is_command": False}
+
+    cmd = parts[0].strip().lower()
+    aliases_default = {"codrex-send", "/codrex-send", "/send-file", "/share-file"}
+    aliases_telegram = {"tgsend", "/tgsend", "telegram-send", "/telegram-send"}
+    if cmd in aliases_telegram:
+        default_send_telegram = True
+    elif cmd in aliases_default:
+        default_send_telegram = bool(CODEX_TELEGRAM_DEFAULT_SEND)
+    else:
+        return {"is_command": False}
+    if len(parts) < 2:
+        return {
+            "is_command": True,
+            "ok": False,
+            "detail": "Missing file path. Usage: codrex-send|tgsend <path> [--title ...] [--expires <hours>] [--telegram|--no-telegram] [--caption ...]",
+        }
+
+    path = parts[1].strip()
+    title = ""
+    expires_hours: Optional[int] = None
+    send_telegram = default_send_telegram
+    caption = ""
+    i = 2
+    while i < len(parts):
+        token = parts[i].strip().lower()
+        if token == "--title":
+            if i + 1 >= len(parts):
+                return {"is_command": True, "ok": False, "detail": "Missing value for --title."}
+            title = parts[i + 1]
+            i += 2
+            continue
+        if token == "--expires":
+            if i + 1 >= len(parts):
+                return {"is_command": True, "ok": False, "detail": "Missing value for --expires."}
+            try:
+                expires_hours = int(parts[i + 1])
+            except Exception:
+                return {"is_command": True, "ok": False, "detail": "Invalid --expires value. Use an integer number of hours."}
+            i += 2
+            continue
+        if token in {"--telegram", "--tg"}:
+            send_telegram = True
+            i += 1
+            continue
+        if token in {"--no-telegram", "--no-tg"}:
+            send_telegram = False
+            i += 1
+            continue
+        if token == "--caption":
+            if i + 1 >= len(parts):
+                return {"is_command": True, "ok": False, "detail": "Missing value for --caption."}
+            caption = parts[i + 1]
+            i += 2
+            continue
+        return {"is_command": True, "ok": False, "detail": f"Unknown option: {parts[i]}"}
+
+    return {
+        "is_command": True,
+        "ok": True,
+        "path": path,
+        "title": title,
+        "expires_hours": expires_hours,
+        "send_telegram": send_telegram,
+        "default_send_telegram": default_send_telegram,
+        "caption": caption,
+    }
+
 @app.post("/codex/session/{session}/send")
 def codex_session_send(session: str, text: str = Body(..., media_type="text/plain")):
     session = _validate_session_name(session)
@@ -5131,11 +5931,41 @@ def codex_session_send(session: str, text: str = Body(..., media_type="text/plai
     if not pane:
         return {"ok": False, "error": "not_found", "detail": f"Session '{session}' has no panes."}
 
+    share_cmd = _parse_share_command(text)
+    if share_cmd.get("is_command"):
+        if not share_cmd.get("ok"):
+            return {
+                "ok": False,
+                "error": "share_command_invalid",
+                "detail": share_cmd.get("detail") or "Invalid share command.",
+            }
+        try:
+            item = _create_shared_outbox_item(
+                share_cmd.get("path") or "",
+                title=share_cmd.get("title") or "",
+                expires_hours=share_cmd.get("expires_hours"),
+                created_by=f"session:{session}",
+            )
+        except HTTPException as e:
+            return {"ok": False, "error": "share_create_failed", "detail": str(e.detail)}
+        telegram_result = None
+        detail = "Shared file added to mobile inbox."
+        if share_cmd.get("send_telegram"):
+            telegram_result = _telegram_send_shared_item(item, caption_override=str(share_cmd.get("caption") or ""))
+            if telegram_result.get("ok"):
+                detail = "Shared file added to mobile inbox and sent to Telegram."
+            else:
+                detail = f"Shared file added to mobile inbox. Telegram send failed: {telegram_result.get('detail') or telegram_result.get('error') or 'unknown error'}"
+        return {
+            "ok": True,
+            "session": session,
+            "shared_file": _public_shared_item(item),
+            "telegram": telegram_result,
+            "detail": detail,
+        }
+
     repair = _maybe_repair_codex_session_reasoning(session, pane["pane_id"])
     repair_applied = bool(repair.get("applied"))
-    repair_warning = ""
-    if not repair.get("ok"):
-        repair_warning = "Could not auto-repair session profile before sending image path."
     repair_warning = ""
     if not repair.get("ok"):
         repair_warning = "Could not auto-repair session profile before send."
@@ -5245,6 +6075,10 @@ def codex_session_screen(session: str):
     session = _validate_session_name(session)
     pane = _session_pane(session)
     if not pane:
+        # Session exists in metadata but has no pane (terminated or failed to start).
+        # Prune stale entry to avoid sticky "no panes" UX loops in client polling.
+        with SESSIONS_LOCK:
+            SESSIONS.pop(session, None)
         return {"ok": False, "error": "not_found", "detail": f"Session '{session}' has no panes."}
     # Full pane capture is needed for Codex because it renders in the alternate screen.
     text = _capture_pane_full(pane["pane_id"], max_chars=25000)
@@ -5276,6 +6110,7 @@ def codex_sessions_live():
     panes = _tmux_list_panes()
     live: List[Dict[str, Any]] = []
     now = time.time()
+    seen_sessions = set()
     for p in panes:
         session = p.get("session", "")
         cc = (p.get("current_command") or "").lower()
@@ -5283,6 +6118,7 @@ def codex_sessions_live():
         codex_like = session.startswith("codex_") or cc == "codex"
         if not (known or codex_like):
             continue
+        seen_sessions.add(session)
         with SESSIONS_LOCK:
             prev = SESSIONS.get(session, {})
         snippet = _capture_snippet(p["pane_id"], lines=60)
@@ -5301,12 +6137,47 @@ def codex_sessions_live():
         live.append(item)
         with SESSIONS_LOCK:
             SESSIONS[session] = {**prev, **item, "last_text": snippet}
+
+    # Include very recent known sessions even when tmux pane discovery has a short startup race.
+    with SESSIONS_LOCK:
+        known_items = dict(SESSIONS)
+    for session, prev in known_items.items():
+        if session in seen_sessions:
+            continue
+        if not str(session or "").startswith("codex_"):
+            continue
+        updated_at = float(prev.get("updated_at") or prev.get("created_at") or now)
+        age_s = max(0.0, now - updated_at)
+        if age_s > 20:
+            # Stale in-memory records without panes are dropped after grace window.
+            with SESSIONS_LOCK:
+                if session in SESSIONS and session not in seen_sessions:
+                    SESSIONS.pop(session, None)
+            continue
+        last_text = str(prev.get("last_text") or "")
+        fallback_snippet = ""
+        if last_text.strip():
+            fallback_snippet = last_text.splitlines()[-1][:240]
+        live.append(
+            {
+                "session": session,
+                "pane_id": str(prev.get("pane_id") or ""),
+                "current_command": str(prev.get("current_command") or ""),
+                "cwd": str(prev.get("cwd") or ""),
+                "state": str(prev.get("state") or "starting"),
+                "updated_at": now,
+                "snippet": fallback_snippet,
+                "model": prev.get("model") or CODEX_DEFAULT_MODEL,
+                "reasoning_effort": prev.get("reasoning_effort") or CODEX_DEFAULT_REASONING_EFFORT,
+            }
+        )
     live.sort(key=lambda x: x["session"])
     return {"ok": True, "sessions": live}
 
 @app.post("/codex/session/{session}/image")
 async def codex_session_image(
     session: str,
+    request: Request,
     file: UploadFile = File(...),
     prompt: str = Form(""),
     paste_desktop: bool = Form(True),
@@ -5345,6 +6216,7 @@ async def codex_session_image(
                 "detail": "Desktop clipboard paste is available only on Windows host.",
                 "saved_path": wsl_abs,
             }
+        _require_desktop_enabled(request)
         pasted = _desktop_paste_image_file(unc)
         if pasted.get("exit_code") != 0:
             return {
@@ -5496,6 +6368,7 @@ def legacy_desktop_mode(enabled: str = Form(""), next: str = Form("/")):
 
 @app.post("/legacy/desktop/click")
 def legacy_desktop_click(
+    request: Request,
     button: str = Form("left"),
     double: str = Form("0"),
     x: str = Form(""),
@@ -5521,7 +6394,7 @@ def legacy_desktop_click(
                 400,
             )
     try:
-        out = desktop_input_click(payload)
+        out = desktop_input_click(request, payload)
     except Exception as e:
         err = _legacy_error_payload(e)
         status = int(err.get("status_code") or 400)
@@ -5530,6 +6403,7 @@ def legacy_desktop_click(
 
 @app.post("/legacy/desktop/tap")
 def legacy_desktop_tap(
+    request: Request,
     tap_x: Optional[int] = Form(default=None, alias="tap.x"),
     tap_y: Optional[int] = Form(default=None, alias="tap.y"),
     x: Optional[int] = Form(default=None),
@@ -5561,6 +6435,7 @@ def legacy_desktop_tap(
         tx = _clamp(tx, 0, native_w - 1)
         ty = _clamp(ty, 0, native_h - 1)
         out = desktop_input_click(
+            request,
             {
                 "x": tx,
                 "y": ty,
@@ -5575,7 +6450,7 @@ def legacy_desktop_tap(
     return _legacy_result_page("Desktop Tap Click", out, 200 if out.get("ok") else 400)
 
 @app.post("/legacy/desktop/scroll")
-def legacy_desktop_scroll(delta: int = Form(0)):
+def legacy_desktop_scroll(request: Request, delta: int = Form(0)):
     if int(delta) == 0:
         return _legacy_result_page(
             "Desktop Scroll",
@@ -5583,7 +6458,7 @@ def legacy_desktop_scroll(delta: int = Form(0)):
             400,
         )
     try:
-        out = desktop_input_scroll({"delta": int(delta)})
+        out = desktop_input_scroll(request, {"delta": int(delta)})
     except Exception as e:
         err = _legacy_error_payload(e)
         status = int(err.get("status_code") or 400)
@@ -5591,7 +6466,7 @@ def legacy_desktop_scroll(delta: int = Form(0)):
     return _legacy_result_page("Desktop Scroll", out, 200 if out.get("ok") else 400)
 
 @app.post("/legacy/desktop/key")
-def legacy_desktop_key(key: str = Form("")):
+def legacy_desktop_key(request: Request, key: str = Form("")):
     if not (key or "").strip():
         return _legacy_result_page(
             "Desktop Key",
@@ -5599,7 +6474,7 @@ def legacy_desktop_key(key: str = Form("")):
             400,
         )
     try:
-        out = desktop_input_key({"key": key})
+        out = desktop_input_key(request, {"key": key})
     except Exception as e:
         err = _legacy_error_payload(e)
         status = int(err.get("status_code") or 400)
@@ -5607,7 +6482,7 @@ def legacy_desktop_key(key: str = Form("")):
     return _legacy_result_page("Desktop Key", out, 200 if out.get("ok") else 400)
 
 @app.post("/legacy/desktop/text")
-def legacy_desktop_text(text: str = Form("")):
+def legacy_desktop_text(request: Request, text: str = Form("")):
     t = text or ""
     if not t.strip():
         return _legacy_result_page(
@@ -5616,7 +6491,7 @@ def legacy_desktop_text(text: str = Form("")):
             400,
         )
     try:
-        out = desktop_input_type({"text": t})
+        out = desktop_input_type(request, {"text": t})
     except Exception as e:
         err = _legacy_error_payload(e)
         status = int(err.get("status_code") or 400)
@@ -5998,6 +6873,136 @@ def pane_ctrlc(pane_id: str):
 # -------------------------
 # WSL file endpoints
 # -------------------------
+@app.get("/shares")
+def shares_list():
+    with SHARED_OUTBOX_LOCK:
+        _load_shared_outbox_unlocked()
+        snapshot = _shared_outbox_snapshot_unlocked()
+    items = [_public_shared_item(item) for item in snapshot.get("items") or []]
+    return {"ok": True, "items": items}
+
+
+@app.get("/telegram/status")
+def telegram_status():
+    token = str(TELEGRAM_BOT_TOKEN or "").strip()
+    resolved_chat_id = _telegram_resolve_chat_id(allow_discovery=True) if token else ""
+    return {
+        "ok": True,
+        "configured": bool(token and resolved_chat_id),
+        "default_send": bool(CODEX_TELEGRAM_DEFAULT_SEND),
+        "chat_id_masked": _mask_sensitive(resolved_chat_id) if resolved_chat_id else "",
+        "bot_token_masked": _mask_sensitive(token) if token else "",
+        "api_base": TELEGRAM_API_BASE,
+        "max_file_mb": max(1, TELEGRAM_MAX_FILE_MB),
+        "secret_file": TELEGRAM_SECRET_FILE,
+        "chat_id_file": TELEGRAM_CHAT_FILE,
+    }
+
+
+@app.post("/telegram/send-text")
+def telegram_send_text(payload: Optional[Dict[str, Any]] = Body(default=None)):
+    payload = payload or {}
+    text = str(payload.get("text") or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="text is required.")
+    telegram_result = _telegram_send_text(text)
+    return {
+        "ok": bool(telegram_result.get("ok")),
+        "telegram": telegram_result,
+        "detail": (
+            "Sent to Telegram."
+            if telegram_result.get("ok")
+            else (telegram_result.get("detail") or telegram_result.get("error") or "Telegram send failed.")
+        ),
+    }
+
+
+@app.post("/shares")
+def shares_create(payload: Optional[Dict[str, Any]] = Body(default=None)):
+    payload = payload or {}
+    path = str(payload.get("path") or "").strip()
+    if not path:
+        raise HTTPException(status_code=400, detail="path is required.")
+    title = str(payload.get("title") or "").strip()
+    expires_hours = payload.get("expires_hours")
+    created_by = str(payload.get("created_by") or "manual").strip()[:64]
+    item = _create_shared_outbox_item(
+        path,
+        title=title,
+        expires_hours=expires_hours,
+        created_by=created_by or "manual",
+    )
+    return {"ok": True, "item": _public_shared_item(item)}
+
+
+@app.post("/shares/{share_id}/telegram")
+def shares_send_telegram(share_id: str, payload: Optional[Dict[str, Any]] = Body(default=None)):
+    share_id = _clean_entity_id(share_id)
+    if not share_id:
+        raise HTTPException(status_code=400, detail="Invalid share id.")
+    payload = payload or {}
+    caption = str(payload.get("caption") or "").strip()
+    with SHARED_OUTBOX_LOCK:
+        _load_shared_outbox_unlocked()
+        item = _find_shared_item_unlocked(share_id)
+        if not item:
+            raise HTTPException(status_code=404, detail="Share not found.")
+        if _share_expired(item):
+            raise HTTPException(status_code=410, detail="Share has expired.")
+        snap = json.loads(json.dumps(item))
+    telegram_result = _telegram_send_shared_item(snap, caption_override=caption)
+    return {
+        "ok": bool(telegram_result.get("ok")),
+        "share_id": share_id,
+        "shared_file": _public_shared_item(snap),
+        "telegram": telegram_result,
+        "detail": (
+            "Sent to Telegram."
+            if telegram_result.get("ok")
+            else (telegram_result.get("detail") or telegram_result.get("error") or "Telegram send failed.")
+        ),
+    }
+
+
+@app.delete("/shares/{share_id}")
+def shares_delete(share_id: str):
+    share_id = _clean_entity_id(share_id)
+    if not share_id:
+        raise HTTPException(status_code=400, detail="Invalid share id.")
+    with SHARED_OUTBOX_LOCK:
+        _load_shared_outbox_unlocked()
+        prev = SHARED_OUTBOX_DATA.get("items") or []
+        next_items = [item for item in prev if (item or {}).get("id") != share_id]
+        if len(next_items) == len(prev):
+            return {"ok": False, "error": "not_found", "detail": f"Share '{share_id}' not found."}
+        SHARED_OUTBOX_DATA["items"] = next_items
+        _persist_shared_outbox_unlocked()
+    return {"ok": True, "share_id": share_id}
+
+
+@app.get("/share/file/{share_id}")
+def share_file_download(share_id: str):
+    share_id = _clean_entity_id(share_id)
+    if not share_id:
+        raise HTTPException(status_code=400, detail="Invalid share id.")
+    with SHARED_OUTBOX_LOCK:
+        _load_shared_outbox_unlocked()
+        item = _find_shared_item_unlocked(share_id)
+        if not item:
+            raise HTTPException(status_code=404, detail="Share not found.")
+        if _share_expired(item):
+            raise HTTPException(status_code=410, detail="Share has expired.")
+        wsl_path = str(item.get("wsl_path") or "")
+    wsl_abs = _resolve_wsl_path(wsl_path)
+    unc = _wsl_unc_path(wsl_abs)
+    if not os.path.exists(unc):
+        raise HTTPException(status_code=404, detail="Shared file is no longer available.")
+    if os.path.isdir(unc):
+        raise HTTPException(status_code=400, detail="Shared path is a directory.")
+    filename = str(item.get("file_name") or os.path.basename(wsl_abs.rstrip("/")) or "download.bin")
+    return FileResponse(unc, filename=filename)
+
+
 @app.get("/wsl/file")
 def wsl_file(path: str):
     wsl_abs = _resolve_wsl_path(path)

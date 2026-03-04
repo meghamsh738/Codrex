@@ -483,6 +483,7 @@ class CodexSessionConfigTests(unittest.TestCase):
         self.assertEqual(out["reasoning_effort"], "high")
         cmd = run_mock.call_args.args[0]
         self.assertIn("tmux new-session", cmd)
+        self.assertIn("codex -c model=gpt-5", cmd)
         self.assertIn("model=gpt-5", cmd)
         self.assertIn("model_reasoning_effort=high", cmd)
 
@@ -653,6 +654,171 @@ class CodexSessionConfigTests(unittest.TestCase):
         self.assertEqual(out["profile_reasoning_effort"], "high")
         send_mock.assert_called_once_with("%9", "hello", codex_mode=True, timeout_s=20)
 
+    def test_parse_share_command_valid(self):
+        out = server_mod._parse_share_command(
+            'codrex-send "/home/megha/codrex-work/output/result.png" --title "Result" --expires 24'
+        )
+        self.assertTrue(out["is_command"])
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["path"], "/home/megha/codrex-work/output/result.png")
+        self.assertEqual(out["title"], "Result")
+        self.assertEqual(out["expires_hours"], 24)
+        self.assertFalse(out["send_telegram"])
+        self.assertEqual(out["caption"], "")
+
+    def test_parse_share_command_with_telegram(self):
+        out = server_mod._parse_share_command(
+            'codrex-send "/home/megha/codrex-work/output/result.png" --telegram --caption "Run output"'
+        )
+        self.assertTrue(out["is_command"])
+        self.assertTrue(out["ok"])
+        self.assertTrue(out["send_telegram"])
+        self.assertEqual(out["caption"], "Run output")
+
+    def test_parse_share_command_tgsend_defaults_to_telegram(self):
+        out = server_mod._parse_share_command(
+            'tgsend "/home/megha/codrex-work/output/result.png" --title "Result"'
+        )
+        self.assertTrue(out["is_command"])
+        self.assertTrue(out["ok"])
+        self.assertTrue(out["send_telegram"])
+
+    def test_parse_share_command_respects_default_send_toggle(self):
+        with mock.patch.object(server_mod, "CODEX_TELEGRAM_DEFAULT_SEND", True):
+            out = server_mod._parse_share_command(
+                'codrex-send "/home/megha/codrex-work/output/result.png"'
+            )
+        self.assertTrue(out["is_command"])
+        self.assertTrue(out["ok"])
+        self.assertTrue(out["send_telegram"])
+
+    def test_parse_share_command_allows_no_telegram_override(self):
+        with mock.patch.object(server_mod, "CODEX_TELEGRAM_DEFAULT_SEND", True):
+            out = server_mod._parse_share_command(
+                'codrex-send "/home/megha/codrex-work/output/result.png" --no-telegram'
+            )
+        self.assertTrue(out["is_command"])
+        self.assertTrue(out["ok"])
+        self.assertFalse(out["send_telegram"])
+
+    def test_parse_share_command_invalid_option(self):
+        out = server_mod._parse_share_command('codrex-send "/tmp/a.png" --bad 1')
+        self.assertTrue(out["is_command"])
+        self.assertFalse(out["ok"])
+        self.assertIn("Unknown option", out["detail"])
+
+    def test_codex_session_send_intercepts_share_command(self):
+        fake_item = {
+            "id": "shr_demo123",
+            "title": "Result",
+            "file_name": "result.png",
+            "mime_type": "image/png",
+            "size_bytes": 1200,
+            "created_at": 1,
+            "expires_at": 2,
+            "created_by": "session:codex_demo",
+            "is_image": True,
+            "wsl_path": "/home/megha/codrex-work/output/result.png",
+        }
+        with mock.patch.object(server_mod, "_session_pane", return_value={"pane_id": "%9"}), \
+             mock.patch.object(server_mod, "_create_shared_outbox_item", return_value=fake_item) as create_mock, \
+             mock.patch.object(server_mod, "_tmux_send_text") as send_mock:
+            out = server_mod.codex_session_send(
+                "codex_demo",
+                'codrex-send "/home/megha/codrex-work/output/result.png" --title "Result" --expires 24',
+            )
+
+        self.assertTrue(out["ok"])
+        self.assertIn("shared_file", out)
+        self.assertEqual(out["shared_file"]["id"], "shr_demo123")
+        create_mock.assert_called_once_with(
+            "/home/megha/codrex-work/output/result.png",
+            title="Result",
+            expires_hours=24,
+            created_by="session:codex_demo",
+        )
+        send_mock.assert_not_called()
+
+    def test_codex_session_send_share_command_with_telegram(self):
+        fake_item = {
+            "id": "shr_demo123",
+            "title": "Result",
+            "file_name": "result.png",
+            "mime_type": "image/png",
+            "size_bytes": 1200,
+            "created_at": 1,
+            "expires_at": 2,
+            "created_by": "session:codex_demo",
+            "is_image": True,
+            "wsl_path": "/home/megha/codrex-work/output/result.png",
+        }
+        with mock.patch.object(server_mod, "_session_pane", return_value={"pane_id": "%9"}), \
+             mock.patch.object(server_mod, "_create_shared_outbox_item", return_value=fake_item), \
+             mock.patch.object(server_mod, "_telegram_send_shared_item", return_value={"ok": True, "message_id": 99}) as tg_mock:
+            out = server_mod.codex_session_send(
+                "codex_demo",
+                'codrex-send "/home/megha/codrex-work/output/result.png" --telegram --caption "Result"',
+            )
+
+        self.assertTrue(out["ok"])
+        self.assertIn("shared_file", out)
+        self.assertIn("telegram", out)
+        self.assertTrue(out["telegram"]["ok"])
+        tg_mock.assert_called_once()
+
+    def test_codex_sessions_live_includes_recent_known_session_without_pane(self):
+        now = server_mod.time.time()
+        fake_sessions = {
+            "codex_demo": {
+                "session": "codex_demo",
+                "cwd": "/home/megha/work",
+                "state": "starting",
+                "created_at": now,
+                "updated_at": now,
+                "model": "gpt-5-codex",
+                "reasoning_effort": "high",
+            }
+        }
+        with mock.patch.object(server_mod, "_tmux_list_panes", return_value=[]), \
+             mock.patch.object(server_mod, "SESSIONS", fake_sessions):
+            out = server_mod.codex_sessions_live()
+
+        self.assertTrue(out["ok"])
+        self.assertEqual(len(out["sessions"]), 1)
+        self.assertEqual(out["sessions"][0]["session"], "codex_demo")
+        self.assertEqual(out["sessions"][0]["state"], "starting")
+
+    def test_codex_sessions_live_drops_stale_known_session_without_pane(self):
+        old = server_mod.time.time() - 600
+        fake_sessions = {
+            "codex_stale": {
+                "session": "codex_stale",
+                "cwd": "/home/megha/work",
+                "state": "starting",
+                "created_at": old,
+                "updated_at": old,
+                "model": "gpt-5-codex",
+                "reasoning_effort": "high",
+            }
+        }
+        with mock.patch.object(server_mod, "_tmux_list_panes", return_value=[]), \
+             mock.patch.object(server_mod, "SESSIONS", fake_sessions):
+            out = server_mod.codex_sessions_live()
+
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["sessions"], [])
+        self.assertNotIn("codex_stale", fake_sessions)
+
+    def test_codex_session_screen_prunes_session_without_pane(self):
+        fake_sessions = {"codex_demo": {"session": "codex_demo", "state": "starting"}}
+        with mock.patch.object(server_mod, "_session_pane", return_value=None), \
+             mock.patch.object(server_mod, "SESSIONS", fake_sessions):
+            out = server_mod.codex_session_screen("codex_demo")
+
+        self.assertFalse(out["ok"])
+        self.assertEqual(out["error"], "not_found")
+        self.assertNotIn("codex_demo", fake_sessions)
+
     def test_auth_bootstrap_local_rejects_non_localhost(self):
         req = SimpleNamespace(headers={"host": "100.64.0.9:8787", "origin": "http://100.64.0.9:8787"})
         with mock.patch.object(server_mod, "CODEX_AUTH_REQUIRED", True), \
@@ -700,6 +866,38 @@ class DesktopModeTests(unittest.TestCase):
         )
         self.assertTrue(server_mod._desktop_enabled_from_request(req))
 
+    def test_require_desktop_enabled_rejects_when_off(self):
+        req = SimpleNamespace(
+            query_params={},
+            cookies={server_mod.CODEX_DESKTOP_MODE_COOKIE: "0"},
+        )
+        with self.assertRaises(Exception) as ctx:
+            server_mod._require_desktop_enabled(req)
+        self.assertIn("Desktop control is disabled", str(ctx.exception))
+
+    def test_desktop_info_reports_mode_flag(self):
+        req = SimpleNamespace(
+            query_params={},
+            cookies={server_mod.CODEX_DESKTOP_MODE_COOKIE: "0"},
+        )
+        with mock.patch.object(server_mod, "_ensure_windows_host"), \
+             mock.patch.object(server_mod, "_desktop_monitor", return_value={"left": 0, "top": 0, "width": 1920, "height": 1080}):
+            out = server_mod.desktop_info(req)
+        self.assertTrue(out["ok"])
+        self.assertFalse(out["enabled"])
+
+    def test_desktop_input_click_blocked_when_mode_off(self):
+        req = SimpleNamespace(
+            query_params={},
+            cookies={server_mod.CODEX_DESKTOP_MODE_COOKIE: "off"},
+        )
+        with mock.patch.object(server_mod, "_ensure_windows_host"), \
+             mock.patch.object(server_mod, "_desktop_click") as click_mock:
+            with self.assertRaises(Exception) as ctx:
+                server_mod.desktop_input_click(req, {"button": "left"})
+        self.assertIn("Desktop control is disabled", str(ctx.exception))
+        click_mock.assert_not_called()
+
     def test_downsample_rgb_nearest_reduces_size(self):
         # 2x2 image: R, G, B, W
         rgb = bytes([
@@ -720,6 +918,194 @@ class DesktopModeTests(unittest.TestCase):
         self.assertEqual(gray[1], gray[2])
         self.assertEqual(gray[3], gray[4])
         self.assertEqual(gray[4], gray[5])
+
+
+class SharedOutboxTests(unittest.TestCase):
+    def test_detect_mime_from_bytes(self):
+        self.assertEqual(server_mod._detect_mime_from_bytes(b"%PDF-1.4\n"), "application/pdf")
+        self.assertEqual(server_mod._detect_mime_from_bytes(b"\x89PNG\r\n\x1a\n\x00\x00\x00\r"), "image/png")
+        self.assertEqual(server_mod._detect_mime_from_bytes(b"hello world\n"), "text/plain")
+
+    def test_create_shared_item_prefers_detected_mime_over_extension(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_png = Path(tmp) / "proof.png"
+            fake_png.write_bytes(b"%PDF-1.4\n1 0 obj\n<<>>\nendobj\n")
+            outbox = Path(tmp) / "shared-outbox.json"
+            with mock.patch.object(server_mod, "SHARED_OUTBOX_FILE", str(outbox)), \
+                 mock.patch.object(server_mod, "SHARED_OUTBOX_LOADED", False), \
+                 mock.patch.object(server_mod, "SHARED_OUTBOX_DATA", {"version": 1, "items": []}), \
+                 mock.patch.object(server_mod, "_resolve_wsl_path", return_value=str(fake_png)), \
+                 mock.patch.object(server_mod, "_wsl_unc_path", return_value=str(fake_png)):
+                item = server_mod._create_shared_outbox_item(str(fake_png), title="", expires_hours=24, created_by="test")
+        self.assertEqual(item["mime_type"], "application/pdf")
+        self.assertFalse(item["is_image"])
+
+    def test_telegram_send_corrects_mime_and_filename_from_content(self):
+        class _DummyResp:
+            def __init__(self, body: bytes):
+                self.status = 200
+                self._body = body
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return self._body
+
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_png = Path(tmp) / "proof.png"
+            fake_png.write_bytes(b"%PDF-1.4\n1 0 obj\n<<>>\nendobj\n")
+            item = {
+                "id": "shr_demo",
+                "title": "Proof",
+                "file_name": "proof.png",
+                "mime_type": "image/png",
+                "wsl_path": "/home/megha/codrex-work/output/proof.png",
+            }
+            with mock.patch.object(server_mod, "TELEGRAM_BOT_TOKEN", "123:abc"), \
+                 mock.patch.object(server_mod, "_telegram_resolve_chat_id", return_value="12345"), \
+                 mock.patch.object(server_mod, "_resolve_wsl_path", return_value=str(fake_png)), \
+                 mock.patch.object(server_mod, "_wsl_unc_path", return_value=str(fake_png)), \
+                 mock.patch.object(server_mod.urllib.request, "urlopen", return_value=_DummyResp(b'{"ok":true,"result":{"message_id":7}}')):
+                out = server_mod._telegram_send_shared_item(item)
+        self.assertTrue(out["ok"])
+        self.assertTrue(out["mime_corrected"])
+        self.assertEqual(out["mime_type"], "application/pdf")
+        self.assertTrue(str(out["file_name"]).endswith(".pdf"))
+
+    def test_parse_telegram_secret_text(self):
+        raw = """
+        # comment
+        token = 123456:ABC_DEF-ghi
+        chat_id = -1001234567890
+        """
+        out = server_mod._parse_telegram_secret_text(raw)
+        self.assertEqual(out["token"], "123456:ABC_DEF-ghi")
+        self.assertEqual(out["chat_id"], "-1001234567890")
+
+    def test_telegram_resolve_chat_id_from_file(self):
+        with mock.patch.object(server_mod, "TELEGRAM_CHAT_ID", ""), \
+             mock.patch.object(server_mod, "TELEGRAM_CHAT_FILE", "/tmp/chat-id.txt"), \
+             mock.patch.object(server_mod, "_read_text_file", return_value="-1001234567890\n"), \
+             mock.patch.object(server_mod, "_telegram_discover_chat_id", return_value=""):
+            out = server_mod._telegram_resolve_chat_id(allow_discovery=True)
+        self.assertEqual(out, "-1001234567890")
+
+    def test_telegram_resolve_chat_id_discovers_when_missing(self):
+        with mock.patch.object(server_mod, "TELEGRAM_CHAT_ID", ""), \
+             mock.patch.object(server_mod, "TELEGRAM_BOT_TOKEN", "123:abc"), \
+             mock.patch.object(server_mod, "_read_text_file", return_value=""), \
+             mock.patch.object(server_mod, "_telegram_discover_chat_id", return_value="123456789") as discover_mock, \
+             mock.patch.object(server_mod, "_persist_telegram_chat_id", return_value=None) as persist_mock:
+            out = server_mod._telegram_resolve_chat_id(allow_discovery=True)
+        self.assertEqual(out, "123456789")
+        discover_mock.assert_called_once()
+        persist_mock.assert_called_once_with("123456789")
+
+    def test_shares_list_returns_public_download_url(self):
+        fake_item = {
+            "id": "shr_abc123",
+            "title": "Result",
+            "file_name": "result.png",
+            "mime_type": "image/png",
+            "size_bytes": 1200,
+            "created_at": 1,
+            "expires_at": 9999999999999,
+            "created_by": "session:codex_demo",
+            "is_image": True,
+            "wsl_path": "/home/megha/codrex-work/output/result.png",
+        }
+        with mock.patch.object(server_mod, "SHARED_OUTBOX_LOADED", True), \
+             mock.patch.object(server_mod, "SHARED_OUTBOX_DATA", {"items": [fake_item]}):
+            out = server_mod.shares_list()
+        self.assertTrue(out["ok"])
+        self.assertEqual(len(out["items"]), 1)
+        self.assertEqual(out["items"][0]["download_url"], "/share/file/shr_abc123")
+
+    def test_shares_delete_removes_item(self):
+        data = {"items": [{"id": "shr_keep"}, {"id": "shr_drop"}]}
+        with mock.patch.object(server_mod, "SHARED_OUTBOX_DATA", data), \
+             mock.patch.object(server_mod, "SHARED_OUTBOX_LOADED", True), \
+             mock.patch.object(server_mod, "_load_shared_outbox_unlocked", return_value=None), \
+             mock.patch.object(server_mod, "_persist_shared_outbox_unlocked", return_value=None):
+            out = server_mod.shares_delete("shr_drop")
+
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["share_id"], "shr_drop")
+        self.assertEqual(len(data["items"]), 1)
+        self.assertEqual(data["items"][0]["id"], "shr_keep")
+
+    def test_shares_send_telegram(self):
+        fake_item = {
+            "id": "shr_abc123",
+            "title": "Result",
+            "file_name": "result.png",
+            "mime_type": "image/png",
+            "size_bytes": 1200,
+            "created_at": 1,
+            "expires_at": 9999999999999,
+            "created_by": "session:codex_demo",
+            "is_image": True,
+            "wsl_path": "/home/megha/codrex-work/output/result.png",
+        }
+        data = {"items": [fake_item]}
+        with mock.patch.object(server_mod, "SHARED_OUTBOX_DATA", data), \
+             mock.patch.object(server_mod, "SHARED_OUTBOX_LOADED", True), \
+             mock.patch.object(server_mod, "_load_shared_outbox_unlocked", return_value=None), \
+             mock.patch.object(server_mod, "_telegram_send_shared_item", return_value={"ok": True, "message_id": 7}) as tg_mock:
+            out = server_mod.shares_send_telegram("shr_abc123", {"caption": "Result"})
+
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["share_id"], "shr_abc123")
+        self.assertTrue(out["telegram"]["ok"])
+        tg_mock.assert_called_once()
+
+    def test_telegram_status_masked(self):
+        with mock.patch.object(server_mod, "TELEGRAM_BOT_TOKEN", "123456:ABCDEF"), \
+             mock.patch.object(server_mod, "TELEGRAM_CHAT_ID", "123456789"), \
+             mock.patch.object(server_mod, "TELEGRAM_API_BASE", "https://api.telegram.org"), \
+             mock.patch.object(server_mod, "TELEGRAM_MAX_FILE_MB", 45):
+            out = server_mod.telegram_status()
+
+        self.assertTrue(out["ok"])
+        self.assertTrue(out["configured"])
+        self.assertEqual(out["api_base"], "https://api.telegram.org")
+        self.assertEqual(out["max_file_mb"], 45)
+        self.assertTrue("*" in out["chat_id_masked"])
+
+    def test_telegram_send_text_success(self):
+        class _DummyResp:
+            def __init__(self, body: bytes):
+                self.status = 200
+                self._body = body
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return self._body
+
+        with mock.patch.object(server_mod, "TELEGRAM_BOT_TOKEN", "123:abc"), \
+             mock.patch.object(server_mod, "_telegram_resolve_chat_id", return_value="12345"), \
+             mock.patch.object(server_mod.urllib.request, "urlopen", return_value=_DummyResp(b'{"ok":true,"result":{"message_id":11}}')):
+            out = server_mod._telegram_send_text("remote ping")
+
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["message_id"], 11)
+        self.assertEqual(out["length"], len("remote ping"))
+
+    def test_telegram_send_text_endpoint(self):
+        with mock.patch.object(server_mod, "_telegram_send_text", return_value={"ok": True, "message_id": 17}) as send_mock:
+            out = server_mod.telegram_send_text({"text": "hello"})
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["detail"], "Sent to Telegram.")
+        send_mock.assert_called_once_with("hello")
 
 
 class CompactModeTests(unittest.TestCase):
@@ -798,13 +1184,14 @@ class LegacyFallbackTests(unittest.TestCase):
             "payload": payload,
             "status_code": status_code,
         }
+        req = SimpleNamespace(query_params={}, cookies={server_mod.CODEX_DESKTOP_MODE_COOKIE: "1"})
         with mock.patch.object(server_mod, "_legacy_result_page", side_effect=fake_page), \
              mock.patch.object(server_mod, "_desktop_monitor", return_value={"left": 0, "top": 0, "width": 1920, "height": 1080}), \
              mock.patch.object(server_mod, "desktop_input_click", return_value={"ok": True, "button": "left"}) as click_mock:
-            out = server_mod.legacy_desktop_tap(tap_x=44, tap_y=55, button="left", double="0")
+            out = server_mod.legacy_desktop_tap(request=req, tap_x=44, tap_y=55, button="left", double="0")
 
         click_mock.assert_called_once()
-        payload = click_mock.call_args.args[0]
+        payload = click_mock.call_args.args[1]
         self.assertEqual(payload["x"], 44)
         self.assertEqual(payload["y"], 55)
         self.assertEqual(payload["button"], "left")
@@ -818,10 +1205,12 @@ class LegacyFallbackTests(unittest.TestCase):
             "payload": payload,
             "status_code": status_code,
         }
+        req = SimpleNamespace(query_params={}, cookies={server_mod.CODEX_DESKTOP_MODE_COOKIE: "1"})
         with mock.patch.object(server_mod, "_legacy_result_page", side_effect=fake_page), \
              mock.patch.object(server_mod, "_desktop_monitor", return_value={"left": 0, "top": 0, "width": 1920, "height": 1080}), \
              mock.patch.object(server_mod, "desktop_input_click", return_value={"ok": True, "button": "left"}) as click_mock:
             out = server_mod.legacy_desktop_tap(
+                request=req,
                 tap_x=210,
                 tap_y=118,
                 render_w=420,
@@ -830,7 +1219,7 @@ class LegacyFallbackTests(unittest.TestCase):
                 double="0",
             )
 
-        payload = click_mock.call_args.args[0]
+        payload = click_mock.call_args.args[1]
         self.assertEqual(payload["x"], 960)
         self.assertEqual(payload["y"], 540)
         self.assertEqual(out["status_code"], 200)
@@ -841,8 +1230,9 @@ class LegacyFallbackTests(unittest.TestCase):
             "payload": payload,
             "status_code": status_code,
         }
+        req = SimpleNamespace(query_params={}, cookies={server_mod.CODEX_DESKTOP_MODE_COOKIE: "1"})
         with mock.patch.object(server_mod, "_legacy_result_page", side_effect=fake_page):
-            out = server_mod.legacy_desktop_click(button="left", double="0", x="120", y="")
+            out = server_mod.legacy_desktop_click(request=req, button="left", double="0", x="120", y="")
 
         self.assertEqual(out["status_code"], 400)
         self.assertFalse(out["payload"]["ok"])

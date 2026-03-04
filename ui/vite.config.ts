@@ -58,7 +58,10 @@ export default defineConfig({
       "/legacy": backendOrigin,
       "/desktop": backendOrigin,
       "/tmux": backendOrigin,
-      "/wsl": backendOrigin
+      "/wsl": backendOrigin,
+      "/shares": backendOrigin,
+      "/share": backendOrigin,
+      "/telegram": backendOrigin
     }
   },
   preview: {
@@ -69,7 +72,10 @@ export default defineConfig({
       "/legacy": backendOrigin,
       "/desktop": backendOrigin,
       "/tmux": backendOrigin,
-      "/wsl": backendOrigin
+      "/wsl": backendOrigin,
+      "/shares": backendOrigin,
+      "/share": backendOrigin,
+      "/telegram": backendOrigin
     }
   },
   test: {

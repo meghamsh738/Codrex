@@ -706,18 +706,36 @@ textarea {
   border: 1px solid color-mix(in srgb, var(--brand-2) 80%, #001226 20%);
   background: linear-gradient(160deg, var(--brand) 0%, var(--brand-2) 100%);
   color: #ffffff;
-  border-radius: var(--radius-s);
-  padding: 10px 14px;
-  min-height: 42px;
+  border-radius: 999px;
+  padding: 8px 12px;
+  min-height: 36px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
   font-weight: 800;
+  font-size: 0.82rem;
   letter-spacing: 0.01em;
   cursor: pointer;
   transition: transform 120ms ease, box-shadow 120ms ease, filter 120ms ease;
   text-decoration: none;
   box-shadow: 0 6px 14px rgba(14, 155, 255, 0.22);
+}
+
+.button.compact {
+  border-radius: 999px;
+  min-height: 32px;
+  padding: 6px 10px;
+  font-size: 0.75rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  box-shadow: 0 4px 10px rgba(14, 155, 255, 0.18);
+}
+
+.button.compact .btn-text {
+  display: inline-flex;
+  align-items: center;
+  white-space: nowrap;
+  font-size: inherit;
 }
 
 .button:hover {
@@ -976,6 +994,53 @@ button:active,
   gap: 10px;
 }
 
+.composer-input-wrap {
+  position: relative;
+}
+
+.composer-input-wrap textarea {
+  padding-right: 60px;
+}
+
+.composer-send-btn {
+  position: absolute;
+  right: 10px;
+  bottom: 10px;
+  width: 40px;
+  height: 40px;
+  border-radius: 999px;
+  border: 1px solid color-mix(in srgb, var(--brand-accent) 65%, var(--border) 35%);
+  background: linear-gradient(160deg, color-mix(in srgb, var(--brand-accent) 78%, #07203e 22%), color-mix(in srgb, var(--brand-2) 80%, #031225 20%));
+  color: #e6f7ff;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  box-shadow: 0 8px 16px rgba(14, 155, 255, 0.34);
+  transition: transform 120ms ease, box-shadow 120ms ease, opacity 120ms ease, filter 120ms ease;
+}
+
+.composer-send-btn:hover:not(:disabled) {
+  transform: translateY(-1px) scale(1.02);
+  box-shadow: 0 10px 18px rgba(14, 155, 255, 0.45);
+  filter: saturate(1.08);
+}
+
+.composer-send-btn:active:not(:disabled) {
+  transform: translateY(0) scale(0.98);
+}
+
+.composer-send-btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.58;
+  box-shadow: none;
+}
+
+.composer-send-btn svg {
+  width: 18px;
+  height: 18px;
+}
+
 .field.inline {
   display: flex;
   flex-direction: row;
@@ -1129,19 +1194,38 @@ button:active,
   }
 
   .session-action-dock {
-    grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
+    grid-template-columns: repeat(6, minmax(44px, 1fr));
     margin-top: 4px;
     padding: 8px;
     border-radius: 14px;
     box-shadow: none;
     backdrop-filter: none;
   }
+
+  .button.compact {
+    min-height: 36px;
+    min-width: 44px;
+    padding: 8px 9px;
+    justify-content: center;
+  }
+
+  .button.compact .btn-text {
+    display: none;
+  }
+
+  .button.compact[data-short]::after {
+    content: attr(data-short);
+    font-size: 0.67rem;
+    font-weight: 800;
+    letter-spacing: 0.04em;
+    line-height: 1;
+  }
 }
 
 .session-detail.console-focus-mode .detail-head .row,
 .session-detail.console-focus-mode .control-panel,
 .session-detail.console-focus-mode .quick-actions,
-.session-detail.console-focus-mode .prompt-composer {
+.session-detail.console-focus-mode .quick-open-card {
   display: none;
 }
 

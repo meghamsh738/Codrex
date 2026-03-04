@@ -18,6 +18,7 @@ vi.mock("../api", async (importOriginal) => {
     closeSession: vi.fn(),
     closeTmuxSession: vi.fn(),
     createPairCode: vi.fn(),
+    createSharedFile: vi.fn(),
     createSessionWithOptions: vi.fn(),
     createTmuxSession: vi.fn(),
     ctrlcSession: vi.fn(),
@@ -32,6 +33,7 @@ vi.mock("../api", async (importOriginal) => {
     getCodexRuns: vi.fn(),
     getDesktopInfo: vi.fn(),
     getNetInfo: vi.fn(),
+    getTelegramStatus: vi.fn(),
     getSessionScreen: vi.fn(),
     getSessions: vi.fn(),
     getThreadStore: vi.fn(),
@@ -42,7 +44,11 @@ vi.mock("../api", async (importOriginal) => {
     interruptSession: vi.fn(),
     login: vi.fn(),
     logout: vi.fn(),
+    listSharedFiles: vi.fn(),
     reportIpcEvent: vi.fn(),
+    sendSharedFileToTelegram: vi.fn(),
+    sendTelegramText: vi.fn(),
+    deleteSharedFile: vi.fn(),
     sendSessionImage: vi.fn(),
     addThreadRecordMessage: vi.fn(),
     createThreadRecord: vi.fn(),
@@ -62,10 +68,16 @@ const getCodexRunMock = vi.mocked(api.getCodexRun);
 const getCodexRunsMock = vi.mocked(api.getCodexRuns);
 const getCodexOptionsMock = vi.mocked(api.getCodexOptions);
 const getNetInfoMock = vi.mocked(api.getNetInfo);
+const getTelegramStatusMock = vi.mocked(api.getTelegramStatus);
 const getSessionsMock = vi.mocked(api.getSessions);
 const getSessionScreenMock = vi.mocked(api.getSessionScreen);
 const getThreadStoreMock = vi.mocked(api.getThreadStore);
 const createSessionMock = vi.mocked(api.createSessionWithOptions);
+const createSharedFileMock = vi.mocked(api.createSharedFile);
+const deleteSharedFileMock = vi.mocked(api.deleteSharedFile);
+const listSharedFilesMock = vi.mocked(api.listSharedFiles);
+const sendSharedFileToTelegramMock = vi.mocked(api.sendSharedFileToTelegram);
+const sendTelegramTextMock = vi.mocked(api.sendTelegramText);
 const createThreadRecordMock = vi.mocked(api.createThreadRecord);
 const updateThreadRecordMock = vi.mocked(api.updateThreadRecord);
 const deleteThreadRecordMock = vi.mocked(api.deleteThreadRecord);
@@ -114,6 +126,10 @@ function setupDefaultMocks(): void {
     lan_ip: "192.168.1.15",
     tailscale_ip: "100.64.0.9",
   });
+  getTelegramStatusMock.mockResolvedValue({
+    ok: true,
+    configured: false,
+  });
   getSessionsMock.mockResolvedValue({
     ok: true,
     sessions: [],
@@ -142,6 +158,18 @@ function setupDefaultMocks(): void {
     ok: true,
     text: "",
   });
+  listSharedFilesMock.mockResolvedValue({
+    ok: true,
+    items: [],
+  });
+  sendSharedFileToTelegramMock.mockResolvedValue({
+    ok: true,
+    detail: "Sent to Telegram.",
+  });
+  sendTelegramTextMock.mockResolvedValue({
+    ok: true,
+    detail: "Sent to Telegram.",
+  });
   getThreadStoreMock.mockResolvedValue({
     ok: true,
     threads: [],
@@ -167,6 +195,23 @@ function setupDefaultMocks(): void {
   });
 
   createSessionMock.mockResolvedValue({ ok: true, session: "dev-main" });
+  createSharedFileMock.mockResolvedValue({
+    ok: true,
+    item: {
+      id: "shr_1",
+      title: "Shared",
+      file_name: "demo.png",
+      mime_type: "image/png",
+      size_bytes: 1024,
+      created_at: Date.now(),
+      expires_at: Date.now() + 24 * 3600 * 1000,
+      created_by: "session:codex_demo",
+      is_image: true,
+      wsl_path: "/home/megha/codrex-work/demo.png",
+      download_url: "/share/file/shr_1",
+    },
+  });
+  deleteSharedFileMock.mockResolvedValue({ ok: true });
   loginMock.mockResolvedValue({ ok: true });
   bootstrapLocalAuthMock.mockResolvedValue({
     ok: false,
@@ -261,6 +306,52 @@ describe("app shell tabs", () => {
     });
   });
 
+  it("disables remote desktop controls when desktop mode is off", async () => {
+    getDesktopInfoMock.mockResolvedValue({
+      ok: true,
+      enabled: false,
+      width: 1920,
+      height: 1080,
+    });
+    render(<App />);
+
+    fireEvent.click(await screen.findByTestId("tab-remote"));
+
+    const leftClickButton = await screen.findByRole("button", { name: "Left Click" });
+    expect(leftClickButton).toBeDisabled();
+    fireEvent.click(leftClickButton);
+    expect(desktopClickMock).not.toHaveBeenCalled();
+
+    expect(screen.getByRole("button", { name: "Send Text" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Send Key" })).toBeDisabled();
+  });
+
+  it("sends remote text to telegram from remote tab", async () => {
+    getTelegramStatusMock.mockResolvedValue({
+      ok: true,
+      configured: true,
+    });
+    getDesktopInfoMock.mockResolvedValue({
+      ok: true,
+      enabled: true,
+      width: 1920,
+      height: 1080,
+    });
+    render(<App />);
+
+    fireEvent.click(await screen.findByTestId("tab-remote"));
+    await screen.findByRole("button", { name: "Disable Desktop" });
+
+    fireEvent.change(screen.getByPlaceholderText("Type text on desktop"), {
+      target: { value: "Remote quick note" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Send Telegram" }));
+
+    await waitFor(() => {
+      expect(sendTelegramTextMock).toHaveBeenCalledWith("Remote quick note");
+    });
+  });
+
   it("creates a session from sessions tab", async () => {
     render(<App />);
 
@@ -349,17 +440,17 @@ describe("app shell tabs", () => {
 
     await waitFor(() => {
       expect((screen.getByTestId("pair-link-text") as HTMLTextAreaElement).value).toBe(
-        "http://192.168.1.15:8787/auth/pair/consume?code=abc123",
+        "http://100.64.0.9:8787/auth/pair/consume?code=abc123",
       );
     });
 
     fireEvent.change(screen.getByTestId("pair-route-hint-select"), {
-      target: { value: "tailscale" },
+      target: { value: "lan" },
     });
 
     await waitFor(() => {
       expect((screen.getByTestId("pair-link-text") as HTMLTextAreaElement).value).toBe(
-        "http://100.64.0.9:8787/auth/pair/consume?code=abc123",
+        "http://192.168.1.15:8787/auth/pair/consume?code=abc123",
       );
     });
   });
@@ -425,7 +516,7 @@ describe("app shell tabs", () => {
     fireEvent.change(screen.getByPlaceholderText("Type your prompt. Codrex will send Enter + Enter to submit."), {
       target: { value: "Create a release checklist" },
     });
-    fireEvent.click(screen.getByTestId("dock-send-prompt"));
+    fireEvent.click(screen.getByTestId("composer-send-prompt"));
 
     await waitFor(() => {
       expect(sendToSessionMock).toHaveBeenCalled();
@@ -434,6 +525,115 @@ describe("app shell tabs", () => {
     const latestCall = sendToSessionMock.mock.calls.at(-1);
     expect(latestCall?.[0]).toBe("codex_demo");
     expect(latestCall?.[1]).toBe("Create a release checklist");
+  });
+
+  it("creates a shared file from sessions panel", async () => {
+    getSessionsMock.mockResolvedValue({
+      ok: true,
+      sessions: [
+        {
+          session: "codex_demo",
+          pane_id: "%1",
+          current_command: "codex",
+          cwd: "/home/megha/work",
+          state: "idle",
+          updated_at: Date.now(),
+          snippet: "",
+        },
+      ],
+    });
+
+    render(<App />);
+    await screen.findByTestId("shared-files-card");
+
+    fireEvent.change(screen.getByTestId("share-path-input"), {
+      target: { value: "/home/megha/codrex-work/output/result.png" },
+    });
+    fireEvent.change(screen.getByTestId("share-title-input"), {
+      target: { value: "Result Plot" },
+    });
+    fireEvent.change(screen.getByTestId("share-expiry-select"), {
+      target: { value: "72" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Share Now" }));
+
+    await waitFor(() => {
+      expect(createSharedFileMock).toHaveBeenCalledWith({
+        path: "/home/megha/codrex-work/output/result.png",
+        title: "Result Plot",
+        expires_hours: 72,
+        created_by: "session:codex_demo",
+      });
+    });
+  });
+
+  it("sends a shared file to telegram from the inbox", async () => {
+    getSessionsMock.mockResolvedValue({
+      ok: true,
+      sessions: [
+        {
+          session: "codex_demo",
+          pane_id: "%1",
+          current_command: "codex",
+          cwd: "/home/megha/work",
+          state: "idle",
+          updated_at: Date.now(),
+          snippet: "",
+        },
+      ],
+    });
+    listSharedFilesMock.mockResolvedValue({
+      ok: true,
+      items: [
+        {
+          id: "shr_abc",
+          title: "Result Plot",
+          file_name: "result.png",
+          mime_type: "image/png",
+          size_bytes: 2048,
+          created_at: Date.now(),
+          expires_at: Date.now() + 24 * 3600 * 1000,
+          created_by: "session:codex_demo",
+          is_image: true,
+          wsl_path: "/home/megha/codrex-work/output/result.png",
+          download_url: "/share/file/shr_abc",
+        },
+      ],
+    });
+
+    render(<App />);
+    await screen.findByTestId("shared-files-card");
+
+    fireEvent.click(screen.getByRole("button", { name: "Send Telegram" }));
+
+    await waitFor(() => {
+      expect(sendSharedFileToTelegramMock).toHaveBeenCalledWith("shr_abc", "Result Plot");
+    });
+  });
+
+  it("hides shared files inbox when telegram is configured", async () => {
+    getSessionsMock.mockResolvedValue({
+      ok: true,
+      sessions: [
+        {
+          session: "codex_demo",
+          pane_id: "%1",
+          current_command: "codex",
+          cwd: "/home/megha/work",
+          state: "idle",
+          updated_at: Date.now(),
+          snippet: "",
+        },
+      ],
+    });
+    getTelegramStatusMock.mockResolvedValueOnce({
+      ok: true,
+      configured: true,
+    });
+
+    render(<App />);
+    expect(screen.queryByTestId("shared-files-card")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("telegram-direct-delivery-card")).not.toBeInTheDocument();
   });
 
   it("enables live output automatically when creating a session", async () => {
@@ -474,7 +674,7 @@ describe("app shell tabs", () => {
     });
   });
 
-  it("toggles console focus mode and sends prompt from action dock", async () => {
+  it("toggles console focus mode and sends prompt from composer send icon", async () => {
     getSessionsMock.mockResolvedValue({
       ok: true,
       sessions: [
@@ -499,7 +699,7 @@ describe("app shell tabs", () => {
     fireEvent.change(screen.getByPlaceholderText("Type your prompt. Codrex will send Enter + Enter to submit."), {
       target: { value: "Review latest logs and summarize key errors." },
     });
-    fireEvent.click(screen.getByTestId("dock-send-prompt"));
+    fireEvent.click(screen.getByTestId("composer-send-prompt"));
 
     await waitFor(() => {
       expect(sendToSessionMock).toHaveBeenCalled();

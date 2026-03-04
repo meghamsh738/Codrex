@@ -1,5 +1,16 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { applySessionProfile, buildPairConsumeUrl, buildPairQrPngUrl, buildSuggestedControllerUrl } from "../api";
+import {
+  applySessionProfile,
+  buildPairConsumeUrl,
+  buildPairQrPngUrl,
+  buildSuggestedControllerUrl,
+  createSharedFile,
+  deleteSharedFile,
+  getTelegramStatus,
+  listSharedFiles,
+  sendTelegramText,
+  sendSharedFileToTelegram,
+} from "../api";
 
 describe("pairing URL helpers", () => {
   it("builds consume link from plain host", () => {
@@ -27,14 +38,14 @@ describe("base URL suggestions", () => {
     expect(suggested).toBe("http://192.168.1.120:8787");
   });
 
-  it("falls back to LAN when tailscale route is selected but unavailable", () => {
+  it("falls back to current host when tailscale route is selected but unavailable", () => {
     const suggested = buildSuggestedControllerUrl(
       "localhost",
       8787,
       { ok: true, lan_ip: "192.168.1.120", tailscale_ip: "" },
       "tailscale",
     );
-    expect(suggested).toBe("http://192.168.1.120:8787");
+    expect(suggested).toBe("http://localhost:8787");
   });
 
   it("falls back to current host", () => {
@@ -80,6 +91,133 @@ describe("session profile apply API", () => {
           model: "gpt-5",
           reasoning_effort: "xhigh",
         }),
+      }),
+    );
+  });
+});
+
+describe("shared files API", () => {
+  const fetchMock = vi.fn();
+
+  beforeEach(() => {
+    vi.stubGlobal("fetch", fetchMock);
+  });
+
+  afterEach(() => {
+    fetchMock.mockReset();
+    vi.unstubAllGlobals();
+  });
+
+  it("lists shared files", async () => {
+    fetchMock.mockResolvedValue({
+      ok: true,
+      status: 200,
+      text: async () => JSON.stringify({ ok: true, items: [] }),
+    });
+    const out = await listSharedFiles();
+    expect(out.ok).toBe(true);
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/shares",
+      expect.objectContaining({
+        credentials: "include",
+      }),
+    );
+  });
+
+  it("creates shared file with payload", async () => {
+    fetchMock.mockResolvedValue({
+      ok: true,
+      status: 200,
+      text: async () => JSON.stringify({ ok: true, item: { id: "shr_1" } }),
+    });
+    const out = await createSharedFile({
+      path: "/home/megha/codrex-work/out/image.png",
+      title: "Image",
+      expires_hours: 24,
+      created_by: "session:codex_demo",
+    });
+    expect(out.ok).toBe(true);
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/shares",
+      expect.objectContaining({
+        method: "POST",
+        credentials: "include",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          path: "/home/megha/codrex-work/out/image.png",
+          title: "Image",
+          expires_hours: 24,
+          created_by: "session:codex_demo",
+        }),
+      }),
+    );
+  });
+
+  it("deletes shared file by id", async () => {
+    fetchMock.mockResolvedValue({
+      ok: true,
+      status: 200,
+      text: async () => JSON.stringify({ ok: true }),
+    });
+    const out = await deleteSharedFile("shr_123");
+    expect(out.ok).toBe(true);
+    expect(fetchMock).toHaveBeenCalledWith("/shares/shr_123", expect.objectContaining({ method: "DELETE" }));
+  });
+
+  it("reads telegram status", async () => {
+    fetchMock.mockResolvedValue({
+      ok: true,
+      status: 200,
+      text: async () => JSON.stringify({ ok: true, configured: false }),
+    });
+    const out = await getTelegramStatus();
+    expect(out.ok).toBe(true);
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/telegram/status",
+      expect.objectContaining({
+        credentials: "include",
+      }),
+    );
+  });
+
+  it("sends shared file to telegram by id", async () => {
+    fetchMock.mockResolvedValue({
+      ok: true,
+      status: 200,
+      text: async () => JSON.stringify({ ok: true, detail: "Sent to Telegram." }),
+    });
+    const out = await sendSharedFileToTelegram("shr_abc", "Result");
+    expect(out.ok).toBe(true);
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/shares/shr_abc/telegram",
+      expect.objectContaining({
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ caption: "Result" }),
+      }),
+    );
+  });
+
+  it("sends arbitrary text to telegram", async () => {
+    fetchMock.mockResolvedValue({
+      ok: true,
+      status: 200,
+      text: async () => JSON.stringify({ ok: true, detail: "Sent to Telegram." }),
+    });
+    const out = await sendTelegramText("hello from remote");
+    expect(out.ok).toBe(true);
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/telegram/send-text",
+      expect.objectContaining({
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ text: "hello from remote" }),
       }),
     );
   });
