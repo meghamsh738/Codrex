@@ -16,6 +16,7 @@ import type {
   SessionCloseResult,
   SessionScreenResult,
   SessionsResult,
+  SharedFilesResult,
   TmuxHealthResult,
   TmuxPaneScreenResult,
   TmuxPanesResult,
@@ -394,6 +395,29 @@ export function sendSessionImage(
   return requestJson<SessionImageResult>(`/codex/session/${encodeURIComponent(session)}/image`, {
     method: "POST",
     body: formData,
+  });
+}
+
+export function listSharedFiles(): Promise<SharedFilesResult> {
+  return requestJson<SharedFilesResult>("/shares");
+}
+
+export function createSharedFile(payload: {
+  path: string;
+  title?: string;
+  expires_hours?: number;
+  created_by?: string;
+}): Promise<SharedFilesResult> {
+  return requestJson<SharedFilesResult>("/shares", {
+    method: "POST",
+    headers: JSON_HEADERS,
+    body: JSON.stringify(payload),
+  });
+}
+
+export function deleteSharedFile(shareId: string): Promise<SharedFilesResult> {
+  return requestJson<SharedFilesResult>(`/shares/${encodeURIComponent(shareId)}`, {
+    method: "DELETE",
   });
 }
 

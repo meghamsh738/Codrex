@@ -653,6 +653,54 @@ class CodexSessionConfigTests(unittest.TestCase):
         self.assertEqual(out["profile_reasoning_effort"], "high")
         send_mock.assert_called_once_with("%9", "hello", codex_mode=True, timeout_s=20)
 
+    def test_parse_share_command_valid(self):
+        out = server_mod._parse_share_command(
+            'codrex-send "/home/megha/codrex-work/output/result.png" --title "Result" --expires 24'
+        )
+        self.assertTrue(out["is_command"])
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["path"], "/home/megha/codrex-work/output/result.png")
+        self.assertEqual(out["title"], "Result")
+        self.assertEqual(out["expires_hours"], 24)
+
+    def test_parse_share_command_invalid_option(self):
+        out = server_mod._parse_share_command('codrex-send "/tmp/a.png" --bad 1')
+        self.assertTrue(out["is_command"])
+        self.assertFalse(out["ok"])
+        self.assertIn("Unknown option", out["detail"])
+
+    def test_codex_session_send_intercepts_share_command(self):
+        fake_item = {
+            "id": "shr_demo123",
+            "title": "Result",
+            "file_name": "result.png",
+            "mime_type": "image/png",
+            "size_bytes": 1200,
+            "created_at": 1,
+            "expires_at": 2,
+            "created_by": "session:codex_demo",
+            "is_image": True,
+            "wsl_path": "/home/megha/codrex-work/output/result.png",
+        }
+        with mock.patch.object(server_mod, "_session_pane", return_value={"pane_id": "%9"}), \
+             mock.patch.object(server_mod, "_create_shared_outbox_item", return_value=fake_item) as create_mock, \
+             mock.patch.object(server_mod, "_tmux_send_text") as send_mock:
+            out = server_mod.codex_session_send(
+                "codex_demo",
+                'codrex-send "/home/megha/codrex-work/output/result.png" --title "Result" --expires 24',
+            )
+
+        self.assertTrue(out["ok"])
+        self.assertIn("shared_file", out)
+        self.assertEqual(out["shared_file"]["id"], "shr_demo123")
+        create_mock.assert_called_once_with(
+            "/home/megha/codrex-work/output/result.png",
+            title="Result",
+            expires_hours=24,
+            created_by="session:codex_demo",
+        )
+        send_mock.assert_not_called()
+
     def test_auth_bootstrap_local_rejects_non_localhost(self):
         req = SimpleNamespace(headers={"host": "100.64.0.9:8787", "origin": "http://100.64.0.9:8787"})
         with mock.patch.object(server_mod, "CODEX_AUTH_REQUIRED", True), \
@@ -720,6 +768,41 @@ class DesktopModeTests(unittest.TestCase):
         self.assertEqual(gray[1], gray[2])
         self.assertEqual(gray[3], gray[4])
         self.assertEqual(gray[4], gray[5])
+
+
+class SharedOutboxTests(unittest.TestCase):
+    def test_shares_list_returns_public_download_url(self):
+        fake_item = {
+            "id": "shr_abc123",
+            "title": "Result",
+            "file_name": "result.png",
+            "mime_type": "image/png",
+            "size_bytes": 1200,
+            "created_at": 1,
+            "expires_at": 9999999999999,
+            "created_by": "session:codex_demo",
+            "is_image": True,
+            "wsl_path": "/home/megha/codrex-work/output/result.png",
+        }
+        with mock.patch.object(server_mod, "SHARED_OUTBOX_LOADED", True), \
+             mock.patch.object(server_mod, "SHARED_OUTBOX_DATA", {"items": [fake_item]}):
+            out = server_mod.shares_list()
+        self.assertTrue(out["ok"])
+        self.assertEqual(len(out["items"]), 1)
+        self.assertEqual(out["items"][0]["download_url"], "/share/file/shr_abc123")
+
+    def test_shares_delete_removes_item(self):
+        data = {"items": [{"id": "shr_keep"}, {"id": "shr_drop"}]}
+        with mock.patch.object(server_mod, "SHARED_OUTBOX_DATA", data), \
+             mock.patch.object(server_mod, "SHARED_OUTBOX_LOADED", True), \
+             mock.patch.object(server_mod, "_load_shared_outbox_unlocked", return_value=None), \
+             mock.patch.object(server_mod, "_persist_shared_outbox_unlocked", return_value=None):
+            out = server_mod.shares_delete("shr_drop")
+
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["share_id"], "shr_drop")
+        self.assertEqual(len(data["items"]), 1)
+        self.assertEqual(data["items"][0]["id"], "shr_keep")
 
 
 class CompactModeTests(unittest.TestCase):

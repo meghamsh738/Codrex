@@ -9,6 +9,8 @@ import subprocess
 import socket
 import io
 import re
+import shlex
+import mimetypes
 import html as html_std
 import threading
 import uuid
@@ -283,6 +285,26 @@ THREADS_DATA: Dict[str, Any] = {
     "messages": {},
 }
 
+# -------------------------
+# Shared file outbox store
+# -------------------------
+DEFAULT_SHARED_OUTBOX_FILE = os.path.abspath(
+    os.environ.get(
+        "CODEX_SHARED_OUTBOX_FILE",
+        os.path.join(os.path.dirname(__file__), "..", "logs", "shared-outbox.json"),
+    )
+)
+SHARED_OUTBOX_FILE = DEFAULT_SHARED_OUTBOX_FILE
+SHARED_OUTBOX_LOCK = threading.Lock()
+SHARED_OUTBOX_LOADED = False
+SHARED_OUTBOX_MAX_KEEP = int(os.environ.get("CODEX_SHARED_OUTBOX_MAX_KEEP", "200") or "200")
+SHARED_OUTBOX_DEFAULT_EXPIRES_HOURS = int(os.environ.get("CODEX_SHARED_OUTBOX_DEFAULT_EXPIRES_HOURS", "24") or "24")
+SHARED_OUTBOX_MAX_EXPIRES_HOURS = int(os.environ.get("CODEX_SHARED_OUTBOX_MAX_EXPIRES_HOURS", "168") or "168")
+SHARED_OUTBOX_MAX_FILE_MB = int(os.environ.get("CODEX_SHARED_OUTBOX_MAX_FILE_MB", "200") or "200")
+SHARED_OUTBOX_DATA: Dict[str, Any] = {
+    "items": [],
+}
+
 
 def _now_ms() -> int:
     return int(time.time() * 1000)
@@ -482,6 +504,191 @@ def _find_thread_unlocked(thread_id: str) -> Optional[Dict[str, Any]]:
         if thread.get("id") == thread_id:
             return thread
     return None
+
+
+def _normalize_share_title(raw: Any, fallback_name: str) -> str:
+    text = re.sub(r"\s+", " ", str(raw or "").strip())
+    if text:
+        return text[:120]
+    return (fallback_name or "Shared file")[:120]
+
+
+def _normalize_share_expires_hours(raw: Any) -> int:
+    try:
+        value = int(raw if raw is not None else SHARED_OUTBOX_DEFAULT_EXPIRES_HOURS)
+    except Exception:
+        value = SHARED_OUTBOX_DEFAULT_EXPIRES_HOURS
+    value = max(1, value)
+    return min(value, max(1, SHARED_OUTBOX_MAX_EXPIRES_HOURS))
+
+
+def _share_expired(item: Dict[str, Any], now_ms: Optional[int] = None) -> bool:
+    current = int(now_ms if now_ms is not None else _now_ms())
+    expires_at = _coerce_ms(item.get("expires_at"), 0)
+    return expires_at > 0 and expires_at <= current
+
+
+def _shared_item_from_raw(raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    item_id = _clean_entity_id(raw.get("id"))
+    wsl_path = str(raw.get("wsl_path") or "").strip()
+    file_name = str(raw.get("file_name") or "").strip()
+    if not item_id or not wsl_path.startswith("/") or not file_name:
+        return None
+    now_ms = _now_ms()
+    created_at = _coerce_ms(raw.get("created_at"), now_ms)
+    expires_at = _coerce_ms(raw.get("expires_at"), created_at)
+    mime_type = str(raw.get("mime_type") or "").strip() or "application/octet-stream"
+    try:
+        size_bytes = max(0, int(raw.get("size_bytes") or 0))
+    except Exception:
+        size_bytes = 0
+    created_by = str(raw.get("created_by") or "").strip()[:64]
+    is_image = bool(raw.get("is_image")) or mime_type.startswith("image/")
+    return {
+        "id": item_id,
+        "title": _normalize_share_title(raw.get("title"), file_name),
+        "wsl_path": wsl_path,
+        "file_name": file_name[:180],
+        "mime_type": mime_type[:120],
+        "size_bytes": size_bytes,
+        "created_at": created_at,
+        "expires_at": expires_at,
+        "created_by": created_by,
+        "is_image": is_image,
+    }
+
+
+def _sort_and_trim_shared_outbox_unlocked() -> None:
+    items = SHARED_OUTBOX_DATA.get("items") or []
+    now_ms = _now_ms()
+    cleaned: List[Dict[str, Any]] = []
+    seen_ids = set()
+    for raw in items:
+        if not isinstance(raw, dict):
+            continue
+        item = _shared_item_from_raw(raw)
+        if not item:
+            continue
+        item_id = item["id"]
+        if item_id in seen_ids:
+            continue
+        if _share_expired(item, now_ms=now_ms):
+            continue
+        seen_ids.add(item_id)
+        cleaned.append(item)
+    cleaned.sort(key=lambda x: int(x.get("created_at") or 0), reverse=True)
+    SHARED_OUTBOX_DATA["items"] = cleaned[: max(1, SHARED_OUTBOX_MAX_KEEP)]
+
+
+def _persist_shared_outbox_unlocked() -> None:
+    _sort_and_trim_shared_outbox_unlocked()
+    parent = os.path.dirname(SHARED_OUTBOX_FILE)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    payload = {"items": SHARED_OUTBOX_DATA.get("items") or []}
+    temp_path = SHARED_OUTBOX_FILE + ".tmp"
+    with open(temp_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    os.replace(temp_path, SHARED_OUTBOX_FILE)
+
+
+def _load_shared_outbox_unlocked() -> None:
+    global SHARED_OUTBOX_LOADED
+    if SHARED_OUTBOX_LOADED:
+        return
+    SHARED_OUTBOX_LOADED = True
+    SHARED_OUTBOX_DATA["items"] = []
+    if not os.path.exists(SHARED_OUTBOX_FILE):
+        return
+    try:
+        with open(SHARED_OUTBOX_FILE, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+    except Exception:
+        return
+    if not isinstance(raw, dict):
+        return
+    items = raw.get("items")
+    if isinstance(items, list):
+        SHARED_OUTBOX_DATA["items"] = items
+    _sort_and_trim_shared_outbox_unlocked()
+
+
+def _shared_outbox_snapshot_unlocked() -> Dict[str, Any]:
+    _sort_and_trim_shared_outbox_unlocked()
+    return {"items": json.loads(json.dumps(SHARED_OUTBOX_DATA.get("items") or []))}
+
+
+def _find_shared_item_unlocked(item_id: str) -> Optional[Dict[str, Any]]:
+    item_id = _clean_entity_id(item_id)
+    if not item_id:
+        return None
+    for item in SHARED_OUTBOX_DATA.get("items") or []:
+        if (item or {}).get("id") == item_id:
+            return item
+    return None
+
+
+def _public_shared_item(item: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "id": item.get("id"),
+        "title": item.get("title"),
+        "file_name": item.get("file_name"),
+        "mime_type": item.get("mime_type"),
+        "size_bytes": item.get("size_bytes"),
+        "created_at": item.get("created_at"),
+        "expires_at": item.get("expires_at"),
+        "created_by": item.get("created_by"),
+        "is_image": bool(item.get("is_image")),
+        "wsl_path": item.get("wsl_path"),
+        "download_url": f"/share/file/{item.get('id')}",
+    }
+
+
+def _create_shared_outbox_item(
+    path: str,
+    *,
+    title: str = "",
+    expires_hours: Optional[int] = None,
+    created_by: str = "",
+) -> Dict[str, Any]:
+    wsl_abs = _resolve_wsl_path(path)
+    unc = _wsl_unc_path(wsl_abs)
+    if not os.path.exists(unc):
+        raise HTTPException(status_code=404, detail="File not found.")
+    if os.path.isdir(unc):
+        raise HTTPException(status_code=400, detail="Path is a directory. Provide a file path.")
+    try:
+        size_bytes = int(os.path.getsize(unc))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not stat file: {type(e).__name__}: {e}")
+    max_bytes = max(1, SHARED_OUTBOX_MAX_FILE_MB) * 1024 * 1024
+    if size_bytes > max_bytes:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File too large ({size_bytes} bytes). Limit is {max_bytes} bytes.",
+        )
+    file_name = os.path.basename(wsl_abs.rstrip("/")) or "shared.bin"
+    mime_type = (mimetypes.guess_type(file_name)[0] or "application/octet-stream").strip() or "application/octet-stream"
+    now_ms = _now_ms()
+    expires_h = _normalize_share_expires_hours(expires_hours)
+    expires_at = now_ms + int(expires_h * 3600 * 1000)
+    item = {
+        "id": f"shr_{uuid.uuid4().hex[:12]}",
+        "title": _normalize_share_title(title, file_name),
+        "wsl_path": wsl_abs,
+        "file_name": file_name,
+        "mime_type": mime_type,
+        "size_bytes": size_bytes,
+        "created_at": now_ms,
+        "expires_at": expires_at,
+        "created_by": (created_by or "manual")[:64],
+        "is_image": mime_type.startswith("image/"),
+    }
+    with SHARED_OUTBOX_LOCK:
+        _load_shared_outbox_unlocked()
+        SHARED_OUTBOX_DATA["items"].insert(0, item)
+        _persist_shared_outbox_unlocked()
+    return item
 
 
 def _overlay_cursor_rgb(rgb_bytes: bytes, size: Tuple[int, int], x: int, y: int) -> bytes:
@@ -5124,6 +5331,56 @@ def _tmux_send_text(pane_id: str, text: str, *, codex_mode: Optional[bool] = Non
         )
     return run_wsl_bash(cmd, timeout_s=timeout_s)
 
+
+def _parse_share_command(raw_text: str) -> Dict[str, Any]:
+    text = str(raw_text or "").strip()
+    if not text:
+        return {"is_command": False}
+    try:
+        parts = shlex.split(text, posix=True)
+    except Exception as e:
+        return {"is_command": True, "ok": False, "detail": f"Could not parse command: {type(e).__name__}: {e}"}
+    if not parts:
+        return {"is_command": False}
+
+    cmd = parts[0].strip().lower()
+    aliases = {"codrex-send", "/codrex-send", "/send-file", "/share-file"}
+    if cmd not in aliases:
+        return {"is_command": False}
+    if len(parts) < 2:
+        return {"is_command": True, "ok": False, "detail": "Missing file path. Usage: codrex-send <path> [--title ...] [--expires <hours>]"}
+
+    path = parts[1].strip()
+    title = ""
+    expires_hours: Optional[int] = None
+    i = 2
+    while i < len(parts):
+        token = parts[i].strip().lower()
+        if token == "--title":
+            if i + 1 >= len(parts):
+                return {"is_command": True, "ok": False, "detail": "Missing value for --title."}
+            title = parts[i + 1]
+            i += 2
+            continue
+        if token == "--expires":
+            if i + 1 >= len(parts):
+                return {"is_command": True, "ok": False, "detail": "Missing value for --expires."}
+            try:
+                expires_hours = int(parts[i + 1])
+            except Exception:
+                return {"is_command": True, "ok": False, "detail": "Invalid --expires value. Use an integer number of hours."}
+            i += 2
+            continue
+        return {"is_command": True, "ok": False, "detail": f"Unknown option: {parts[i]}"}
+
+    return {
+        "is_command": True,
+        "ok": True,
+        "path": path,
+        "title": title,
+        "expires_hours": expires_hours,
+    }
+
 @app.post("/codex/session/{session}/send")
 def codex_session_send(session: str, text: str = Body(..., media_type="text/plain")):
     session = _validate_session_name(session)
@@ -5131,11 +5388,32 @@ def codex_session_send(session: str, text: str = Body(..., media_type="text/plai
     if not pane:
         return {"ok": False, "error": "not_found", "detail": f"Session '{session}' has no panes."}
 
+    share_cmd = _parse_share_command(text)
+    if share_cmd.get("is_command"):
+        if not share_cmd.get("ok"):
+            return {
+                "ok": False,
+                "error": "share_command_invalid",
+                "detail": share_cmd.get("detail") or "Invalid share command.",
+            }
+        try:
+            item = _create_shared_outbox_item(
+                share_cmd.get("path") or "",
+                title=share_cmd.get("title") or "",
+                expires_hours=share_cmd.get("expires_hours"),
+                created_by=f"session:{session}",
+            )
+        except HTTPException as e:
+            return {"ok": False, "error": "share_create_failed", "detail": str(e.detail)}
+        return {
+            "ok": True,
+            "session": session,
+            "shared_file": _public_shared_item(item),
+            "detail": "Shared file added to mobile inbox.",
+        }
+
     repair = _maybe_repair_codex_session_reasoning(session, pane["pane_id"])
     repair_applied = bool(repair.get("applied"))
-    repair_warning = ""
-    if not repair.get("ok"):
-        repair_warning = "Could not auto-repair session profile before sending image path."
     repair_warning = ""
     if not repair.get("ok"):
         repair_warning = "Could not auto-repair session profile before send."
@@ -5998,6 +6276,72 @@ def pane_ctrlc(pane_id: str):
 # -------------------------
 # WSL file endpoints
 # -------------------------
+@app.get("/shares")
+def shares_list():
+    with SHARED_OUTBOX_LOCK:
+        _load_shared_outbox_unlocked()
+        snapshot = _shared_outbox_snapshot_unlocked()
+    items = [_public_shared_item(item) for item in snapshot.get("items") or []]
+    return {"ok": True, "items": items}
+
+
+@app.post("/shares")
+def shares_create(payload: Optional[Dict[str, Any]] = Body(default=None)):
+    payload = payload or {}
+    path = str(payload.get("path") or "").strip()
+    if not path:
+        raise HTTPException(status_code=400, detail="path is required.")
+    title = str(payload.get("title") or "").strip()
+    expires_hours = payload.get("expires_hours")
+    created_by = str(payload.get("created_by") or "manual").strip()[:64]
+    item = _create_shared_outbox_item(
+        path,
+        title=title,
+        expires_hours=expires_hours,
+        created_by=created_by or "manual",
+    )
+    return {"ok": True, "item": _public_shared_item(item)}
+
+
+@app.delete("/shares/{share_id}")
+def shares_delete(share_id: str):
+    share_id = _clean_entity_id(share_id)
+    if not share_id:
+        raise HTTPException(status_code=400, detail="Invalid share id.")
+    with SHARED_OUTBOX_LOCK:
+        _load_shared_outbox_unlocked()
+        prev = SHARED_OUTBOX_DATA.get("items") or []
+        next_items = [item for item in prev if (item or {}).get("id") != share_id]
+        if len(next_items) == len(prev):
+            return {"ok": False, "error": "not_found", "detail": f"Share '{share_id}' not found."}
+        SHARED_OUTBOX_DATA["items"] = next_items
+        _persist_shared_outbox_unlocked()
+    return {"ok": True, "share_id": share_id}
+
+
+@app.get("/share/file/{share_id}")
+def share_file_download(share_id: str):
+    share_id = _clean_entity_id(share_id)
+    if not share_id:
+        raise HTTPException(status_code=400, detail="Invalid share id.")
+    with SHARED_OUTBOX_LOCK:
+        _load_shared_outbox_unlocked()
+        item = _find_shared_item_unlocked(share_id)
+        if not item:
+            raise HTTPException(status_code=404, detail="Share not found.")
+        if _share_expired(item):
+            raise HTTPException(status_code=410, detail="Share has expired.")
+        wsl_path = str(item.get("wsl_path") or "")
+    wsl_abs = _resolve_wsl_path(wsl_path)
+    unc = _wsl_unc_path(wsl_abs)
+    if not os.path.exists(unc):
+        raise HTTPException(status_code=404, detail="Shared file is no longer available.")
+    if os.path.isdir(unc):
+        raise HTTPException(status_code=400, detail="Shared path is a directory.")
+    filename = str(item.get("file_name") or os.path.basename(wsl_abs.rstrip("/")) or "download.bin")
+    return FileResponse(unc, filename=filename)
+
+
 @app.get("/wsl/file")
 def wsl_file(path: str):
     wsl_abs = _resolve_wsl_path(path)

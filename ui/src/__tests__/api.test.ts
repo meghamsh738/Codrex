@@ -1,5 +1,13 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { applySessionProfile, buildPairConsumeUrl, buildPairQrPngUrl, buildSuggestedControllerUrl } from "../api";
+import {
+  applySessionProfile,
+  buildPairConsumeUrl,
+  buildPairQrPngUrl,
+  buildSuggestedControllerUrl,
+  createSharedFile,
+  deleteSharedFile,
+  listSharedFiles,
+} from "../api";
 
 describe("pairing URL helpers", () => {
   it("builds consume link from plain host", () => {
@@ -82,5 +90,76 @@ describe("session profile apply API", () => {
         }),
       }),
     );
+  });
+});
+
+describe("shared files API", () => {
+  const fetchMock = vi.fn();
+
+  beforeEach(() => {
+    vi.stubGlobal("fetch", fetchMock);
+  });
+
+  afterEach(() => {
+    fetchMock.mockReset();
+    vi.unstubAllGlobals();
+  });
+
+  it("lists shared files", async () => {
+    fetchMock.mockResolvedValue({
+      ok: true,
+      status: 200,
+      text: async () => JSON.stringify({ ok: true, items: [] }),
+    });
+    const out = await listSharedFiles();
+    expect(out.ok).toBe(true);
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/shares",
+      expect.objectContaining({
+        credentials: "include",
+      }),
+    );
+  });
+
+  it("creates shared file with payload", async () => {
+    fetchMock.mockResolvedValue({
+      ok: true,
+      status: 200,
+      text: async () => JSON.stringify({ ok: true, item: { id: "shr_1" } }),
+    });
+    const out = await createSharedFile({
+      path: "/home/megha/codrex-work/out/image.png",
+      title: "Image",
+      expires_hours: 24,
+      created_by: "session:codex_demo",
+    });
+    expect(out.ok).toBe(true);
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/shares",
+      expect.objectContaining({
+        method: "POST",
+        credentials: "include",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          path: "/home/megha/codrex-work/out/image.png",
+          title: "Image",
+          expires_hours: 24,
+          created_by: "session:codex_demo",
+        }),
+      }),
+    );
+  });
+
+  it("deletes shared file by id", async () => {
+    fetchMock.mockResolvedValue({
+      ok: true,
+      status: 200,
+      text: async () => JSON.stringify({ ok: true }),
+    });
+    const out = await deleteSharedFile("shr_123");
+    expect(out.ok).toBe(true);
+    expect(fetchMock).toHaveBeenCalledWith("/shares/shr_123", expect.objectContaining({ method: "DELETE" }));
   });
 });

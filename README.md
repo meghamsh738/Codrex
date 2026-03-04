@@ -71,6 +71,7 @@ Current slice focuses on:
 - Refined visual system (cleaner typography, spacing rhythm, and card hierarchy)
 - Unified branding via app icon in header + install surfaces
 - Android PWA icon set (any + maskable + apple-touch) for native-style install polish
+- Shared Files Inbox with deterministic `codrex-send` command interception and mobile download links
 
 Run it:
 
@@ -88,6 +89,24 @@ Notes:
 - Set `VITE_BACKEND_ORIGIN` if your backend is running on another host/port.
 - Legacy UI remains available at `http://127.0.0.1:8787/?compact=1`.
 - If the app was already installed before icon updates, uninstall/reinstall once so Android refreshes cached manifest assets.
+
+### Deterministic File Sharing (Recommended)
+
+You can share files to phone/tablet inbox without relying on prompt memory:
+
+- In a Codex session composer, run:
+  - `codrex-send "/home/megha/codrex-work/output/result.png" --title "Result" --expires 24`
+- The backend intercepts this command and writes a share entry to outbox.
+- Mobile WebUI shows it under **Shared Files Inbox** with:
+  - open/download,
+  - copy link,
+  - remove.
+
+Supported command aliases:
+- `codrex-send ...`
+- `/codrex-send ...`
+- `/send-file ...`
+- `/share-file ...`
 
 ### One-Command Mobile Start (Windows)
 

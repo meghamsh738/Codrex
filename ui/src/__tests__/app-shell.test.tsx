@@ -18,6 +18,7 @@ vi.mock("../api", async (importOriginal) => {
     closeSession: vi.fn(),
     closeTmuxSession: vi.fn(),
     createPairCode: vi.fn(),
+    createSharedFile: vi.fn(),
     createSessionWithOptions: vi.fn(),
     createTmuxSession: vi.fn(),
     ctrlcSession: vi.fn(),
@@ -42,7 +43,9 @@ vi.mock("../api", async (importOriginal) => {
     interruptSession: vi.fn(),
     login: vi.fn(),
     logout: vi.fn(),
+    listSharedFiles: vi.fn(),
     reportIpcEvent: vi.fn(),
+    deleteSharedFile: vi.fn(),
     sendSessionImage: vi.fn(),
     addThreadRecordMessage: vi.fn(),
     createThreadRecord: vi.fn(),
@@ -66,6 +69,9 @@ const getSessionsMock = vi.mocked(api.getSessions);
 const getSessionScreenMock = vi.mocked(api.getSessionScreen);
 const getThreadStoreMock = vi.mocked(api.getThreadStore);
 const createSessionMock = vi.mocked(api.createSessionWithOptions);
+const createSharedFileMock = vi.mocked(api.createSharedFile);
+const deleteSharedFileMock = vi.mocked(api.deleteSharedFile);
+const listSharedFilesMock = vi.mocked(api.listSharedFiles);
 const createThreadRecordMock = vi.mocked(api.createThreadRecord);
 const updateThreadRecordMock = vi.mocked(api.updateThreadRecord);
 const deleteThreadRecordMock = vi.mocked(api.deleteThreadRecord);
@@ -142,6 +148,10 @@ function setupDefaultMocks(): void {
     ok: true,
     text: "",
   });
+  listSharedFilesMock.mockResolvedValue({
+    ok: true,
+    items: [],
+  });
   getThreadStoreMock.mockResolvedValue({
     ok: true,
     threads: [],
@@ -167,6 +177,23 @@ function setupDefaultMocks(): void {
   });
 
   createSessionMock.mockResolvedValue({ ok: true, session: "dev-main" });
+  createSharedFileMock.mockResolvedValue({
+    ok: true,
+    item: {
+      id: "shr_1",
+      title: "Shared",
+      file_name: "demo.png",
+      mime_type: "image/png",
+      size_bytes: 1024,
+      created_at: Date.now(),
+      expires_at: Date.now() + 24 * 3600 * 1000,
+      created_by: "session:codex_demo",
+      is_image: true,
+      wsl_path: "/home/megha/codrex-work/demo.png",
+      download_url: "/share/file/shr_1",
+    },
+  });
+  deleteSharedFileMock.mockResolvedValue({ ok: true });
   loginMock.mockResolvedValue({ ok: true });
   bootstrapLocalAuthMock.mockResolvedValue({
     ok: false,
@@ -434,6 +461,46 @@ describe("app shell tabs", () => {
     const latestCall = sendToSessionMock.mock.calls.at(-1);
     expect(latestCall?.[0]).toBe("codex_demo");
     expect(latestCall?.[1]).toBe("Create a release checklist");
+  });
+
+  it("creates a shared file from sessions panel", async () => {
+    getSessionsMock.mockResolvedValue({
+      ok: true,
+      sessions: [
+        {
+          session: "codex_demo",
+          pane_id: "%1",
+          current_command: "codex",
+          cwd: "/home/megha/work",
+          state: "idle",
+          updated_at: Date.now(),
+          snippet: "",
+        },
+      ],
+    });
+
+    render(<App />);
+    await screen.findByTestId("shared-files-card");
+
+    fireEvent.change(screen.getByTestId("share-path-input"), {
+      target: { value: "/home/megha/codrex-work/output/result.png" },
+    });
+    fireEvent.change(screen.getByTestId("share-title-input"), {
+      target: { value: "Result Plot" },
+    });
+    fireEvent.change(screen.getByTestId("share-expiry-select"), {
+      target: { value: "72" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Share Now" }));
+
+    await waitFor(() => {
+      expect(createSharedFileMock).toHaveBeenCalledWith({
+        path: "/home/megha/codrex-work/output/result.png",
+        title: "Result Plot",
+        expires_hours: 72,
+        created_by: "session:codex_demo",
+      });
+    });
   });
 
   it("enables live output automatically when creating a session", async () => {

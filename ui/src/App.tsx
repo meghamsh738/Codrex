@@ -13,6 +13,7 @@ import {
   closeTmuxSession,
   createThreadRecord,
   createSessionWithOptions,
+  createSharedFile,
   createTmuxSession,
   createPairCode,
   deleteThreadRecord,
@@ -29,6 +30,7 @@ import {
   getCodexRun,
   getCodexRuns,
   getNetInfo,
+  listSharedFiles,
   getThreadStore,
   getTmuxHealth,
   getTmuxPaneScreen,
@@ -40,6 +42,7 @@ import {
   login,
   logout,
   reportIpcEvent,
+  deleteSharedFile,
   sendSessionImage,
   sendToPane,
   sendToSession,
@@ -55,6 +58,7 @@ import type {
   CodexRunSummary,
   DesktopInfoResult,
   NetInfo,
+  SharedFileInfo,
   SessionInfo,
   ThreadInfo,
   ThreadMessageInfo,
@@ -234,6 +238,20 @@ function formatClock(tsMs: number): string {
   } catch {
     return "";
   }
+}
+
+function formatFileSize(bytes: number): string {
+  const value = Number.isFinite(bytes) ? Math.max(0, bytes) : 0;
+  if (value < 1024) {
+    return `${value} B`;
+  }
+  if (value < 1024 * 1024) {
+    return `${(value / 1024).toFixed(1)} KB`;
+  }
+  if (value < 1024 * 1024 * 1024) {
+    return `${(value / (1024 * 1024)).toFixed(1)} MB`;
+  }
+  return `${(value / (1024 * 1024 * 1024)).toFixed(1)} GB`;
 }
 
 function parseThemeMode(raw: string): ThemeMode {
@@ -577,6 +595,12 @@ export default function App() {
   const [sessionImageDeliveryMode, setSessionImageDeliveryMode] = useState<SessionImageDeliveryMode>(() =>
     parseSessionImageDeliveryMode(safeStorageGet(IMAGE_DELIVERY_MODE_STORAGE)),
   );
+  const [sharedFiles, setSharedFiles] = useState<SharedFileInfo[]>([]);
+  const [sharesLoading, setSharesLoading] = useState(true);
+  const [shareBusy, setShareBusy] = useState(false);
+  const [sharePathInput, setSharePathInput] = useState("");
+  const [shareTitleInput, setShareTitleInput] = useState("");
+  const [shareExpiresHours, setShareExpiresHours] = useState("24");
   const [consoleFocusMode, setConsoleFocusMode] = useState(false);
 
   const [threads, setThreads] = useState<ChatThread[]>(() => {
@@ -1004,6 +1028,20 @@ export default function App() {
     }
   }, [setError, setStatus]);
 
+  const refreshSharedFiles = useCallback(async () => {
+    try {
+      const response = await listSharedFiles();
+      if (!response.ok) {
+        throw new Error(response.detail || response.error || "Failed to read shared files.");
+      }
+      setSharedFiles(response.items || []);
+    } catch (error) {
+      addEvent("error", `Could not load shared files: ${(error as Error).message}`);
+    } finally {
+      setSharesLoading(false);
+    }
+  }, [addEvent]);
+
   const refreshThreads = useCallback(async () => {
     try {
       let response = await getThreadStore();
@@ -1185,6 +1223,7 @@ export default function App() {
         refreshCodexOptions(),
         refreshNet(),
         refreshSessions(),
+        refreshSharedFiles(),
         refreshThreads(),
         refreshDebugRuns(),
         refreshTmuxState(),
@@ -1192,7 +1231,7 @@ export default function App() {
       ]);
       setStatus("Connected. Ready.");
     })();
-  }, [refreshAuth, refreshCodexOptions, refreshDebugRuns, refreshDesktopState, refreshNet, refreshSessions, refreshThreads, refreshTmuxState, setStatus]);
+  }, [refreshAuth, refreshCodexOptions, refreshDebugRuns, refreshDesktopState, refreshNet, refreshSessions, refreshSharedFiles, refreshThreads, refreshTmuxState, setStatus]);
 
   useEffect(() => {
     if (typeof window === "undefined") {
@@ -1476,6 +1515,7 @@ export default function App() {
         if (selectedSession && !liveStreamActive) {
           void refreshScreen(selectedSession);
         }
+        void refreshSharedFiles();
       }
 
       if (activeTab === "debug") {
@@ -1504,6 +1544,7 @@ export default function App() {
     refreshRunDetail,
     refreshScreen,
     refreshSessions,
+    refreshSharedFiles,
     refreshThreads,
     refreshTmuxScreen,
     refreshTmuxState,
@@ -1849,6 +1890,7 @@ export default function App() {
       refreshCodexOptions(),
       refreshNet(),
       refreshSessions(),
+      refreshSharedFiles(),
       refreshThreads(),
       refreshDebugRuns(),
       refreshTmuxState(),
@@ -1864,7 +1906,7 @@ export default function App() {
       await refreshRunDetail(selectedRunId);
     }
     setStatus("Synced.");
-  }, [refreshAuth, refreshCodexOptions, refreshDebugRuns, refreshDesktopState, refreshNet, refreshRunDetail, refreshScreen, refreshSessions, refreshThreads, refreshTmuxScreen, refreshTmuxState, selectedRunId, selectedSession, selectedTmuxPane, setStatus]);
+  }, [refreshAuth, refreshCodexOptions, refreshDebugRuns, refreshDesktopState, refreshNet, refreshRunDetail, refreshScreen, refreshSessions, refreshSharedFiles, refreshThreads, refreshTmuxScreen, refreshTmuxState, selectedRunId, selectedSession, selectedTmuxPane, setStatus]);
 
   const onLogin = useCallback(async () => {
     if (!tokenInput.trim()) {
@@ -2082,6 +2124,13 @@ export default function App() {
       if (!response.ok) {
         throw new Error(response.detail || response.error || "Prompt send failed.");
       }
+      if (response.shared_file) {
+        setPromptText("");
+        setStatus(`Shared ${response.shared_file.file_name} to mobile inbox.`);
+        await refreshSharedFiles();
+        await refreshSessions();
+        return;
+      }
       setPromptText("");
       const threadId = await ensureThreadForSession(selectedSession, userPrompt);
       if (threadId) {
@@ -2106,7 +2155,7 @@ export default function App() {
     } finally {
       setSessionBusy(false);
     }
-  }, [addThreadMessage, captureAssistantSnapshot, ensureThreadForSession, promptText, refreshScreen, refreshSessions, selectedSession, setError, setStatus, syncThreadMessage]);
+  }, [addThreadMessage, captureAssistantSnapshot, ensureThreadForSession, promptText, refreshScreen, refreshSessions, refreshSharedFiles, selectedSession, setError, setStatus, syncThreadMessage]);
 
   const onSendEnter = useCallback(async () => {
     if (!selectedSession) {
@@ -2260,6 +2309,94 @@ export default function App() {
     setError,
     setStatus,
   ]);
+
+  const onCreateSharedFile = useCallback(async () => {
+    const path = sharePathInput.trim();
+    if (!path) {
+      setError("Enter a file path to share.");
+      return;
+    }
+    const expires = Number.parseInt(shareExpiresHours, 10);
+    if (!Number.isFinite(expires) || expires <= 0) {
+      setError("Expiry must be a positive number of hours.");
+      return;
+    }
+    setShareBusy(true);
+    try {
+      const response = await createSharedFile({
+        path,
+        title: shareTitleInput.trim() || undefined,
+        expires_hours: expires,
+        created_by: selectedSession ? `session:${selectedSession}` : "manual",
+      });
+      if (!response.ok || !response.item) {
+        throw new Error(response.detail || response.error || "Share creation failed.");
+      }
+      setSharePathInput("");
+      setShareTitleInput("");
+      setStatus(`Shared ${response.item.file_name}.`);
+      await refreshSharedFiles();
+    } catch (error) {
+      setError(`Share failed: ${(error as Error).message}`);
+    } finally {
+      setShareBusy(false);
+    }
+  }, [refreshSharedFiles, selectedSession, setError, setStatus, shareExpiresHours, sharePathInput, shareTitleInput]);
+
+  const onDeleteSharedFile = useCallback(async (itemId: string) => {
+    if (!itemId) {
+      return;
+    }
+    setShareBusy(true);
+    try {
+      const response = await deleteSharedFile(itemId);
+      if (!response.ok) {
+        throw new Error(response.detail || response.error || "Delete failed.");
+      }
+      setStatus("Shared file removed.");
+      await refreshSharedFiles();
+    } catch (error) {
+      setError(`Delete failed: ${(error as Error).message}`);
+    } finally {
+      setShareBusy(false);
+    }
+  }, [refreshSharedFiles, setError, setStatus]);
+
+  const onCopyShareCommand = useCallback(async () => {
+    const path = sharePathInput.trim();
+    if (!path) {
+      setError("Enter a path first to build command.");
+      return;
+    }
+    const parts: string[] = [`codrex-send "${path.replace(/"/g, '\\"')}"`];
+    if (shareTitleInput.trim()) {
+      parts.push(`--title "${shareTitleInput.trim().replace(/"/g, '\\"')}"`);
+    }
+    const expires = Number.parseInt(shareExpiresHours, 10);
+    if (Number.isFinite(expires) && expires > 0) {
+      parts.push(`--expires ${expires}`);
+    }
+    const cmd = parts.join(" ");
+    try {
+      await navigator.clipboard.writeText(cmd);
+      setStatus("Share command copied.");
+    } catch (error) {
+      setError(`Could not copy command: ${(error as Error).message}`);
+    }
+  }, [setError, setStatus, shareExpiresHours, sharePathInput, shareTitleInput]);
+
+  const onCopyShareLink = useCallback(async (item: SharedFileInfo) => {
+    const base = (controllerBase || "").trim() || (typeof window !== "undefined" ? window.location.origin : "");
+    const normalizedBase = base.replace(/\/$/, "");
+    const path = item.download_url.startsWith("/") ? item.download_url : `/${item.download_url}`;
+    const full = `${normalizedBase}${path}`;
+    try {
+      await navigator.clipboard.writeText(full);
+      setStatus("Share link copied.");
+    } catch (error) {
+      setError(`Could not copy share link: ${(error as Error).message}`);
+    }
+  }, [controllerBase, setError, setStatus]);
 
   const onApplySessionProfile = useCallback(async () => {
     if (!selectedSession) {
@@ -3192,6 +3329,94 @@ export default function App() {
                             ? "Requires Codex input focused on laptop; copies image to clipboard and sends Ctrl+V."
                             : "Sends a path message directly to session transcript and submits immediately."}
                       </p>
+                    </div>
+
+                    <div className="quick-open-card" data-testid="shared-files-card">
+                      <h3>Shared Files Inbox</h3>
+                      <p className="small">
+                        Deterministic route: send `codrex-send` command instead of relying on model memory.
+                      </p>
+                      <div className="row">
+                        <input
+                          type="text"
+                          data-testid="share-path-input"
+                          value={sharePathInput}
+                          onChange={(event) => setSharePathInput(event.target.value)}
+                          placeholder="/home/megha/codrex-work/output/result.png"
+                        />
+                        <input
+                          type="text"
+                          data-testid="share-title-input"
+                          value={shareTitleInput}
+                          onChange={(event) => setShareTitleInput(event.target.value)}
+                          placeholder="Optional title"
+                        />
+                        <label className="field inline">
+                          <span>Expires</span>
+                          <select
+                            data-testid="share-expiry-select"
+                            value={shareExpiresHours}
+                            onChange={(event) => setShareExpiresHours(event.target.value)}
+                          >
+                            <option value="1">1h</option>
+                            <option value="24">24h</option>
+                            <option value="72">72h</option>
+                            <option value="168">7d</option>
+                          </select>
+                        </label>
+                      </div>
+                      <div className="row">
+                        <button type="button" className="button soft" onClick={() => void onCopyShareCommand()}>
+                          Copy `codrex-send`
+                        </button>
+                        <button type="button" className="button soft" onClick={() => void onCreateSharedFile()} disabled={shareBusy || !sharePathInput.trim()}>
+                          Share Now
+                        </button>
+                        <button type="button" className="button soft" onClick={() => void refreshSharedFiles()}>
+                          Refresh Inbox
+                        </button>
+                      </div>
+                      <p className="small">
+                        Example: <code>codrex-send "/home/megha/codrex-work/output/result.png" --title "Result" --expires 24</code>
+                      </p>
+                      {sharesLoading ? <p className="small">Loading shared files...</p> : null}
+                      {!sharesLoading && sharedFiles.length === 0 ? (
+                        <div className="empty-state panel-empty">
+                          <h3>No shared files yet</h3>
+                          <p>Run `codrex-send` from prompt composer or use Share Now above.</p>
+                        </div>
+                      ) : null}
+                      {!sharesLoading && sharedFiles.length > 0 ? (
+                        <div className="run-list" role="list" aria-label="Shared files inbox">
+                          {sharedFiles.map((item) => (
+                            <div key={item.id} className="run-item">
+                              <div className="session-row">
+                                <strong>{item.title || item.file_name}</strong>
+                                <span className="badge muted">{formatFileSize(item.size_bytes)}</span>
+                              </div>
+                              <p>{item.file_name}</p>
+                              <small>
+                                Added {formatClock(item.created_at)} | Expires {new Date(item.expires_at).toLocaleString()}
+                              </small>
+                              <div className="row">
+                                <button
+                                  type="button"
+                                  className="button soft"
+                                  onClick={() => window.open(item.download_url, "_blank", "noopener,noreferrer")}
+                                >
+                                  Open
+                                </button>
+                                <button type="button" className="button soft" onClick={() => void onCopyShareLink(item)}>
+                                  Copy Link
+                                </button>
+                                <button type="button" className="button danger" onClick={() => void onDeleteSharedFile(item.id)} disabled={shareBusy}>
+                                  Remove
+                                </button>
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      ) : null}
                     </div>
 
                     <label className="field">

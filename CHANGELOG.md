@@ -4,6 +4,26 @@ All notable changes to this project are documented in this file.
 
 The format follows Keep a Changelog and the project uses Semantic Versioning.
 
+## [Unreleased]
+
+### Added
+- Deterministic shared-file outbox APIs:
+  - `GET /shares`
+  - `POST /shares`
+  - `DELETE /shares/{share_id}`
+  - `GET /share/file/{share_id}`
+- Codex session command interception for share commands:
+  - `codrex-send <path> [--title ...] [--expires <hours>]`
+  - aliases: `/codrex-send`, `/send-file`, `/share-file`
+- New **Shared Files Inbox** panel in Sessions tab with:
+  - direct share creation,
+  - command copy helper,
+  - open/copy-link/remove actions.
+
+### Changed
+- Vite dev/preview proxy now includes `/shares` and `/share` routes.
+- Expanded backend/unit and UI/API test coverage for the outbox flow.
+
 ## [1.4.1] - 2026-03-04
 
 ### Added

@@ -6,10 +6,31 @@ export interface AuthStatus {
   authenticated: boolean;
 }
 
+export interface SharedFileInfo {
+  id: string;
+  title: string;
+  file_name: string;
+  mime_type: string;
+  size_bytes: number;
+  created_at: number;
+  expires_at: number;
+  created_by?: string;
+  is_image?: boolean;
+  wsl_path: string;
+  download_url: string;
+}
+
 export interface BasicResult {
   ok: boolean;
   error?: string;
   detail?: string;
+  shared_file?: SharedFileInfo;
+}
+
+export interface SharedFilesResult extends BasicResult {
+  items?: SharedFileInfo[];
+  item?: SharedFileInfo;
+  share_id?: string;
 }
 
 export interface NetInfo {
