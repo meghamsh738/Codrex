@@ -626,7 +626,6 @@ export default function App() {
   const [sharePathInput, setSharePathInput] = useState("");
   const [shareTitleInput, setShareTitleInput] = useState("");
   const [shareExpiresHours, setShareExpiresHours] = useState("24");
-  const [consoleFocusMode, setConsoleFocusMode] = useState(false);
 
   const [threads, setThreads] = useState<ChatThread[]>(() => {
     const stored = parseThreads(safeStorageGet(THREADS_STORAGE));
@@ -1467,9 +1466,6 @@ export default function App() {
     const ignoreSelector = "input, textarea, select, button, a, label, [role='button']";
 
     const beginSwipe = (x: number, y: number, target: Element | null) => {
-      if (consoleFocusMode) {
-        return;
-      }
       if (target?.closest(ignoreSelector)) {
         return;
       }
@@ -1551,7 +1547,7 @@ export default function App() {
       node.removeEventListener("touchend", onTouchEnd);
       node.removeEventListener("touchcancel", onPointerCancel);
     };
-  }, [activeTab, addEvent, consoleFocusMode]);
+  }, [activeTab, addEvent]);
 
   useEffect(() => {
     const intervalMs = activeTab === "remote" ? 3500 : 2500;
@@ -1623,12 +1619,6 @@ export default function App() {
     }
     void refreshTmuxScreen(selectedTmuxPane);
   }, [refreshTmuxScreen, selectedTmuxPane]);
-
-  useEffect(() => {
-    if (activeTab !== "sessions" || !selectedSession) {
-      setConsoleFocusMode(false);
-    }
-  }, [activeTab, selectedSession]);
 
   useEffect(() => {
     if (showSwipeHint) {
@@ -1929,7 +1919,6 @@ export default function App() {
         : installState === "prompting"
           ? "Installing..."
           : "Install Help";
-  const focusButtonLabel = consoleFocusMode ? "Exit Focus" : "Focus Console";
   const screenCardClassName = `card screen-card ${tabTransitionClass}`;
 
   const onHardRefresh = useCallback(async () => {
@@ -3364,7 +3353,7 @@ export default function App() {
                   : filteredSessions.map((session) => renderSessionButton(session))}
               </div>
 
-              <div className={`session-detail ${consoleFocusMode ? "console-focus-mode" : ""}`} data-testid="session-detail">
+              <div className="session-detail" data-testid="session-detail">
                 {!selectedSessionInfo ? (
                   <div className="empty-state">
                     <h3>Select or create a session</h3>
@@ -3414,14 +3403,6 @@ export default function App() {
                           <option value="battery">Battery</option>
                         </select>
                       </label>
-                      <button
-                        type="button"
-                        className="button soft compact"
-                        data-testid="toggle-console-focus"
-                        onClick={() => setConsoleFocusMode((current) => !current)}
-                      >
-                        {focusButtonLabel}
-                      </button>
                     </div>
 
                     <div className="prompt-composer">
@@ -3610,9 +3591,6 @@ export default function App() {
                       </button>
                       <button type="button" className="button danger compact" data-short="CLS" onClick={() => void onCloseSession()} disabled={sessionBusy}>
                         <span className="btn-text">Close</span>
-                      </button>
-                      <button type="button" className="button soft compact" data-short={consoleFocusMode ? "EXIT" : "FOC"} onClick={() => setConsoleFocusMode((current) => !current)}>
-                        <span className="btn-text">{consoleFocusMode ? "Exit Focus Mode" : "Focus Console"}</span>
                       </button>
                     </div>
 
@@ -4043,7 +4021,7 @@ export default function App() {
                     </strong>
                   </p>
                   <p className="small">{desktopStatus || "Desktop controls are available only on Windows host."}</p>
-                  <div className="pair-qr-wrap">
+                  <div className="stream-wrap">
                     <img
                       ref={desktopFrameRef}
                       className="desktop-frame"

@@ -958,15 +958,6 @@ button:active,
   position: relative;
 }
 
-.session-detail.console-focus-mode {
-  position: fixed;
-  inset: 8px 8px calc(env(safe-area-inset-bottom) + 88px) 8px;
-  z-index: 22;
-  border-color: color-mix(in srgb, var(--brand-accent) 52%, var(--border) 48%);
-  box-shadow: var(--shadow-2);
-  background: linear-gradient(160deg, color-mix(in srgb, var(--surface-soft) 95%, transparent), color-mix(in srgb, var(--surface) 99%, transparent));
-}
-
 .detail-head {
   display: flex;
   justify-content: space-between;
@@ -1224,18 +1215,11 @@ button:active,
   .button.compact[data-short]::after {
     content: none;
   }
-}
 
-.session-detail.console-focus-mode .detail-head .row,
-.session-detail.console-focus-mode .control-panel,
-.session-detail.console-focus-mode .quick-actions,
-.session-detail.console-focus-mode .quick-open-card {
-  display: none;
-}
-
-.session-detail.console-focus-mode .console {
-  min-height: 58dvh;
-  max-height: 70dvh;
+  .desktop-frame {
+    min-height: 34vh;
+    max-height: 66vh;
+  }
 }
 
 .empty-state {
@@ -1277,6 +1261,15 @@ button:active,
   background: color-mix(in srgb, var(--surface) 95%, transparent);
 }
 
+.stream-wrap {
+  display: block;
+  width: 100%;
+  border-radius: var(--radius-m);
+  overflow: hidden;
+  border: 1px solid var(--border);
+  background: #030d1f;
+}
+
 .qr {
   width: min(270px, 76vw);
   border: 1px solid var(--border);
@@ -1288,7 +1281,8 @@ button:active,
 .desktop-frame {
   width: 100%;
   max-width: 100%;
-  max-height: 52vh;
+  max-height: min(82vh, 1200px);
+  min-height: 48vh;
   border: 1px solid var(--border-strong);
   border-radius: var(--radius-m);
   background: #0b1220;
@@ -1321,6 +1315,29 @@ button:active,
 .debug-layout.full-width .debug-column,
 .debug-layout.full-width .debug-block {
   width: 100%;
+}
+
+[data-testid="tab-panel-remote"] .debug-layout,
+[data-testid="tab-panel-threads"] .debug-layout {
+  display: block;
+}
+
+[data-testid="tab-panel-remote"] .debug-column,
+[data-testid="tab-panel-threads"] .debug-column {
+  display: block;
+}
+
+[data-testid="tab-panel-remote"] .debug-block,
+[data-testid="tab-panel-threads"] .debug-block {
+  border: none;
+  background: transparent;
+  padding: 0;
+  box-shadow: none;
+  gap: 10px;
+}
+
+[data-testid="tab-panel-threads"] .console {
+  max-height: 62vh;
 }
 
 .debug-layout > :only-child {
@@ -1695,10 +1712,6 @@ button.event-item:hover {
     background: linear-gradient(170deg, color-mix(in srgb, var(--surface-soft) 95%, transparent), color-mix(in srgb, var(--surface) 96%, transparent));
     backdrop-filter: none;
     box-shadow: none;
-  }
-
-  .session-detail.console-focus-mode {
-    inset: 16px 16px 20px 16px;
   }
 
   .swipe-hint {

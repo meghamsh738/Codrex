@@ -676,7 +676,7 @@ describe("app shell tabs", () => {
     });
   });
 
-  it("toggles console focus mode and sends prompt from composer send icon", async () => {
+  it("sends prompt from composer send icon", async () => {
     getSessionsMock.mockResolvedValue({
       ok: true,
       sessions: [
@@ -695,8 +695,6 @@ describe("app shell tabs", () => {
     render(<App />);
 
     expect(await screen.findByText("Prompt Composer")).toBeInTheDocument();
-    fireEvent.click(screen.getByTestId("toggle-console-focus"));
-    expect(screen.getByTestId("session-detail")).toHaveClass("console-focus-mode");
 
     fireEvent.change(screen.getByPlaceholderText("Type your prompt. Codrex will send Enter + Enter to submit."), {
       target: { value: "Review latest logs and summarize key errors." },
