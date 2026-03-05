@@ -47,6 +47,7 @@ import {
   sendSharedFileToTelegram,
   deleteSharedFile,
   sendSessionImage,
+  sendToPaneKey,
   sendToPane,
   sendToSession,
   setDesktopMode,
@@ -675,7 +676,7 @@ export default function App() {
   const [tmuxPrompt, setTmuxPrompt] = useState("");
   const [tmuxScreenText, setTmuxScreenText] = useState("");
   const [tmuxBusy, setTmuxBusy] = useState(false);
-  const showLegacyThreadTools = false;
+  const [showLegacyThreadTools, setShowLegacyThreadTools] = useState(false);
 
   const [desktopInfo, setDesktopInfo] = useState<DesktopInfoResult | null>(null);
   const [desktopEnabled, setDesktopEnabled] = useState(false);
@@ -1898,6 +1899,7 @@ export default function App() {
   const visibleSessionCountLabel = `${filteredSessions.length} visible`;
   const runningRuns = debugRuns.filter((run) => run.status === "running").length;
   const totalEvents = eventLog.length;
+  const errorEvents = eventLog.filter((evt) => evt.level === "error").length;
   const controlProfileSummary = `${selectedModel} | ${selectedReasoningEffort}`;
   const resolvedTheme = themeMode === "system" ? (prefersDarkTheme ? "dark" : "light") : themeMode;
   const controllerRouteKind = classifyControllerRoute(controllerBase, netInfo);
@@ -1917,9 +1919,23 @@ export default function App() {
         : controllerRouteKind === "localhost"
           ? "Phone/tablet cannot reach localhost. Use LAN or Tailscale."
           : "Set a valid base URL before generating pairing QR.";
+  const controllerRouteSeverity =
+    controllerRouteKind === "tailscale"
+      ? "ok"
+      : controllerRouteKind === "lan"
+        ? "caution"
+        : "warn";
   const outputFeedSummary = streamEnabled ? `${outputFeedState} / ${streamProfile}` : "polling only";
   const connectivitySummary = isOnline ? "Online" : "Offline";
   const installSummary = installState === "installed" ? "Installed" : installPromptEvent ? "Ready" : "Browser Menu";
+  const remoteControlSummary = desktopEnabled ? "Control enabled" : "View-only mode";
+  const statusSnapshotSummary = errorMessage
+    ? "Action required"
+    : statusMessage.startsWith("Install ")
+      ? "Install flow update"
+      : statusMessage === "Ready."
+        ? "Ready"
+        : statusMessage;
   const canSendPrompt = promptText.trim().length > 0;
   const installButtonLabel =
     installState === "installed"
@@ -2161,6 +2177,45 @@ export default function App() {
     refreshScreen,
     refreshSessions,
     reasoningEffortOptions,
+    selectedModel,
+    selectedReasoningEffort,
+    setError,
+    setStatus,
+  ]);
+
+  const onResumeLastSession = useCallback(async () => {
+    setSessionBusy(true);
+    try {
+      const response = await createSessionWithOptions({
+        name: newSessionName.trim(),
+        cwd: newSessionCwd.trim(),
+        model: selectedModel,
+        reasoning_effort: clampReasoningForModel(selectedModel, selectedReasoningEffort, reasoningEffortOptions),
+        resume_last: true,
+      });
+      if (!response.ok || !response.session) {
+        throw new Error(response.detail || response.error || "Could not start resume session.");
+      }
+      setNewSessionName("");
+      setNewSessionCwd("");
+      setSelectedSession(response.session);
+      setStreamEnabled(true);
+      setOutputFeedState("polling");
+      await refreshSessions();
+      await refreshScreen(response.session);
+      setActiveTab("sessions");
+      setStatus(`Started ${response.session} in resume-last mode.`);
+    } catch (error) {
+      setError(`Resume last failed: ${(error as Error).message}`);
+    } finally {
+      setSessionBusy(false);
+    }
+  }, [
+    newSessionCwd,
+    newSessionName,
+    reasoningEffortOptions,
+    refreshScreen,
+    refreshSessions,
     selectedModel,
     selectedReasoningEffort,
     setError,
@@ -2793,6 +2848,46 @@ export default function App() {
     }
   }, [refreshTmuxScreen, selectedTmuxPane, setError, setStatus, tmuxPrompt]);
 
+  const onSendTmuxKey = useCallback(async (key: "up" | "down" | "left" | "right" | "enter") => {
+    if (!selectedTmuxPane) {
+      setError("Select a tmux pane first.");
+      return;
+    }
+    setTmuxBusy(true);
+    try {
+      const response = await sendToPaneKey(selectedTmuxPane, key);
+      if (!response.ok) {
+        throw new Error(response.detail || response.error || "tmux key failed.");
+      }
+      setStatus(`Sent ${key} key to pane.`);
+      await refreshTmuxScreen(selectedTmuxPane);
+    } catch (error) {
+      setError(`tmux key failed: ${(error as Error).message}`);
+    } finally {
+      setTmuxBusy(false);
+    }
+  }, [refreshTmuxScreen, selectedTmuxPane, setError, setStatus]);
+
+  const onResumeLastTmux = useCallback(async () => {
+    if (!selectedTmuxPane) {
+      setError("Select a tmux pane first.");
+      return;
+    }
+    setTmuxBusy(true);
+    try {
+      const response = await sendToPane(selectedTmuxPane, "codex resume --last");
+      if (!response.ok) {
+        throw new Error(response.detail || response.error || "tmux resume failed.");
+      }
+      setStatus("Sent `codex resume --last` to pane.");
+      await refreshTmuxScreen(selectedTmuxPane);
+    } catch (error) {
+      setError(`tmux resume failed: ${(error as Error).message}`);
+    } finally {
+      setTmuxBusy(false);
+    }
+  }, [refreshTmuxScreen, selectedTmuxPane, setError, setStatus]);
+
   const onInterruptTmuxPane = useCallback(async () => {
     if (!selectedTmuxPane) {
       setError("Select a tmux pane first.");
@@ -3087,6 +3182,7 @@ export default function App() {
   const renderSessionButton = useCallback(
     (session: SessionInfo) => {
       const selected = session.session === selectedSession;
+      const project = inferProjectFromCwd(session.cwd);
       return (
         <button
           key={session.session}
@@ -3098,8 +3194,13 @@ export default function App() {
             <strong>{session.session}</strong>
             <span className={`state state-${session.state}`}>{session.state}</span>
           </div>
-          <p>{session.snippet || "No output yet."}</p>
-          <small>{session.cwd || "Unknown cwd"}</small>
+          <p className="session-snippet">{session.snippet || "No output yet."}</p>
+          <small className="session-meta">
+            <span>{project}</span>
+            <span>{session.model || "default model"}</span>
+            <span>{session.reasoning_effort || "default reasoning"}</span>
+          </small>
+          <small className="session-cwd">{session.cwd || "Unknown cwd"}</small>
         </button>
       );
     },
@@ -3160,6 +3261,81 @@ export default function App() {
     );
   }, []);
 
+  const primaryActions =
+    activeTab === "sessions" ? (
+      <>
+        <button type="button" className="button compact" onClick={() => void onCreateSession()} disabled={sessionBusy}>
+          New Session
+        </button>
+        <button type="button" className="button soft compact" onClick={() => void refreshSessions()}>
+          Refresh List
+        </button>
+        <button type="button" className="button soft compact" onClick={() => setStreamEnabled((current) => !current)}>
+          {streamEnabled ? "Live Output On" : "Live Output Off"}
+        </button>
+      </>
+    ) : activeTab === "threads" ? (
+      <>
+        <button type="button" className="button compact" onClick={() => void refreshTmuxState()}>
+          Refresh Monitor
+        </button>
+        <button type="button" className="button soft compact" onClick={() => setShowLegacyThreadTools((current) => !current)}>
+          {showLegacyThreadTools ? "Hide Advanced Tools" : "Show Advanced Tools"}
+        </button>
+        <button type="button" className="button soft compact" onClick={() => void onResumeLastTmux()} disabled={tmuxBusy || !selectedTmuxPane}>
+          Resume Last Pane
+        </button>
+      </>
+    ) : activeTab === "remote" ? (
+      <>
+        <button type="button" className={`button compact ${desktopEnabled ? "warn" : ""}`} onClick={() => void onToggleDesktopMode()}>
+          {desktopEnabled ? "Quick Disable Control" : "Quick Enable Control"}
+        </button>
+        <button type="button" className="button soft compact" onClick={onCaptureLatestShot}>
+          Capture Screen
+        </button>
+        <button type="button" className="button soft compact" onClick={() => void refreshDesktopState()}>
+          Refresh Remote
+        </button>
+      </>
+    ) : activeTab === "pair" ? (
+      <>
+        <button type="button" className="button compact" onClick={() => void onGeneratePairing()} disabled={pairBusy}>
+          {pairBusy ? "Quick Generating..." : "Quick Generate QR"}
+        </button>
+        <button type="button" className="button soft compact" onClick={() => void refreshNet()}>
+          Refresh Routes
+        </button>
+        <button type="button" className="button soft compact" onClick={() => void onPairExchange()} disabled={pairBusy || !pairCode}>
+          Exchange Here
+        </button>
+      </>
+    ) : activeTab === "settings" ? (
+      <>
+        <button type="button" className="button compact" onClick={() => void refreshAuth()}>
+          Refresh Auth
+        </button>
+        <button type="button" className="button soft compact" onClick={() => void refreshNet()}>
+          Refresh Network
+        </button>
+        <button type="button" className="button soft compact" onClick={() => setTouchComfortMode((current) => !current)}>
+          Touch Comfort: {touchComfortMode ? "On" : "Off"}
+        </button>
+      </>
+    ) : (
+      <>
+        <button type="button" className="button compact" onClick={() => void refreshDebugRuns()}>
+          Refresh Runs
+        </button>
+        <button type="button" className="button soft compact" onClick={onExportIpcHistory} disabled={ipcHistory.length === 0}>
+          Export IPC
+        </button>
+        <button type="button" className="button soft compact" onClick={onClearIpcHistory} disabled={ipcHistory.length === 0}>
+          Clear IPC
+        </button>
+      </>
+    );
+
   return (
     <div
       className={`app-shell${compactTranscript ? " compact-transcript" : ""}${touchComfortMode ? " touch-comfort" : ""}`}
@@ -3204,43 +3380,64 @@ export default function App() {
         ) : null}
       </header>
 
-      <section className="meta-strip">
-        <div className="meta-chip">
+      <section className="meta-strip primary">
+        <div className="meta-chip important">
           <span>Auth</span>
           <strong>{authSummary}</strong>
         </div>
-        <div className="meta-chip">
+        <div className="meta-chip important">
           <span>Network</span>
           <strong>{networkSummary}</strong>
         </div>
-        <div className="meta-chip">
+        <div className="meta-chip important">
           <span>Sessions</span>
           <strong>{sessionCountLabel}</strong>
         </div>
-        <div className="meta-chip">
-          <span>Debug</span>
-          <strong>{runningRuns} running | {totalEvents} events</strong>
-        </div>
-        <div className="meta-chip">
-          <span>Controls</span>
-          <strong>{controlProfileSummary}</strong>
-        </div>
-        <div className="meta-chip">
-          <span>Output</span>
-          <strong>{outputFeedSummary}</strong>
-        </div>
-        <div className="meta-chip">
-          <span>Connectivity</span>
-          <strong>{connectivitySummary} | {installSummary}</strong>
+        <div className="meta-chip important">
+          <span>Remote</span>
+          <strong>{remoteControlSummary}</strong>
         </div>
       </section>
 
+      <details className="meta-details">
+        <summary>System Snapshot</summary>
+        <div className="meta-strip secondary">
+          <div className="meta-chip">
+            <span>Status</span>
+            <strong>{statusSnapshotSummary}</strong>
+          </div>
+          <div className="meta-chip">
+            <span>Controls</span>
+            <strong>{controlProfileSummary}</strong>
+          </div>
+          <div className="meta-chip">
+            <span>Output</span>
+            <strong>{outputFeedSummary}</strong>
+          </div>
+          <div className="meta-chip">
+            <span>Debug</span>
+            <strong>{runningRuns} running | {totalEvents} events</strong>
+          </div>
+          <div className="meta-chip">
+            <span>Connectivity</span>
+            <strong>{connectivitySummary} | {installSummary}</strong>
+          </div>
+        </div>
+      </details>
+
       <section className="status-strip" aria-live="polite">
-        <span className="status-pill">{statusMessage}</span>
-        {errorMessage ? <span className="status-pill error">{errorMessage}</span> : null}
+        <span className={`status-pill ${errorMessage ? "error" : ""}`}>{errorMessage || statusMessage}</span>
+        <span className="status-pill subtle">{connectivitySummary} | {outputFeedSummary}</span>
       </section>
 
       <main className="screen-shell" ref={screenShellRef} data-testid="screen-shell">
+        <section className="action-strip" data-testid={`primary-actions-${activeTab}`}>
+          <div className="action-strip-head">
+            <strong>Primary Actions</strong>
+            <span className="small">Focused controls for this tab</span>
+          </div>
+          <div className="action-strip-grid">{primaryActions}</div>
+        </section>
         {showSwipeHint ? (
           <div className="swipe-hint" data-testid="swipe-hint">
             <p>
@@ -3261,7 +3458,7 @@ export default function App() {
             <div className="card-head">
               <h2>Codex Sessions</h2>
               <div className="row">
-                <span className="badge">Live polling</span>
+                <span className="badge">Output {outputFeedState}</span>
                 <span className="badge muted">{sessionCountLabel}</span>
               </div>
             </div>
@@ -3290,6 +3487,14 @@ export default function App() {
                     disabled={sessionBusy}
                   >
                     Create
+                  </button>
+                  <button
+                    type="button"
+                    className="button soft compact"
+                    onClick={() => void onResumeLastSession()}
+                    disabled={sessionBusy}
+                  >
+                    Resume Last
                   </button>
                 </div>
 
@@ -3672,6 +3877,22 @@ export default function App() {
               </div>
             </div>
 
+            <div className="quick-open-card compact-card">
+              <div className="row section-row">
+                <div className="stack">
+                  <h3>Advanced Utilities</h3>
+                  <p className="small">Legacy transcript tools and one-shot utilities are hidden by default.</p>
+                </div>
+                <button
+                  type="button"
+                  className="button soft compact"
+                  onClick={() => setShowLegacyThreadTools((current) => !current)}
+                >
+                  {showLegacyThreadTools ? "Hide Advanced Utilities" : "Show Advanced Utilities"}
+                </button>
+              </div>
+            </div>
+
             <div className="debug-layout full-width">
               <div className="debug-column">
                 <div className="debug-block">
@@ -3705,6 +3926,7 @@ export default function App() {
                   <label className="field">
                     <span>Pane</span>
                     <select
+                      data-testid="threads-pane-select"
                       value={selectedTmuxPane}
                       onChange={(event) => setSelectedTmuxPane(event.target.value)}
                     >
@@ -3723,11 +3945,31 @@ export default function App() {
                     <button type="button" className="button soft compact" onClick={() => void refreshTmuxScreen(selectedTmuxPane)} disabled={!selectedTmuxPane}>
                       Pull Pane
                     </button>
+                    <button type="button" className="button soft compact" onClick={() => void onResumeLastTmux()} disabled={tmuxBusy || !selectedTmuxPane}>
+                      Resume Last
+                    </button>
                     <button type="button" className="button warn compact" onClick={() => void onInterruptTmuxPane()} disabled={tmuxBusy || !selectedTmuxPane}>
                       Interrupt
                     </button>
                     <button type="button" className="button danger compact" onClick={() => void onCloseTmuxSession()} disabled={tmuxBusy || !selectedTmuxPaneInfo}>
                       Close Session
+                    </button>
+                  </div>
+                  <div className="row">
+                    <button type="button" className="button soft compact" onClick={() => void onSendTmuxKey("up")} disabled={tmuxBusy || !selectedTmuxPane}>
+                      Up
+                    </button>
+                    <button type="button" className="button soft compact" onClick={() => void onSendTmuxKey("down")} disabled={tmuxBusy || !selectedTmuxPane}>
+                      Down
+                    </button>
+                    <button type="button" className="button soft compact" onClick={() => void onSendTmuxKey("left")} disabled={tmuxBusy || !selectedTmuxPane}>
+                      Left
+                    </button>
+                    <button type="button" className="button soft compact" onClick={() => void onSendTmuxKey("right")} disabled={tmuxBusy || !selectedTmuxPane}>
+                      Right
+                    </button>
+                    <button type="button" className="button soft compact" onClick={() => void onSendTmuxKey("enter")} disabled={tmuxBusy || !selectedTmuxPane}>
+                      Enter
                     </button>
                   </div>
                   <div className="row">
@@ -4009,6 +4251,10 @@ export default function App() {
               <div className="debug-column">
                 <div className="debug-block">
                   <h3>Desktop Remote</h3>
+                  <div className={`mode-banner ${desktopEnabled ? "active" : "inactive"}`}>
+                    <strong>{desktopEnabled ? "Control Enabled" : "View-only Mode"}</strong>
+                    <span>{desktopEnabled ? "Tap stream and controls to interact." : "Live stream remains active. Input is locked for safety."}</span>
+                  </div>
                   <div className="row">
                     <button type="button" className={`button ${desktopEnabled ? "warn" : ""}`} onClick={() => void onToggleDesktopMode()}>
                       {desktopEnabled ? "Disable Control" : "Enable Control"}
@@ -4052,57 +4298,63 @@ export default function App() {
                   <p className="small">
                     Live stream stays on in both modes. Enable control to click/type; disable control for safe view-only monitoring.
                   </p>
-                  <div className="row remote-mouse-controls">
-                    <button type="button" className="button soft compact" data-short="L" onClick={() => void onDesktopClick("left")} disabled={desktopInteractionDisabled}>
-                      <span className="btn-text">Left Click</span>
-                    </button>
-                    <button type="button" className="button soft compact" data-short="R" onClick={() => void onDesktopClick("right")} disabled={desktopInteractionDisabled}>
-                      <span className="btn-text">Right Click</span>
-                    </button>
-                    <button type="button" className="button soft compact" data-short="2X" onClick={() => void onDesktopClick("left", true)} disabled={desktopInteractionDisabled}>
-                      <span className="btn-text">Double</span>
-                    </button>
-                    <button type="button" className="button soft compact" data-short="UP" onClick={() => void onDesktopScroll(-240)} disabled={desktopInteractionDisabled}>
-                      <span className="btn-text">Scroll Up</span>
-                    </button>
-                    <button type="button" className="button soft compact" data-short="DN" onClick={() => void onDesktopScroll(240)} disabled={desktopInteractionDisabled}>
-                      <span className="btn-text">Scroll Down</span>
-                    </button>
+                  <div className="remote-control-group">
+                    <h4>Pointer Controls</h4>
+                    <div className="row remote-mouse-controls">
+                      <button type="button" className="button soft compact" data-short="L" onClick={() => void onDesktopClick("left")} disabled={desktopInteractionDisabled}>
+                        <span className="btn-text">Left Click</span>
+                      </button>
+                      <button type="button" className="button soft compact" data-short="R" onClick={() => void onDesktopClick("right")} disabled={desktopInteractionDisabled}>
+                        <span className="btn-text">Right Click</span>
+                      </button>
+                      <button type="button" className="button soft compact" data-short="2X" onClick={() => void onDesktopClick("left", true)} disabled={desktopInteractionDisabled}>
+                        <span className="btn-text">Double</span>
+                      </button>
+                      <button type="button" className="button soft compact" data-short="UP" onClick={() => void onDesktopScroll(-240)} disabled={desktopInteractionDisabled}>
+                        <span className="btn-text">Scroll Up</span>
+                      </button>
+                      <button type="button" className="button soft compact" data-short="DN" onClick={() => void onDesktopScroll(240)} disabled={desktopInteractionDisabled}>
+                        <span className="btn-text">Scroll Down</span>
+                      </button>
+                    </div>
                   </div>
-                  <div className="row remote-text-controls">
-                    <input
-                      type="text"
-                      value={desktopTextInput}
-                      onChange={(event) => setDesktopTextInput(event.target.value)}
-                      placeholder="Type text on desktop"
-                      disabled={desktopInteractionDisabled}
-                    />
-                    <button type="button" className="button soft compact" data-short="SEND" onClick={() => void onDesktopSendText()} disabled={desktopInteractionDisabled || !desktopTextInput}>
-                      <span className="btn-text">Send Text</span>
-                    </button>
-                    <button type="button" className="button soft compact" data-short="PASTE" onClick={() => void onDesktopPasteClipboard()} disabled={desktopInteractionDisabled}>
-                      <span className="btn-text">Paste Clipboard</span>
-                    </button>
-                  </div>
-                  <div className="row remote-key-controls">
-                    <select value={desktopKeyInput} onChange={(event) => setDesktopKeyInput(event.target.value)} disabled={desktopInteractionDisabled}>
-                      <option value="enter">Enter</option>
-                      <option value="backspace">Backspace</option>
-                      <option value="delete">Delete</option>
-                      <option value="esc">Esc</option>
-                      <option value="tab">Tab</option>
-                      <option value="up">Up</option>
-                      <option value="down">Down</option>
-                      <option value="left">Left</option>
-                      <option value="right">Right</option>
-                      <option value="alt+tab">Alt+Tab</option>
-                      <option value="ctrl+a">Ctrl+A</option>
-                      <option value="ctrl+c">Ctrl+C</option>
-                      <option value="ctrl+v">Ctrl+V</option>
-                    </select>
-                    <button type="button" className="button soft compact" data-short="KEY" onClick={() => void onDesktopSendKey()} disabled={desktopInteractionDisabled}>
-                      <span className="btn-text">Send Key</span>
-                    </button>
+                  <div className="remote-control-group">
+                    <h4>Text and Keyboard</h4>
+                    <div className="row remote-text-controls">
+                      <input
+                        type="text"
+                        value={desktopTextInput}
+                        onChange={(event) => setDesktopTextInput(event.target.value)}
+                        placeholder="Type text on desktop"
+                        disabled={desktopInteractionDisabled}
+                      />
+                      <button type="button" className="button soft compact" data-short="SEND" onClick={() => void onDesktopSendText()} disabled={desktopInteractionDisabled || !desktopTextInput}>
+                        <span className="btn-text">Send Text</span>
+                      </button>
+                      <button type="button" className="button soft compact" data-short="PASTE" onClick={() => void onDesktopPasteClipboard()} disabled={desktopInteractionDisabled}>
+                        <span className="btn-text">Paste Clipboard</span>
+                      </button>
+                    </div>
+                    <div className="row remote-key-controls">
+                      <select value={desktopKeyInput} onChange={(event) => setDesktopKeyInput(event.target.value)} disabled={desktopInteractionDisabled}>
+                        <option value="enter">Enter</option>
+                        <option value="backspace">Backspace</option>
+                        <option value="delete">Delete</option>
+                        <option value="esc">Esc</option>
+                        <option value="tab">Tab</option>
+                        <option value="up">Up</option>
+                        <option value="down">Down</option>
+                        <option value="left">Left</option>
+                        <option value="right">Right</option>
+                        <option value="alt+tab">Alt+Tab</option>
+                        <option value="ctrl+a">Ctrl+A</option>
+                        <option value="ctrl+c">Ctrl+C</option>
+                        <option value="ctrl+v">Ctrl+V</option>
+                      </select>
+                      <button type="button" className="button soft compact" data-short="KEY" onClick={() => void onDesktopSendKey()} disabled={desktopInteractionDisabled}>
+                        <span className="btn-text">Send Key</span>
+                      </button>
+                    </div>
                   </div>
                 </div>
 
@@ -4144,68 +4396,83 @@ export default function App() {
                   Keep using Tailscale + token auth. QR exchange only grants this device the existing backend token context.
                 </p>
 
-                <label className="field">
-                  <span>Route Hint</span>
-                  <select
-                    data-testid="pair-route-hint-select"
-                    value={routeHint}
-                    onChange={(event) => onRouteHintChange(event.target.value as RouteHint)}
-                  >
-                    <option value="tailscale">{prettyRouteLabel("tailscale")} (default)</option>
-                    <option value="lan" disabled={!isLocalBrowser}>
-                      {prettyRouteLabel("lan")}{!isLocalBrowser ? " (localhost only)" : ""}
-                    </option>
-                    <option value="current" disabled={!isLocalBrowser}>
-                      {prettyRouteLabel("current")}{!isLocalBrowser ? " (localhost only)" : ""}
-                    </option>
-                  </select>
-                </label>
-                {!isLocalBrowser ? (
-                  <p className="small warn">
-                    For safety, LAN/current pairing routes are disabled outside localhost browser sessions.
+                <div className="step-card">
+                  <div className="step-head">
+                    <span className="step-index">1</span>
+                    <h3>Choose Route</h3>
+                  </div>
+                  <label className="field">
+                    <span>Route Hint</span>
+                    <select
+                      data-testid="pair-route-hint-select"
+                      value={routeHint}
+                      onChange={(event) => onRouteHintChange(event.target.value as RouteHint)}
+                    >
+                      <option value="tailscale">{prettyRouteLabel("tailscale")} (default)</option>
+                      <option value="lan" disabled={!isLocalBrowser}>
+                        {prettyRouteLabel("lan")}{!isLocalBrowser ? " (localhost only)" : ""}
+                      </option>
+                      <option value="current" disabled={!isLocalBrowser}>
+                        {prettyRouteLabel("current")}{!isLocalBrowser ? " (localhost only)" : ""}
+                      </option>
+                    </select>
+                  </label>
+                  {!isLocalBrowser ? (
+                    <p className="small warn">
+                      For safety, LAN/current pairing routes are disabled outside localhost browser sessions.
+                    </p>
+                  ) : null}
+                  <label className="field">
+                    <span>Controller Base URL</span>
+                    <input
+                      type="text"
+                      value={controllerBase}
+                      onChange={(event) => setControllerBase(event.target.value)}
+                      placeholder="http://192.168.x.x:8787"
+                    />
+                  </label>
+                  <p className="small">
+                    LAN: <strong>{netInfo?.lan_ip || "n/a"}</strong> | Tailscale: <strong>{netInfo?.tailscale_ip || "n/a"}</strong>
                   </p>
-                ) : null}
+                  {tailscaleRouteUnavailable ? (
+                    <p className="small warn">
+                      Tailscale route is selected but no Tailscale IP is detected.
+                    </p>
+                  ) : null}
+                </div>
 
-                <label className="field">
-                  <span>Controller Base URL</span>
-                  <input
-                    type="text"
-                    value={controllerBase}
-                    onChange={(event) => setControllerBase(event.target.value)}
-                    placeholder="http://192.168.x.x:8787"
-                  />
-                </label>
-
-                <p className="small">
-                  LAN: <strong>{netInfo?.lan_ip || "n/a"}</strong> | Tailscale: <strong>{netInfo?.tailscale_ip || "n/a"}</strong>
-                </p>
-                {tailscaleRouteUnavailable ? (
-                  <p className="small warn">
-                    Tailscale route is selected but no Tailscale IP is detected.
-                  </p>
-                ) : null}
-
-                <div className="row">
-                  <button type="button" className="button" onClick={() => void onGeneratePairing()} disabled={pairBusy}>
-                    {pairBusy ? "Generating..." : "Generate QR"}
-                  </button>
-                  <button type="button" className="button soft compact" onClick={() => void refreshNet()}>
-                    Refresh Routes
-                  </button>
-                  <button
-                    type="button"
-                    className="button soft compact"
-                    onClick={() => void onPairExchange()}
-                    disabled={pairBusy || !pairCode}
-                  >
-                    Exchange Here
-                  </button>
+                <div className="step-card">
+                  <div className="step-head">
+                    <span className="step-index">2</span>
+                    <h3>Generate and Exchange</h3>
+                  </div>
+                  <div className="row">
+                    <button type="button" className="button" onClick={() => void onGeneratePairing()} disabled={pairBusy}>
+                      {pairBusy ? "Generating..." : "Generate QR"}
+                    </button>
+                    <button type="button" className="button soft compact" onClick={() => void refreshNet()}>
+                      Refresh Routes
+                    </button>
+                    <button
+                      type="button"
+                      className="button soft compact"
+                      onClick={() => void onPairExchange()}
+                      disabled={pairBusy || !pairCode}
+                    >
+                      Exchange Here
+                    </button>
+                  </div>
+                  <p className="small">Generate QR first, then use Exchange Here on this device if needed.</p>
                 </div>
               </div>
 
               <div className="pair-preview">
                 {pairCode ? (
                   <>
+                    <div className="step-head">
+                      <span className="step-index">3</span>
+                      <h3>Scan or Share</h3>
+                    </div>
                     <p className="small">
                       Code: <code>{pairCode}</code>
                       {pairExpiry ? ` (expires in ${pairExpiry}s)` : ""}
@@ -4330,7 +4597,7 @@ export default function App() {
                     <p className="small">
                       Current route: <strong>{controllerRouteSummary}</strong>
                     </p>
-                    <p className="small">{controllerRouteAdvice}</p>
+                    <p className={`small severity ${controllerRouteSeverity}`}>{controllerRouteAdvice}</p>
                     <p className="small">Controller base: <code>{controllerBase || "(not set)"}</code></p>
                     <p className="small">Route hint: <strong>{prettyRouteLabel(routeHint)}</strong></p>
                     <p className="small">LAN: <strong>{netInfo?.lan_ip || "n/a"}</strong></p>
@@ -4367,6 +4634,7 @@ export default function App() {
               <h2>Debug Timeline</h2>
               <div className="row">
                 <span className="badge">Events {totalEvents}</span>
+                <span className={`badge ${errorEvents > 0 ? "warn" : "muted"}`}>Errors {errorEvents}</span>
                 <span className="badge muted">Runs {debugRuns.length}</span>
                 <button type="button" className="button soft compact" onClick={() => void refreshDebugRuns()}>
                   Refresh Runs

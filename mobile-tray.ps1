@@ -164,15 +164,19 @@ function Show-PairQrWindow {
   $lanIp = [string]$status.lan_ip
   $pairHost = ""
   $routeLabel = ""
+  $routeConfidence = ""
   if ($tailscaleIp) {
     $pairHost = $tailscaleIp
     $routeLabel = "Tailscale"
+    $routeConfidence = "high confidence"
   } elseif ($lanIp -and $lanIp -ne "127.0.0.1") {
     $pairHost = $lanIp
     $routeLabel = "LAN"
+    $routeConfidence = "medium confidence"
   } else {
     $pairHost = "127.0.0.1"
     $routeLabel = "Localhost"
+    $routeConfidence = "low confidence"
   }
 
   $controllerPort = [int]$status.controller_port
@@ -224,7 +228,7 @@ function Show-PairQrWindow {
   $form.Controls.Add($layout)
 
   $lblTop = New-Object System.Windows.Forms.Label
-  $lblTop.Text = "Scan from phone/tablet to login to mobile app."
+  $lblTop.Text = "Step 1: scan on phone/tablet. Step 2: finish login in the mobile app."
   $lblTop.Dock = "Fill"
   $lblTop.TextAlign = "MiddleLeft"
   $layout.Controls.Add($lblTop, 0, 0)
@@ -238,7 +242,7 @@ function Show-PairQrWindow {
 
   $expires = if ($create.expires_in) { [int]$create.expires_in } else { 0 }
   $lblRoute = New-Object System.Windows.Forms.Label
-  $lblRoute.Text = "Route: $routeLabel | Expires in: ${expires}s"
+  $lblRoute.Text = "Route: $routeLabel ($routeConfidence) | Expires in: ${expires}s"
   $lblRoute.Dock = "Fill"
   $lblRoute.TextAlign = "MiddleLeft"
   $layout.Controls.Add($lblRoute, 0, 2)
@@ -417,9 +421,9 @@ function Handle-PendingAction {
 
   if ($exitCode -eq 0) {
     if ($action -eq "start") {
-      Enqueue-Balloon -Title "Codrex" -Text "Mobile stack started." -Icon ([System.Windows.Forms.ToolTipIcon]::Info)
+      Enqueue-Balloon -Title "Codrex" -Text "Mobile stack started. Open UI or Show Pair QR from this menu." -Icon ([System.Windows.Forms.ToolTipIcon]::Info)
     } else {
-      Enqueue-Balloon -Title "Codrex" -Text "Mobile stack stopped." -Icon ([System.Windows.Forms.ToolTipIcon]::Info)
+      Enqueue-Balloon -Title "Codrex" -Text "Mobile stack stopped. Start again when remote control is needed." -Icon ([System.Windows.Forms.ToolTipIcon]::Info)
     }
   } else {
     Enqueue-Balloon -Title "Codrex" -Text ("Action failed (exit code " + $exitCode + "). Check logs.") -Icon ([System.Windows.Forms.ToolTipIcon]::Error)
@@ -440,7 +444,7 @@ function Update-UiState {
   }
 
   $script:StatusItem.Text = "Status: $stateText"
-  $script:StatusDetailsItem.Text = "Controller:$($status.controller_port) PID:$($status.controller_pid) | UI:$($status.ui_port) PID:$($status.ui_pid)"
+  $script:StatusDetailsItem.Text = "Controller $($status.controller_port) (PID $($status.controller_pid)) | UI $($status.ui_port) (PID $($status.ui_pid)) | LAN $($status.lan_ip)"
 
   $isBusy = [bool]$script:PendingAction
   $script:StartItem.Enabled = (-not $isBusy) -and (-not ($status.controller_running -and $status.ui_running))
@@ -486,6 +490,12 @@ $script:StatusItem = New-Object System.Windows.Forms.ToolStripMenuItem("Status: 
 $script:StatusItem.Enabled = $false
 $script:StatusDetailsItem = New-Object System.Windows.Forms.ToolStripMenuItem("Controller/UI status")
 $script:StatusDetailsItem.Enabled = $false
+$script:HeaderStackItem = New-Object System.Windows.Forms.ToolStripMenuItem("Service Control")
+$script:HeaderStackItem.Enabled = $false
+$script:HeaderOpenItem = New-Object System.Windows.Forms.ToolStripMenuItem("Open Surfaces")
+$script:HeaderOpenItem.Enabled = $false
+$script:HeaderPairItem = New-Object System.Windows.Forms.ToolStripMenuItem("Pair and Diagnostics")
+$script:HeaderPairItem.Enabled = $false
 
 $script:StartItem = New-Object System.Windows.Forms.ToolStripMenuItem("Start Mobile Stack")
 $script:StopItem = New-Object System.Windows.Forms.ToolStripMenuItem("Stop Mobile Stack")
@@ -525,13 +535,17 @@ $script:ExitItem.Add_Click({ Cleanup-And-Exit })
 $null = $script:ContextMenu.Items.Add($script:StatusItem)
 $null = $script:ContextMenu.Items.Add($script:StatusDetailsItem)
 $null = $script:ContextMenu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
+$null = $script:ContextMenu.Items.Add($script:HeaderStackItem)
 $null = $script:ContextMenu.Items.Add($script:StartItem)
 $null = $script:ContextMenu.Items.Add($script:StopItem)
 $null = $script:ContextMenu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
+$null = $script:ContextMenu.Items.Add($script:HeaderOpenItem)
 $null = $script:ContextMenu.Items.Add($script:OpenUiLocalItem)
 $null = $script:ContextMenu.Items.Add($script:OpenUiNetworkItem)
-$null = $script:ContextMenu.Items.Add($script:PairQrItem)
 $null = $script:ContextMenu.Items.Add($script:OpenControllerItem)
+$null = $script:ContextMenu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
+$null = $script:ContextMenu.Items.Add($script:HeaderPairItem)
+$null = $script:ContextMenu.Items.Add($script:PairQrItem)
 $null = $script:ContextMenu.Items.Add($script:OpenLogsItem)
 $null = $script:ContextMenu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
 $null = $script:ContextMenu.Items.Add($script:ExitItem)

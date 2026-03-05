@@ -581,7 +581,7 @@ $btnCopyLink.Dock = "Fill"
 $pairOutLayout.Controls.Add($btnCopyLink, 1, 0)
 
 $lblPairStatus = New-Object System.Windows.Forms.Label
-$lblPairStatus.Text = "Tip: start server, choose base URL, then Generate QR."
+$lblPairStatus.Text = "Step 1: choose route. Step 2: generate QR. Step 3: scan on phone."
 $lblPairStatus.Dock = "Fill"
 $lblPairStatus.TextAlign = "TopLeft"
 $pairOutLayout.Controls.Add($lblPairStatus, 0, 1)
@@ -810,17 +810,17 @@ function Update-NetworkAndRoute {
   $kind = Get-BaseRouteKind -Base $txtBase.Text -LanUrl $urls.lan -TsUrl $urls.tailscale
   switch ($kind) {
     "tailscale" {
-      $lblBaseRoute.Text = "Route: Tailscale (recommended off-campus/college Wi-Fi)"
+      $lblBaseRoute.Text = "Route: Tailscale [high confidence]"
       $lblBaseRoute.ForeColor = $script:Theme.SuccessText
       break
     }
     "lan" {
-      $lblBaseRoute.Text = "Route: LAN (works when phone and laptop share same local network)"
+      $lblBaseRoute.Text = "Route: LAN [medium confidence]"
       $lblBaseRoute.ForeColor = $script:Theme.WarnText
       break
     }
     "local" {
-      $lblBaseRoute.Text = "Route: Localhost (not reachable from phone)"
+      $lblBaseRoute.Text = "Route: Localhost [low confidence: phone unreachable]"
       $lblBaseRoute.ForeColor = $script:Theme.ErrorText
       break
     }
@@ -1015,7 +1015,7 @@ function Generate-Qr {
     return
   }
   $picQr.Image = $img
-  $lblPairStatus.Text = "QR ready. Scan with phone camera (expires quickly)."
+  $lblPairStatus.Text = "QR ready. Scan now and complete mobile sign-in before expiry."
   $lblPairStatus.ForeColor = $script:Theme.SuccessText
   $script:QrExpiresAt = [DateTimeOffset]::UtcNow.AddSeconds([Math]::Max(0, $expires))
   Update-QrCountdown

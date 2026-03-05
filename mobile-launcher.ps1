@@ -89,6 +89,39 @@ function Get-ProcessByPort([int]$Port) {
   return $null
 }
 
+function Get-ListeningStateMap {
+  param(
+    [int[]]$Ports
+  )
+  $map = @{}
+  foreach ($p in $Ports) {
+    $map[[int]$p] = $false
+  }
+  try {
+    $listeners = Get-NetTCPConnection -State Listen -ErrorAction Stop |
+      Where-Object { $map.ContainsKey([int]$_.LocalPort) } |
+      Select-Object -ExpandProperty LocalPort -Unique
+    foreach ($lp in $listeners) {
+      $map[[int]$lp] = $true
+    }
+    return $map
+  } catch {
+    try {
+      $lines = netstat -ano -p tcp | Select-String "LISTENING"
+      foreach ($line in $lines) {
+        $raw = [string]$line
+        if ($raw -match "^\s*TCP\s+\S+:(\d+)\s+\S+\s+LISTENING\s+\d+\s*$") {
+          $lp = [int]$matches[1]
+          if ($map.ContainsKey($lp)) {
+            $map[$lp] = $true
+          }
+        }
+      }
+    } catch {}
+  }
+  return $map
+}
+
 function Invoke-Json {
   param(
     [string]$Url,
@@ -168,6 +201,14 @@ $colorMuted = [System.Drawing.ColorTranslator]::FromHtml("#9cb8d6")
 $colorAccent = [System.Drawing.ColorTranslator]::FromHtml("#1cc8ff")
 $colorAccentSoft = [System.Drawing.ColorTranslator]::FromHtml("#0d2f53")
 $colorDanger = [System.Drawing.ColorTranslator]::FromHtml("#ff5f7d")
+$script:cachedControllerConfig = $null
+$script:cachedControllerConfigAt = [DateTime]::MinValue
+$script:cachedLanIp = "127.0.0.1"
+$script:cachedLanIpAt = [DateTime]::MinValue
+$script:refreshInProgress = $false
+$script:actionInProgress = $false
+$script:refreshTimer = $null
+$script:launcherButtons = @()
 
 function Set-LauncherButtonStyle {
   param(
@@ -185,19 +226,79 @@ function Set-LauncherButtonStyle {
   $Button.Margin = New-Object System.Windows.Forms.Padding(0, 0, 10, 10)
   $Button.AutoSize = $false
   $Button.Size = New-Object System.Drawing.Size(168, 38)
+  $kind = "default"
+  $normalBack = $colorAccentSoft
+  $normalFore = $colorText
+  $normalBorder = $colorBorder
+  $pressedBack = [System.Drawing.ColorTranslator]::FromHtml("#0b3556")
+  $pressedFore = $colorText
+  $pressedBorder = [System.Drawing.ColorTranslator]::FromHtml("#4ea8dc")
   if ($Danger) {
-    $Button.BackColor = [System.Drawing.ColorTranslator]::FromHtml("#2a121d")
-    $Button.ForeColor = $colorDanger
-    $Button.FlatAppearance.BorderColor = [System.Drawing.ColorTranslator]::FromHtml("#6d2d43")
+    $kind = "danger"
+    $normalBack = [System.Drawing.ColorTranslator]::FromHtml("#2a121d")
+    $normalFore = $colorDanger
+    $normalBorder = [System.Drawing.ColorTranslator]::FromHtml("#6d2d43")
+    $pressedBack = [System.Drawing.ColorTranslator]::FromHtml("#4b1d2d")
+    $pressedFore = [System.Drawing.ColorTranslator]::FromHtml("#ffd9e1")
+    $pressedBorder = [System.Drawing.ColorTranslator]::FromHtml("#ff9ab1")
   } elseif ($Primary) {
-    $Button.BackColor = [System.Drawing.ColorTranslator]::FromHtml("#0c3f63")
-    $Button.ForeColor = $colorText
-    $Button.FlatAppearance.BorderColor = [System.Drawing.ColorTranslator]::FromHtml("#2b7cb2")
-  } else {
-    $Button.BackColor = $colorAccentSoft
-    $Button.ForeColor = $colorText
-    $Button.FlatAppearance.BorderColor = $colorBorder
+    $kind = "primary"
+    $normalBack = [System.Drawing.ColorTranslator]::FromHtml("#0c3f63")
+    $normalFore = $colorText
+    $normalBorder = [System.Drawing.ColorTranslator]::FromHtml("#2b7cb2")
+    $pressedBack = [System.Drawing.ColorTranslator]::FromHtml("#136094")
+    $pressedFore = [System.Drawing.ColorTranslator]::FromHtml("#f3fbff")
+    $pressedBorder = [System.Drawing.ColorTranslator]::FromHtml("#63cfff")
   }
+  $Button.BackColor = $normalBack
+  $Button.ForeColor = $normalFore
+  $Button.FlatAppearance.BorderColor = $normalBorder
+  $Button.Tag = @{
+    kind = $kind
+    normalBack = $normalBack
+    normalFore = $normalFore
+    normalBorder = $normalBorder
+    pressedBack = $pressedBack
+    pressedFore = $pressedFore
+    pressedBorder = $pressedBorder
+  }
+}
+
+function Reset-LauncherButtonVisual {
+  param(
+    [System.Windows.Forms.Button]$Button
+  )
+  if (-not $Button) { return }
+  $meta = $Button.Tag
+  if ($meta -is [hashtable]) {
+    $Button.BackColor = $meta["normalBack"]
+    $Button.ForeColor = $meta["normalFore"]
+    $Button.FlatAppearance.BorderColor = $meta["normalBorder"]
+  }
+}
+
+function Register-LauncherButtonFeedback {
+  param(
+    [System.Windows.Forms.Button]$Button
+  )
+  if (-not $Button) { return }
+  $Button.Add_MouseDown({
+    param($sender, $eventArgs)
+    $meta = $sender.Tag
+    if ($meta -is [hashtable]) {
+      $sender.BackColor = $meta["pressedBack"]
+      $sender.ForeColor = $meta["pressedFore"]
+      $sender.FlatAppearance.BorderColor = $meta["pressedBorder"]
+    }
+  })
+  $Button.Add_MouseUp({
+    param($sender, $eventArgs)
+    Reset-LauncherButtonVisual -Button $sender
+  })
+  $Button.Add_MouseLeave({
+    param($sender, $eventArgs)
+    Reset-LauncherButtonVisual -Button $sender
+  })
 }
 
 $form = New-Object System.Windows.Forms.Form
@@ -292,7 +393,7 @@ $statusCard.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
 $left.Controls.Add($statusCard, 0, 1)
 
 $lblStatus = New-Object System.Windows.Forms.Label
-$lblStatus.Text = "Status: checking..."
+$lblStatus.Text = "State: checking..."
 $lblStatus.Dock = "Fill"
 $lblStatus.TextAlign = "MiddleLeft"
 $statusCard.Controls.Add($lblStatus)
@@ -363,7 +464,7 @@ $btnOpenPair.Text = "Open Pair Link"
 $rowPair.Controls.Add($btnOpenPair) | Out-Null
 
 $lblPairLink = New-Object System.Windows.Forms.Label
-$lblPairLink.Text = "Pair Link"
+$lblPairLink.Text = "Pair Handoff Link"
 $lblPairLink.Dock = "Fill"
 $lblPairLink.TextAlign = "BottomLeft"
 $lblPairLink.Font = New-Object System.Drawing.Font("Segoe UI Semibold", 9)
@@ -410,7 +511,7 @@ $picQr.SizeMode = [System.Windows.Forms.PictureBoxSizeMode]::Zoom
 $qrCard.Controls.Add($picQr)
 
 $lblQrInfo = New-Object System.Windows.Forms.Label
-$lblQrInfo.Text = "Generate QR, then scan from mobile/tablet."
+$lblQrInfo.Text = "Step 1: Generate QR. Step 2: Scan on phone/tablet."
 $lblQrInfo.Dock = "Fill"
 $lblQrInfo.TextAlign = "MiddleLeft"
 $right.Controls.Add($lblQrInfo, 0, 2)
@@ -462,6 +563,26 @@ Set-LauncherButtonStyle -Button $btnOpenController
 Set-LauncherButtonStyle -Button $btnGenQr -Primary $true
 Set-LauncherButtonStyle -Button $btnCopyPair
 Set-LauncherButtonStyle -Button $btnOpenPair
+@(
+  $btnStart,
+  $btnStop,
+  $btnOpenLocal,
+  $btnOpenNetwork,
+  $btnOpenController,
+  $btnGenQr,
+  $btnCopyPair,
+  $btnOpenPair
+) | ForEach-Object { Register-LauncherButtonFeedback -Button $_ }
+$script:launcherButtons = @(
+  $btnStart,
+  $btnStop,
+  $btnOpenLocal,
+  $btnOpenNetwork,
+  $btnOpenController,
+  $btnGenQr,
+  $btnCopyPair,
+  $btnOpenPair
+)
 
 function Set-SplitLayout {
   try {
@@ -521,29 +642,62 @@ function Ensure-LauncherAuth {
   return $false
 }
 
+function Get-CachedControllerConfig {
+  $now = Get-Date
+  if (($null -eq $script:cachedControllerConfig) -or ($now -ge $script:cachedControllerConfigAt)) {
+    $script:cachedControllerConfig = Read-ControllerConfig -Path $configPath
+    $script:cachedControllerConfigAt = $now.AddSeconds(5)
+  }
+  return $script:cachedControllerConfig
+}
+
+function Get-CachedLanIp {
+  $now = Get-Date
+  if ((-not $script:cachedLanIp) -or ($now -ge $script:cachedLanIpAt)) {
+    $script:cachedLanIp = Get-PrimaryIPv4
+    $script:cachedLanIpAt = $now.AddSeconds(15)
+  }
+  return $script:cachedLanIp
+}
+
 function Refresh-State {
-  $cfg = Read-ControllerConfig -Path $configPath
-  $controllerPort = if ($cfg.port) { [int]$cfg.port } else { 8787 }
-  $controllerToken = [string]$cfg.token
-  $lanIp = Get-PrimaryIPv4
+  if ($script:refreshInProgress -or $script:actionInProgress) { return }
+  $script:refreshInProgress = $true
+  try {
+    $cfg = Get-CachedControllerConfig
+    $controllerPort = if ($cfg.port) { [int]$cfg.port } else { 8787 }
+    $controllerToken = [string]$cfg.token
+    $lanIp = Get-CachedLanIp
 
-  $controllerProc = Get-ProcessByPort -Port $controllerPort
-  $uiProc = Get-ProcessByPort -Port $uiPort
+    $listening = Get-ListeningStateMap -Ports @($controllerPort, $uiPort)
+    $controllerOn = [bool]$listening[[int]$controllerPort]
+    $uiOn = [bool]$listening[[int]$uiPort]
+    $status = if ($controllerOn -and $uiOn) { "running" } elseif ($controllerOn -or $uiOn) { "partial" } else { "stopped" }
+    $lblStatus.Text = "State: $status`r`nController:$controllerPort  UI:$uiPort  LAN:$lanIp"
+    if ($controllerOn -and $uiOn) {
+      $statusCard.BackColor = [System.Drawing.ColorTranslator]::FromHtml("#0d2f53")
+      $lblStatus.ForeColor = $colorAccent
+    } elseif ($controllerOn -or $uiOn) {
+      $statusCard.BackColor = [System.Drawing.ColorTranslator]::FromHtml("#2a2415")
+      $lblStatus.ForeColor = [System.Drawing.ColorTranslator]::FromHtml("#ffd38a")
+    } else {
+      $statusCard.BackColor = $colorSurfaceSoft
+      $lblStatus.ForeColor = $colorText
+    }
 
-  $controllerOn = ($null -ne $controllerProc)
-  $uiOn = ($null -ne $uiProc)
-  $status = if ($controllerOn -and $uiOn) { "running" } elseif ($controllerOn -or $uiOn) { "partial" } else { "stopped" }
-  $lblStatus.Text = "Status: $status | Controller:$controllerPort | UI:$uiPort | IP:$lanIp"
-
-  $btnStop.Enabled = $controllerOn -or $uiOn
-  $btnStart.Enabled = -not ($controllerOn -and $uiOn)
-  $btnOpenLocal.Enabled = $uiOn
-  $btnOpenNetwork.Enabled = $uiOn -and ($lanIp -ne "127.0.0.1")
-  $btnOpenController.Enabled = $controllerOn
-  $btnGenQr.Enabled = $controllerOn -and $uiOn
-  $hasPair = [bool]$pairUrl
-  $btnCopyPair.Enabled = $hasPair
-  $btnOpenPair.Enabled = $hasPair
+    $busy = $script:actionInProgress
+    $btnStop.Enabled = (-not $busy) -and ($controllerOn -or $uiOn)
+    $btnStart.Enabled = (-not $busy) -and (-not ($controllerOn -and $uiOn))
+    $btnOpenLocal.Enabled = (-not $busy) -and $uiOn
+    $btnOpenNetwork.Enabled = (-not $busy) -and $uiOn -and ($lanIp -ne "127.0.0.1")
+    $btnOpenController.Enabled = (-not $busy) -and $controllerOn
+    $btnGenQr.Enabled = (-not $busy) -and $controllerOn -and $uiOn
+    $hasPair = [bool]$pairUrl
+    $btnCopyPair.Enabled = (-not $busy) -and $hasPair
+    $btnOpenPair.Enabled = (-not $busy) -and $hasPair
+  } finally {
+    $script:refreshInProgress = $false
+  }
 }
 
 function Start-Stack {
@@ -553,14 +707,18 @@ function Start-Stack {
   Append-Log "Starting mobile stack..."
   # Request firewall rules on start so LAN pairing/open-app links are reachable from Android.
   $p = Start-Process -FilePath "powershell.exe" -ArgumentList @("-NoProfile","-ExecutionPolicy","Bypass","-File",$startMobileScript,"-UiPort",[string]$uiPort,"-OpenFirewall") -WorkingDirectory $root -WindowStyle Hidden -PassThru
-  for ($i = 0; $i -lt 80; $i++) {
+  for ($i = 0; $i -lt 70; $i++) {
     Start-Sleep -Milliseconds 250
     [System.Windows.Forms.Application]::DoEvents()
-    $okController = Test-HttpReady -Url ("http://127.0.0.1:{0}/auth/status" -f $controllerPort)
-    $okUi = Test-HttpReady -Url ("http://127.0.0.1:{0}/" -f $uiPort)
+    $listening = Get-ListeningStateMap -Ports @($controllerPort, $uiPort)
+    $okController = [bool]$listening[[int]$controllerPort]
+    $okUi = [bool]$listening[[int]$uiPort]
     if ($okController -and $okUi) { break }
     if ($p.HasExited -and $p.ExitCode -ne 0) { break }
   }
+  # Force refresh of cached network/config for next paint.
+  $script:cachedControllerConfigAt = [DateTime]::MinValue
+  $script:cachedLanIpAt = [DateTime]::MinValue
   Refresh-State
   Open-Url ("http://127.0.0.1:{0}" -f $uiPort)
   Append-Log "Start complete."
@@ -575,19 +733,24 @@ function Stop-Stack {
   for ($i = 0; $i -lt 50; $i++) {
     Start-Sleep -Milliseconds 250
     [System.Windows.Forms.Application]::DoEvents()
-    $okUi = Test-HttpReady -Url ("http://127.0.0.1:{0}/" -f $uiPort)
-    if (-not $okUi) { break }
+    $listening = Get-ListeningStateMap -Ports @($controllerPort, $uiPort)
+    $okController = [bool]$listening[[int]$controllerPort]
+    $okUi = [bool]$listening[[int]$uiPort]
+    if ((-not $okController) -and (-not $okUi)) { break }
   }
+  $script:cachedControllerConfigAt = [DateTime]::MinValue
+  $script:cachedLanIpAt = [DateTime]::MinValue
   Refresh-State
   Append-Log "Stop complete."
 }
 
 function Generate-PairQr {
-  $cfg = Read-ControllerConfig -Path $configPath
+  $cfg = Get-CachedControllerConfig
   $controllerPort = if ($cfg.port) { [int]$cfg.port } else { 8787 }
   $controllerToken = [string]$cfg.token
 
-  if (-not (Test-HttpReady -Url ("http://127.0.0.1:{0}/auth/status" -f $controllerPort))) {
+  $listening = Get-ListeningStateMap -Ports @($controllerPort)
+  if (-not [bool]$listening[[int]$controllerPort]) {
     throw "Controller is not reachable."
   }
   if (-not (Ensure-LauncherAuth -ControllerPort $controllerPort -FallbackToken $controllerToken)) {
@@ -595,9 +758,10 @@ function Generate-PairQr {
   }
 
   $tailscale = Get-TailscaleIPv4
-  $lan = Get-PrimaryIPv4
+  $lan = Get-CachedLanIp
   $pairHost = if ($tailscale) { $tailscale } elseif ($lan) { $lan } else { "127.0.0.1" }
   $route = if ($tailscale) { "Tailscale" } elseif ($lan -and $lan -ne "127.0.0.1") { "LAN" } else { "Localhost" }
+  $confidence = if ($tailscale) { "high confidence" } elseif ($lan -and $lan -ne "127.0.0.1") { "medium confidence" } else { "low confidence" }
 
   Append-Log "Creating pairing code ($route)..."
   $create = Invoke-Json -Url ("http://127.0.0.1:{0}/auth/pair/create" -f $controllerPort) -Method "POST" -BodyObj @{} -Token "" -Session $authSession
@@ -619,12 +783,38 @@ function Generate-PairQr {
   }
   $picQr.Image = $img
   $expires = if ($create.expires_in) { [int]$create.expires_in } else { 0 }
-  $lblQrInfo.Text = "Route: $route | Expires in: ${expires}s"
+  $lblQrInfo.Text = "Route: $route ($confidence) | Expires in: ${expires}s"
+  $lblHint.Text = "Scan now. If the phone cannot open it, retry with Tailscale route."
   Append-Log "QR ready. Scan from phone/tablet."
 }
 
-function Safe-Action([scriptblock]$Action) {
+function Safe-Action {
+  param(
+    [scriptblock]$Action,
+    [System.Windows.Forms.Button]$Button
+  )
+  $savedText = ""
+  $activeButton = $null
+  $wasTimerRunning = $false
   try {
+    if ($script:actionInProgress) { return }
+    $script:actionInProgress = $true
+    foreach ($b in $script:launcherButtons) {
+      if ($b) { $b.Enabled = $false }
+    }
+    $activeButton = $Button
+    if ($activeButton) {
+      $savedText = [string]$activeButton.Text
+      $activeButton.Text = "Working..."
+      $activeButton.BackColor = [System.Drawing.ColorTranslator]::FromHtml("#1a4a73")
+      $activeButton.ForeColor = [System.Drawing.ColorTranslator]::FromHtml("#f3fbff")
+    }
+    if ($script:refreshTimer) {
+      $wasTimerRunning = $script:refreshTimer.Enabled
+      if ($wasTimerRunning) { $script:refreshTimer.Stop() }
+    }
+    $form.UseWaitCursor = $true
+    [System.Windows.Forms.Application]::DoEvents()
     & $Action
   } catch {
     $msg = [string]$_.Exception.Message
@@ -637,42 +827,55 @@ function Safe-Action([scriptblock]$Action) {
       [System.Windows.Forms.MessageBoxIcon]::Error
     ) | Out-Null
   } finally {
+    if ($activeButton) {
+      $activeButton.Text = $savedText
+      Reset-LauncherButtonVisual -Button $activeButton
+    }
+    $form.UseWaitCursor = $false
+    $script:actionInProgress = $false
+    if ($script:refreshTimer -and $wasTimerRunning) {
+      $script:refreshTimer.Start()
+    }
     Refresh-State
   }
 }
 
-$btnStart.Add_Click({ Safe-Action { Start-Stack } })
-$btnStop.Add_Click({ Safe-Action { Stop-Stack } })
+$btnStart.Add_Click({ Safe-Action -Action { Start-Stack } -Button $btnStart })
+$btnStop.Add_Click({ Safe-Action -Action { Stop-Stack } -Button $btnStop })
 $btnOpenLocal.Add_Click({ Open-Url ("http://127.0.0.1:{0}" -f $uiPort) })
 $btnOpenNetwork.Add_Click({
-  $ip = Get-PrimaryIPv4
+  $ip = Get-CachedLanIp
   Open-Url ("http://{0}:{1}" -f $ip, $uiPort)
 })
 $btnOpenController.Add_Click({
   Open-Url ("http://127.0.0.1:{0}" -f $controllerPort)
 })
-$btnGenQr.Add_Click({ Safe-Action { Generate-PairQr } })
+$btnGenQr.Add_Click({ Safe-Action -Action { Generate-PairQr } -Button $btnGenQr })
 $btnCopyPair.Add_Click({
   if ($pairUrl) {
     try { [System.Windows.Forms.Clipboard]::SetText($pairUrl) } catch {}
+    Append-Log "Pair link copied to clipboard."
   }
 })
 $btnOpenPair.Add_Click({
-  if ($pairUrl) { Open-Url $pairUrl }
+  if ($pairUrl) {
+    Open-Url $pairUrl
+    Append-Log "Opened pair link."
+  }
 })
 
 $form.Add_Shown({
   Set-SplitLayout
 })
 
-$refreshTimer = New-Object System.Windows.Forms.Timer
-$refreshTimer.Interval = 3500
-$refreshTimer.Add_Tick({ Refresh-State })
-$refreshTimer.Start()
+$script:refreshTimer = New-Object System.Windows.Forms.Timer
+$script:refreshTimer.Interval = 2000
+$script:refreshTimer.Add_Tick({ Refresh-State })
+$script:refreshTimer.Start()
 
 $form.Add_FormClosed({
-  try { $refreshTimer.Stop() } catch {}
-  try { $refreshTimer.Dispose() } catch {}
+  try { $script:refreshTimer.Stop() } catch {}
+  try { $script:refreshTimer.Dispose() } catch {}
   try { if ($picTitle.Image) { $picTitle.Image.Dispose() } } catch {}
   try { if ($picQr.Image) { $picQr.Image.Dispose() } } catch {}
   try { $form.Dispose() } catch {}
