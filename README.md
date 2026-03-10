@@ -68,6 +68,11 @@ If your Linux username is not `megha`, replace the path in config accordingly.
 
 ### 4) First bootstrap
 
+Double-clickable Windows bootstrap:
+- `Setup.cmd`
+
+Command-line equivalent:
+
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\setup.ps1 -OpenFirewall
 ```
@@ -208,7 +213,7 @@ Advanced Windows tools:
 ## Windows App Layout
 
 The repo root is intentionally simplified:
-- use `setup.ps1` for first-time machine bootstrap
+- use `Setup.cmd` for first-time machine bootstrap
 - use `Codrex.cmd` for daily launch
 - use `tools/windows/` only for advanced utilities, tray mode, controller-only tools, or autostart setup
 
