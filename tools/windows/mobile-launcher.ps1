@@ -230,8 +230,19 @@ function Get-QrPngImage {
 }
 
 function Open-Url([string]$Url) {
-  if (-not $Url) { return }
-  try { Start-Process $Url | Out-Null } catch {}
+  if (-not $Url) { return $false }
+  try {
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $Url
+    $psi.UseShellExecute = $true
+    $null = [System.Diagnostics.Process]::Start($psi)
+    return $true
+  } catch {}
+  try {
+    $null = Start-Process -FilePath "cmd.exe" -ArgumentList @("/d", "/c", "start", "", $Url) -WindowStyle Hidden -PassThru
+    return $true
+  } catch {}
+  return $false
 }
 
 function Invoke-HiddenPowerShellScript {
@@ -553,6 +564,7 @@ $script:lastHelperOutput = ""
 $script:pendingRuntimeAction = ""
 $script:pendingRuntimeActionAt = [DateTime]::MinValue
 $script:pendingRuntimeTimeoutSec = 45
+$script:autoOpenedRunningApp = $false
 $script:pendingStart = $false
 $script:pendingStartAt = [DateTime]::MinValue
 $script:pendingStartTimeoutSec = 45
@@ -1032,7 +1044,11 @@ function Refresh-State {
           $script:pendingRuntimeAction = ""
           if ($snapshot.local_url) {
             Append-Log ("Start complete. App ready on port {0} (v{1})." -f $snapshot.controller_port, $(if ($snapshot.version) { $snapshot.version } else { "n/a" }))
-            Open-Url ([string]$snapshot.local_url)
+            if (Open-Url ([string]$snapshot.local_url)) {
+              Append-Log ("Opened app: {0}" -f $snapshot.local_url)
+            } else {
+              Append-Log ("Could not open app automatically. Open it manually: {0}" -f $snapshot.local_url)
+            }
           }
         } elseif ($ageSeconds -le $script:pendingRuntimeTimeoutSec) {
           $snapshot.status = "starting"
@@ -1066,6 +1082,12 @@ function Refresh-State {
     $hasPair = [bool]$pairUrl
     $btnCopyPair.Enabled = (-not $busy) -and $hasPair
     $btnOpenPair.Enabled = (-not $busy) -and $hasPair
+    if ((-not $script:autoOpenedRunningApp) -and $snapshot.status -eq "running" -and $snapshot.local_url -and $snapshot.local_url -ne "offline") {
+      if (Open-Url ([string]$snapshot.local_url)) {
+        Append-Log ("Opened app: {0}" -f $snapshot.local_url)
+        $script:autoOpenedRunningApp = $true
+      }
+    }
   } catch {
     $msg = [string]$_.Exception.Message
     if (-not $msg) { $msg = "Could not refresh launcher state." }
@@ -1198,16 +1220,31 @@ $btnStart.Add_Click({ Safe-Action -Action { Start-Stack } -Button $btnStart })
 $btnStop.Add_Click({ Safe-Action -Action { Stop-Stack } -Button $btnStop })
 $btnOpenLocal.Add_Click({
   $port = Resolve-LauncherControllerPort
-  Open-Url ("http://127.0.0.1:{0}/" -f $port)
+  $url = ("http://127.0.0.1:{0}/" -f $port)
+  if (Open-Url $url) {
+    Append-Log ("Opened app: {0}" -f $url)
+  } else {
+    Append-Log ("Could not open app: {0}" -f $url)
+  }
 })
 $btnOpenNetwork.Add_Click({
   $port = Resolve-LauncherControllerPort
   $ip = Get-CachedLanIp
-  Open-Url ("http://{0}:{1}/" -f $ip, $port)
+  $url = ("http://{0}:{1}/" -f $ip, $port)
+  if (Open-Url $url) {
+    Append-Log ("Opened network app: {0}" -f $url)
+  } else {
+    Append-Log ("Could not open network app: {0}" -f $url)
+  }
 })
 $btnOpenController.Add_Click({
   $port = Resolve-LauncherControllerPort
-  Open-Url ("http://127.0.0.1:{0}/legacy" -f $port)
+  $url = ("http://127.0.0.1:{0}/legacy" -f $port)
+  if (Open-Url $url) {
+    Append-Log ("Opened fallback page: {0}" -f $url)
+  } else {
+    Append-Log ("Could not open fallback page: {0}" -f $url)
+  }
 })
 $btnGenQr.Add_Click({ Safe-Action -Action { Generate-PairQr } -Button $btnGenQr })
 $btnCopyPair.Add_Click({
@@ -1218,8 +1255,11 @@ $btnCopyPair.Add_Click({
 })
 $btnOpenPair.Add_Click({
   if ($pairUrl) {
-    Open-Url $pairUrl
-    Append-Log "Opened pair link."
+    if (Open-Url $pairUrl) {
+      Append-Log "Opened pair link."
+    } else {
+      Append-Log ("Could not open pair link: {0}" -f $pairUrl)
+    }
   }
 })
 
