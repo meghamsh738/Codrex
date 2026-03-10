@@ -245,7 +245,6 @@ function Invoke-HiddenPowerShellScript {
   $invokeArgs = @(
     "-NoProfile",
     "-ExecutionPolicy", "Bypass",
-    "-WindowStyle", "Hidden",
     "-File", $ScriptPath
   )
   if ($Arguments) {
@@ -260,26 +259,6 @@ function Invoke-HiddenPowerShellScript {
     return [int]$LASTEXITCODE
   }
   return 0
-}
-
-function Start-HiddenPowerShellScript {
-  param(
-    [string]$ScriptPath,
-    [string[]]$Arguments = @()
-  )
-  if (-not (Test-Path $ScriptPath)) {
-    throw "Missing $ScriptPath"
-  }
-  $invokeArgs = @(
-    "-NoProfile",
-    "-ExecutionPolicy", "Bypass",
-    "-WindowStyle", "Hidden",
-    "-File", $ScriptPath
-  )
-  if ($Arguments) {
-    $invokeArgs += $Arguments
-  }
-  return Start-Process -FilePath "powershell.exe" -ArgumentList $invokeArgs -WorkingDirectory $root -WindowStyle Hidden -PassThru
 }
 
 function Wait-ForPortsReleased {
@@ -978,17 +957,17 @@ function Start-Stack {
   Set-ActionStatus -State "starting" -Detail "Launching Codrex helper..." -ControllerPort $existingSnapshot.controller_port
   [System.Windows.Forms.Application]::DoEvents()
 
-  $startProc = Start-HiddenPowerShellScript -ScriptPath $startMobileScript -Arguments @(
+  $startExitCode = Invoke-HiddenPowerShellScript -ScriptPath $startMobileScript -Arguments @(
     "-UiPort", [string]$uiPort
   )
-  if (-not $startProc) {
-    throw "Could not launch the Codrex start helper."
+  if ($startExitCode -ne 0) {
+    $detail = if ($script:lastHelperOutput) { " Detail: $($script:lastHelperOutput)" } else { "" }
+    throw "Codrex start helper exited with code $startExitCode.$detail Logs: $logsDir"
   }
 
   $readySnapshot = $null
-  $lastHelperExit = $null
-  for ($attempt = 0; $attempt -lt 90; $attempt++) {
-    Start-Sleep -Milliseconds 500
+  for ($attempt = 0; $attempt -lt 20; $attempt++) {
+    Start-Sleep -Milliseconds 300
     [System.Windows.Forms.Application]::DoEvents()
 
     $script:cachedControllerConfigAt = [DateTime]::MinValue
@@ -1006,16 +985,6 @@ function Start-Stack {
     } else {
       Set-ActionStatus -State "starting" -Detail "Waiting for controller process..." -ControllerPort $snapshot.controller_port
     }
-
-    try {
-      if ($startProc.HasExited) {
-        $lastHelperExit = [int]$startProc.ExitCode
-        if ($lastHelperExit -ne 0 -and -not $snapshot.app_built) {
-          $detail = if ($script:lastHelperOutput) { " Detail: $($script:lastHelperOutput)" } else { "" }
-          throw "Codrex start helper exited with code $lastHelperExit.$detail Logs: $logsDir"
-        }
-      }
-    } catch {}
   }
 
   if (-not $readySnapshot) {
@@ -1028,8 +997,7 @@ function Start-Stack {
   }
 
   if (-not $readySnapshot) {
-    $detail = if ($lastHelperExit -ne $null) { " Helper exit: $lastHelperExit." } else { "" }
-    throw "Codrex did not reach running state after launch.$detail Logs: $logsDir"
+    throw "Codrex did not reach running state after launch. Logs: $logsDir"
   }
 
   Refresh-State -Force
