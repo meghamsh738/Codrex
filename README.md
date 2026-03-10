@@ -13,6 +13,9 @@ It includes:
 - Codex session control, shell session monitor, and remote desktop controls
 - optional Telegram delivery pipeline for generated files
 
+Project status and open maintenance items:
+- `PROJECT_STATUS.md`
+
 ## Screenshots
 
 ### WebUI Tabs (Latest)

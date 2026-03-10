@@ -3706,7 +3706,7 @@ export default function App() {
           >
             {installButtonLabel}
           </button>
-          <a className="button ghost" href="/?compact=1" target="_blank" rel="noreferrer">
+          <a className="button ghost" href="/legacy" target="_blank" rel="noreferrer">
             Legacy
           </a>
         </div>
