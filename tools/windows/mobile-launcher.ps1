@@ -251,7 +251,11 @@ function Invoke-HiddenPowerShellScript {
   if ($Arguments) {
     $invokeArgs += $Arguments
   }
-  & powershell.exe @invokeArgs
+  $script:lastHelperOutput = ""
+  $capturedOutput = @(& powershell.exe @invokeArgs 2>&1 | ForEach-Object { [string]$_ })
+  if ($capturedOutput.Count -gt 0) {
+    $script:lastHelperOutput = ($capturedOutput -join "`n").Trim()
+  }
   if ($LASTEXITCODE -is [int]) {
     return [int]$LASTEXITCODE
   }
@@ -452,6 +456,7 @@ $script:refreshInProgress = $false
 $script:actionInProgress = $false
 $script:refreshTimer = $null
 $script:launcherButtons = @()
+$script:lastHelperOutput = ""
 
 function Set-LauncherButtonStyle {
   param(
@@ -957,7 +962,8 @@ function Start-Stack {
     "-UiPort", [string]$uiPort
   )
   if ($startExitCode -ne 0) {
-    throw "Codrex start helper exited with code $startExitCode. Logs: $logsDir"
+    $detail = if ($script:lastHelperOutput) { " Detail: $($script:lastHelperOutput)" } else { "" }
+    throw "Codrex start helper exited with code $startExitCode.$detail Logs: $logsDir"
   }
 
   $readySnapshot = $null
@@ -1018,6 +1024,7 @@ function Stop-Stack {
     if ($controllerStillListening) { $reasons.Add("controller still listening on $controllerPort") }
     if ($uiStillListening) { $reasons.Add("UI still listening on $uiPort") }
     if (-not $sessionCleared) { $reasons.Add("runtime session file still present") }
+    if ($script:lastHelperOutput) { $reasons.Add($script:lastHelperOutput) }
     $detail = if ($reasons.Count -gt 0) { $reasons -join "; " } else { "unknown stop state" }
     throw "Codrex stop did not complete cleanly: $detail. Use Open Fallback or inspect runtime logs."
   }
