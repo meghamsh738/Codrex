@@ -1150,10 +1150,9 @@ function Start-Stack {
 
 function Stop-Stack {
   Append-Log "Stopping mobile stack..."
-  $procId = Start-DetachedRuntimeAction -ActionName "stop"
-  $script:pendingRuntimeAction = "stop"
-  $script:pendingRuntimeActionAt = [DateTime]::UtcNow
-  Append-Log ("Stop requested via runtime helper PID {0}." -f $procId)
+  $null = Invoke-RuntimeAction -ActionName "stop"
+  Clear-PairingState
+  Append-Log "Stop complete."
 }
 
 function Toggle-AdvancedActions {
