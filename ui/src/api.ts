@@ -231,6 +231,24 @@ export function buildSuggestedControllerUrl(
   return `http://${hostname}:${port}`;
 }
 
+export function detectControllerPort(locationPort?: string): number {
+  const fromEnv = Number.parseInt(import.meta.env.VITE_BACKEND_PORT || "", 10);
+  if (Number.isInteger(fromEnv) && fromEnv > 0) {
+    return fromEnv;
+  }
+  const rawLocationPort =
+    typeof locationPort === "string"
+      ? locationPort
+      : typeof window !== "undefined"
+        ? window.location.port || ""
+        : "";
+  const fromLocation = Number.parseInt(rawLocationPort, 10);
+  if (Number.isInteger(fromLocation) && fromLocation > 0) {
+    return fromLocation;
+  }
+  return 48787;
+}
+
 export function getAuthStatus(): Promise<AuthStatus> {
   return requestJson<AuthStatus>("/auth/status");
 }

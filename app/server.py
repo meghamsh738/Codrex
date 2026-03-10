@@ -3905,7 +3905,7 @@ def legacy_index(request: Request):
 	        <div class="row pair-actions">
 	          <label class="field grow">
 	            <span class="label">Base URL (must be reachable from phone)</span>
-	            <input id="pairBaseUrl" placeholder="http://100.x.x.x:8787" data-testid="pair-base-url" />
+	            <input id="pairBaseUrl" placeholder="http://100.x.x.x:&lt;codrex-port&gt;" data-testid="pair-base-url" />
 	          </label>
 	          <button class="ghost soft" onclick="useTailscaleBase()" data-testid="pair-use-tailscale">Use Tailscale</button>
 	          <button class="ghost soft" onclick="useLanBase()" data-testid="pair-use-lan">Use LAN</button>
@@ -4645,9 +4645,9 @@ async function checkAuthStatus() {
 
 function _hashParams() {
   // Supports pairing links like:
-  //   http://host:8787/#pair=...   (hash isn't sent to server)
+  //   http://host:48787/#pair=...   (hash isn't sent to server)
   // and token links like:
-  //   http://host:8787/#token=...
+  //   http://host:48787/#token=...
   const raw = (window.location.hash || "").replace(/^#/, "").trim();
   if (!raw) return null;
   try { return new URLSearchParams(raw); } catch (_e) { return null; }
@@ -4888,7 +4888,7 @@ async function useTailscaleBase() {
     _syncPairRouteUi();
     return;
   }
-  const port = window.location.port || "8787";
+  const port = window.location.port || "48787";
   pairBaseUrlEl.value = `http://${info.tailscale_ip}:${port}`;
   _setPairStatus("Using Tailscale base URL.");
   _syncPairRouteUi();
@@ -4902,7 +4902,7 @@ async function useLanBase() {
     _syncPairRouteUi();
     return;
   }
-  const port = window.location.port || "8787";
+  const port = window.location.port || "48787";
   pairBaseUrlEl.value = `http://${info.lan_ip}:${port}`;
   _setPairStatus("Using LAN base URL.");
   _syncPairRouteUi();

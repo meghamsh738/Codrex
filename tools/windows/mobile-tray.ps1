@@ -4,6 +4,9 @@ $ErrorActionPreference = "Stop"
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
+$script:DefaultControllerPort = 48787
+$script:DefaultDevUiPort = 54312
+
 function Get-CodrexRuntimeDir {
   param(
     [string]$RepoRoot
@@ -41,7 +44,7 @@ $script:StopScript = Join-Path $script:ScriptRoot "stop-mobile.ps1"
 $script:ConfigPath = Join-Path $script:Root "controller.config.json"
 $script:LocalConfigPath = Join-Path $script:StateDir "controller.config.local.json"
 $script:LegacyLocalConfigPath = Join-Path $script:Root "controller.config.local.json"
-$script:UiPort = 4312
+$script:UiPort = $script:DefaultDevUiPort
 $script:PendingAction = ""
 $script:PendingProc = $null
 $script:BalloonQueue = @()
@@ -69,7 +72,7 @@ function Get-PrimaryIPv4 {
 
 function Read-ControllerConfig {
   $cfg = [ordered]@{
-    port = 8787
+    port = $script:DefaultControllerPort
     token = ""
   }
   if (Test-Path $script:ConfigPath) {
@@ -94,7 +97,7 @@ function Read-ControllerConfig {
 function Read-ControllerPort {
   $cfg = Read-ControllerConfig
   if ($cfg -and $cfg.port) { return [int]$cfg.port }
-  return 8787
+  return $script:DefaultControllerPort
 }
 
 foreach ($dir in @($script:RuntimeDir, $script:StateDir, $script:LogsDir)) {
@@ -543,14 +546,14 @@ $script:StartItem.Add_Click({ Start-ActionProcess -Action "start" })
 $script:StopItem.Add_Click({ Start-ActionProcess -Action "stop" })
 $script:OpenUiLocalItem.Add_Click({
   if (-not $script:LastStatus) { Update-UiState }
-  $port = if ($script:LastStatus -and $script:LastStatus.controller_port) { [int]$script:LastStatus.controller_port } else { 8787 }
+  $port = if ($script:LastStatus -and $script:LastStatus.controller_port) { [int]$script:LastStatus.controller_port } else { $script:DefaultControllerPort }
   Open-Url ("http://127.0.0.1:{0}" -f $port)
 })
 $script:OpenUiNetworkItem.Add_Click({
   if (-not $script:LastStatus) { Update-UiState }
   $ip = [string]$script:LastStatus.lan_ip
   if ($ip) {
-    $port = if ($script:LastStatus -and $script:LastStatus.controller_port) { [int]$script:LastStatus.controller_port } else { 8787 }
+    $port = if ($script:LastStatus -and $script:LastStatus.controller_port) { [int]$script:LastStatus.controller_port } else { $script:DefaultControllerPort }
     Open-Url ("http://{0}:{1}" -f $ip, $port)
   }
 })
@@ -596,7 +599,9 @@ $script:NotifyIcon.BalloonTipIcon = [System.Windows.Forms.ToolTipIcon]::Info
 $script:NotifyIcon.ShowBalloonTip(1800)
 
 $script:NotifyIcon.Add_DoubleClick({
-  Open-Url ("http://127.0.0.1:{0}" -f $script:UiPort)
+  if (-not $script:LastStatus) { Update-UiState }
+  $port = if ($script:LastStatus -and $script:LastStatus.controller_port) { [int]$script:LastStatus.controller_port } else { $script:DefaultControllerPort }
+  Open-Url ("http://127.0.0.1:{0}" -f $port)
 })
 
 $script:Timer = New-Object System.Windows.Forms.Timer

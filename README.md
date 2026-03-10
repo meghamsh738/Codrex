@@ -99,13 +99,14 @@ Primary Windows launcher:
 - `Codrex.cmd`
 
 Expected URLs:
-- App + controller: `http://<your-lan-ip>:8787`
-- Legacy fallback controls: `http://<your-lan-ip>:8787/legacy`
+- App + controller: `http://<your-lan-ip>:<codrex-port>`
+- Legacy fallback controls: `http://<your-lan-ip>:<codrex-port>/legacy`
+- Default Codrex port target is `48787`, but startup can move to the next free port if that port is already in use.
 
 ### 6) Auth and pairing
 
 On laptop browser:
-1. Open `http://127.0.0.1:8787`
+1. Open the URL shown by `Codrex.cmd` or the launcher. On a clean setup this is usually `http://127.0.0.1:48787`.
 2. Go to **Pair** tab
 3. Keep **Tailscale** route (default and recommended)
 4. Generate QR
@@ -113,6 +114,7 @@ On laptop browser:
 
 Important:
 - `controller.config.json` ships with empty token; `start-controller.ps1` auto-generates a strong token on first run.
+- Codrex now prefers uncommon ports and auto-shifts to the next free port if the preferred one is already taken by another app.
 - Generated token is stored in `%LocalAppData%\Codrex\remote-ui\state\controller.config.local.json`.
 - Pair QR uses short-lived one-time code exchange and does not place the long token in URL.
 - LAN/current pairing routes are intentionally restricted for localhost browser sessions only.
@@ -215,7 +217,7 @@ Primary launcher:
 Advanced Windows tools:
 - `tools/windows/`
 - `tools/windows/legacy-launchers/` keeps the older `.cmd` wrappers for compatibility only
-- `http://127.0.0.1:8787/legacy` stays available as the no-JS fallback if the built app is missing
+- `http://127.0.0.1:<codrex-port>/legacy` stays available as the no-JS fallback if the built app is missing
 
 ## Windows App Layout
 
@@ -236,7 +238,7 @@ The repo root is intentionally simplified:
 
 ## Known Security Risks
 
-- If ports `8787`/`4312` are exposed to the public internet, attack surface increases significantly.
+- If the controller port or optional dev UI port are exposed to the public internet, attack surface increases significantly.
 - If someone gets local filesystem access, they can read local runtime secrets and logs.
 - Pair links are short-lived but still sensitive while valid; share only in trusted context.
 - Telegram delivery sends files to the configured chat ID; treat bot token as a secret.

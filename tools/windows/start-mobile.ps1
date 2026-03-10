@@ -1,5 +1,5 @@
 param(
-  [int]$UiPort = 4312,
+  [int]$UiPort = 54312,
   [switch]$OpenFirewall,
   [switch]$SkipUiInstall,
   [switch]$DevUi
@@ -8,6 +8,9 @@ param(
 $ErrorActionPreference = "Stop"
 $scriptRoot = Split-Path -Parent $PSCommandPath
 $root = (Resolve-Path (Join-Path $scriptRoot "..\..")).Path
+$script:DefaultControllerPort = 48787
+$script:LegacyControllerPort = 8787
+$script:DefaultDevUiPort = 54312
 
 function Get-PrimaryIPv4 {
   try {
@@ -33,14 +36,14 @@ function Read-ControllerPort {
   param(
     [string]$ConfigPath
   )
-  if (-not (Test-Path $ConfigPath)) { return 8787 }
+  if (-not (Test-Path $ConfigPath)) { return $script:DefaultControllerPort }
   try {
     $cfg = Get-Content -Path $ConfigPath -Raw | ConvertFrom-Json
     if ($cfg -and $cfg.port) {
       return [int]$cfg.port
     }
   } catch {}
-  return 8787
+  return $script:DefaultControllerPort
 }
 
 function Ensure-UiDependencies {
@@ -120,6 +123,42 @@ function Get-UiOwnerInfo {
   return $owners
 }
 
+function Resolve-DevUiPort {
+  param(
+    [int]$PreferredPort
+  )
+  $candidates = [System.Collections.Generic.List[int]]::new()
+  foreach ($port in @($PreferredPort, $script:DefaultDevUiPort)) {
+    if ($port -gt 0 -and -not $candidates.Contains([int]$port)) {
+      $null = $candidates.Add([int]$port)
+    }
+  }
+  for ($offset = 0; $offset -lt 20; $offset++) {
+    $candidate = $script:DefaultDevUiPort + $offset
+    if (-not $candidates.Contains([int]$candidate)) {
+      $null = $candidates.Add([int]$candidate)
+    }
+  }
+  for ($offset = 1; $offset -le 20; $offset++) {
+    $candidate = $PreferredPort + $offset
+    if ($candidate -gt 0 -and -not $candidates.Contains([int]$candidate)) {
+      $null = $candidates.Add([int]$candidate)
+    }
+  }
+
+  foreach ($candidate in $candidates) {
+    $owners = @(Get-UiOwnerInfo -Port $candidate)
+    if ($owners.Count -eq 0) {
+      return [int]$candidate
+    }
+    $viteOwner = $owners | Where-Object { $_.CommandLine -and $_.CommandLine -match "vite" } | Select-Object -First 1
+    if ($viteOwner) {
+      return [int]$candidate
+    }
+  }
+  throw "Could not find a free dev UI port near $PreferredPort."
+}
+
 function Ensure-FirewallRuleForPort {
   param(
     [int]$Port,
@@ -190,6 +229,17 @@ foreach ($dir in @($runtimeDir, $stateDir, $logsDir)) {
 }
 
 $controllerPort = Read-ControllerPort -ConfigPath $configPath
+if ($controllerPort -eq $script:LegacyControllerPort) {
+  $controllerPort = $script:DefaultControllerPort
+}
+
+if ($DevUi) {
+  $resolvedUiPort = Resolve-DevUiPort -PreferredPort $UiPort
+  if ($resolvedUiPort -ne $UiPort) {
+    Write-Host ("Codrex dev UI port {0} is busy. Using {1} instead." -f $UiPort, $resolvedUiPort)
+    $UiPort = $resolvedUiPort
+  }
+}
 
 $startControllerScript = Join-Path $scriptRoot "start-controller.ps1"
 if (-not (Test-Path $startControllerScript)) {
@@ -272,6 +322,7 @@ if ($DevUi) {
   $appHealth = $null
   for ($i = 0; $i -lt 40; $i++) {
     Start-Sleep -Milliseconds 300
+    $controllerPort = Read-ControllerPort -ConfigPath $configPath
     $appHealth = Get-AppHealth -Port $controllerPort
     if ($appHealth -and $appHealth.ok -and $appHealth.ui_mode -eq "built") {
       $appReady = $true
@@ -283,6 +334,8 @@ if ($DevUi) {
     throw "Built app startup failed. $detail"
   }
 }
+
+$controllerPort = Read-ControllerPort -ConfigPath $configPath
 
 if ($OpenFirewall) {
   if ($DevUi) {

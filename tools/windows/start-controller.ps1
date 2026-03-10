@@ -1,6 +1,6 @@
 param(
-  [int]$Port = 8787,
-  [int]$UiPort = 4312,
+  [int]$Port = 48787,
+  [int]$UiPort = 54312,
   [string]$Distro = "Ubuntu",
   [string]$Workdir = "/home/megha/codrex-work",
   [string]$FileRoot = "/home/megha/codrex-work",
@@ -10,6 +10,9 @@ param(
 $ErrorActionPreference = "Stop"
 $scriptRoot = Split-Path -Parent $PSCommandPath
 $root = (Resolve-Path (Join-Path $scriptRoot "..\..")).Path
+$script:DefaultControllerPort = 48787
+$script:LegacyControllerPort = 8787
+$script:DefaultDevUiPort = 54312
 
 function New-SecureToken([int]$ByteCount = 32) {
   $bytes = New-Object byte[] $ByteCount
@@ -101,6 +104,77 @@ function Get-PrimaryIPv4 {
     if ($line -match ":\s*([0-9\.]+)\s*$") { return $matches[1] }
   } catch {}
   return "127.0.0.1"
+}
+
+function Get-PortOwners {
+  param(
+    [int]$Port
+  )
+  try {
+    $listeners = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue
+  } catch {
+    return @()
+  }
+  if (-not $listeners) {
+    return @()
+  }
+  $owners = @()
+  foreach ($listener in ($listeners | Select-Object -Unique OwningProcess)) {
+    $procId = [int]$listener.OwningProcess
+    $proc = Get-CimInstance Win32_Process -Filter ("ProcessId = {0}" -f $procId) -ErrorAction SilentlyContinue
+    if ($proc) {
+      $owners += $proc
+    }
+  }
+  return $owners
+}
+
+function Test-CodrexControllerOwner {
+  param(
+    [object[]]$Owners
+  )
+  foreach ($owner in ($Owners | Where-Object { $_ })) {
+    $cmd = [string]$owner.CommandLine
+    if ($cmd -and $cmd -match "app\.server:app") {
+      return $true
+    }
+  }
+  return $false
+}
+
+function Resolve-CodrexControllerPort {
+  param(
+    [int]$PreferredPort
+  )
+  $candidates = [System.Collections.Generic.List[int]]::new()
+  foreach ($port in @($PreferredPort, $script:DefaultControllerPort)) {
+    if ($port -gt 0 -and -not $candidates.Contains([int]$port)) {
+      $null = $candidates.Add([int]$port)
+    }
+  }
+  for ($offset = 0; $offset -lt 20; $offset++) {
+    $candidate = $script:DefaultControllerPort + $offset
+    if (-not $candidates.Contains([int]$candidate)) {
+      $null = $candidates.Add([int]$candidate)
+    }
+  }
+  for ($offset = 1; $offset -le 20; $offset++) {
+    $candidate = $PreferredPort + $offset
+    if ($candidate -gt 0 -and -not $candidates.Contains([int]$candidate)) {
+      $null = $candidates.Add([int]$candidate)
+    }
+  }
+
+  foreach ($candidate in $candidates) {
+    $owners = @(Get-PortOwners -Port $candidate)
+    if ($owners.Count -eq 0) {
+      return [int]$candidate
+    }
+    if (Test-CodrexControllerOwner -Owners $owners) {
+      return [int]$candidate
+    }
+  }
+  throw "Could not find a free controller port near $PreferredPort. Close the conflicting app or set a custom Codrex port."
 }
 
 function Test-ControllerReady {
@@ -206,12 +280,21 @@ if ($PSBoundParameters.ContainsKey("Distro")) { $cfg.distro = $Distro }
 if ($PSBoundParameters.ContainsKey("Workdir")) { $cfg.workdir = $Workdir }
 if ($PSBoundParameters.ContainsKey("FileRoot")) { $cfg.fileRoot = $FileRoot }
 
-if (-not $cfg.port) { $cfg.port = 8787 }
+if (-not $cfg.port) { $cfg.port = $script:DefaultControllerPort }
 if (-not $cfg.distro) { $cfg.distro = "Ubuntu" }
 if (-not $cfg.workdir) { $cfg.workdir = "/home/megha/codrex-work" }
 if (-not $cfg.fileRoot) { $cfg.fileRoot = $cfg.workdir }
 if (-not $cfg.token -or $cfg.token.Length -lt 24) { $cfg.token = New-SecureToken }
 $cfg.telegramDefaultSend = Convert-ToBoolean -Value $cfg.telegramDefaultSend -Default $true
+
+if ((-not $PSBoundParameters.ContainsKey("Port")) -and ([int]$cfg.port -eq $script:LegacyControllerPort)) {
+  $cfg.port = $script:DefaultControllerPort
+}
+$resolvedPort = Resolve-CodrexControllerPort -PreferredPort ([int]$cfg.port)
+if ($resolvedPort -ne [int]$cfg.port) {
+  Write-Host ("Codrex controller port {0} is busy. Using {1} instead." -f $cfg.port, $resolvedPort)
+  $cfg.port = $resolvedPort
+}
 
 $persistMain = [ordered]@{
   port = [int]$cfg.port

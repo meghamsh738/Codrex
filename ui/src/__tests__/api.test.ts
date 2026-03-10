@@ -6,6 +6,7 @@ import {
   buildSuggestedControllerUrl,
   createSessionWithOptions,
   createSharedFile,
+  detectControllerPort,
   deleteSharedFile,
   getPowerStatus,
   getTelegramStatus,
@@ -55,6 +56,14 @@ describe("base URL suggestions", () => {
   it("falls back to current host", () => {
     const suggested = buildSuggestedControllerUrl("localhost", 8787, null, "tailscale");
     expect(suggested).toBe("http://localhost:8787");
+  });
+
+  it("detects controller port from current location when env is unset", () => {
+    expect(detectControllerPort("48792")).toBe(48792);
+  });
+
+  it("falls back to Codrex default controller port", () => {
+    expect(detectControllerPort("")).toBe(48787);
   });
 });
 

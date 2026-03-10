@@ -4,6 +4,8 @@ $ErrorActionPreference = "Stop"
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
+$script:DefaultControllerPort = 48787
+
 function Coalesce-Value($Value, $Default) {
   if ($null -eq $Value) { return $Default }
   if ($Value -is [string] -and $Value.Trim() -eq "") { return $Default }
@@ -31,7 +33,7 @@ function Read-ControllerConfig([string]$Root) {
   $localConfigPath = Join-Path (Join-Path $runtimeDir "state") "controller.config.local.json"
   $legacyLocalConfigPath = Join-Path $Root "controller.config.local.json"
   $cfg = [ordered]@{
-    port = 8787
+    port = $script:DefaultControllerPort
     token = ""
   }
   if (Test-Path $path) {
@@ -338,7 +340,7 @@ function Get-BaseRouteKind([string]$Base, [string]$LanUrl, [string]$TsUrl) {
 $scriptRoot = Split-Path -Parent $PSCommandPath
 $root = (Resolve-Path (Join-Path $scriptRoot "..\..")).Path
 $cfg = Read-ControllerConfig -Root $root
-$port = [int](Coalesce-Value $cfg.port 8787)
+$port = [int](Coalesce-Value $cfg.port $script:DefaultControllerPort)
 $token = [string](Coalesce-Value $cfg.token "")
 
 $form = New-Object System.Windows.Forms.Form
@@ -860,7 +862,7 @@ function Update-NetworkAndRoute {
 
 function Base-Urls {
   $cfg = Read-ControllerConfig -Root $root
-  $p = [int](Coalesce-Value $cfg.port 8787)
+  $p = [int](Coalesce-Value $cfg.port $script:DefaultControllerPort)
   $lan = Get-LanIPv4
   $ts = Get-TailscaleIPv4
   return [pscustomobject]@{
@@ -873,7 +875,7 @@ function Base-Urls {
 
 function Refresh-UiStatus {
   $cfg = Read-ControllerConfig -Root $root
-  $p = [int](Coalesce-Value $cfg.port 8787)
+  $p = [int](Coalesce-Value $cfg.port $script:DefaultControllerPort)
   $t = [string](Coalesce-Value $cfg.token "")
   $txtToken.Text = $t
 
@@ -935,7 +937,7 @@ function Run-Start {
     Start-Sleep -Milliseconds 250
     [System.Windows.Forms.Application]::DoEvents()
     $cfg = Read-ControllerConfig -Root $root
-    $p = [int](Coalesce-Value $cfg.port 8787)
+    $p = [int](Coalesce-Value $cfg.port $script:DefaultControllerPort)
     $t = [string](Coalesce-Value $cfg.token "")
     $j = Invoke-Json -Url "http://127.0.0.1:$p/auth/status" -Method "GET" -BodyObj $null -Token $t
     if ($j -and $j.ok) { break }
@@ -965,7 +967,7 @@ function Run-Stop {
     Start-Sleep -Milliseconds 250
     [System.Windows.Forms.Application]::DoEvents()
     $cfg = Read-ControllerConfig -Root $root
-    $p = [int](Coalesce-Value $cfg.port 8787)
+    $p = [int](Coalesce-Value $cfg.port $script:DefaultControllerPort)
     $t = [string](Coalesce-Value $cfg.token "")
     $j = Invoke-Json -Url "http://127.0.0.1:$p/auth/status" -Method "GET" -BodyObj $null -Token $t
     if ($null -eq $j) { break }
@@ -991,7 +993,7 @@ function Ensure-BaseUrl {
 
 function Generate-Qr {
   $cfg = Read-ControllerConfig -Root $root
-  $p = [int](Coalesce-Value $cfg.port 8787)
+  $p = [int](Coalesce-Value $cfg.port $script:DefaultControllerPort)
   $t = [string](Coalesce-Value $cfg.token "")
 
   $base = Ensure-BaseUrl

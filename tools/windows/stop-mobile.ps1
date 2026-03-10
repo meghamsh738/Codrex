@@ -1,5 +1,5 @@
 param(
-  [int]$UiPort = 4312,
+  [int]$UiPort = 54312,
   [switch]$KeepController
 )
 
@@ -66,12 +66,12 @@ function Stop-UiByPort {
 
 function Read-ControllerPort {
   param([string]$ConfigPath)
-  if (-not (Test-Path $ConfigPath)) { return 8787 }
+  if (-not (Test-Path $ConfigPath)) { return 48787 }
   try {
     $cfg = Get-Content -Path $ConfigPath -Raw | ConvertFrom-Json
     if ($cfg -and $cfg.port) { return [int]$cfg.port }
   } catch {}
-  return 8787
+  return 48787
 }
 
 function Get-CodrexRuntimeDir {

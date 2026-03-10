@@ -16,6 +16,7 @@ import {
   createSessionWithOptions,
   createTmuxSession,
   createPairCode,
+  detectControllerPort,
   deleteSessionFile,
   deleteThreadRecord,
   desktopClick,
@@ -261,11 +262,7 @@ function parseInitialTab(): MainTab {
 }
 
 function parsePort(): number {
-  const fromEnv = Number.parseInt(import.meta.env.VITE_BACKEND_PORT || "", 10);
-  if (Number.isInteger(fromEnv) && fromEnv > 0) {
-    return fromEnv;
-  }
-  return 8787;
+  return detectControllerPort();
 }
 
 function formatClock(tsMs: number): string {
@@ -5005,7 +5002,7 @@ export default function App() {
                       type="text"
                       value={controllerBase}
                       onChange={(event) => setControllerBase(event.target.value)}
-                      placeholder="http://192.168.x.x:8787"
+                      placeholder="http://192.168.x.x:<codrex-port>"
                     />
                   </label>
                   <p className="small">

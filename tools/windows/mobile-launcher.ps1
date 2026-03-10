@@ -4,6 +4,9 @@ $ErrorActionPreference = "Stop"
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
+$script:DefaultControllerPort = 48787
+$script:DefaultDevUiPort = 54312
+
 function Get-PrimaryIPv4 {
   try {
     $route = Get-NetRoute -DestinationPrefix "0.0.0.0/0" -ErrorAction Stop |
@@ -67,7 +70,7 @@ function Get-CodrexRuntimeDir {
 
 function Read-ControllerConfig([string]$Path) {
   $cfg = [ordered]@{
-    port = 8787
+    port = $script:DefaultControllerPort
     token = ""
   }
   if (Test-Path $Path) {
@@ -221,8 +224,8 @@ $script:LocalConfigPath = Join-Path $stateDir "controller.config.local.json"
 $script:LegacyLocalConfigPath = Join-Path $root "controller.config.local.json"
 $startMobileScript = Join-Path $scriptRoot "start-mobile.ps1"
 $stopMobileScript = Join-Path $scriptRoot "stop-mobile.ps1"
-$uiPort = 4312
-$controllerPort = 8787
+$uiPort = $script:DefaultDevUiPort
+$controllerPort = $script:DefaultControllerPort
 $controllerToken = ""
 $pairUrl = ""
 $authSession = New-Object Microsoft.PowerShell.Commands.WebRequestSession
@@ -699,7 +702,7 @@ function Refresh-State {
   $script:refreshInProgress = $true
   try {
     $cfg = Get-CachedControllerConfig
-    $controllerPort = if ($cfg.port) { [int]$cfg.port } else { 8787 }
+    $controllerPort = if ($cfg.port) { [int]$cfg.port } else { $script:DefaultControllerPort }
     $controllerToken = [string]$cfg.token
     $lanIp = Get-CachedLanIp
 
@@ -741,7 +744,7 @@ function Start-Stack {
     throw "Missing $startMobileScript"
   }
   $cfg = Get-CachedControllerConfig
-  $controllerPort = if ($cfg.port) { [int]$cfg.port } else { 8787 }
+  $controllerPort = if ($cfg.port) { [int]$cfg.port } else { $script:DefaultControllerPort }
   Append-Log "Starting mobile stack..."
   # Request firewall rules on start so LAN pairing/open-app links are reachable from Android.
   $p = Start-Process -FilePath "powershell.exe" -ArgumentList @("-NoProfile","-ExecutionPolicy","Bypass","-File",$startMobileScript,"-UiPort",[string]$uiPort,"-OpenFirewall") -WorkingDirectory $root -WindowStyle Hidden -PassThru
@@ -778,7 +781,7 @@ function Stop-Stack {
     throw "Missing $stopMobileScript"
   }
   $cfg = Get-CachedControllerConfig
-  $controllerPort = if ($cfg.port) { [int]$cfg.port } else { 8787 }
+  $controllerPort = if ($cfg.port) { [int]$cfg.port } else { $script:DefaultControllerPort }
   Append-Log "Stopping mobile stack..."
   Start-Process -FilePath "powershell.exe" -ArgumentList @("-NoProfile","-ExecutionPolicy","Bypass","-File",$stopMobileScript,"-UiPort",[string]$uiPort) -WorkingDirectory $root -WindowStyle Hidden | Out-Null
   for ($i = 0; $i -lt 50; $i++) {
@@ -797,7 +800,7 @@ function Stop-Stack {
 
 function Generate-PairQr {
   $cfg = Get-CachedControllerConfig
-  $controllerPort = if ($cfg.port) { [int]$cfg.port } else { 8787 }
+  $controllerPort = if ($cfg.port) { [int]$cfg.port } else { $script:DefaultControllerPort }
   $controllerToken = [string]$cfg.token
 
   $listening = Get-ListeningStateMap -Ports @($controllerPort)
@@ -895,18 +898,18 @@ $btnStart.Add_Click({ Safe-Action -Action { Start-Stack } -Button $btnStart })
 $btnStop.Add_Click({ Safe-Action -Action { Stop-Stack } -Button $btnStop })
 $btnOpenLocal.Add_Click({
   $cfg = Get-CachedControllerConfig
-  $port = if ($cfg.port) { [int]$cfg.port } else { 8787 }
+  $port = if ($cfg.port) { [int]$cfg.port } else { $script:DefaultControllerPort }
   Open-Url ("http://127.0.0.1:{0}/" -f $port)
 })
 $btnOpenNetwork.Add_Click({
   $cfg = Get-CachedControllerConfig
-  $port = if ($cfg.port) { [int]$cfg.port } else { 8787 }
+  $port = if ($cfg.port) { [int]$cfg.port } else { $script:DefaultControllerPort }
   $ip = Get-CachedLanIp
   Open-Url ("http://{0}:{1}/" -f $ip, $port)
 })
 $btnOpenController.Add_Click({
   $cfg = Get-CachedControllerConfig
-  $port = if ($cfg.port) { [int]$cfg.port } else { 8787 }
+  $port = if ($cfg.port) { [int]$cfg.port } else { $script:DefaultControllerPort }
   Open-Url ("http://127.0.0.1:{0}/legacy" -f $port)
 })
 $btnGenQr.Add_Click({ Safe-Action -Action { Generate-PairQr } -Button $btnGenQr })
