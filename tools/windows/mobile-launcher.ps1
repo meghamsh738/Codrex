@@ -234,6 +234,71 @@ function Open-Url([string]$Url) {
   try { Start-Process $Url | Out-Null } catch {}
 }
 
+function Invoke-HiddenPowerShellScript {
+  param(
+    [string]$ScriptPath,
+    [string[]]$Arguments = @()
+  )
+  if (-not (Test-Path $ScriptPath)) {
+    throw "Missing $ScriptPath"
+  }
+  $invokeArgs = @(
+    "-NoProfile",
+    "-ExecutionPolicy", "Bypass",
+    "-WindowStyle", "Hidden",
+    "-File", $ScriptPath
+  )
+  if ($Arguments) {
+    $invokeArgs += $Arguments
+  }
+  & powershell.exe @invokeArgs
+  if ($LASTEXITCODE -is [int]) {
+    return [int]$LASTEXITCODE
+  }
+  return 0
+}
+
+function Wait-ForPortsReleased {
+  param(
+    [int[]]$Ports,
+    [int]$Attempts = 24,
+    [int]$DelayMs = 250
+  )
+  $filtered = @($Ports | Where-Object { $_ -gt 0 } | Select-Object -Unique)
+  if (-not $filtered -or $filtered.Count -eq 0) {
+    return $true
+  }
+  for ($i = 0; $i -lt $Attempts; $i++) {
+    $listening = Get-ListeningStateMap -Ports $filtered
+    $hasListeners = $false
+    foreach ($port in $filtered) {
+      if ([bool]$listening[[int]$port]) {
+        $hasListeners = $true
+        break
+      }
+    }
+    if (-not $hasListeners) {
+      return $true
+    }
+    Start-Sleep -Milliseconds $DelayMs
+  }
+  return $false
+}
+
+function Wait-ForSessionCleared {
+  param(
+    [int]$Attempts = 20,
+    [int]$DelayMs = 200
+  )
+  for ($i = 0; $i -lt $Attempts; $i++) {
+    if (-not (Read-MobileSession)) {
+      return $true
+    }
+    Start-Sleep -Milliseconds $DelayMs
+  }
+  return $false
+}
+
 $scriptRoot = Split-Path -Parent $PSCommandPath
 $root = (Resolve-Path (Join-Path $scriptRoot "..\..")).Path
 $runtimeDir = Get-CodrexRuntimeDir -RepoRoot $root
@@ -787,9 +852,6 @@ function Refresh-State {
 }
 
 function Start-Stack {
-  if (-not (Test-Path $startMobileScript)) {
-    throw "Missing $startMobileScript"
-  }
   $existingPort = Resolve-LauncherControllerPort
   $existingListening = Get-ListeningStateMap -Ports @($existingPort)
   if ([bool]$existingListening[[int]$existingPort]) {
@@ -801,11 +863,11 @@ function Start-Stack {
     }
   }
   Append-Log "Starting mobile stack..."
-  $p = Start-Process -FilePath "powershell.exe" -ArgumentList @(
-    "-NoProfile","-ExecutionPolicy","Bypass","-File",$startMobileScript,"-UiPort",[string]$uiPort,"-OpenFirewall"
-  ) -WorkingDirectory $root -WindowStyle Hidden -PassThru -Wait
-  if ($p.ExitCode -ne 0) {
-    throw "Codrex start script failed with exit code $($p.ExitCode). Run Setup.cmd again if this is a fresh checkout."
+  $startExitCode = Invoke-HiddenPowerShellScript -ScriptPath $startMobileScript -Arguments @(
+    "-UiPort", [string]$uiPort, "-OpenFirewall"
+  )
+  if ($startExitCode -ne 0) {
+    throw "Codrex start script failed with exit code $startExitCode. Run Setup.cmd again if this is a fresh checkout."
   }
   $script:cachedControllerConfigAt = [DateTime]::MinValue
   $script:cachedLanIpAt = [DateTime]::MinValue
@@ -822,19 +884,24 @@ function Start-Stack {
 }
 
 function Stop-Stack {
-  if (-not (Test-Path $stopMobileScript)) {
-    throw "Missing $stopMobileScript"
-  }
   $controllerPort = Resolve-LauncherControllerPort
   Append-Log "Stopping mobile stack..."
-  $p = Start-Process -FilePath "powershell.exe" -ArgumentList @(
-    "-NoProfile","-ExecutionPolicy","Bypass","-File",$stopMobileScript,"-UiPort",[string]$uiPort
-  ) -WorkingDirectory $root -WindowStyle Hidden -PassThru -Wait
+  $stopExitCode = Invoke-HiddenPowerShellScript -ScriptPath $stopMobileScript -Arguments @(
+    "-UiPort", [string]$uiPort
+  )
+  $portsReleased = Wait-ForPortsReleased -Ports @($controllerPort, $uiPort)
+  $sessionCleared = Wait-ForSessionCleared
   $listening = Get-ListeningStateMap -Ports @($controllerPort, $uiPort)
-  $okController = [bool]$listening[[int]$controllerPort]
-  $okUi = [bool]$listening[[int]$uiPort]
-  if ($p.ExitCode -ne 0 -or $okController -or $okUi) {
-    throw "Codrex stop did not complete cleanly. Use Open Fallback or inspect runtime logs."
+  $controllerStillListening = [bool]$listening[[int]$controllerPort]
+  $uiStillListening = [bool]$listening[[int]$uiPort]
+  if ($stopExitCode -ne 0 -or -not $portsReleased -or -not $sessionCleared -or $controllerStillListening -or $uiStillListening) {
+    $reasons = New-Object System.Collections.Generic.List[string]
+    if ($stopExitCode -ne 0) { $reasons.Add("stop script exit $stopExitCode") }
+    if ($controllerStillListening) { $reasons.Add("controller still listening on $controllerPort") }
+    if ($uiStillListening) { $reasons.Add("UI still listening on $uiPort") }
+    if (-not $sessionCleared) { $reasons.Add("runtime session file still present") }
+    $detail = if ($reasons.Count -gt 0) { $reasons -join "; " } else { "unknown stop state" }
+    throw "Codrex stop did not complete cleanly: $detail. Use Open Fallback or inspect runtime logs."
   }
   $script:cachedControllerConfigAt = [DateTime]::MinValue
   $script:cachedLanIpAt = [DateTime]::MinValue
