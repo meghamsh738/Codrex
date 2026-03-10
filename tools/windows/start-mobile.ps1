@@ -1,7 +1,8 @@
 param(
   [int]$UiPort = 4312,
   [switch]$OpenFirewall,
-  [switch]$SkipUiInstall
+  [switch]$SkipUiInstall,
+  [switch]$DevUi
 )
 
 $ErrorActionPreference = "Stop"
@@ -65,6 +66,16 @@ function Ensure-UiDependencies {
   }
 }
 
+function Ensure-BuiltUi {
+  param(
+    [string]$UiRoot
+  )
+  $builtIndex = Join-Path $UiRoot "dist\index.html"
+  if (-not (Test-Path $builtIndex)) {
+    throw "Built UI missing at $builtIndex. Run Setup.cmd or 'npm run build' in the ui folder first."
+  }
+}
+
 function Test-HttpReady {
   param(
     [string]$Url
@@ -74,6 +85,16 @@ function Test-HttpReady {
     return ($resp.StatusCode -eq 200)
   } catch {}
   return $false
+}
+
+function Get-AppHealth {
+  param(
+    [int]$Port
+  )
+  try {
+    return Invoke-RestMethod -UseBasicParsing -Uri ("http://127.0.0.1:{0}/app/health" -f $Port) -TimeoutSec 2
+  } catch {}
+  return $null
 }
 
 function Get-UiOwnerInfo {
@@ -175,74 +196,98 @@ if (-not (Test-Path $startControllerScript)) {
   throw "Missing start script at $startControllerScript"
 }
 
+$controllerUiPort = if ($DevUi) { $UiPort } else { $controllerPort }
 $controllerArgs = @(
   "-NoProfile",
   "-ExecutionPolicy", "Bypass",
   "-File", $startControllerScript,
   "-Port", [string]$controllerPort,
-  "-UiPort", [string]$UiPort
+  "-UiPort", [string]$controllerUiPort
 )
 if ($OpenFirewall) {
   $controllerArgs += "-OpenFirewall"
 }
 
+if ($DevUi) {
+  Ensure-UiDependencies -UiRoot $uiRoot -SkipInstall:$SkipUiInstall
+} else {
+  Ensure-BuiltUi -UiRoot $uiRoot
+}
+
 Write-Host "Starting controller..."
 & powershell.exe @controllerArgs
 
-Ensure-UiDependencies -UiRoot $uiRoot -SkipInstall:$SkipUiInstall
-
 $uiPid = $null
-$existingUiOwners = Get-UiOwnerInfo -Port $UiPort
-if ($existingUiOwners.Count -gt 0) {
-  $viteOwner = $existingUiOwners | Where-Object { $_.CommandLine -and $_.CommandLine -match "vite" } | Select-Object -First 1
-  if ($viteOwner) {
-    $uiPid = [int]$viteOwner.ProcessId
-    Write-Host "UI already running on port $UiPort (PID $uiPid). Reusing existing process."
+if ($DevUi) {
+  $existingUiOwners = Get-UiOwnerInfo -Port $UiPort
+  if ($existingUiOwners.Count -gt 0) {
+    $viteOwner = $existingUiOwners | Where-Object { $_.CommandLine -and $_.CommandLine -match "vite" } | Select-Object -First 1
+    if ($viteOwner) {
+      $uiPid = [int]$viteOwner.ProcessId
+      Write-Host "Dev UI already running on port $UiPort (PID $uiPid). Reusing existing process."
+    } else {
+      $details = ($existingUiOwners | ForEach-Object { "PID=$($_.ProcessId) Name=$($_.Name)" }) -join "; "
+      throw "Port $UiPort is already in use by another process. $details"
+    }
   } else {
-    $details = ($existingUiOwners | ForEach-Object { "PID=$($_.ProcessId) Name=$($_.Name)" }) -join "; "
-    throw "Port $UiPort is already in use by another process. $details"
+    $npmCmd = (Get-Command npm.cmd -ErrorAction SilentlyContinue).Source
+    if (-not $npmCmd) {
+      throw "npm.cmd not found. Install Node.js/npm on Windows first."
+    }
+
+    $uiOutTarget = Resolve-LogTargetPath -Path $uiOutLog
+    $uiErrTarget = Resolve-LogTargetPath -Path $uiErrLog
+
+    Write-Host "Starting dev UI on port $UiPort..."
+    $uiProc = Start-Process -FilePath $npmCmd `
+      -ArgumentList @("run", "dev", "--", "--host", "0.0.0.0", "--port", [string]$UiPort) `
+      -WorkingDirectory $uiRoot `
+      -WindowStyle Hidden `
+      -RedirectStandardOutput $uiOutTarget `
+      -RedirectStandardError $uiErrTarget `
+      -PassThru
+    $uiPid = [int]$uiProc.Id
+
+    $uiReady = $false
+    for ($i = 0; $i -lt 40; $i++) {
+      Start-Sleep -Milliseconds 300
+      if (Test-HttpReady -Url ("http://127.0.0.1:{0}/" -f $UiPort)) {
+        $uiReady = $true
+        break
+      }
+      if (-not (Get-Process -Id $uiPid -ErrorAction SilentlyContinue)) {
+        break
+      }
+    }
+    if (-not $uiReady) {
+      try { Stop-Process -Id $uiPid -Force -ErrorAction SilentlyContinue } catch {}
+      Write-Host "Dev UI failed to start. Recent logs:"
+      if (Test-Path $uiErrTarget) { Get-Content $uiErrTarget -Tail 80 }
+      if (Test-Path $uiOutTarget) { Get-Content $uiOutTarget -Tail 80 }
+      throw "Dev UI startup failed."
+    }
   }
 } else {
-  $npmCmd = (Get-Command npm.cmd -ErrorAction SilentlyContinue).Source
-  if (-not $npmCmd) {
-    throw "npm.cmd not found. Install Node.js/npm on Windows first."
-  }
-
-  $uiOutTarget = Resolve-LogTargetPath -Path $uiOutLog
-  $uiErrTarget = Resolve-LogTargetPath -Path $uiErrLog
-
-  Write-Host "Starting mobile UI on port $UiPort..."
-  $uiProc = Start-Process -FilePath $npmCmd `
-    -ArgumentList @("run", "dev", "--", "--host", "0.0.0.0", "--port", [string]$UiPort) `
-    -WorkingDirectory $uiRoot `
-    -WindowStyle Hidden `
-    -RedirectStandardOutput $uiOutTarget `
-    -RedirectStandardError $uiErrTarget `
-    -PassThru
-  $uiPid = [int]$uiProc.Id
-
-  $uiReady = $false
+  $appReady = $false
+  $appHealth = $null
   for ($i = 0; $i -lt 40; $i++) {
     Start-Sleep -Milliseconds 300
-    if (Test-HttpReady -Url ("http://127.0.0.1:{0}/" -f $UiPort)) {
-      $uiReady = $true
-      break
-    }
-    if (-not (Get-Process -Id $uiPid -ErrorAction SilentlyContinue)) {
+    $appHealth = Get-AppHealth -Port $controllerPort
+    if ($appHealth -and $appHealth.ok -and $appHealth.ui_mode -eq "built") {
+      $appReady = $true
       break
     }
   }
-  if (-not $uiReady) {
-    try { Stop-Process -Id $uiPid -Force -ErrorAction SilentlyContinue } catch {}
-    Write-Host "UI failed to start. Recent logs:"
-    if (Test-Path $uiErrTarget) { Get-Content $uiErrTarget -Tail 80 }
-    if (Test-Path $uiOutTarget) { Get-Content $uiOutTarget -Tail 80 }
-    throw "UI startup failed."
+  if (-not $appReady) {
+    $detail = if ($appHealth -and $appHealth.detail) { [string]$appHealth.detail } else { "Controller app health never reached built mode." }
+    throw "Built app startup failed. $detail"
   }
 }
 
 if ($OpenFirewall) {
-  Ensure-FirewallRuleForPort -Port $UiPort -RuleName ("Codrex Mobile UI {0}" -f $UiPort)
+  if ($DevUi) {
+    Ensure-FirewallRuleForPort -Port $UiPort -RuleName ("Codrex Mobile UI {0}" -f $UiPort)
+  }
 }
 
 $controllerPattern = "--port\s+$controllerPort\b"
@@ -257,22 +302,26 @@ $sessionData = [ordered]@{
   started_at = (Get-Date).ToString("o")
   controller_port = $controllerPort
   controller_pid = $controllerPid
-  ui_port = $UiPort
+  ui_port = if ($DevUi) { $UiPort } else { $null }
   ui_pid = $uiPid
+  ui_mode = if ($DevUi) { "dev" } else { "built" }
 }
 $sessionData | ConvertTo-Json | Set-Content -Path $sessionPath -Encoding UTF8
 
 Write-Host ""
 Write-Host "Mobile stack ready."
 Write-Host ("Controller URL: http://{0}:{1}" -f $lanIp, $controllerPort)
-Write-Host ("UI Local URL:   http://127.0.0.1:{0}" -f $UiPort)
+Write-Host ("App Local URL:  http://127.0.0.1:{0}" -f $controllerPort)
 if ($lanIp -and $lanIp -ne "127.0.0.1") {
-  Write-Host ("UI Network URL: http://{0}:{1}" -f $lanIp, $UiPort)
+  Write-Host ("App Network URL: http://{0}:{1}" -f $lanIp, $controllerPort)
+}
+if ($DevUi) {
+  Write-Host ("Dev UI Local URL: http://127.0.0.1:{0}" -f $UiPort)
 }
 Write-Host ("Controller PID: {0}" -f ($(if ($controllerPid) { $controllerPid } else { "unknown" })))
-Write-Host ("UI PID:         {0}" -f ($(if ($uiPid) { $uiPid } else { "unknown" })))
+Write-Host ("Dev UI PID:     {0}" -f ($(if ($uiPid) { $uiPid } else { "n/a" })))
 Write-Host ("Session file:   {0}" -f $sessionPath)
 Write-Host ("Runtime dir:    {0}" -f $runtimeDir)
-if (-not $OpenFirewall) {
+if ((-not $OpenFirewall) -and ($lanIp -and $lanIp -ne "127.0.0.1")) {
   Write-Host "Tip: if phone/tablet cannot open network URL, rerun with -OpenFirewall."
 }

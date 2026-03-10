@@ -80,6 +80,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\setup.ps1 -OpenFirewall
 What this does:
 - creates/updates `.venv`
 - installs Python deps
+- installs UI deps
+- builds the React app
 - starts controller
 - can open firewall rule for the configured port
 
@@ -94,13 +96,13 @@ Primary Windows launcher:
 - `Codrex.cmd`
 
 Expected URLs:
-- Controller: `http://<your-lan-ip>:8787`
-- Mobile UI (React): `http://<your-lan-ip>:4312`
+- App + controller: `http://<your-lan-ip>:8787`
+- Legacy fallback controls: `http://<your-lan-ip>:8787/legacy`
 
 ### 6) Auth and pairing
 
 On laptop browser:
-1. Open `http://127.0.0.1:4312`
+1. Open `http://127.0.0.1:8787`
 2. Go to **Pair** tab
 3. Keep **Tailscale** route (default and recommended)
 4. Generate QR
@@ -112,6 +114,7 @@ Important:
 - Pair QR uses short-lived one-time code exchange and does not place the long token in URL.
 - LAN/current pairing routes are intentionally restricted for localhost browser sessions only.
 - `/docs`, `/redoc`, and `/openapi.json` are auth-protected whenever auth is enabled.
+- built app health is exposed at `/app/health` for the Windows launcher
 - Runtime logs and mobile session state also live under `%LocalAppData%\Codrex\remote-ui\`.
 
 ### 7) Telegram delivery (optional)
@@ -209,6 +212,7 @@ Primary launcher:
 Advanced Windows tools:
 - `tools/windows/`
 - `tools/windows/legacy-launchers/` keeps the older `.cmd` wrappers for compatibility only
+- `http://127.0.0.1:8787/legacy` stays available as the no-JS fallback if the built app is missing
 
 ## Windows App Layout
 

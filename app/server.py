@@ -29,6 +29,9 @@ from mss.tools import to_png
 
 START_TIME = time.time()
 app = FastAPI(title="Codrex Remote UI", version="1.4.1")
+APP_ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+UI_DIST_DIR = os.path.join(APP_ROOT_DIR, "ui", "dist")
+UI_DIST_ASSETS_DIR = os.path.join(UI_DIST_DIR, "assets")
 
 WSL_DISTRO = os.environ.get("CODEX_WSL_DISTRO", "Ubuntu")
 WSL_EXE = os.environ.get("CODEX_WSL_EXE", "wsl")
@@ -40,6 +43,87 @@ CODEX_AUTH_REQUIRED = bool(CODEX_AUTH_TOKEN)
 BLANK_IMAGE_DATA_URL = "data:image/gif;base64,R0lGODlhAQABAAD/ACwAAAAAAQABAAACADs="
 DEFAULT_CODEX_MODELS = ["gpt-5-codex", "gpt-5", "gpt-5-mini", "gpt-4.1", "o4-mini"]
 DEFAULT_REASONING_EFFORTS = ["minimal", "low", "medium", "high", "xhigh"]
+BUILT_UI_ROOT_FILES = {
+    "apple-touch-icon.png",
+    "icon-192.png",
+    "icon-512.png",
+    "icon-maskable-192.png",
+    "icon-maskable-512.png",
+    "icon-maskable.svg",
+    "icon.svg",
+    "manifest.webmanifest",
+    "sw.js",
+}
+
+
+def _built_ui_index_path() -> str:
+    return os.path.join(UI_DIST_DIR, "index.html")
+
+
+def _built_ui_present() -> bool:
+    return os.path.isfile(_built_ui_index_path())
+
+
+def _built_ui_mode() -> str:
+    return "built" if _built_ui_present() else "legacy"
+
+
+def _built_ui_health_payload() -> Dict[str, Any]:
+    return {
+        "ok": True,
+        "controller_ok": True,
+        "ui_mode": _built_ui_mode(),
+        "build_present": _built_ui_present(),
+        "dist_dir": UI_DIST_DIR,
+        "entry": _built_ui_index_path(),
+    }
+
+
+def _serve_built_ui_root_file(filename: str) -> FileResponse:
+    safe_name = posixpath.basename(filename or "")
+    if safe_name not in BUILT_UI_ROOT_FILES and not safe_name.startswith("workbox-"):
+        raise HTTPException(status_code=404, detail="asset_not_found")
+    target = os.path.join(UI_DIST_DIR, safe_name)
+    if not os.path.isfile(target):
+        raise HTTPException(status_code=404, detail="asset_not_found")
+    return FileResponse(target)
+
+
+def _built_ui_missing_response() -> HTMLResponse:
+    html = """
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Codrex App Unavailable</title>
+    <style>
+      body { margin: 0; min-height: 100vh; display: grid; place-items: center; background: #edf4fb; color: #0f172a; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; padding: 20px; }
+      .card { width: min(100%, 560px); background: #fff; border: 1px solid #d7dfeb; border-radius: 18px; padding: 20px 22px; box-shadow: 0 18px 36px rgba(15, 23, 42, 0.12); }
+      h1 { margin: 0 0 10px; font-size: 28px; }
+      p { margin: 0 0 12px; line-height: 1.5; }
+      code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+      .actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 16px; }
+      .actions a { text-decoration: none; border-radius: 12px; border: 1px solid #0f766e; padding: 10px 14px; font-weight: 600; }
+      .primary { background: #0f766e; color: #fff; }
+      .secondary { background: #fff; color: #0f766e; }
+      .muted { color: #526173; font-size: 14px; }
+    </style>
+  </head>
+  <body>
+    <section class="card">
+      <h1>Codrex app build missing</h1>
+      <p>The controller is running, but the built web app is not available yet.</p>
+      <p class="muted">Run <code>Setup.cmd</code> or <code>npm run build</code> inside <code>ui/</code>, then launch Codrex again.</p>
+      <div class="actions">
+        <a class="primary" href="/legacy">Open Fallback Controls</a>
+        <a class="secondary" href="/auth/status">Open Auth Status</a>
+      </div>
+    </section>
+  </body>
+</html>
+    """.strip()
+    return HTMLResponse(content=html, status_code=503, headers={"Cache-Control": "no-store"})
 
 
 def _default_runtime_dir() -> str:
@@ -2558,10 +2642,20 @@ async def auth_middleware(request: Request, call_next):
     path = request.url.path
     public_paths = {
         "/",
+        "/app/health",
         "/mobile",
         "/diag/js",
         "/diag/status",
         "/favicon.ico",
+        "/manifest.webmanifest",
+        "/sw.js",
+        "/apple-touch-icon.png",
+        "/icon.svg",
+        "/icon-192.png",
+        "/icon-512.png",
+        "/icon-maskable-192.png",
+        "/icon-maskable-512.png",
+        "/icon-maskable.svg",
         "/auth/login",
         "/auth/bootstrap/local",
         "/auth/logout",
@@ -2575,7 +2669,11 @@ async def auth_middleware(request: Request, call_next):
         "/legacy/auth/login",
         "/legacy/auth/logout",
     }
-    if path in public_paths:
+    public_prefixes = (
+        "/assets/",
+        "/workbox-",
+    )
+    if path in public_paths or any(path.startswith(prefix) for prefix in public_prefixes):
         return await call_next(request)
 
     token = _auth_token_from_request(request)
@@ -2590,9 +2688,47 @@ async def auth_middleware(request: Request, call_next):
     return await call_next(request)
 
 
+@app.get("/app/health")
+def app_health():
+    payload = _built_ui_health_payload()
+    if payload["ui_mode"] != "built":
+        payload["detail"] = "Built app is unavailable. Use /legacy until the UI is built."
+    return payload
+
+
+@app.get("/assets/{asset_path:path}")
+def app_asset(asset_path: str):
+    target = os.path.join(UI_DIST_ASSETS_DIR, asset_path or "")
+    safe_target = os.path.abspath(target)
+    safe_root = os.path.abspath(UI_DIST_ASSETS_DIR)
+    if not safe_target.startswith(safe_root + os.sep):
+        raise HTTPException(status_code=404, detail="asset_not_found")
+    if not os.path.isfile(safe_target):
+        raise HTTPException(status_code=404, detail="asset_not_found")
+    return FileResponse(safe_target)
+
+
+@app.get("/manifest.webmanifest")
+@app.get("/sw.js")
+@app.get("/apple-touch-icon.png")
+@app.get("/icon.svg")
+@app.get("/icon-192.png")
+@app.get("/icon-512.png")
+@app.get("/icon-maskable-192.png")
+@app.get("/icon-maskable-512.png")
+@app.get("/icon-maskable.svg")
+def app_root_file(request: Request):
+    return _serve_built_ui_root_file(request.url.path.lstrip("/"))
+
+
+@app.get("/workbox-{suffix:path}")
+def app_workbox_asset(suffix: str):
+    return _serve_built_ui_root_file(f"workbox-{suffix}")
+
+
 @app.get("/mobile")
 def mobile_entry():
-    resp = RedirectResponse(url="/?compact=1", status_code=307)
+    resp = RedirectResponse(url="/", status_code=307)
     resp.headers["Cache-Control"] = "no-store"
     return resp
 
@@ -3173,7 +3309,15 @@ def diag_js():
     return HTMLResponse(content=html, headers={"Cache-Control": "no-store"})
 
 @app.get("/", response_class=HTMLResponse)
-def index(request: Request):
+def app_entry():
+    if not _built_ui_present():
+        return _built_ui_missing_response()
+    return FileResponse(_built_ui_index_path(), headers={"Cache-Control": "no-store"})
+
+
+@app.get("/legacy", response_class=HTMLResponse)
+@app.get("/legacy/", response_class=HTMLResponse)
+def legacy_index(request: Request):
     root = CODEX_FILE_ROOT
     workdir = CODEX_WORKDIR
     distro = WSL_DISTRO
@@ -3802,11 +3946,11 @@ def index(request: Request):
             <span class="label">Access token</span>
             <input name="token" type="password" autocomplete="current-password" placeholder="Enter CODEX_AUTH_TOKEN" />
           </label>
-          <input type="hidden" name="next" value="/" />
+          <input type="hidden" name="next" value="/legacy" />
           <button class="primary" type="submit">Login (No-JS)</button>
         </form>
         <form class="legacy-form" method="post" action="/legacy/auth/logout">
-          <input type="hidden" name="next" value="/" />
+          <input type="hidden" name="next" value="/legacy" />
           <button class="ghost" type="submit">Logout (No-JS)</button>
           <a class="ghost" href="/auth/status" target="_blank" rel="noopener">Auth status JSON</a>
         </form>
@@ -4066,12 +4210,12 @@ def index(request: Request):
           <div class="row">
             <form class="legacy-form" method="post" action="/legacy/desktop/mode">
               <input type="hidden" name="enabled" value="1" />
-              <input type="hidden" name="next" value="/" />
+              <input type="hidden" name="next" value="/legacy" />
               <button class="primary" type="submit">Desktop On</button>
             </form>
             <form class="legacy-form" method="post" action="/legacy/desktop/mode">
               <input type="hidden" name="enabled" value="0" />
-              <input type="hidden" name="next" value="/" />
+              <input type="hidden" name="next" value="/legacy" />
               <button class="ghost" type="submit">Desktop Off</button>
             </form>
           </div>
@@ -6069,10 +6213,10 @@ def legacy_auth_page():
           <label for="token">Access token</label>
           <input id="token" name="token" type="password" autocomplete="current-password" required />
         </div>
-        <input type="hidden" name="next" value="/" />
+        <input type="hidden" name="next" value="/legacy" />
         <button type="submit">Login</button>
       </form>
-      <a href="/">Back to controller</a>
+      <a href="/legacy">Back to fallback controls</a>
     </div>
   </body>
 </html>
@@ -6081,7 +6225,7 @@ def legacy_auth_page():
     )
 
 @app.post("/legacy/auth/login")
-def legacy_auth_login(request: Request, token: str = Form(""), next: str = Form("/")):
+def legacy_auth_login(request: Request, token: str = Form(""), next: str = Form("/legacy")):
     t = (token or "").strip()
     if not _is_valid_auth_token(t):
         return _legacy_result_page(
@@ -6101,7 +6245,7 @@ def legacy_auth_login(request: Request, token: str = Form(""), next: str = Form(
     return resp
 
 @app.post("/legacy/auth/logout")
-def legacy_auth_logout(next: str = Form("/")):
+def legacy_auth_logout(next: str = Form("/legacy")):
     resp = Response(status_code=303, headers={"Location": _safe_next_path(next)})
     resp.delete_cookie(CODEX_AUTH_COOKIE)
     return resp

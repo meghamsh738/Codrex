@@ -1344,7 +1344,7 @@ class CompactModeTests(unittest.TestCase):
         req = SimpleNamespace(query_params={"compact": "mobile"})
         self.assertTrue(server_mod._compact_enabled_from_request(req))
 
-    def test_mobile_entry_redirects_to_compact(self):
+    def test_mobile_entry_redirects_to_root_app(self):
         class _Resp:
             def __init__(self):
                 self.headers = {}
@@ -1352,7 +1352,7 @@ class CompactModeTests(unittest.TestCase):
         fake_resp = _Resp()
         with mock.patch.object(server_mod, "RedirectResponse", return_value=fake_resp) as redirect_mock:
             out = server_mod.mobile_entry()
-        redirect_mock.assert_called_once_with(url="/?compact=1", status_code=307)
+        redirect_mock.assert_called_once_with(url="/", status_code=307)
         self.assertIs(out, fake_resp)
         self.assertEqual(out.headers.get("Cache-Control"), "no-store")
 
@@ -1776,6 +1776,46 @@ class PowerControlTests(unittest.TestCase):
         self.assertTrue(out["ok"])
         self.assertEqual(out["action"], "lock")
         schedule_mock.assert_called_once_with("lock")
+
+
+class BuiltUiRoutingTests(unittest.TestCase):
+    def test_built_ui_health_reports_legacy_when_index_missing(self):
+        with tempfile.TemporaryDirectory() as td, \
+             mock.patch.object(server_mod, "UI_DIST_DIR", td):
+            out = server_mod._built_ui_health_payload()
+
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["ui_mode"], "legacy")
+        self.assertFalse(out["build_present"])
+
+    def test_built_ui_health_reports_built_when_index_exists(self):
+        with tempfile.TemporaryDirectory() as td, \
+             mock.patch.object(server_mod, "UI_DIST_DIR", td):
+            Path(td, "index.html").write_text("<!doctype html>", encoding="utf-8")
+            out = server_mod._built_ui_health_payload()
+
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["ui_mode"], "built")
+        self.assertTrue(out["build_present"])
+
+    def test_app_entry_uses_built_index_when_present(self):
+        with tempfile.TemporaryDirectory() as td, \
+             mock.patch.object(server_mod, "UI_DIST_DIR", td):
+            Path(td, "index.html").write_text("<!doctype html>", encoding="utf-8")
+            with mock.patch.object(server_mod, "FileResponse", return_value="built-response") as file_mock:
+                out = server_mod.app_entry()
+
+        self.assertEqual(out, "built-response")
+        file_mock.assert_called_once()
+
+    def test_app_entry_returns_missing_page_when_build_is_absent(self):
+        with tempfile.TemporaryDirectory() as td, \
+             mock.patch.object(server_mod, "UI_DIST_DIR", td), \
+             mock.patch.object(server_mod, "_built_ui_missing_response", return_value="missing-response") as missing_mock:
+            out = server_mod.app_entry()
+
+        self.assertEqual(out, "missing-response")
+        missing_mock.assert_called_once()
 
 
 if __name__ == "__main__":

@@ -173,6 +173,13 @@ function Invoke-Json {
   return $null
 }
 
+function Get-AppHealth {
+  param(
+    [int]$ControllerPort
+  )
+  return Invoke-Json -Url ("http://127.0.0.1:{0}/app/health" -f $ControllerPort) -Method "GET" -BodyObj $null -Token "" -Session $null
+}
+
 function Get-QrPngImage {
   param(
     [string]$Url,
@@ -469,7 +476,7 @@ $btnOpenNetwork.Text = "Open Network App"
 $rowOpen.Controls.Add($btnOpenNetwork) | Out-Null
 
 $btnOpenController = New-Object System.Windows.Forms.Button
-$btnOpenController.Text = "Open Controller API"
+$btnOpenController.Text = "Open Fallback"
 $rowOpen.Controls.Add($btnOpenController) | Out-Null
 
 $rowPair = New-Object System.Windows.Forms.FlowLayoutPanel
@@ -698,27 +705,29 @@ function Refresh-State {
 
     $listening = Get-ListeningStateMap -Ports @($controllerPort, $uiPort)
     $controllerOn = [bool]$listening[[int]$controllerPort]
-    $uiOn = [bool]$listening[[int]$uiPort]
-    $status = if ($controllerOn -and $uiOn) { "running" } elseif ($controllerOn -or $uiOn) { "partial" } else { "stopped" }
-    $lblStatus.Text = "State: $status`r`nController:$controllerPort  UI:$uiPort  LAN:$lanIp"
-    if ($controllerOn -and $uiOn) {
+    $appHealth = if ($controllerOn) { Get-AppHealth -ControllerPort $controllerPort } else { $null }
+    $appBuilt = [bool]($appHealth -and $appHealth.ok -and $appHealth.ui_mode -eq "built")
+    $appMode = if ($appHealth -and $appHealth.ui_mode) { [string]$appHealth.ui_mode } else { "offline" }
+    $status = if ($appBuilt) { "running" } elseif ($controllerOn) { "error" } else { "stopped" }
+    $lblStatus.Text = "State: $status`r`nController:$controllerPort  App:$controllerPort  LAN:$lanIp  Mode:$appMode"
+    if ($appBuilt) {
       $statusCard.BackColor = [System.Drawing.ColorTranslator]::FromHtml("#0d2f53")
       $lblStatus.ForeColor = $colorAccent
-    } elseif ($controllerOn -or $uiOn) {
-      $statusCard.BackColor = [System.Drawing.ColorTranslator]::FromHtml("#2a2415")
-      $lblStatus.ForeColor = [System.Drawing.ColorTranslator]::FromHtml("#ffd38a")
+    } elseif ($controllerOn) {
+      $statusCard.BackColor = [System.Drawing.ColorTranslator]::FromHtml("#3a1620")
+      $lblStatus.ForeColor = $colorDanger
     } else {
       $statusCard.BackColor = $colorSurfaceSoft
       $lblStatus.ForeColor = $colorText
     }
 
     $busy = $script:actionInProgress
-    $btnStop.Enabled = (-not $busy) -and ($controllerOn -or $uiOn)
-    $btnStart.Enabled = (-not $busy) -and (-not ($controllerOn -and $uiOn))
-    $btnOpenLocal.Enabled = (-not $busy) -and $uiOn
-    $btnOpenNetwork.Enabled = (-not $busy) -and $uiOn -and ($lanIp -ne "127.0.0.1")
+    $btnStop.Enabled = (-not $busy) -and $controllerOn
+    $btnStart.Enabled = (-not $busy) -and (-not $appBuilt)
+    $btnOpenLocal.Enabled = (-not $busy) -and $controllerOn
+    $btnOpenNetwork.Enabled = (-not $busy) -and $controllerOn -and ($lanIp -ne "127.0.0.1")
     $btnOpenController.Enabled = (-not $busy) -and $controllerOn
-    $btnGenQr.Enabled = (-not $busy) -and $controllerOn -and $uiOn
+    $btnGenQr.Enabled = (-not $busy) -and $appBuilt
     $hasPair = [bool]$pairUrl
     $btnCopyPair.Enabled = (-not $busy) -and $hasPair
     $btnOpenPair.Enabled = (-not $busy) -and $hasPair
@@ -731,23 +740,36 @@ function Start-Stack {
   if (-not (Test-Path $startMobileScript)) {
     throw "Missing $startMobileScript"
   }
+  $cfg = Get-CachedControllerConfig
+  $controllerPort = if ($cfg.port) { [int]$cfg.port } else { 8787 }
   Append-Log "Starting mobile stack..."
   # Request firewall rules on start so LAN pairing/open-app links are reachable from Android.
   $p = Start-Process -FilePath "powershell.exe" -ArgumentList @("-NoProfile","-ExecutionPolicy","Bypass","-File",$startMobileScript,"-UiPort",[string]$uiPort,"-OpenFirewall") -WorkingDirectory $root -WindowStyle Hidden -PassThru
+  $appReady = $false
+  $appHealth = $null
   for ($i = 0; $i -lt 70; $i++) {
     Start-Sleep -Milliseconds 250
     [System.Windows.Forms.Application]::DoEvents()
-    $listening = Get-ListeningStateMap -Ports @($controllerPort, $uiPort)
+    $listening = Get-ListeningStateMap -Ports @($controllerPort)
     $okController = [bool]$listening[[int]$controllerPort]
-    $okUi = [bool]$listening[[int]$uiPort]
-    if ($okController -and $okUi) { break }
+    if ($okController) {
+      $appHealth = Get-AppHealth -ControllerPort $controllerPort
+      if ($appHealth -and $appHealth.ok -and $appHealth.ui_mode -eq "built") {
+        $appReady = $true
+        break
+      }
+    }
     if ($p.HasExited -and $p.ExitCode -ne 0) { break }
   }
   # Force refresh of cached network/config for next paint.
   $script:cachedControllerConfigAt = [DateTime]::MinValue
   $script:cachedLanIpAt = [DateTime]::MinValue
   Refresh-State
-  Open-Url ("http://127.0.0.1:{0}" -f $uiPort)
+  if (-not $appReady) {
+    $detail = if ($appHealth -and $appHealth.detail) { [string]$appHealth.detail } else { "Run Setup.cmd if this is a fresh checkout. Use Open Fallback for the legacy controller." }
+    throw "Codrex app did not reach running state. $detail"
+  }
+  Open-Url ("http://127.0.0.1:{0}/" -f $controllerPort)
   Append-Log "Start complete."
 }
 
@@ -755,6 +777,8 @@ function Stop-Stack {
   if (-not (Test-Path $stopMobileScript)) {
     throw "Missing $stopMobileScript"
   }
+  $cfg = Get-CachedControllerConfig
+  $controllerPort = if ($cfg.port) { [int]$cfg.port } else { 8787 }
   Append-Log "Stopping mobile stack..."
   Start-Process -FilePath "powershell.exe" -ArgumentList @("-NoProfile","-ExecutionPolicy","Bypass","-File",$stopMobileScript,"-UiPort",[string]$uiPort) -WorkingDirectory $root -WindowStyle Hidden | Out-Null
   for ($i = 0; $i -lt 50; $i++) {
@@ -869,13 +893,21 @@ function Safe-Action {
 
 $btnStart.Add_Click({ Safe-Action -Action { Start-Stack } -Button $btnStart })
 $btnStop.Add_Click({ Safe-Action -Action { Stop-Stack } -Button $btnStop })
-$btnOpenLocal.Add_Click({ Open-Url ("http://127.0.0.1:{0}" -f $uiPort) })
+$btnOpenLocal.Add_Click({
+  $cfg = Get-CachedControllerConfig
+  $port = if ($cfg.port) { [int]$cfg.port } else { 8787 }
+  Open-Url ("http://127.0.0.1:{0}/" -f $port)
+})
 $btnOpenNetwork.Add_Click({
+  $cfg = Get-CachedControllerConfig
+  $port = if ($cfg.port) { [int]$cfg.port } else { 8787 }
   $ip = Get-CachedLanIp
-  Open-Url ("http://{0}:{1}" -f $ip, $uiPort)
+  Open-Url ("http://{0}:{1}/" -f $ip, $port)
 })
 $btnOpenController.Add_Click({
-  Open-Url ("http://127.0.0.1:{0}" -f $controllerPort)
+  $cfg = Get-CachedControllerConfig
+  $port = if ($cfg.port) { [int]$cfg.port } else { 8787 }
+  Open-Url ("http://127.0.0.1:{0}/legacy" -f $port)
 })
 $btnGenQr.Add_Click({ Safe-Action -Action { Generate-PairQr } -Button $btnGenQr })
 $btnCopyPair.Add_Click({
