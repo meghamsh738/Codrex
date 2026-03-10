@@ -78,7 +78,7 @@ if [ ! -f '$helperWsl' ]; then
 fi
 mkdir -p ~/.local/bin
 ln -sf '$helperWsl' ~/.local/bin/codrex-send
-chmod +x '$helperWsl' ~/.local/bin/codrex-send
+chmod +x '$helperWsl' ~/.local/bin/codrex-send >/dev/null 2>&1 || true
 "@
     & wsl.exe -d $Distro -- bash -lc $installCmd | Out-Null
   } catch {

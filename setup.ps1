@@ -30,6 +30,7 @@ function Read-ControllerPort {
 $configPath = Join-Path $root "controller.config.json"
 $startMobileScript = Join-Path $root "tools\windows\start-mobile.ps1"
 $launcherCmd = Join-Path $root "Codrex.cmd"
+$logsPath = Join-Path $env:LocalAppData "Codrex\\remote-ui\\logs"
 $summaryLines = New-Object System.Collections.Generic.List[string]
 $setupFailed = $false
 
@@ -75,13 +76,16 @@ try {
     "-NoProfile",
     "-ExecutionPolicy", "Bypass",
     "-File", $startMobileScript,
-    "-OpenFirewall:$OpenFirewall",
     "-UiPort", "54312"
   )
+  if ($OpenFirewall) {
+    $args += "-OpenFirewall"
+  }
   Write-Host "Starting Codrex app stack..."
-  $startProc = Start-Process -FilePath "powershell.exe" -ArgumentList $args -WorkingDirectory $root -PassThru -Wait
-  if ($startProc.ExitCode -ne 0) {
-    throw "Codrex start script exited with code $($startProc.ExitCode)."
+  & powershell.exe @args
+  $startExitCode = if ($LASTEXITCODE -is [int]) { [int]$LASTEXITCODE } else { 0 }
+  if ($startExitCode -ne 0) {
+    throw "Codrex start script exited with code $startExitCode."
   }
 
   $resolvedPort = Read-ControllerPort -ConfigPath $configPath -FallbackPort $Port
@@ -98,7 +102,7 @@ try {
   $setupFailed = $true
   $summaryLines.Add("Setup failed.")
   $summaryLines.Add(($_.Exception.Message | Out-String).Trim())
-  $summaryLines.Add("Controller logs: $env:LocalAppData\\Codrex\\remote-ui\\logs")
+  $summaryLines.Add("Controller logs: $logsPath")
 } finally {
   Write-Host ""
   Write-Host "Codrex Setup Summary"
