@@ -2621,18 +2621,28 @@ def _compact_enabled_from_request(request: Request) -> bool:
 
 def _mobile_ui_target_url(request: Request) -> str:
     """
-    After QR pairing succeeds on the controller port, send users to the modern
-    mobile Web UI (Vite app) running on a separate port.
+    After QR pairing succeeds on the controller port, send users back to the
+    built app served from the same controller origin.
     """
-    host = (request.url.hostname or "").strip() or "127.0.0.1"
-    scheme = (request.url.scheme or "http").strip() or "http"
     try:
-        ui_port = int((os.environ.get("CODEX_MOBILE_UI_PORT", "4312") or "4312").strip())
+        base_url = str(getattr(request, "base_url", "") or "").strip()
+        if base_url:
+            return base_url
     except Exception:
-        ui_port = 4312
-    if ui_port <= 0 or ui_port > 65535:
-        ui_port = 4312
-    return f"{scheme}://{host}:{ui_port}/"
+        pass
+
+    url = getattr(request, "url", None)
+    host = str(getattr(url, "hostname", "") or "").strip() or "127.0.0.1"
+    scheme = str(getattr(url, "scheme", "") or "http").strip() or "http"
+    port = getattr(url, "port", None)
+    try:
+        port_num = int(port) if port is not None else None
+    except Exception:
+        port_num = None
+
+    if port_num and port_num not in {80, 443}:
+        return f"{scheme}://{host}:{port_num}/"
+    return f"{scheme}://{host}/"
 
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):

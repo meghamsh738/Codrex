@@ -16,9 +16,15 @@ def _install_fastapi_stubs():
 
     class DummyResponse:
         def __init__(self, *args, **kwargs):
-            pass
+            self.args = args
+            self.content = kwargs.get("content")
+            self.media_type = kwargs.get("media_type")
+            self.status_code = kwargs.get("status_code")
+            self.headers = kwargs.get("headers") or {}
+            self.cookies = []
 
         def set_cookie(self, *args, **kwargs):
+            self.cookies.append((args, kwargs))
             return None
 
         def delete_cookie(self, *args, **kwargs):
@@ -278,6 +284,30 @@ Ethernet adapter Tailscale:
             out = server_mod.get_tailscale_ipv4()
 
         self.assertEqual(out, "100.64.12.34")
+
+
+class PairingRouteTests(unittest.TestCase):
+    def test_mobile_ui_target_url_uses_same_origin_base_url(self):
+        request = SimpleNamespace(
+            base_url="http://100.64.0.9:8787/",
+            url=SimpleNamespace(hostname="100.64.0.9", scheme="http", port=8787),
+        )
+
+        out = server_mod._mobile_ui_target_url(request)
+
+        self.assertEqual(out, "http://100.64.0.9:8787/")
+
+    def test_auth_pair_consume_redirects_to_controller_root_when_auth_disabled(self):
+        request = SimpleNamespace(
+            base_url="http://192.168.1.15:8787/",
+            url=SimpleNamespace(hostname="192.168.1.15", scheme="http", port=8787),
+        )
+
+        with mock.patch.object(server_mod, "CODEX_AUTH_REQUIRED", False):
+            response = server_mod.auth_pair_consume(request, code="abc123")
+
+        self.assertEqual(response.status_code, 303)
+        self.assertEqual(response.headers.get("Location"), "http://192.168.1.15:8787/")
 
 
 class TmuxPanesTests(unittest.TestCase):
@@ -1820,3 +1850,4 @@ class BuiltUiRoutingTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

@@ -225,7 +225,7 @@ function Show-PairQrWindow {
     return
   }
 
-  $baseUrl = ("http://{0}:{1}" -f $pairHost, $script:UiPort)
+  $baseUrl = ("http://{0}:{1}" -f $pairHost, $controllerPort)
   $pairUrl = "$baseUrl/auth/pair/consume?code=$([Uri]::EscapeDataString([string]$create.code))"
   $qrEndpoint = "http://127.0.0.1:$controllerPort/auth/pair/qr.png?data=$([Uri]::EscapeDataString($pairUrl))&ts=$([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds())"
   $img = Get-QrPngImage -Url $qrEndpoint -Token $token
@@ -543,13 +543,15 @@ $script:StartItem.Add_Click({ Start-ActionProcess -Action "start" })
 $script:StopItem.Add_Click({ Start-ActionProcess -Action "stop" })
 $script:OpenUiLocalItem.Add_Click({
   if (-not $script:LastStatus) { Update-UiState }
-  Open-Url ("http://127.0.0.1:{0}" -f $script:UiPort)
+  $port = if ($script:LastStatus -and $script:LastStatus.controller_port) { [int]$script:LastStatus.controller_port } else { 8787 }
+  Open-Url ("http://127.0.0.1:{0}" -f $port)
 })
 $script:OpenUiNetworkItem.Add_Click({
   if (-not $script:LastStatus) { Update-UiState }
   $ip = [string]$script:LastStatus.lan_ip
   if ($ip) {
-    Open-Url ("http://{0}:{1}" -f $ip, $script:UiPort)
+    $port = if ($script:LastStatus -and $script:LastStatus.controller_port) { [int]$script:LastStatus.controller_port } else { 8787 }
+    Open-Url ("http://{0}:{1}" -f $ip, $port)
   }
 })
 $script:PairQrItem.Add_Click({
