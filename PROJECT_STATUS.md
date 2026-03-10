@@ -4,7 +4,7 @@
 
 - Canonical repo: `E:\coding projects\codex-remote-ui`
 - Daily launch: `Setup.cmd` once, then `Codrex.cmd`
-- Launcher shell: `Codrex.cmd` opens the Windows launcher and the main web app after setup/start succeeds
+- Launcher shell: `Codrex.cmd` opens only the Windows launcher shell; the laptop browser app opens only when `Open App` is clicked
 - Windows lifecycle path: `Setup.cmd` and the launcher both go through `tools/windows/codrex-runtime.ps1`
 - Preferred controller port: `48787`, with automatic fallback to the next free port if that range is occupied
 - Main app URL: `http://127.0.0.1:<active-port>/`
@@ -28,7 +28,7 @@
 
 - `faeed21`: stabilized launcher/runtime state, authoritative session record, setup auto-launch, and launcher health handling
 - `85e0d64`: fixed launcher startup session handoff so background start writes the runtime session correctly
-- current working tree: headless Windows lifecycle script, launcher thin-shell conversion, detached launcher start/stop requests, repo-config drift removal, and runtime contract tests
+- current working tree: headless Windows lifecycle script, launcher thin-shell conversion, manual-only browser open, manual QR flow, advanced-action collapse, repo-config drift removal, and runtime contract tests
 
 ## Security Status
 
@@ -45,6 +45,7 @@
 ## Current TODO
 
 - Manual Windows verification:
+  - confirm `Codrex.cmd` does not auto-open the laptop browser app
   - confirm the launcher transitions cleanly from `starting` to `running` in a live `Codrex.cmd` session
   - confirm `Stop` truly clears the controller and session file in real launcher usage
   - confirm launch/stop does not dirty tracked `controller.config.json`

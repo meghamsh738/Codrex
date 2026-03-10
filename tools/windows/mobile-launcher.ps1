@@ -544,7 +544,7 @@ $runtimeScript = Join-Path $scriptRoot "codrex-runtime.ps1"
 $uiPort = $script:DefaultDevUiPort
 $controllerPort = $script:DefaultControllerPort
 $controllerToken = ""
-$pairUrl = ""
+$script:pairUrl = ""
 $authSession = New-Object Microsoft.PowerShell.Commands.WebRequestSession
 $script:applyFirewallOnStart = $false
 $colorBg = [System.Drawing.ColorTranslator]::FromHtml("#040915")
@@ -568,7 +568,7 @@ $script:lastHelperOutput = ""
 $script:pendingRuntimeAction = ""
 $script:pendingRuntimeActionAt = [DateTime]::MinValue
 $script:pendingRuntimeTimeoutSec = 45
-$script:autoOpenedRunningApp = $false
+$script:advancedVisible = $false
 $script:pendingStart = $false
 $script:pendingStartAt = [DateTime]::MinValue
 $script:pendingStartTimeoutSec = 45
@@ -776,8 +776,8 @@ $actionsGrid.Dock = "Fill"
 $actionsGrid.ColumnCount = 1
 $actionsGrid.RowCount = 3
 $actionsGrid.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 54)))
-$actionsGrid.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 54)))
-$actionsGrid.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 54)))
+$actionsGrid.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 0)))
+$actionsGrid.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 0)))
 $actionsCard.Controls.Add($actionsGrid)
 
 $rowStartStop = New-Object System.Windows.Forms.FlowLayoutPanel
@@ -790,19 +790,23 @@ $btnStart = New-Object System.Windows.Forms.Button
 $btnStart.Text = "Start"
 $rowStartStop.Controls.Add($btnStart) | Out-Null
 
-$btnStop = New-Object System.Windows.Forms.Button
-$btnStop.Text = "Stop"
-$rowStartStop.Controls.Add($btnStop) | Out-Null
+$btnOpenLocal = New-Object System.Windows.Forms.Button
+$btnOpenLocal.Text = "Open App"
+$rowStartStop.Controls.Add($btnOpenLocal) | Out-Null
+
+$btnGenQr = New-Object System.Windows.Forms.Button
+$btnGenQr.Text = "Show Pair QR"
+$rowStartStop.Controls.Add($btnGenQr) | Out-Null
+
+$btnAdvanced = New-Object System.Windows.Forms.Button
+$btnAdvanced.Text = "Advanced"
+$rowStartStop.Controls.Add($btnAdvanced) | Out-Null
 
 $rowOpen = New-Object System.Windows.Forms.FlowLayoutPanel
 $rowOpen.Dock = "Fill"
 $rowOpen.FlowDirection = [System.Windows.Forms.FlowDirection]::LeftToRight
 $rowOpen.WrapContents = $true
 $actionsGrid.Controls.Add($rowOpen, 0, 1)
-
-$btnOpenLocal = New-Object System.Windows.Forms.Button
-$btnOpenLocal.Text = "Open App"
-$rowOpen.Controls.Add($btnOpenLocal) | Out-Null
 
 $btnOpenNetwork = New-Object System.Windows.Forms.Button
 $btnOpenNetwork.Text = "Open Network App"
@@ -817,10 +821,6 @@ $rowPair.Dock = "Fill"
 $rowPair.FlowDirection = [System.Windows.Forms.FlowDirection]::LeftToRight
 $rowPair.WrapContents = $true
 $actionsGrid.Controls.Add($rowPair, 0, 2)
-
-$btnGenQr = New-Object System.Windows.Forms.Button
-$btnGenQr.Text = "Show Pair QR"
-$rowPair.Controls.Add($btnGenQr) | Out-Null
 
 $btnCopyPair = New-Object System.Windows.Forms.Button
 $btnCopyPair.Text = "Copy Pair Link"
@@ -878,13 +878,13 @@ $picQr.SizeMode = [System.Windows.Forms.PictureBoxSizeMode]::Zoom
 $qrCard.Controls.Add($picQr)
 
 $lblQrInfo = New-Object System.Windows.Forms.Label
-$lblQrInfo.Text = "Step 1: Show QR. Step 2: Scan on phone/tablet."
+$lblQrInfo.Text = "Press Show Pair QR, then scan on phone/tablet."
 $lblQrInfo.Dock = "Fill"
 $lblQrInfo.TextAlign = "MiddleLeft"
 $right.Controls.Add($lblQrInfo, 0, 2)
 
 $lblHint = New-Object System.Windows.Forms.Label
-$lblHint.Text = "Main app lives in the browser. This window is the local launcher and status shell."
+$lblHint.Text = "Browser app opens only when you click Open App. This window is the local launcher and status shell."
 $lblHint.Dock = "Fill"
 $lblHint.TextAlign = "TopLeft"
 $right.Controls.Add($lblHint, 0, 3)
@@ -923,8 +923,8 @@ $picQr.BackColor = $colorSurfaceSoft
 $picQr.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
 
 Set-LauncherButtonStyle -Button $btnStart -Primary $true
-Set-LauncherButtonStyle -Button $btnStop -Danger $true
 Set-LauncherButtonStyle -Button $btnOpenLocal
+Set-LauncherButtonStyle -Button $btnAdvanced
 Set-LauncherButtonStyle -Button $btnOpenNetwork
 Set-LauncherButtonStyle -Button $btnOpenController
 Set-LauncherButtonStyle -Button $btnGenQr -Primary $true
@@ -932,8 +932,8 @@ Set-LauncherButtonStyle -Button $btnCopyPair
 Set-LauncherButtonStyle -Button $btnOpenPair
 @(
   $btnStart,
-  $btnStop,
   $btnOpenLocal,
+  $btnAdvanced,
   $btnOpenNetwork,
   $btnOpenController,
   $btnGenQr,
@@ -942,8 +942,8 @@ Set-LauncherButtonStyle -Button $btnOpenPair
 ) | ForEach-Object { Register-LauncherButtonFeedback -Button $_ }
 $script:launcherButtons = @(
   $btnStart,
-  $btnStop,
   $btnOpenLocal,
+  $btnAdvanced,
   $btnOpenNetwork,
   $btnOpenController,
   $btnGenQr,
@@ -967,6 +967,46 @@ function Set-SplitLayout {
       $split.SplitterDistance = $target
     }
   } catch {}
+}
+
+function Set-PrimaryActionStyle {
+  param(
+    [bool]$IsRunning
+  )
+  if ($IsRunning) {
+    Set-LauncherButtonStyle -Button $btnStart -Danger $true
+  } else {
+    Set-LauncherButtonStyle -Button $btnStart -Primary $true
+  }
+  Reset-LauncherButtonVisual -Button $btnStart
+}
+
+function Set-AdvancedVisibility {
+  param(
+    [bool]$Visible
+  )
+  $script:advancedVisible = $Visible
+  $rowOpen.Visible = $Visible
+  $rowPair.Visible = $Visible
+  $lblPairLink.Visible = $Visible
+  $txtPair.Visible = $Visible
+  $actionsGrid.RowStyles[1].Height = if ($Visible) { 54 } else { 0 }
+  $actionsGrid.RowStyles[2].Height = if ($Visible) { 54 } else { 0 }
+  $left.RowStyles[2].Height = if ($Visible) { 180 } else { 76 }
+  $left.RowStyles[3].Height = if ($Visible) { 24 } else { 0 }
+  $left.RowStyles[4].Height = if ($Visible) { 40 } else { 0 }
+  $btnAdvanced.Text = if ($Visible) { "Hide Advanced" } else { "Advanced" }
+}
+
+function Clear-PairingState {
+  $script:pairUrl = ""
+  $txtPair.Text = ""
+  if ($picQr.Image) {
+    try { $picQr.Image.Dispose() } catch {}
+  }
+  $picQr.Image = $null
+  $lblQrInfo.Text = "Press Show Pair QR, then scan on phone/tablet."
+  $lblHint.Text = "Browser app opens only when you click Open App. This window is the local launcher and status shell."
 }
 
 function Append-Log([string]$Line) {
@@ -1040,20 +1080,14 @@ function Refresh-State {
   $script:refreshInProgress = $true
   try {
     $snapshot = Get-LauncherStatusSnapshot
+    $stackActive = ($snapshot.controller_on -or $snapshot.session_state -eq "present")
     $pendingAction = [string]$script:pendingRuntimeAction
     if ($pendingAction) {
       $ageSeconds = [int]([DateTime]::UtcNow - $script:pendingRuntimeActionAt).TotalSeconds
       if ($pendingAction -eq "start") {
         if ($snapshot.status -eq "running") {
           $script:pendingRuntimeAction = ""
-          if ($snapshot.local_url) {
-            Append-Log ("Start complete. App ready on port {0} (v{1})." -f $snapshot.controller_port, $(if ($snapshot.version) { $snapshot.version } else { "n/a" }))
-            if (Open-Url ([string]$snapshot.local_url)) {
-              Append-Log ("Opened app: {0}" -f $snapshot.local_url)
-            } else {
-              Append-Log ("Could not open app automatically. Open it manually: {0}" -f $snapshot.local_url)
-            }
-          }
+          Append-Log ("Start complete. App ready on port {0} (v{1}). Click Open App to launch the browser UI." -f $snapshot.controller_port, $(if ($snapshot.version) { $snapshot.version } else { "n/a" }))
         } elseif ($ageSeconds -le $script:pendingRuntimeTimeoutSec) {
           $snapshot.status = "starting"
           $snapshot.detail = "Waiting for Codrex runtime to report ready..."
@@ -1064,6 +1098,7 @@ function Refresh-State {
       } elseif ($pendingAction -eq "stop") {
         if ($snapshot.status -eq "stopped") {
           $script:pendingRuntimeAction = ""
+          Clear-PairingState
           Append-Log "Stop complete."
         } elseif ($ageSeconds -le $script:pendingRuntimeTimeoutSec) {
           $snapshot.status = "checking"
@@ -1074,24 +1109,22 @@ function Refresh-State {
         }
       }
     }
+    if (-not $stackActive) {
+      Clear-PairingState
+    }
     Apply-LauncherStatus -Snapshot $snapshot
     $busy = ($script:actionInProgress -or [bool]$script:pendingRuntimeAction)
-    $btnStop.Enabled = (-not $busy) -and ($snapshot.controller_on -or $snapshot.session_state -eq "present")
     $btnStart.Enabled = (-not $busy)
-    $btnStart.Text = if ($snapshot.app_built) { "Open App" } else { "Start" }
+    $btnStart.Text = if ($stackActive) { "Stop" } else { "Start" }
+    Set-PrimaryActionStyle -IsRunning:$stackActive
     $btnOpenLocal.Enabled = (-not $busy) -and $snapshot.controller_on
     $btnOpenNetwork.Enabled = (-not $busy) -and $snapshot.controller_on -and ($snapshot.lan_ip -ne "127.0.0.1")
     $btnOpenController.Enabled = (-not $busy) -and $snapshot.controller_on
     $btnGenQr.Enabled = (-not $busy) -and $snapshot.app_built
-    $hasPair = [bool]$pairUrl
+    $btnAdvanced.Enabled = (-not $busy)
+    $hasPair = [bool]$script:pairUrl
     $btnCopyPair.Enabled = (-not $busy) -and $hasPair
     $btnOpenPair.Enabled = (-not $busy) -and $hasPair
-    if ((-not $script:autoOpenedRunningApp) -and $snapshot.status -eq "running" -and $snapshot.local_url -and $snapshot.local_url -ne "offline") {
-      if (Open-Url ([string]$snapshot.local_url)) {
-        Append-Log ("Opened app: {0}" -f $snapshot.local_url)
-        $script:autoOpenedRunningApp = $true
-      }
-    }
   } catch {
     $msg = [string]$_.Exception.Message
     if (-not $msg) { $msg = "Could not refresh launcher state." }
@@ -1104,8 +1137,7 @@ function Refresh-State {
 function Start-Stack {
   $existingSnapshot = Get-LauncherStatusSnapshot
   if ($existingSnapshot.app_built) {
-    Open-Url $existingSnapshot.local_url
-    Append-Log ("App already running on port {0}." -f $existingSnapshot.controller_port)
+    Append-Log ("Codrex is already running on port {0}." -f $existingSnapshot.controller_port)
     return
   }
   Append-Log "Starting mobile stack..."
@@ -1122,6 +1154,10 @@ function Stop-Stack {
   $script:pendingRuntimeAction = "stop"
   $script:pendingRuntimeActionAt = [DateTime]::UtcNow
   Append-Log ("Stop requested via runtime helper PID {0}." -f $procId)
+}
+
+function Toggle-AdvancedActions {
+  Set-AdvancedVisibility -Visible:(-not $script:advancedVisible)
 }
 
 function Generate-PairQr {
@@ -1150,10 +1186,10 @@ function Generate-PairQr {
   }
 
   $base = ("http://{0}:{1}" -f $pairHost, $controllerPort)
-  $pairUrl = "$base/auth/pair/consume?code=$([Uri]::EscapeDataString([string]$create.code))"
-  $txtPair.Text = $pairUrl
+  $script:pairUrl = "$base/auth/pair/consume?code=$([Uri]::EscapeDataString([string]$create.code))"
+  $txtPair.Text = $script:pairUrl
 
-  $qrEndpoint = "http://127.0.0.1:$controllerPort/auth/pair/qr.png?data=$([Uri]::EscapeDataString($pairUrl))&ts=$([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds())"
+  $qrEndpoint = "http://127.0.0.1:$controllerPort/auth/pair/qr.png?data=$([Uri]::EscapeDataString($script:pairUrl))&ts=$([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds())"
   $img = Get-QrPngImage -Url $qrEndpoint -Token "" -Session $authSession
   if ($null -eq $img) {
     throw "Could not render QR image."
@@ -1220,8 +1256,16 @@ function Safe-Action {
   }
 }
 
-$btnStart.Add_Click({ Safe-Action -Action { Start-Stack } -Button $btnStart })
-$btnStop.Add_Click({ Safe-Action -Action { Stop-Stack } -Button $btnStop })
+$btnStart.Add_Click({
+  Safe-Action -Action {
+    $snapshot = Get-LauncherStatusSnapshot
+    if ($snapshot.controller_on -or $snapshot.session_state -eq "present") {
+      Stop-Stack
+    } else {
+      Start-Stack
+    }
+  } -Button $btnStart
+})
 $btnOpenLocal.Add_Click({
   $port = Resolve-LauncherControllerPort
   $url = ("http://127.0.0.1:{0}/" -f $port)
@@ -1231,6 +1275,7 @@ $btnOpenLocal.Add_Click({
     Append-Log ("Could not open app: {0}" -f $url)
   }
 })
+$btnAdvanced.Add_Click({ Toggle-AdvancedActions })
 $btnOpenNetwork.Add_Click({
   $port = Resolve-LauncherControllerPort
   $ip = Get-CachedLanIp
@@ -1252,17 +1297,17 @@ $btnOpenController.Add_Click({
 })
 $btnGenQr.Add_Click({ Safe-Action -Action { Generate-PairQr } -Button $btnGenQr })
 $btnCopyPair.Add_Click({
-  if ($pairUrl) {
-    try { [System.Windows.Forms.Clipboard]::SetText($pairUrl) } catch {}
+  if ($script:pairUrl) {
+    try { [System.Windows.Forms.Clipboard]::SetText($script:pairUrl) } catch {}
     Append-Log "Pair link copied to clipboard."
   }
 })
 $btnOpenPair.Add_Click({
-  if ($pairUrl) {
-    if (Open-Url $pairUrl) {
+  if ($script:pairUrl) {
+    if (Open-Url $script:pairUrl) {
       Append-Log "Opened pair link."
     } else {
-      Append-Log ("Could not open pair link: {0}" -f $pairUrl)
+      Append-Log ("Could not open pair link: {0}" -f $script:pairUrl)
     }
   }
 })
@@ -1275,6 +1320,9 @@ $script:refreshTimer = New-Object System.Windows.Forms.Timer
 $script:refreshTimer.Interval = 2000
 $script:refreshTimer.Add_Tick({ Refresh-State })
 $script:refreshTimer.Start()
+
+Set-AdvancedVisibility -Visible:$false
+Clear-PairingState
 
 $form.Add_FormClosed({
   try { $script:refreshTimer.Stop() } catch {}

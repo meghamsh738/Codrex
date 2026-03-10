@@ -5,6 +5,8 @@ This folder contains the Windows-specific scripts behind the Codrex launcher.
 Normal use:
 - daily launch: `..\..\Codrex.cmd`
 - first-time bootstrap: `..\..\Setup.cmd`
+- launcher behavior: `Codrex.cmd` opens only the launcher shell; the laptop browser app opens only when you click `Open App`
+- pairing behavior: QR generation is manual via `Show Pair QR`
 
 Advanced tools kept here:
 - `mobile-launcher.ps1`: launcher UI used by `Codrex.cmd`
