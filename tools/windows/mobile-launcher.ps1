@@ -299,6 +299,125 @@ function Wait-ForSessionCleared {
   return $false
 }
 
+function Get-LauncherStatusSnapshot {
+  $cfg = Get-CachedControllerConfig
+  $session = Read-MobileSession
+  $controllerPort = if ($session -and $session.controller_port) {
+    [int]$session.controller_port
+  } elseif ($cfg.port) {
+    [int]$cfg.port
+  } else {
+    $script:DefaultControllerPort
+  }
+  $lanIp = Get-CachedLanIp
+  $listening = Get-ListeningStateMap -Ports @($controllerPort, $uiPort)
+  $controllerOn = [bool]$listening[[int]$controllerPort]
+  $appRuntime = if ($controllerOn) { Get-AppRuntime -ControllerPort $controllerPort } else { $null }
+  $appHealth = if ($appRuntime) { $appRuntime } elseif ($controllerOn) { Get-AppHealth -ControllerPort $controllerPort } else { $null }
+  $appBuilt = [bool]($appHealth -and $appHealth.ok -and $appHealth.ui_mode -eq "built")
+  $appMode = if ($appHealth -and $appHealth.ui_mode) {
+    [string]$appHealth.ui_mode
+  } elseif ($session -and $session.ui_mode) {
+    [string]$session.ui_mode
+  } elseif ($session) {
+    "checking"
+  } else {
+    "offline"
+  }
+  $version = if ($appRuntime -and $appRuntime.version) {
+    [string]$appRuntime.version
+  } else {
+    "n/a"
+  }
+  $repoRoot = ""
+  if ($appRuntime -and $appRuntime.repo_root) {
+    $repoRoot = [string]$appRuntime.repo_root
+  } elseif ($session -and $session.repo_root) {
+    $repoRoot = [string]$session.repo_root
+  }
+  $repoLabel = if ($repoRoot) { Split-Path -Leaf $repoRoot } else { "n/a" }
+  $sessionState = if ($session) { "present" } else { "missing" }
+  $localUrl = if ($controllerOn -or $session) { "http://127.0.0.1:$controllerPort/" } else { "offline" }
+  $networkUrl = if ($lanIp -and $lanIp -ne "127.0.0.1") { "http://$lanIp`:$controllerPort/" } else { "n/a" }
+  $status = if ($appBuilt) {
+    "running"
+  } elseif ($controllerOn -and $session) {
+    "checking"
+  } elseif ($controllerOn) {
+    "error"
+  } elseif ($session) {
+    "recovering"
+  } else {
+    "stopped"
+  }
+  return [pscustomobject]@{
+    session = $session
+    controller_port = $controllerPort
+    controller_on = $controllerOn
+    app_runtime = $appRuntime
+    app_health = $appHealth
+    app_built = $appBuilt
+    app_mode = $appMode
+    version = $version
+    repo_root = $repoRoot
+    repo_label = $repoLabel
+    session_state = $sessionState
+    local_url = $localUrl
+    network_url = $networkUrl
+    status = $status
+    lan_ip = $lanIp
+  }
+}
+
+function Apply-LauncherStatus {
+  param(
+    [object]$Snapshot
+  )
+  if (-not $Snapshot) {
+    return
+  }
+  $lblStatus.Text = "Launcher shell | State: $($Snapshot.status) | Mode: $($Snapshot.app_mode)`r`nBuild: v$($Snapshot.version) | Port: $($Snapshot.controller_port) | Session: $($Snapshot.session_state)`r`nApp: $($Snapshot.local_url)`r`nLAN: $($Snapshot.network_url) | Repo: $($Snapshot.repo_label)"
+  switch ([string]$Snapshot.status) {
+    "running" {
+      $statusCard.BackColor = [System.Drawing.ColorTranslator]::FromHtml("#0d2f53")
+      $lblStatus.ForeColor = $colorAccent
+    }
+    "checking" {
+      $statusCard.BackColor = [System.Drawing.ColorTranslator]::FromHtml("#3c3110")
+      $lblStatus.ForeColor = [System.Drawing.ColorTranslator]::FromHtml("#ffd166")
+    }
+    "recovering" {
+      $statusCard.BackColor = [System.Drawing.ColorTranslator]::FromHtml("#2f2b0d")
+      $lblStatus.ForeColor = [System.Drawing.ColorTranslator]::FromHtml("#ffd166")
+    }
+    "error" {
+      $statusCard.BackColor = [System.Drawing.ColorTranslator]::FromHtml("#3a1620")
+      $lblStatus.ForeColor = $colorDanger
+    }
+    default {
+      $statusCard.BackColor = $colorSurfaceSoft
+      $lblStatus.ForeColor = $colorText
+    }
+  }
+}
+
+function Set-ActionStatus {
+  param(
+    [string]$State,
+    [string]$Detail,
+    [int]$ControllerPort = 0
+  )
+  $portText = if ($ControllerPort -gt 0) { [string]$ControllerPort } else { "pending" }
+  $lblStatus.Text = "Launcher shell | State: $State | Mode: action`r`nPort: $portText | Detail: $Detail`r`nLogs: $logsDir"
+  if ($State -eq "error") {
+    $statusCard.BackColor = [System.Drawing.ColorTranslator]::FromHtml("#3a1620")
+    $lblStatus.ForeColor = $colorDanger
+  } else {
+    $statusCard.BackColor = [System.Drawing.ColorTranslator]::FromHtml("#3c3110")
+    $lblStatus.ForeColor = [System.Drawing.ColorTranslator]::FromHtml("#ffd166")
+  }
+}
+
 $scriptRoot = Split-Path -Parent $PSCommandPath
 $root = (Resolve-Path (Join-Path $scriptRoot "..\..")).Path
 $runtimeDir = Get-CodrexRuntimeDir -RepoRoot $root
@@ -797,52 +916,23 @@ function Resolve-LauncherControllerPort {
 }
 
 function Refresh-State {
-  if ($script:refreshInProgress -or $script:actionInProgress) { return }
+  param(
+    [switch]$Force
+  )
+  if ($script:refreshInProgress -or ($script:actionInProgress -and -not $Force)) { return }
   $script:refreshInProgress = $true
   try {
-    $cfg = Get-CachedControllerConfig
-    $session = Read-MobileSession
-    $controllerPort = Resolve-LauncherControllerPort
-    $lanIp = Get-CachedLanIp
-
-    $listening = Get-ListeningStateMap -Ports @($controllerPort, $uiPort)
-    $controllerOn = [bool]$listening[[int]$controllerPort]
-    $appRuntime = if ($controllerOn) { Get-AppRuntime -ControllerPort $controllerPort } else { $null }
-    $appHealth = if ($appRuntime) { $appRuntime } elseif ($controllerOn) { Get-AppHealth -ControllerPort $controllerPort } else { $null }
-    $appBuilt = [bool]($appHealth -and $appHealth.ok -and $appHealth.ui_mode -eq "built")
-    $appMode = if ($appHealth -and $appHealth.ui_mode) { [string]$appHealth.ui_mode } else { "offline" }
-    $version = if ($appRuntime -and $appRuntime.version) { [string]$appRuntime.version } else { "n/a" }
-    $repoRoot = ""
-    if ($appRuntime -and $appRuntime.repo_root) {
-      $repoRoot = [string]$appRuntime.repo_root
-    } elseif ($session -and $session.repo_root) {
-      $repoRoot = [string]$session.repo_root
-    }
-    $repoLabel = if ($repoRoot) { Split-Path -Leaf $repoRoot } else { "n/a" }
-    $sessionState = if ($session) { "present" } else { "missing" }
-    $localUrl = if ($controllerOn) { "http://127.0.0.1:$controllerPort/" } else { "offline" }
-    $networkUrl = if ($lanIp -and $lanIp -ne "127.0.0.1") { "http://$lanIp`:$controllerPort/" } else { "n/a" }
-    $status = if ($appBuilt) { "running" } elseif ($controllerOn) { "error" } else { "stopped" }
-    $lblStatus.Text = "Launcher shell | State: $status | Mode: $appMode`r`nBuild: v$version | Port: $controllerPort | Session: $sessionState`r`nApp: $localUrl`r`nLAN: $networkUrl | Repo: $repoLabel"
-    if ($appBuilt) {
-      $statusCard.BackColor = [System.Drawing.ColorTranslator]::FromHtml("#0d2f53")
-      $lblStatus.ForeColor = $colorAccent
-    } elseif ($controllerOn) {
-      $statusCard.BackColor = [System.Drawing.ColorTranslator]::FromHtml("#3a1620")
-      $lblStatus.ForeColor = $colorDanger
-    } else {
-      $statusCard.BackColor = $colorSurfaceSoft
-      $lblStatus.ForeColor = $colorText
-    }
+    $snapshot = Get-LauncherStatusSnapshot
+    Apply-LauncherStatus -Snapshot $snapshot
 
     $busy = $script:actionInProgress
-    $btnStop.Enabled = (-not $busy) -and $controllerOn
+    $btnStop.Enabled = (-not $busy) -and ($snapshot.controller_on -or $snapshot.session_state -eq "present")
     $btnStart.Enabled = (-not $busy)
-    $btnStart.Text = if ($appBuilt) { "Open App" } else { "Start" }
-    $btnOpenLocal.Enabled = (-not $busy) -and $controllerOn
-    $btnOpenNetwork.Enabled = (-not $busy) -and $controllerOn -and ($lanIp -ne "127.0.0.1")
-    $btnOpenController.Enabled = (-not $busy) -and $controllerOn
-    $btnGenQr.Enabled = (-not $busy) -and $appBuilt
+    $btnStart.Text = if ($snapshot.app_built) { "Open App" } else { "Start" }
+    $btnOpenLocal.Enabled = (-not $busy) -and $snapshot.controller_on
+    $btnOpenNetwork.Enabled = (-not $busy) -and $snapshot.controller_on -and ($snapshot.lan_ip -ne "127.0.0.1")
+    $btnOpenController.Enabled = (-not $busy) -and $snapshot.controller_on
+    $btnGenQr.Enabled = (-not $busy) -and $snapshot.app_built
     $hasPair = [bool]$pairUrl
     $btnCopyPair.Enabled = (-not $busy) -and $hasPair
     $btnOpenPair.Enabled = (-not $busy) -and $hasPair
@@ -852,35 +942,63 @@ function Refresh-State {
 }
 
 function Start-Stack {
-  $existingPort = Resolve-LauncherControllerPort
-  $existingListening = Get-ListeningStateMap -Ports @($existingPort)
-  if ([bool]$existingListening[[int]$existingPort]) {
-    $existingHealth = Get-AppRuntime -ControllerPort $existingPort
-    if ($existingHealth -and $existingHealth.ok -and $existingHealth.ui_mode -eq "built") {
-      Open-Url ("http://127.0.0.1:{0}/" -f $existingPort)
-      Append-Log ("App already running on port {0}." -f $existingPort)
-      return
-    }
+  $existingSnapshot = Get-LauncherStatusSnapshot
+  if ($existingSnapshot.app_built) {
+    Open-Url $existingSnapshot.local_url
+    Append-Log ("App already running on port {0}." -f $existingSnapshot.controller_port)
+    return
   }
+
   Append-Log "Starting mobile stack..."
+  Set-ActionStatus -State "starting" -Detail "Launching Codrex helper..." -ControllerPort $existingSnapshot.controller_port
+  [System.Windows.Forms.Application]::DoEvents()
+
   $startExitCode = Invoke-HiddenPowerShellScript -ScriptPath $startMobileScript -Arguments @(
-    "-UiPort", [string]$uiPort, "-OpenFirewall"
+    "-UiPort", [string]$uiPort
   )
   if ($startExitCode -ne 0) {
-    throw "Codrex start script failed with exit code $startExitCode. Run Setup.cmd again if this is a fresh checkout."
+    throw "Codrex start helper exited with code $startExitCode. Logs: $logsDir"
   }
-  $script:cachedControllerConfigAt = [DateTime]::MinValue
-  $script:cachedLanIpAt = [DateTime]::MinValue
-  $controllerPort = Resolve-LauncherControllerPort
-  $appHealth = Get-AppRuntime -ControllerPort $controllerPort
-  Refresh-State
-  if (-not ($appHealth -and $appHealth.ok -and $appHealth.ui_mode -eq "built")) {
-    $detail = if ($appHealth -and $appHealth.detail) { [string]$appHealth.detail } else { "Run Setup.cmd if this is a fresh checkout. Use Open Fallback for the legacy controller." }
-    throw "Codrex app did not reach running state. $detail"
+
+  $readySnapshot = $null
+  for ($attempt = 0; $attempt -lt 20; $attempt++) {
+    Start-Sleep -Milliseconds 300
+    [System.Windows.Forms.Application]::DoEvents()
+
+    $script:cachedControllerConfigAt = [DateTime]::MinValue
+    $script:cachedLanIpAt = [DateTime]::MinValue
+    $snapshot = Get-LauncherStatusSnapshot
+
+    if ($snapshot.app_built) {
+      $readySnapshot = $snapshot
+      break
+    }
+    if ($snapshot.session_state -eq "present") {
+      Set-ActionStatus -State "checking" -Detail "Runtime session written. Waiting for browser app readiness..." -ControllerPort $snapshot.controller_port
+    } elseif ($snapshot.controller_on) {
+      Set-ActionStatus -State "checking" -Detail "Controller reachable. Waiting for runtime session..." -ControllerPort $snapshot.controller_port
+    } else {
+      Set-ActionStatus -State "starting" -Detail "Waiting for controller process..." -ControllerPort $snapshot.controller_port
+    }
   }
-  Open-Url ("http://127.0.0.1:{0}/" -f $controllerPort)
-  $runtimeVersion = if ($appHealth -and $appHealth.version) { [string]$appHealth.version } else { "n/a" }
-  Append-Log ("Start complete. App ready on port {0} (v{1})." -f $controllerPort, $runtimeVersion)
+
+  if (-not $readySnapshot) {
+    $script:cachedControllerConfigAt = [DateTime]::MinValue
+    $script:cachedLanIpAt = [DateTime]::MinValue
+    $finalSnapshot = Get-LauncherStatusSnapshot
+    if ($finalSnapshot.app_built) {
+      $readySnapshot = $finalSnapshot
+    }
+  }
+
+  if (-not $readySnapshot) {
+    throw "Codrex did not reach running state after the helper completed. Logs: $logsDir"
+  }
+
+  Refresh-State -Force
+  Open-Url $readySnapshot.local_url
+  Append-Log ("Firewall changes skipped on normal start. Use Setup.cmd if you need firewall rules refreshed.")
+  Append-Log ("Start complete. App ready on port {0} (v{1})." -f $readySnapshot.controller_port, $readySnapshot.version)
 }
 
 function Stop-Stack {
