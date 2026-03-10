@@ -58,6 +58,12 @@ test.describe("mobile Sessions flow", () => {
     await expect.poll(() => mock.promptRequests[0]?.session ?? "").toBe("codex_demo");
     await expect.poll(() => mock.promptRequests[0]?.prompt ?? "").toBe("Summarize the latest build status.");
 
+    const notesInput = page.getByTestId("session-notes-input");
+    await notesInput.fill("Release checklist");
+    await page.getByRole("button", { name: "Save" }).click();
+    await page.getByRole("button", { name: "Append Latest Response" }).click();
+    await expect(notesInput).toContainText("Streaming mobile session output.");
+
     await testInfo.attach("sessions-mobile-shell", {
       body: await page.screenshot({ fullPage: true }),
       contentType: "image/png",

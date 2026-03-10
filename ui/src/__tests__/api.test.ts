@@ -1,16 +1,21 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  appendLatestSessionNotes,
   applySessionProfile,
   buildPairConsumeUrl,
   buildPairQrPngUrl,
   buildSuggestedControllerUrl,
   createSessionWithOptions,
   createSharedFile,
+  desktopMove,
   detectControllerPort,
   deleteSharedFile,
+  getAppRuntime,
   getPowerStatus,
+  getSessionNotes,
   getTelegramStatus,
   listSharedFiles,
+  saveSessionNotes,
   sendPowerAction,
   sendSessionKey,
   sendTelegramText,
@@ -323,6 +328,101 @@ describe("shared files API", () => {
           "Content-Type": "application/json",
         },
         body: JSON.stringify({ action: "shutdown", confirm_token: "tok_123" }),
+      }),
+    );
+  });
+
+  it("reads app runtime metadata", async () => {
+    fetchMock.mockResolvedValue({
+      ok: true,
+      status: 200,
+      text: async () => JSON.stringify({ ok: true, version: "1.5.0", ui_mode: "built" }),
+    });
+    const out = await getAppRuntime();
+    expect(out.ok).toBe(true);
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/app/runtime",
+      expect.objectContaining({
+        credentials: "include",
+      }),
+    );
+  });
+
+  it("reads and saves session notes", async () => {
+    fetchMock
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        text: async () => JSON.stringify({ ok: true, notes: { content: "Draft" } }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        text: async () => JSON.stringify({ ok: true, notes: { content: "Saved note" } }),
+      });
+
+    const read = await getSessionNotes("codex_demo");
+    const saved = await saveSessionNotes("codex_demo", {
+      content: "Saved note",
+      last_response_snapshot: "Latest output",
+    });
+
+    expect(read.ok).toBe(true);
+    expect(saved.ok).toBe(true);
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      "/codex/session/codex_demo/notes",
+      expect.objectContaining({
+        credentials: "include",
+      }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      "/codex/session/codex_demo/notes",
+      expect.objectContaining({
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ content: "Saved note", last_response_snapshot: "Latest output" }),
+      }),
+    );
+  });
+
+  it("appends latest session notes snapshot and sends desktop move coordinates", async () => {
+    fetchMock
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        text: async () => JSON.stringify({ ok: true, appended_text: "Latest output" }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        text: async () => JSON.stringify({ ok: true, x: 120, y: 80 }),
+      });
+
+    const appended = await appendLatestSessionNotes("codex_demo");
+    const moved = await desktopMove(120, 80);
+
+    expect(appended.ok).toBe(true);
+    expect(moved.ok).toBe(true);
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      "/codex/session/codex_demo/notes/append-latest",
+      expect.objectContaining({
+        method: "POST",
+      }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      "/desktop/input/move",
+      expect.objectContaining({
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ x: 120, y: 80 }),
       }),
     );
   });

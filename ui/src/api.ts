@@ -1,4 +1,5 @@
 import type {
+  AppRuntimeResult,
   AuthStatus,
   BasicResult,
   BrowserListResult,
@@ -17,6 +18,7 @@ import type {
   SessionFilesResult,
   SessionProfileApplyResult,
   SessionImageResult,
+  SessionNotesResult,
   SessionCloseResult,
   SessionScreenResult,
   SessionsResult,
@@ -253,6 +255,10 @@ export function getAuthStatus(): Promise<AuthStatus> {
   return requestJson<AuthStatus>("/auth/status");
 }
 
+export function getAppRuntime(): Promise<AppRuntimeResult> {
+  return requestJson<AppRuntimeResult>("/app/runtime");
+}
+
 export function login(token: string): Promise<BasicResult> {
   return requestJson<BasicResult>("/auth/login", {
     method: "POST",
@@ -454,6 +460,29 @@ export function listSharedFiles(): Promise<SharedFilesResult> {
 
 export function listSessionFiles(session: string): Promise<SessionFilesResult> {
   return requestJson<SessionFilesResult>(`/codex/session/${encodeURIComponent(session)}/files`);
+}
+
+export function getSessionNotes(session: string): Promise<SessionNotesResult> {
+  return requestJson<SessionNotesResult>(`/codex/session/${encodeURIComponent(session)}/notes`);
+}
+
+export function saveSessionNotes(
+  session: string,
+  payload: { content: string; last_response_snapshot?: string },
+): Promise<SessionNotesResult> {
+  return requestJson<SessionNotesResult>(`/codex/session/${encodeURIComponent(session)}/notes`, {
+    method: "POST",
+    headers: JSON_HEADERS,
+    body: JSON.stringify(payload),
+  });
+}
+
+export function appendLatestSessionNotes(session: string): Promise<SessionNotesResult> {
+  return requestJson<SessionNotesResult>(`/codex/session/${encodeURIComponent(session)}/notes/append-latest`, {
+    method: "POST",
+    headers: JSON_HEADERS,
+    body: JSON.stringify({}),
+  });
 }
 
 export function registerSessionFile(
@@ -696,6 +725,14 @@ export function desktopClick(params: { button?: "left" | "right"; double?: boole
       x: params.x,
       y: params.y,
     }),
+  });
+}
+
+export function desktopMove(x: number, y: number): Promise<DesktopInputResult> {
+  return requestJson<DesktopInputResult>("/desktop/input/move", {
+    method: "POST",
+    headers: JSON_HEADERS,
+    body: JSON.stringify({ x, y }),
   });
 }
 

@@ -7,6 +7,7 @@ vi.mock("../api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../api")>();
   return {
     ...actual,
+    appendLatestSessionNotes: vi.fn(),
     buildDesktopShotUrl: vi.fn(() => "/desktop/shot?ts=1"),
     buildDesktopStreamUrl: vi.fn(() => "/desktop/stream?fps=3&level=3"),
     buildPairConsumeUrl: vi.fn(() => "http://controller/auth/pair/consume?code=abc123"),
@@ -24,10 +25,12 @@ vi.mock("../api", async (importOriginal) => {
     ctrlcSession: vi.fn(),
     deleteSessionFile: vi.fn(),
     desktopClick: vi.fn(),
+    desktopMove: vi.fn(),
     desktopScroll: vi.fn(),
     desktopSendKey: vi.fn(),
     desktopSendText: vi.fn(),
     exchangePairCode: vi.fn(),
+    getAppRuntime: vi.fn(),
     getAuthStatus: vi.fn(),
     getCodexOptions: vi.fn(),
     getCodexRun: vi.fn(),
@@ -43,6 +46,7 @@ vi.mock("../api", async (importOriginal) => {
     getTmuxHealth: vi.fn(),
     getTmuxPaneScreen: vi.fn(),
     getTmuxPanes: vi.fn(),
+    getSessionNotes: vi.fn(),
     interruptPane: vi.fn(),
     interruptSession: vi.fn(),
     listSessionFiles: vi.fn(),
@@ -50,6 +54,7 @@ vi.mock("../api", async (importOriginal) => {
     logout: vi.fn(),
     reportIpcEvent: vi.fn(),
     registerSessionFile: vi.fn(),
+    saveSessionNotes: vi.fn(),
     sendSessionFileToTelegram: vi.fn(),
     sendSessionImage: vi.fn(),
     sendTelegramText: vi.fn(),
@@ -71,6 +76,7 @@ vi.mock("../api", async (importOriginal) => {
 });
 
 const getAuthStatusMock = vi.mocked(api.getAuthStatus);
+const getAppRuntimeMock = vi.mocked(api.getAppRuntime);
 const getCodexRunMock = vi.mocked(api.getCodexRun);
 const getCodexRunsMock = vi.mocked(api.getCodexRuns);
 const getCodexOptionsMock = vi.mocked(api.getCodexOptions);
@@ -105,6 +111,7 @@ const getDesktopInfoMock = vi.mocked(api.getDesktopInfo);
 const getPowerStatusMock = vi.mocked(api.getPowerStatus);
 const setDesktopModeMock = vi.mocked(api.setDesktopMode);
 const desktopClickMock = vi.mocked(api.desktopClick);
+const desktopMoveMock = vi.mocked(api.desktopMove);
 const desktopScrollMock = vi.mocked(api.desktopScroll);
 const desktopSendTextMock = vi.mocked(api.desktopSendText);
 const desktopSendKeyMock = vi.mocked(api.desktopSendKey);
@@ -114,6 +121,9 @@ const sendToPaneMock = vi.mocked(api.sendToPane);
 const sendToPaneKeyMock = vi.mocked(api.sendToPaneKey);
 const interruptPaneMock = vi.mocked(api.interruptPane);
 const closeSessionMock = vi.mocked(api.closeSession);
+const getSessionNotesMock = vi.mocked(api.getSessionNotes);
+const saveSessionNotesMock = vi.mocked(api.saveSessionNotes);
+const appendLatestSessionNotesMock = vi.mocked(api.appendLatestSessionNotes);
 const sendSessionImageMock = vi.mocked(api.sendSessionImage);
 const sendPowerActionMock = vi.mocked(api.sendPowerAction);
 const uploadSessionFileMock = vi.mocked(api.uploadSessionFile);
@@ -132,6 +142,14 @@ function setupDefaultMocks(): void {
     ok: true,
     auth_required: true,
     authenticated: false,
+  });
+  getAppRuntimeMock.mockResolvedValue({
+    ok: true,
+    version: "1.5.0",
+    ui_mode: "built",
+    build_present: true,
+    controller_port: 48787,
+    controller_origin: "http://127.0.0.1:48787",
   });
   getNetInfoMock.mockResolvedValue({
     ok: true,
@@ -173,6 +191,40 @@ function setupDefaultMocks(): void {
   listSessionFilesMock.mockResolvedValue({
     ok: true,
     items: [],
+  });
+  getSessionNotesMock.mockResolvedValue({
+    ok: true,
+    session: "codex_demo",
+    notes: {
+      session: "codex_demo",
+      content: "",
+      created_at: Date.now(),
+      updated_at: Date.now(),
+      last_response_snapshot: "",
+    },
+  });
+  saveSessionNotesMock.mockResolvedValue({
+    ok: true,
+    session: "codex_demo",
+    notes: {
+      session: "codex_demo",
+      content: "Saved note",
+      created_at: Date.now(),
+      updated_at: Date.now(),
+      last_response_snapshot: "Latest output",
+    },
+  });
+  appendLatestSessionNotesMock.mockResolvedValue({
+    ok: true,
+    session: "codex_demo",
+    appended_text: "Latest output",
+    notes: {
+      session: "codex_demo",
+      content: "Latest output",
+      created_at: Date.now(),
+      updated_at: Date.now(),
+      last_response_snapshot: "Latest output",
+    },
   });
   sendSessionFileToTelegramMock.mockResolvedValue({
     ok: true,
@@ -273,6 +325,7 @@ function setupDefaultMocks(): void {
   sendToSessionMock.mockResolvedValue({ ok: true });
   setDesktopModeMock.mockResolvedValue({ ok: true, enabled: false });
   desktopClickMock.mockResolvedValue({ ok: true });
+  desktopMoveMock.mockResolvedValue({ ok: true, x: 100, y: 80 });
   desktopScrollMock.mockResolvedValue({ ok: true });
   desktopSendTextMock.mockResolvedValue({ ok: true });
   desktopSendKeyMock.mockResolvedValue({ ok: true });
@@ -672,6 +725,46 @@ describe("app shell tabs", () => {
     const latestCall = sendToSessionMock.mock.calls.at(-1);
     expect(latestCall?.[0]).toBe("codex_demo");
     expect(latestCall?.[1]).toBe("Create a release checklist");
+  });
+
+  it("saves notes and appends the latest response inside the sessions workspace", async () => {
+    getSessionsMock.mockResolvedValue({
+      ok: true,
+      sessions: [
+        {
+          session: "codex_demo",
+          pane_id: "%1",
+          current_command: "codex",
+          cwd: "/home/megha/work",
+          state: "idle",
+          updated_at: Date.now(),
+          snippet: "Assistant ready",
+        },
+      ],
+    });
+    getSessionScreenMock.mockResolvedValue({
+      ok: true,
+      text: "Plan heading\n\nFirst action\nSecond action",
+    });
+
+    render(<App />);
+
+    const notesInput = await screen.findByTestId("session-notes-input");
+    fireEvent.change(notesInput, { target: { value: "Ship checklist" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+
+    await waitFor(() => {
+      expect(saveSessionNotesMock).toHaveBeenCalledWith("codex_demo", {
+        content: "Ship checklist",
+        last_response_snapshot: "Plan heading\nFirst action\nSecond action",
+      });
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Append Latest Response" }));
+
+    await waitFor(() => {
+      expect(appendLatestSessionNotesMock).toHaveBeenCalledWith("codex_demo");
+    });
   });
 
   it("sends arrow key to session from action dock", async () => {

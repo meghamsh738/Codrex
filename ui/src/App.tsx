@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   addThreadRecordMessage,
+  appendLatestSessionNotes,
   buildDesktopShotUrl,
   buildDesktopStreamUrl,
   buildPairConsumeUrl,
@@ -16,6 +17,7 @@ import {
   createSessionWithOptions,
   createTmuxSession,
   createPairCode,
+  desktopMove,
   detectControllerPort,
   deleteSessionFile,
   deleteThreadRecord,
@@ -27,6 +29,7 @@ import {
   exchangePairCode,
   enterSession,
   sendSessionKey,
+  getAppRuntime,
   getDesktopInfo,
   getAuthStatus,
   listBrowseEntries,
@@ -41,6 +44,7 @@ import {
   getTmuxHealth,
   getTmuxPaneScreen,
   getTmuxPanes,
+  getSessionNotes,
   getSessionScreen,
   getSessions,
   interruptSession,
@@ -49,6 +53,7 @@ import {
   logout,
   reportIpcEvent,
   registerSessionFile,
+  saveSessionNotes,
   sendPowerAction,
   sendSessionFileToTelegram,
   sendSessionImage,
@@ -63,6 +68,7 @@ import {
   uploadWslFile,
 } from "./api";
 import type {
+  AppRuntimeResult,
   AuthStatus,
   BrowserEntryInfo,
   BrowserListResult,
@@ -73,6 +79,7 @@ import type {
   PowerStatusResult,
   SharedFileInfo,
   SessionInfo,
+  SessionNoteInfo,
   SessionStreamEvent,
   ThreadInfo,
   ThreadMessageInfo,
@@ -720,6 +727,10 @@ export default function App() {
   const [browserState, setBrowserState] = useState<BrowserListResult | null>(null);
   const [browserRoot, setBrowserRoot] = useState("workspace");
   const [browserSelectedPath, setBrowserSelectedPath] = useState("");
+  const [sessionNotes, setSessionNotes] = useState("");
+  const [sessionNotesInfo, setSessionNotesInfo] = useState<SessionNoteInfo | null>(null);
+  const [sessionNotesLoading, setSessionNotesLoading] = useState(false);
+  const [sessionNotesBusy, setSessionNotesBusy] = useState(false);
   const [telegramConfigured, setTelegramConfigured] = useState(false);
 
   const [threads, setThreads] = useState<ChatThread[]>(() => {
@@ -770,6 +781,8 @@ export default function App() {
   const [desktopTextInput, setDesktopTextInput] = useState("");
   const [desktopStatus, setDesktopStatus] = useState("");
   const [desktopFocusPoint, setDesktopFocusPoint] = useState<{ x: number; y: number } | null>(null);
+  const [desktopFullscreen, setDesktopFullscreen] = useState(false);
+  const [desktopTrackpadMode, setDesktopTrackpadMode] = useState(true);
   const [powerStatus, setPowerStatus] = useState<PowerStatusResult | null>(null);
   const [powerBusy, setPowerBusy] = useState(false);
   const [powerConfirmAction, setPowerConfirmAction] = useState<PowerActionName | "">("");
@@ -813,6 +826,7 @@ export default function App() {
   const [installPromptEvent, setInstallPromptEvent] = useState<DeferredInstallPromptEvent | null>(null);
   const [installState, setInstallState] = useState<InstallState>("hidden");
   const [showInstallGuide, setShowInstallGuide] = useState(false);
+  const [appRuntime, setAppRuntime] = useState<AppRuntimeResult | null>(null);
 
   const [statusMessage, setStatusMessage] = useState("Loading controller state...");
   const [errorMessage, setErrorMessage] = useState("");
@@ -828,7 +842,14 @@ export default function App() {
   const sessionStreamQueueRef = useRef<SessionStreamEvent[]>([]);
   const sessionStreamFrameRef = useRef<number | null>(null);
   const sessionStreamSeqRef = useRef<Record<string, number>>({});
+  const remoteStageRef = useRef<HTMLDivElement | null>(null);
   const desktopFrameRef = useRef<HTMLImageElement | null>(null);
+  const desktopPointerRef = useRef<{ active: boolean; x: number; y: number; moved: boolean }>({
+    active: false,
+    x: 0,
+    y: 0,
+    moved: false,
+  });
   const threadLastAssistantAtRef = useRef<Record<string, number>>({});
   const localThreadsRef = useRef<ChatThread[]>([]);
   const localThreadMessagesRef = useRef<Record<string, ThreadMessage[]>>({});
@@ -839,6 +860,7 @@ export default function App() {
   const browserHostname = typeof window !== "undefined" ? window.location.hostname || "127.0.0.1" : "127.0.0.1";
   const isLocalBrowser = isLocalHostName(browserHostname);
   const sessionTranscriptText = useMemo(() => transcriptToText(sessionTranscriptChunks), [sessionTranscriptChunks]);
+  const latestSessionResponseSnapshot = useMemo(() => compactAssistantSnapshot(sessionTranscriptText), [sessionTranscriptText]);
   const tailscaleRouteUnavailable = routeHint === "tailscale" && !netInfo?.tailscale_ip;
   const desktopStreamUrl = useMemo(() => {
     const profile = DESKTOP_PROFILE_STREAM[desktopProfile];
@@ -1087,6 +1109,19 @@ export default function App() {
     }
   }, [setError]);
 
+  const refreshAppRuntime = useCallback(async () => {
+    try {
+      const response = await getAppRuntime();
+      if (!response.ok) {
+        throw new Error(response.detail || response.error || "Could not read app runtime.");
+      }
+      setAppRuntime(response);
+    } catch (error) {
+      addEvent("error", `Could not read app runtime: ${(error as Error).message}`);
+      setAppRuntime(null);
+    }
+  }, [addEvent]);
+
   const refreshPowerStatus = useCallback(async () => {
     try {
       const response = await getPowerStatus();
@@ -1186,6 +1221,29 @@ export default function App() {
       addEvent("error", `Could not load session files: ${(error as Error).message}`);
     } finally {
       setSessionFilesLoading(false);
+    }
+  }, [addEvent]);
+
+  const refreshSessionNotes = useCallback(async (session: string) => {
+    if (!session) {
+      setSessionNotes("");
+      setSessionNotesInfo(null);
+      setSessionNotesLoading(false);
+      return;
+    }
+    try {
+      const response = await getSessionNotes(session);
+      if (!response.ok || !response.notes) {
+        throw new Error(response.detail || response.error || "Failed to read session notes.");
+      }
+      setSessionNotes(response.notes.content || "");
+      setSessionNotesInfo(response.notes);
+    } catch (error) {
+      addEvent("error", `Could not load session notes: ${(error as Error).message}`);
+      setSessionNotes("");
+      setSessionNotesInfo(null);
+    } finally {
+      setSessionNotesLoading(false);
     }
   }, [addEvent]);
 
@@ -1450,6 +1508,7 @@ export default function App() {
   useEffect(() => {
     void (async () => {
       await Promise.all([
+        refreshAppRuntime(),
         refreshAuth(),
         refreshCodexOptions(),
         refreshNet(),
@@ -1463,7 +1522,7 @@ export default function App() {
       ]);
       setStatus("Connected. Ready.");
     })();
-  }, [refreshAuth, refreshCodexOptions, refreshDebugRuns, refreshDesktopState, refreshNet, refreshPowerStatus, refreshSessions, refreshTelegramStatus, refreshThreads, refreshTmuxState, setStatus]);
+  }, [refreshAppRuntime, refreshAuth, refreshCodexOptions, refreshDebugRuns, refreshDesktopState, refreshNet, refreshPowerStatus, refreshSessions, refreshTelegramStatus, refreshThreads, refreshTmuxState, setStatus]);
 
   useEffect(() => {
     if (typeof window === "undefined") {
@@ -1665,6 +1724,9 @@ export default function App() {
       if (target?.closest(ignoreSelector)) {
         return;
       }
+      if (target?.closest("[data-remote-gesture='true']")) {
+        return;
+      }
       tracking = true;
       startX = x;
       startY = y;
@@ -1812,7 +1874,10 @@ export default function App() {
     if (!selectedSession) {
       setSessionTranscriptChunks([]);
       setSessionFiles([]);
+      setSessionNotes("");
+      setSessionNotesInfo(null);
       setSessionFilesLoading(false);
+      setSessionNotesLoading(false);
       return;
     }
     setSessionAutoFollow(true);
@@ -1820,7 +1885,9 @@ export default function App() {
     void refreshScreen(selectedSession);
     setSessionFilesLoading(true);
     void refreshSessionFiles(selectedSession);
-  }, [refreshScreen, refreshSessionFiles, selectedSession]);
+    setSessionNotesLoading(true);
+    void refreshSessionNotes(selectedSession);
+  }, [refreshScreen, refreshSessionFiles, refreshSessionNotes, selectedSession]);
 
   useEffect(() => {
     setBrowserLoading(true);
@@ -1836,6 +1903,14 @@ export default function App() {
     }
     void refreshTmuxScreen(selectedTmuxPane);
   }, [refreshTmuxScreen, selectedTmuxPane]);
+
+  useEffect(() => {
+    const onFullscreenChange = () => {
+      setDesktopFullscreen(Boolean(document.fullscreenElement));
+    };
+    document.addEventListener("fullscreenchange", onFullscreenChange);
+    return () => document.removeEventListener("fullscreenchange", onFullscreenChange);
+  }, []);
 
   useEffect(() => {
     if (showSwipeHint) {
@@ -2193,11 +2268,14 @@ export default function App() {
         : installState === "prompting"
           ? "Installing..."
           : "Install Help";
+  const appVersionLabel = appRuntime?.version ? `v${appRuntime.version}` : "version unavailable";
+  const appModeLabel = appRuntime?.ui_mode || "offline";
   const screenCardClassName = `card screen-card ${tabTransitionClass}`;
 
   const onHardRefresh = useCallback(async () => {
     setStatus("Syncing controller state...");
     await Promise.all([
+      refreshAppRuntime(),
       refreshAuth(),
       refreshCodexOptions(),
       refreshNet(),
@@ -2211,6 +2289,7 @@ export default function App() {
     ]);
     if (selectedSession) {
       await refreshScreen(selectedSession);
+      await refreshSessionNotes(selectedSession);
     }
     if (selectedTmuxPane) {
       await refreshTmuxScreen(selectedTmuxPane);
@@ -2219,7 +2298,7 @@ export default function App() {
       await refreshRunDetail(selectedRunId);
     }
     setStatus("Synced.");
-  }, [refreshAuth, refreshCodexOptions, refreshDebugRuns, refreshDesktopState, refreshNet, refreshPowerStatus, refreshRunDetail, refreshScreen, refreshSessions, refreshTelegramStatus, refreshThreads, refreshTmuxScreen, refreshTmuxState, selectedRunId, selectedSession, selectedTmuxPane, setStatus]);
+  }, [refreshAppRuntime, refreshAuth, refreshCodexOptions, refreshDebugRuns, refreshDesktopState, refreshNet, refreshPowerStatus, refreshRunDetail, refreshScreen, refreshSessionNotes, refreshSessions, refreshTelegramStatus, refreshThreads, refreshTmuxScreen, refreshTmuxState, selectedRunId, selectedSession, selectedTmuxPane, setStatus]);
 
   const onLogin = useCallback(async () => {
     if (!tokenInput.trim()) {
@@ -2798,6 +2877,84 @@ export default function App() {
     setStatus(`Path inserted into composer: ${path}`);
   }, [setStatus]);
 
+  const onSaveSessionNotes = useCallback(async () => {
+    if (!selectedSession) {
+      setError("Select a session first.");
+      return;
+    }
+    setSessionNotesBusy(true);
+    try {
+      const response = await saveSessionNotes(selectedSession, {
+        content: sessionNotes,
+        last_response_snapshot: latestSessionResponseSnapshot,
+      });
+      if (!response.ok || !response.notes) {
+        throw new Error(response.detail || response.error || "Could not save session notes.");
+      }
+      setSessionNotes(response.notes.content || "");
+      setSessionNotesInfo(response.notes);
+      setStatus(`Notes saved for ${selectedSession}.`);
+    } catch (error) {
+      setError(`Save notes failed: ${(error as Error).message}`);
+    } finally {
+      setSessionNotesBusy(false);
+    }
+  }, [latestSessionResponseSnapshot, selectedSession, sessionNotes, setError, setStatus]);
+
+  const onAppendLatestToSessionNotes = useCallback(async () => {
+    if (!selectedSession) {
+      setError("Select a session first.");
+      return;
+    }
+    setSessionNotesBusy(true);
+    try {
+      const response = await appendLatestSessionNotes(selectedSession);
+      if (!response.ok || !response.notes) {
+        throw new Error(response.detail || response.error || "Could not append latest response.");
+      }
+      setSessionNotes(response.notes.content || "");
+      setSessionNotesInfo(response.notes);
+      setStatus(response.detail || `Latest response appended to ${selectedSession} notes.`);
+    } catch (error) {
+      setError(`Append latest failed: ${(error as Error).message}`);
+    } finally {
+      setSessionNotesBusy(false);
+    }
+  }, [selectedSession, setError, setStatus]);
+
+  const onCopyLatestSessionResponse = useCallback(async () => {
+    const text = latestSessionResponseSnapshot.trim() || (sessionNotesInfo?.last_response_snapshot || "").trim();
+    if (!text) {
+      setError("No recent Codex response is available to copy.");
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(text);
+      setStatus(`Latest response copied: ${text}`);
+    } catch (error) {
+      setError(`Copy latest response failed: ${(error as Error).message}`);
+    }
+  }, [latestSessionResponseSnapshot, sessionNotesInfo?.last_response_snapshot, setError, setStatus]);
+
+  const onCopySessionNotes = useCallback(async () => {
+    const text = sessionNotes.trim();
+    if (!text) {
+      setError("Notes are empty.");
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(text);
+      setStatus("Session notes copied.");
+    } catch (error) {
+      setError(`Copy notes failed: ${(error as Error).message}`);
+    }
+  }, [sessionNotes, setError, setStatus]);
+
+  const onClearSessionNotes = useCallback(() => {
+    setSessionNotes("");
+    setStatus("Notes cleared locally. Press Save to persist the empty note.");
+  }, [setStatus]);
+
   const onSessionOutputScroll = useCallback(() => {
     const node = sessionOutputRef.current;
     if (!node) {
@@ -3308,39 +3465,170 @@ export default function App() {
     }
   }, [desktopEnabled, desktopFocusPoint, desktopTextInput, setError]);
 
+  const mapDesktopPointFromClient = useCallback((clientX: number, clientY: number) => {
+    if (!desktopInfo?.width || !desktopInfo?.height) {
+      return null;
+    }
+    const img = desktopFrameRef.current;
+    if (!img) {
+      return null;
+    }
+    const rect = img.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) {
+      return null;
+    }
+    const normX = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
+    const normY = Math.max(0, Math.min(1, (clientY - rect.top) / rect.height));
+    return {
+      x: Math.round(normX * desktopInfo.width),
+      y: Math.round(normY * desktopInfo.height),
+    };
+  }, [desktopInfo?.height, desktopInfo?.width]);
+
+  const onDesktopMovePointer = useCallback(async (clientX: number, clientY: number) => {
+    if (!desktopEnabled) {
+      return;
+    }
+    const target = mapDesktopPointFromClient(clientX, clientY);
+    if (!target) {
+      return;
+    }
+    setDesktopFocusPoint(target);
+    try {
+      const response = await desktopMove(target.x, target.y);
+      if (!response.ok) {
+        throw new Error(response.detail || response.error || "Desktop move failed.");
+      }
+      setDesktopStatus(`Pointer moved to ${target.x}, ${target.y}.`);
+    } catch (error) {
+      setError(`Desktop move failed: ${(error as Error).message}`);
+    }
+  }, [desktopEnabled, mapDesktopPointFromClient, setError]);
+
+  const onDesktopWheel = useCallback(async (event: React.WheelEvent<HTMLImageElement>) => {
+    if (!desktopEnabled) {
+      return;
+    }
+    event.preventDefault();
+    await onDesktopScroll(event.deltaY >= 0 ? 240 : -240);
+  }, [desktopEnabled, onDesktopScroll]);
+
+  const onDesktopPointerDown = useCallback((event: React.PointerEvent<HTMLImageElement>) => {
+    if (!desktopEnabled) {
+      return;
+    }
+    if (event.pointerType === "mouse" && !desktopTrackpadMode) {
+      return;
+    }
+    desktopPointerRef.current = {
+      active: true,
+      x: event.clientX,
+      y: event.clientY,
+      moved: false,
+    };
+    event.currentTarget.setPointerCapture(event.pointerId);
+  }, [desktopEnabled, desktopTrackpadMode]);
+
+  const onDesktopPointerMove = useCallback(async (event: React.PointerEvent<HTMLImageElement>) => {
+    if (!desktopEnabled || !desktopTrackpadMode || !desktopPointerRef.current.active) {
+      return;
+    }
+    const state = desktopPointerRef.current;
+    const delta = Math.abs(event.clientX - state.x) + Math.abs(event.clientY - state.y);
+    if (delta < 8) {
+      return;
+    }
+    desktopPointerRef.current = {
+      active: true,
+      x: event.clientX,
+      y: event.clientY,
+      moved: true,
+    };
+    await onDesktopMovePointer(event.clientX, event.clientY);
+  }, [desktopEnabled, desktopTrackpadMode, onDesktopMovePointer]);
+
+  const onDesktopPointerUp = useCallback(async (event: React.PointerEvent<HTMLImageElement>) => {
+    const state = desktopPointerRef.current;
+    desktopPointerRef.current = { active: false, x: 0, y: 0, moved: false };
+    if (!desktopEnabled) {
+      return;
+    }
+    const target = mapDesktopPointFromClient(event.clientX, event.clientY);
+    if (!target) {
+      return;
+    }
+    setDesktopFocusPoint(target);
+    if (desktopTrackpadMode && state.moved) {
+      setDesktopStatus(`Pointer focused at ${target.x}, ${target.y}.`);
+      return;
+    }
+    try {
+      const response = await desktopClick({ x: target.x, y: target.y, button: "left" });
+      if (!response.ok) {
+        throw new Error(response.detail || response.error || "Desktop tap failed.");
+      }
+      setDesktopStatus(`Focused desktop at ${target.x}, ${target.y}.`);
+    } catch (error) {
+      setError(`Desktop tap failed: ${(error as Error).message}`);
+    }
+  }, [desktopEnabled, desktopTrackpadMode, mapDesktopPointFromClient, setError]);
+
+  const onDesktopContextMenu = useCallback(async (event: React.MouseEvent<HTMLImageElement>) => {
+    if (!desktopEnabled) {
+      return;
+    }
+    event.preventDefault();
+    const target = mapDesktopPointFromClient(event.clientX, event.clientY);
+    if (!target) {
+      return;
+    }
+    setDesktopFocusPoint(target);
+    try {
+      const response = await desktopClick({ x: target.x, y: target.y, button: "right" });
+      if (!response.ok) {
+        throw new Error(response.detail || response.error || "Desktop right click failed.");
+      }
+      setDesktopStatus(`Right click sent at ${target.x}, ${target.y}.`);
+    } catch (error) {
+      setError(`Desktop right click failed: ${(error as Error).message}`);
+    }
+  }, [desktopEnabled, mapDesktopPointFromClient, setError]);
+
   const onDesktopFrameTap = useCallback(async (event: React.MouseEvent<HTMLImageElement>) => {
     if (!desktopEnabled) {
       setDesktopStatus("Desktop control is disabled. Enable Desktop first.");
       return;
     }
-    if (!desktopInfo?.width || !desktopInfo?.height) {
+    if (desktopTrackpadMode) {
       return;
     }
-    const img = desktopFrameRef.current;
-    if (!img) {
+    const target = mapDesktopPointFromClient(event.clientX, event.clientY);
+    if (!target) {
       return;
     }
-    const rect = img.getBoundingClientRect();
-    if (rect.width <= 0 || rect.height <= 0) {
-      return;
-    }
-
-    const normX = Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width));
-    const normY = Math.max(0, Math.min(1, (event.clientY - rect.top) / rect.height));
-    const targetX = Math.round(normX * desktopInfo.width);
-    const targetY = Math.round(normY * desktopInfo.height);
-    setDesktopFocusPoint({ x: targetX, y: targetY });
-
+    setDesktopFocusPoint(target);
     try {
-      const response = await desktopClick({ x: targetX, y: targetY, button: "left" });
+      const response = await desktopClick({ x: target.x, y: target.y, button: "left" });
       if (!response.ok) {
         throw new Error(response.detail || response.error || "Desktop tap failed.");
       }
-      setDesktopStatus(`Focused desktop at ${targetX}, ${targetY}.`);
+      setDesktopStatus(`Focused desktop at ${target.x}, ${target.y}.`);
     } catch (error) {
       setError(`Desktop tap failed: ${(error as Error).message}`);
     }
-  }, [desktopEnabled, desktopInfo?.height, desktopInfo?.width, setError]);
+  }, [desktopEnabled, desktopTrackpadMode, mapDesktopPointFromClient, setError]);
+
+  const onToggleDesktopFullscreen = useCallback(async () => {
+    try {
+      if (!document.fullscreenElement) {
+        await remoteStageRef.current?.requestFullscreen();
+      } else {
+        await document.exitFullscreen();
+      }
+    } catch (error) {
+      setError(`Fullscreen failed: ${(error as Error).message}`);
+    }
+  }, [setError]);
 
   const onDesktopSendKey = useCallback(async () => {
     if (!desktopEnabled) {
@@ -3357,6 +3645,23 @@ export default function App() {
       setError(`Desktop key failed: ${(error as Error).message}`);
     }
   }, [desktopEnabled, desktopKeyInput, setError]);
+
+  const onDesktopSendQuickKey = useCallback(async (key: string) => {
+    if (!desktopEnabled) {
+      setError("Desktop control is disabled. Enable Desktop first.");
+      return;
+    }
+    try {
+      const response = await desktopSendKey(key);
+      if (!response.ok) {
+        throw new Error(response.detail || response.error || "Desktop key failed.");
+      }
+      setDesktopKeyInput(key);
+      setDesktopStatus(`Key sent: ${key}`);
+    } catch (error) {
+      setError(`Desktop key failed: ${(error as Error).message}`);
+    }
+  }, [desktopEnabled, setError]);
 
   const onRequestPowerAction = useCallback(async (action: PowerActionName, confirmToken = "") => {
     setPowerBusy(true);
@@ -3686,7 +3991,7 @@ export default function App() {
           <div>
             <p className="eyebrow">Codrex Remote</p>
             <h1>Mobile Control Surface</h1>
-            <p className="subtitle">Native-feel controller for Codex sessions, thread tools, pairing, and remote desktop.</p>
+            <p className="subtitle">Main web app for Codex sessions, per-session notes, pairing, files, and browser-based remote control.</p>
           </div>
         </div>
 
@@ -3732,6 +4037,10 @@ export default function App() {
         <div className="meta-chip important">
           <span>Remote</span>
           <strong>{remoteControlSummary}</strong>
+        </div>
+        <div className="meta-chip important">
+          <span>Build</span>
+          <strong>{appVersionLabel} / {appModeLabel}</strong>
         </div>
       </section>
 
@@ -4059,6 +4368,80 @@ export default function App() {
                               ? sessionTranscriptChunks.map((chunk) => <span key={chunk.id}>{chunk.text}</span>)
                               : "(No screen output captured yet)"}
                           </pre>
+                        </div>
+
+                        <div className="quick-open-card session-notes-card" data-testid="session-notes-panel">
+                          <div className="session-files-subhead">
+                            <div>
+                              <h3>Session Notes</h3>
+                              <p className="small">Keep planning notes and save the latest Codex response directly into this session.</p>
+                            </div>
+                            <span className="badge muted">
+                              {sessionNotesInfo?.updated_at ? `Saved ${formatClock(sessionNotesInfo.updated_at)}` : "Not saved yet"}
+                            </span>
+                          </div>
+                          <div className="row">
+                            <button
+                              type="button"
+                              className="button soft compact"
+                              onClick={() => void onSaveSessionNotes()}
+                              disabled={sessionNotesBusy || sessionNotesLoading}
+                            >
+                              {sessionNotesBusy ? "Saving..." : "Save"}
+                            </button>
+                            <button
+                              type="button"
+                              className="button soft compact"
+                              onClick={() => void onAppendLatestToSessionNotes()}
+                              disabled={sessionNotesBusy || sessionNotesLoading || !selectedSession}
+                            >
+                              Append Latest Response
+                            </button>
+                            <button
+                              type="button"
+                              className="button soft compact"
+                              onClick={() => void onCopyLatestSessionResponse()}
+                              disabled={!latestSessionResponseSnapshot && !sessionNotesInfo?.last_response_snapshot}
+                            >
+                              Copy Latest Response
+                            </button>
+                            <button
+                              type="button"
+                              className="button soft compact"
+                              onClick={() => void onCopySessionNotes()}
+                              disabled={!sessionNotes.trim()}
+                            >
+                              Copy Notes
+                            </button>
+                            <button
+                              type="button"
+                              className="button danger compact"
+                              onClick={onClearSessionNotes}
+                              disabled={sessionNotesBusy || sessionNotesLoading || !sessionNotes.trim()}
+                            >
+                              Clear Notes
+                            </button>
+                          </div>
+                          {sessionNotesLoading ? <p className="small">Loading notes...</p> : null}
+                          {!sessionNotesLoading && !sessionNotes.trim() ? (
+                            <div className="empty-state panel-empty">
+                              <h3>No notes yet</h3>
+                              <p>Use this space for plans, checklists, or summaries from the current Codex session.</p>
+                            </div>
+                          ) : null}
+                          <label className="field">
+                            <span>Notes</span>
+                            <textarea
+                              data-testid="session-notes-input"
+                              value={sessionNotes}
+                              onChange={(event) => setSessionNotes(event.target.value)}
+                              rows={8}
+                              placeholder="Write session notes here. Save keeps them attached to this Codex session."
+                            />
+                          </label>
+                          <p className="small">
+                            Latest response snapshot: <strong>{latestSessionResponseSnapshot ? "available" : "not captured yet"}</strong>
+                          </p>
                         </div>
 
                         <div className="session-action-dock" data-testid="session-action-dock">
@@ -4732,6 +5115,21 @@ export default function App() {
                     <button type="button" className={`button ${desktopEnabled ? "warn" : ""}`} onClick={() => void onToggleDesktopMode()}>
                       {desktopEnabled ? "Disable Control" : "Enable Control"}
                     </button>
+                    <button
+                      type="button"
+                      className="button soft compact"
+                      data-testid="remote-fullscreen-toggle"
+                      onClick={() => void onToggleDesktopFullscreen()}
+                    >
+                      {desktopFullscreen ? "Exit Fullscreen" : "Enter Fullscreen"}
+                    </button>
+                    <button
+                      type="button"
+                      className="button soft compact"
+                      onClick={() => setDesktopTrackpadMode((current) => !current)}
+                    >
+                      Trackpad: {desktopTrackpadMode ? "On" : "Direct"}
+                    </button>
                     <span className="small">
                       {desktopInfo?.width && desktopInfo?.height
                         ? `${desktopInfo.width}x${desktopInfo.height}`
@@ -4759,17 +5157,31 @@ export default function App() {
                     </strong>
                   </p>
                   <p className="small">{desktopStatus || "Desktop controls are available only on Windows host."}</p>
-                  <div className="stream-wrap">
+                  <div
+                    ref={remoteStageRef}
+                    className={`stream-wrap remote-stage${desktopFullscreen ? " fullscreen-active" : ""}`}
+                    data-remote-gesture="true"
+                    data-testid="remote-stage"
+                  >
+                    <div className="remote-stage-toolbar">
+                      <span className="badge muted">{desktopTrackpadMode ? "Trackpad mode" : "Direct tap mode"}</span>
+                      <span className="badge muted">{desktopFullscreen ? "Fullscreen" : "Windowed"}</span>
+                    </div>
                     <img
                       ref={desktopFrameRef}
                       className="desktop-frame"
                       src={desktopStreamUrl}
                       alt="Desktop stream"
                       onClick={(event) => void onDesktopFrameTap(event)}
+                      onContextMenu={(event) => void onDesktopContextMenu(event)}
+                      onWheel={(event) => void onDesktopWheel(event)}
+                      onPointerDown={(event) => void onDesktopPointerDown(event)}
+                      onPointerMove={(event) => void onDesktopPointerMove(event)}
+                      onPointerUp={(event) => void onDesktopPointerUp(event)}
                     />
                   </div>
                   <p className="small">
-                    Live stream stays on in both modes. Enable control to click/type; disable control for safe view-only monitoring.
+                    Live stream stays on in both modes. Fullscreen turns the browser into a tablet-friendly remote stage. Trackpad mode moves first and taps on release; Direct mode clicks exactly where you tap.
                   </p>
                   <div className="remote-control-group">
                     <h4>Pointer Controls</h4>
@@ -4827,6 +5239,19 @@ export default function App() {
                       <button type="button" className="button soft compact" data-short="KEY" onClick={() => void onDesktopSendKey()} disabled={desktopInteractionDisabled}>
                         <span className="btn-text">Send Key</span>
                       </button>
+                    </div>
+                    <div className="row remote-key-controls">
+                      {["tab", "esc", "enter", "alt+tab", "ctrl+c", "ctrl+v"].map((key) => (
+                        <button
+                          key={key}
+                          type="button"
+                          className="button soft compact"
+                          onClick={() => void onDesktopSendQuickKey(key)}
+                          disabled={desktopInteractionDisabled}
+                        >
+                          {key}
+                        </button>
+                      ))}
                     </div>
                   </div>
                 </div>

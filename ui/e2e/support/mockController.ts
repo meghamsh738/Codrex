@@ -62,8 +62,20 @@ export async function installMockController(
 ): Promise<MockControllerHandle> {
   const sessions = options.sessions ?? [];
   const promptRequests: PromptRequest[] = [];
+  const notesBySession = new Map<string, string>();
   const screenTextBySession = new Map(
     sessions.map((session) => [session.session, session.screenText ?? session.snippet ?? ""]),
+  );
+
+  await page.route(/\/app\/runtime(?:\?.*)?$/, async (route) =>
+    json(route, {
+      ok: true,
+      version: "1.5.0",
+      ui_mode: "built",
+      build_present: true,
+      controller_port: 48787,
+      controller_origin: "http://127.0.0.1:48787",
+    }),
   );
 
   await page.route(/\/auth\/status(?:\?.*)?$/, async (route) =>
@@ -177,8 +189,16 @@ export async function installMockController(
   await page.route(/\/desktop\/info(?:\?.*)?$/, async (route) =>
     json(route, {
       ok: true,
-      width: 0,
-      height: 0,
+      width: 1440,
+      height: 900,
+    }),
+  );
+
+  await page.route(/\/desktop\/input\/move(?:\?.*)?$/, async (route) =>
+    json(route, {
+      ok: true,
+      x: 120,
+      y: 80,
     }),
   );
 
@@ -216,6 +236,59 @@ export async function installMockController(
       items: [],
     }),
   );
+
+  await page.route(/\/codex\/session\/[^/]+\/notes\/append-latest(?:\?.*)?$/, async (route) => {
+    const sessionName = decodeSessionName(route.request().url());
+    const screenText = screenTextBySession.get(sessionName) ?? "";
+    const compact = screenText.split(/\r?\n/).map((line) => line.trimEnd()).filter(Boolean).slice(-24).join("\n");
+    const existing = notesBySession.get(sessionName)?.trim();
+    const next = existing ? `${existing}\n\n${compact}` : compact;
+    notesBySession.set(sessionName, next);
+    await json(route, {
+      ok: true,
+      session: sessionName,
+      appended_text: compact,
+      notes: {
+        session: sessionName,
+        content: next,
+        created_at: Date.now(),
+        updated_at: Date.now(),
+        last_response_snapshot: compact,
+      },
+    });
+  });
+
+  await page.route(/\/codex\/session\/[^/]+\/notes(?:\?.*)?$/, async (route) => {
+    const sessionName = decodeSessionName(route.request().url());
+    if (route.request().method() === "POST") {
+      const payload = route.request().postDataJSON() as { content?: string; last_response_snapshot?: string };
+      const next = payload?.content ?? "";
+      notesBySession.set(sessionName, next);
+      await json(route, {
+        ok: true,
+        session: sessionName,
+        notes: {
+          session: sessionName,
+          content: next,
+          created_at: Date.now(),
+          updated_at: Date.now(),
+          last_response_snapshot: payload?.last_response_snapshot ?? "",
+        },
+      });
+      return;
+    }
+    await json(route, {
+      ok: true,
+      session: sessionName,
+      notes: {
+        session: sessionName,
+        content: notesBySession.get(sessionName) ?? "",
+        created_at: Date.now(),
+        updated_at: Date.now(),
+        last_response_snapshot: "",
+      },
+    });
+  });
 
   await page.route(/\/codex\/session\/[^/]+\/send(?:\?.*)?$/, async (route) => {
     const sessionName = decodeSessionName(route.request().url());

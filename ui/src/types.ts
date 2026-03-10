@@ -6,6 +6,21 @@ export interface AuthStatus {
   authenticated: boolean;
 }
 
+export type AppRuntimeResult = Omit<BasicResult, "session_file"> & {
+  version?: string;
+  launcher_mode?: string;
+  repo_root?: string;
+  runtime_dir?: string;
+  state_dir?: string;
+  session_file?: string;
+  session_present?: boolean;
+  session?: Record<string, unknown> | null;
+  controller_port?: number | null;
+  controller_origin?: string;
+  ui_mode?: string;
+  build_present?: boolean;
+};
+
 export interface SharedFileInfo {
   id: string;
   title: string;
@@ -218,6 +233,20 @@ export interface SessionFilesResult extends BasicResult {
   items?: SharedFileInfo[];
   item?: SharedFileInfo;
   deleted_source?: boolean;
+}
+
+export interface SessionNoteInfo {
+  session: string;
+  content: string;
+  created_at: number;
+  updated_at: number;
+  last_response_snapshot?: string;
+}
+
+export interface SessionNotesResult extends BasicResult {
+  session?: string;
+  notes?: SessionNoteInfo;
+  appended_text?: string;
 }
 
 export interface BrowserRootInfo {

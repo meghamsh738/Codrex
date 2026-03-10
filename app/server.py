@@ -759,6 +759,20 @@ SESSION_FILES_MAX_FILE_MB = int(os.environ.get("CODEX_SESSION_FILES_MAX_FILE_MB"
 SESSION_FILES_DATA: Dict[str, Any] = {
     "items": [],
 }
+DEFAULT_SESSION_NOTES_FILE = os.path.abspath(
+    os.environ.get(
+        "CODEX_SESSION_NOTES_FILE",
+        os.path.join(CODEX_RUNTIME_STATE_DIR, "session-notes.json"),
+    )
+)
+SESSION_NOTES_FILE = DEFAULT_SESSION_NOTES_FILE
+SESSION_NOTES_LOCK = threading.Lock()
+SESSION_NOTES_LOADED = False
+SESSION_NOTES_MAX_CHARS = int(os.environ.get("CODEX_SESSION_NOTES_MAX_CHARS", "200000") or "200000")
+SESSION_NOTES_MAX_SNAPSHOT_CHARS = int(os.environ.get("CODEX_SESSION_NOTES_MAX_SNAPSHOT_CHARS", "2000") or "2000")
+SESSION_NOTES_DATA: Dict[str, Any] = {
+    "notes": {},
+}
 APP_RUNTIME_SESSION_FILE = os.path.abspath(
     os.environ.get(
         "CODEX_APP_RUNTIME_SESSION_FILE",
@@ -1528,6 +1542,119 @@ def _session_file_is_managed_upload(item: Dict[str, Any]) -> bool:
     if not session_id or not wsl_path.startswith("/"):
         return False
     return _path_under_root(wsl_path, _session_upload_root(session_id))
+
+
+def _compact_assistant_snapshot_text(text: str) -> str:
+    lines = [line.rstrip() for line in str(text or "").splitlines()]
+    lines = [line for line in lines if line.strip()]
+    if not lines:
+        return ""
+    tail = "\n".join(lines[-24:]).strip()
+    if len(tail) > SESSION_NOTES_MAX_SNAPSHOT_CHARS:
+        tail = tail[-SESSION_NOTES_MAX_SNAPSHOT_CHARS :]
+    return tail
+
+
+def _normalize_session_note_record(session: str, raw: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    session_id = _validate_session_name(session)
+    data = raw or {}
+    now_ms = _now_ms()
+    created_at = _coerce_ms(data.get("created_at"), now_ms)
+    updated_at = _coerce_ms(data.get("updated_at"), created_at)
+    if updated_at < created_at:
+        updated_at = created_at
+    content = str(data.get("content") or "")
+    if len(content) > SESSION_NOTES_MAX_CHARS:
+        content = content[:SESSION_NOTES_MAX_CHARS]
+    snapshot = _compact_assistant_snapshot_text(str(data.get("last_response_snapshot") or ""))
+    return {
+        "session": session_id,
+        "content": content,
+        "created_at": created_at,
+        "updated_at": updated_at,
+        "last_response_snapshot": snapshot,
+    }
+
+
+def _sort_and_trim_session_notes_unlocked() -> None:
+    cleaned: Dict[str, Dict[str, Any]] = {}
+    for key, value in (SESSION_NOTES_DATA.get("notes") or {}).items():
+        try:
+            session_id = _validate_session_name(key)
+        except Exception:
+            continue
+        cleaned[session_id] = _normalize_session_note_record(session_id, value if isinstance(value, dict) else {})
+    SESSION_NOTES_DATA["notes"] = cleaned
+
+
+def _persist_session_notes_unlocked() -> None:
+    _sort_and_trim_session_notes_unlocked()
+    parent = os.path.dirname(SESSION_NOTES_FILE)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    payload = {"notes": SESSION_NOTES_DATA.get("notes") or {}}
+    temp_path = SESSION_NOTES_FILE + ".tmp"
+    with open(temp_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    os.replace(temp_path, SESSION_NOTES_FILE)
+
+
+def _load_session_notes_unlocked() -> None:
+    global SESSION_NOTES_LOADED
+    if SESSION_NOTES_LOADED:
+        return
+    SESSION_NOTES_LOADED = True
+    SESSION_NOTES_DATA["notes"] = {}
+    raw = _read_json_file(SESSION_NOTES_FILE)
+    if not isinstance(raw, dict):
+        return
+    notes = raw.get("notes")
+    if isinstance(notes, dict):
+        SESSION_NOTES_DATA["notes"] = notes
+    _sort_and_trim_session_notes_unlocked()
+
+
+def _get_session_note_unlocked(session: str) -> Dict[str, Any]:
+    session_id = _validate_session_name(session)
+    _sort_and_trim_session_notes_unlocked()
+    existing = (SESSION_NOTES_DATA.get("notes") or {}).get(session_id)
+    if isinstance(existing, dict):
+        return json.loads(json.dumps(existing))
+    now_ms = _now_ms()
+    return {
+        "session": session_id,
+        "content": "",
+        "created_at": now_ms,
+        "updated_at": now_ms,
+        "last_response_snapshot": "",
+    }
+
+
+def _save_session_note_unlocked(session: str, content: str, last_response_snapshot: str = "") -> Dict[str, Any]:
+    session_id = _validate_session_name(session)
+    existing = _get_session_note_unlocked(session_id)
+    snapshot = _compact_assistant_snapshot_text(last_response_snapshot or existing.get("last_response_snapshot") or "")
+    now_ms = _now_ms()
+    record = {
+        "session": session_id,
+        "content": str(content or "")[:SESSION_NOTES_MAX_CHARS],
+        "created_at": existing.get("created_at") or now_ms,
+        "updated_at": now_ms,
+        "last_response_snapshot": snapshot,
+    }
+    SESSION_NOTES_DATA.setdefault("notes", {})[session_id] = record
+    _persist_session_notes_unlocked()
+    return json.loads(json.dumps(record))
+
+
+def _append_session_note_snapshot_unlocked(session: str, snapshot: str) -> Dict[str, Any]:
+    compact = _compact_assistant_snapshot_text(snapshot)
+    if not compact:
+        raise HTTPException(status_code=409, detail="No recent assistant response available to append.")
+    existing = _get_session_note_unlocked(session)
+    base = str(existing.get("content") or "").rstrip()
+    next_content = f"{base}\n\n{compact}" if base else compact
+    return _save_session_note_unlocked(session, next_content, compact)
 
 
 def _telegram_get_updates(token: str) -> Dict[str, Any]:
@@ -7965,6 +8092,51 @@ async def codex_session_image(
 @app.get("/fs/list")
 def fs_list(root: str = "workspace", path: str = ""):
     return _list_browser_entries(root, path)
+
+
+@app.get("/codex/session/{session}/notes")
+def codex_session_notes_get(session: str):
+    session = _validate_session_name(session)
+    with SESSION_NOTES_LOCK:
+        _load_session_notes_unlocked()
+        note = _get_session_note_unlocked(session)
+    return {"ok": True, "session": session, "notes": note}
+
+
+@app.post("/codex/session/{session}/notes")
+def codex_session_notes_save(session: str, payload: Optional[Dict[str, Any]] = Body(default=None)):
+    session = _validate_session_name(session)
+    payload = payload or {}
+    content = str(payload.get("content") or "")
+    if len(content) > SESSION_NOTES_MAX_CHARS:
+        raise HTTPException(status_code=400, detail=f"Notes are too long (max {SESSION_NOTES_MAX_CHARS} chars).")
+    snapshot = str(payload.get("last_response_snapshot") or "")
+    with SESSION_NOTES_LOCK:
+        _load_session_notes_unlocked()
+        note = _save_session_note_unlocked(session, content, snapshot)
+    return {"ok": True, "session": session, "notes": note, "detail": "Notes saved."}
+
+
+@app.post("/codex/session/{session}/notes/append-latest")
+def codex_session_notes_append_latest(session: str):
+    session = _validate_session_name(session)
+    pane = _session_pane(session)
+    if not pane:
+        raise HTTPException(status_code=404, detail=f"Session '{session}' has no active pane.")
+    latest_text = _capture_pane_full(pane["pane_id"], max_chars=25000)
+    compact = _compact_assistant_snapshot_text(latest_text)
+    if not compact:
+        raise HTTPException(status_code=409, detail="No recent assistant response available.")
+    with SESSION_NOTES_LOCK:
+        _load_session_notes_unlocked()
+        note = _append_session_note_snapshot_unlocked(session, compact)
+    return {
+        "ok": True,
+        "session": session,
+        "notes": note,
+        "appended_text": compact,
+        "detail": "Latest assistant response appended to notes.",
+    }
 
 
 @app.get("/codex/session/{session}/files")

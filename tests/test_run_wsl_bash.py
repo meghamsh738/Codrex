@@ -1584,6 +1584,59 @@ class ThreadStoreTests(unittest.TestCase):
                 self.assertEqual(len(snap["messages"].get(tid, [])), 1)
 
 
+class SessionNotesTests(unittest.TestCase):
+    def _reset_session_notes_store(self):
+        server_mod.SESSION_NOTES_LOADED = False
+        server_mod.SESSION_NOTES_DATA = {"notes": {}}
+
+    def test_session_notes_save_and_read(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store_path = str(Path(tmp) / "session-notes.json")
+            with mock.patch.object(server_mod, "SESSION_NOTES_FILE", store_path):
+                self._reset_session_notes_store()
+
+                saved = server_mod.codex_session_notes_save("codex_demo", {
+                    "content": "Plan the rollout",
+                    "last_response_snapshot": "Latest output",
+                })
+                self.assertTrue(saved["ok"])
+                self.assertEqual(saved["notes"]["content"], "Plan the rollout")
+                self.assertEqual(saved["notes"]["last_response_snapshot"], "Latest output")
+
+                fetched = server_mod.codex_session_notes_get("codex_demo")
+                self.assertTrue(fetched["ok"])
+                self.assertEqual(fetched["notes"]["content"], "Plan the rollout")
+                self.assertTrue(Path(store_path).exists())
+
+    def test_session_notes_append_latest_uses_compact_snapshot(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store_path = str(Path(tmp) / "session-notes.json")
+            with mock.patch.object(server_mod, "SESSION_NOTES_FILE", store_path), \
+                 mock.patch.object(server_mod, "_session_pane", return_value={"pane_id": "%42"}), \
+                 mock.patch.object(server_mod, "_capture_pane_full", return_value="line 1\n\nline 2\nline 3"):
+                self._reset_session_notes_store()
+
+                out = server_mod.codex_session_notes_append_latest("codex_demo")
+
+                self.assertTrue(out["ok"])
+                self.assertIn("line 2\nline 3", out["notes"]["content"])
+                self.assertEqual(out["appended_text"], "line 1\nline 2\nline 3")
+
+    def test_session_notes_are_isolated_per_session(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store_path = str(Path(tmp) / "session-notes.json")
+            with mock.patch.object(server_mod, "SESSION_NOTES_FILE", store_path):
+                self._reset_session_notes_store()
+                server_mod.codex_session_notes_save("codex_alpha", {"content": "Alpha notes"})
+                server_mod.codex_session_notes_save("codex_beta", {"content": "Beta notes"})
+
+                alpha = server_mod.codex_session_notes_get("codex_alpha")
+                beta = server_mod.codex_session_notes_get("codex_beta")
+
+                self.assertEqual(alpha["notes"]["content"], "Alpha notes")
+                self.assertEqual(beta["notes"]["content"], "Beta notes")
+
+
 class SessionFilesTests(unittest.TestCase):
     def _reset_session_files_store(self):
         server_mod.SESSION_FILES_LOADED = False
