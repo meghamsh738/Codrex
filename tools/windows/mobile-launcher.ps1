@@ -421,6 +421,32 @@ function Set-ActionStatus {
   }
 }
 
+function Clear-PendingStart {
+  $script:pendingStart = $false
+  $script:pendingStartAt = [DateTime]::MinValue
+  $script:pendingStartProcessId = 0
+  $script:pendingStartPort = 0
+}
+
+function Start-PowerShellScriptAsync {
+  param(
+    [string]$ScriptPath,
+    [string[]]$Arguments = @()
+  )
+  if (-not (Test-Path $ScriptPath)) {
+    throw "Missing $ScriptPath"
+  }
+  $argList = @(
+    "-NoProfile",
+    "-ExecutionPolicy", "Bypass",
+    "-File", $ScriptPath
+  )
+  if ($Arguments) {
+    $argList += $Arguments
+  }
+  return Start-Process -FilePath "powershell.exe" -ArgumentList $argList -WorkingDirectory $root -WindowStyle Hidden -PassThru
+}
+
 $scriptRoot = Split-Path -Parent $PSCommandPath
 $root = (Resolve-Path (Join-Path $scriptRoot "..\..")).Path
 $runtimeDir = Get-CodrexRuntimeDir -RepoRoot $root
@@ -456,6 +482,11 @@ $script:actionInProgress = $false
 $script:refreshTimer = $null
 $script:launcherButtons = @()
 $script:lastHelperOutput = ""
+$script:pendingStart = $false
+$script:pendingStartAt = [DateTime]::MinValue
+$script:pendingStartTimeoutSec = 45
+$script:pendingStartProcessId = 0
+$script:pendingStartPort = 0
 
 function Set-LauncherButtonStyle {
   param(
@@ -927,12 +958,56 @@ function Refresh-State {
   $script:refreshInProgress = $true
   try {
     $snapshot = Get-LauncherStatusSnapshot
-    Apply-LauncherStatus -Snapshot $snapshot
+    if ($script:pendingStart) {
+      $elapsedSeconds = if ($script:pendingStartAt -eq [DateTime]::MinValue) {
+        0
+      } else {
+        [int]((Get-Date) - $script:pendingStartAt).TotalSeconds
+      }
+      if ($snapshot.app_built) {
+        Clear-PendingStart
+        Apply-LauncherStatus -Snapshot $snapshot
+        Append-Log ("Start complete. App ready on port {0} (v{1})." -f $snapshot.controller_port, $snapshot.version)
+        if ($snapshot.local_url -and $snapshot.local_url -ne "offline") {
+          Open-Url $snapshot.local_url
+        }
+      } elseif ($elapsedSeconds -ge $script:pendingStartTimeoutSec) {
+        $helperStatus = ""
+        if ($script:pendingStartProcessId -gt 0) {
+          $helperProc = Get-CimInstance Win32_Process -Filter ("ProcessId = {0}" -f $script:pendingStartProcessId) -ErrorAction SilentlyContinue
+          $helperStatus = if ($helperProc) {
+            " Helper PID $($script:pendingStartProcessId) is still running."
+          } else {
+            " Helper PID $($script:pendingStartProcessId) already exited."
+          }
+        }
+        Clear-PendingStart
+        $detail = "Codrex did not reach running state within $($script:pendingStartTimeoutSec)s.$helperStatus Logs: $logsDir"
+        Set-ActionStatus -State "error" -Detail $detail -ControllerPort $snapshot.controller_port
+        Append-Log "Error: $detail"
+        [System.Windows.Forms.MessageBox]::Show(
+          $detail,
+          "Codrex",
+          [System.Windows.Forms.MessageBoxButtons]::OK,
+          [System.Windows.Forms.MessageBoxIcon]::Error
+        ) | Out-Null
+      } elseif ($snapshot.session_state -eq "present") {
+        Set-ActionStatus -State "checking" -Detail "Runtime session written. Waiting for browser app readiness..." -ControllerPort $snapshot.controller_port
+      } elseif ($snapshot.controller_on) {
+        Set-ActionStatus -State "checking" -Detail "Controller reachable. Waiting for runtime session..." -ControllerPort $snapshot.controller_port
+      } else {
+        $statusPort = if ($script:pendingStartPort -gt 0) { $script:pendingStartPort } else { $snapshot.controller_port }
+        Set-ActionStatus -State "starting" -Detail "Launching Codrex helper..." -ControllerPort $statusPort
+      }
+    } else {
+      Apply-LauncherStatus -Snapshot $snapshot
+    }
 
     $busy = $script:actionInProgress
-    $btnStop.Enabled = (-not $busy) -and ($snapshot.controller_on -or $snapshot.session_state -eq "present")
-    $btnStart.Enabled = (-not $busy)
-    $btnStart.Text = if ($snapshot.app_built) { "Open App" } else { "Start" }
+    $starting = $script:pendingStart
+    $btnStop.Enabled = (-not $busy) -and (-not $starting) -and ($snapshot.controller_on -or $snapshot.session_state -eq "present")
+    $btnStart.Enabled = (-not $busy) -and (-not $starting)
+    $btnStart.Text = if ($starting) { "Starting..." } elseif ($snapshot.app_built) { "Open App" } else { "Start" }
     $btnOpenLocal.Enabled = (-not $busy) -and $snapshot.controller_on
     $btnOpenNetwork.Enabled = (-not $busy) -and $snapshot.controller_on -and ($snapshot.lan_ip -ne "127.0.0.1")
     $btnOpenController.Enabled = (-not $busy) -and $snapshot.controller_on
@@ -952,58 +1027,24 @@ function Start-Stack {
     Append-Log ("App already running on port {0}." -f $existingSnapshot.controller_port)
     return
   }
+  if ($script:pendingStart) {
+    Append-Log "Start already in progress."
+    return
+  }
 
   Append-Log "Starting mobile stack..."
   Set-ActionStatus -State "starting" -Detail "Launching Codrex helper..." -ControllerPort $existingSnapshot.controller_port
-  [System.Windows.Forms.Application]::DoEvents()
-
-  $startExitCode = Invoke-HiddenPowerShellScript -ScriptPath $startMobileScript -Arguments @(
+  $script:cachedControllerConfigAt = [DateTime]::MinValue
+  $script:cachedLanIpAt = [DateTime]::MinValue
+  $helperProc = Start-PowerShellScriptAsync -ScriptPath $startMobileScript -Arguments @(
     "-UiPort", [string]$uiPort
   )
-  if ($startExitCode -ne 0) {
-    $detail = if ($script:lastHelperOutput) { " Detail: $($script:lastHelperOutput)" } else { "" }
-    throw "Codrex start helper exited with code $startExitCode.$detail Logs: $logsDir"
-  }
-
-  $readySnapshot = $null
-  for ($attempt = 0; $attempt -lt 20; $attempt++) {
-    Start-Sleep -Milliseconds 300
-    [System.Windows.Forms.Application]::DoEvents()
-
-    $script:cachedControllerConfigAt = [DateTime]::MinValue
-    $script:cachedLanIpAt = [DateTime]::MinValue
-    $snapshot = Get-LauncherStatusSnapshot
-
-    if ($snapshot.app_built) {
-      $readySnapshot = $snapshot
-      break
-    }
-    if ($snapshot.session_state -eq "present") {
-      Set-ActionStatus -State "checking" -Detail "Runtime session written. Waiting for browser app readiness..." -ControllerPort $snapshot.controller_port
-    } elseif ($snapshot.controller_on) {
-      Set-ActionStatus -State "checking" -Detail "Controller reachable. Waiting for runtime session..." -ControllerPort $snapshot.controller_port
-    } else {
-      Set-ActionStatus -State "starting" -Detail "Waiting for controller process..." -ControllerPort $snapshot.controller_port
-    }
-  }
-
-  if (-not $readySnapshot) {
-    $script:cachedControllerConfigAt = [DateTime]::MinValue
-    $script:cachedLanIpAt = [DateTime]::MinValue
-    $finalSnapshot = Get-LauncherStatusSnapshot
-    if ($finalSnapshot.app_built) {
-      $readySnapshot = $finalSnapshot
-    }
-  }
-
-  if (-not $readySnapshot) {
-    throw "Codrex did not reach running state after launch. Logs: $logsDir"
-  }
-
-  Refresh-State -Force
-  Open-Url $readySnapshot.local_url
+  $script:pendingStart = $true
+  $script:pendingStartAt = Get-Date
+  $script:pendingStartProcessId = if ($helperProc) { [int]$helperProc.Id } else { 0 }
+  $script:pendingStartPort = $existingSnapshot.controller_port
   Append-Log ("Firewall changes skipped on normal start. Use Setup.cmd if you need firewall rules refreshed.")
-  Append-Log ("Start complete. App ready on port {0} (v{1})." -f $readySnapshot.controller_port, $readySnapshot.version)
+  Refresh-State -Force
 }
 
 function Stop-Stack {
