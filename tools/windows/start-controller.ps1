@@ -8,6 +8,8 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+$scriptRoot = Split-Path -Parent $PSCommandPath
+$root = (Resolve-Path (Join-Path $scriptRoot "..\..")).Path
 
 function New-SecureToken([int]$ByteCount = 32) {
   $bytes = New-Object byte[] $ByteCount
@@ -133,7 +135,6 @@ function Get-CodrexRuntimeDir {
   return (Join-Path $RepoRoot ".runtime")
 }
 
-$root = Split-Path -Parent $PSCommandPath
 $runtimeDir = Get-CodrexRuntimeDir -RepoRoot $root
 $stateDir = Join-Path $runtimeDir "state"
 $logsDir = Join-Path $runtimeDir "logs"

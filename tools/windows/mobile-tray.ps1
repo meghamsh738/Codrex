@@ -23,7 +23,7 @@ $createdNew = $false
 $mutex = New-Object System.Threading.Mutex($true, "Codrex.MobileTray.Singleton", [ref]$createdNew)
 if (-not $createdNew) {
   [System.Windows.Forms.MessageBox]::Show(
-    "Codrex Mobile Tray is already running.",
+    "Codrex tray is already running.",
     "Codrex",
     [System.Windows.Forms.MessageBoxButtons]::OK,
     [System.Windows.Forms.MessageBoxIcon]::Information
@@ -31,12 +31,13 @@ if (-not $createdNew) {
   exit 0
 }
 
-$script:Root = Split-Path -Parent $PSCommandPath
+$script:ScriptRoot = Split-Path -Parent $PSCommandPath
+$script:Root = (Resolve-Path (Join-Path $script:ScriptRoot "..\..")).Path
 $script:RuntimeDir = Get-CodrexRuntimeDir -RepoRoot $script:Root
 $script:StateDir = Join-Path $script:RuntimeDir "state"
 $script:LogsDir = Join-Path $script:RuntimeDir "logs"
-$script:StartScript = Join-Path $script:Root "start-mobile.ps1"
-$script:StopScript = Join-Path $script:Root "stop-mobile.ps1"
+$script:StartScript = Join-Path $script:ScriptRoot "start-mobile.ps1"
+$script:StopScript = Join-Path $script:ScriptRoot "stop-mobile.ps1"
 $script:ConfigPath = Join-Path $script:Root "controller.config.json"
 $script:LocalConfigPath = Join-Path $script:StateDir "controller.config.local.json"
 $script:LegacyLocalConfigPath = Join-Path $script:Root "controller.config.local.json"
@@ -172,7 +173,7 @@ function Show-PairQrWindow {
   $status = Get-StackStatus
   if (-not $status.controller_running -or -not $status.ui_running) {
     [System.Windows.Forms.MessageBox]::Show(
-      "Start Mobile Stack first, then try Show Pair QR.",
+      "Start Codrex first, then try Show Pair QR.",
       "Codrex",
       [System.Windows.Forms.MessageBoxButtons]::OK,
       [System.Windows.Forms.MessageBoxIcon]::Information
@@ -453,9 +454,9 @@ function Handle-PendingAction {
 
   if ($exitCode -eq 0) {
     if ($action -eq "start") {
-      Enqueue-Balloon -Title "Codrex" -Text "Mobile stack started. Open UI or Show Pair QR from this menu." -Icon ([System.Windows.Forms.ToolTipIcon]::Info)
+      Enqueue-Balloon -Title "Codrex" -Text "Codrex started. Open the app or show Pair QR from this menu." -Icon ([System.Windows.Forms.ToolTipIcon]::Info)
     } else {
-      Enqueue-Balloon -Title "Codrex" -Text "Mobile stack stopped. Start again when remote control is needed." -Icon ([System.Windows.Forms.ToolTipIcon]::Info)
+      Enqueue-Balloon -Title "Codrex" -Text "Codrex stopped. Start again when remote control is needed." -Icon ([System.Windows.Forms.ToolTipIcon]::Info)
     }
   } else {
     Enqueue-Balloon -Title "Codrex" -Text ("Action failed (exit code " + $exitCode + "). Check logs.") -Icon ([System.Windows.Forms.ToolTipIcon]::Error)
@@ -488,7 +489,7 @@ function Update-UiState {
   $script:PairQrItem.Enabled = (-not $isBusy) -and $status.controller_running -and $status.ui_running
 
   $tooltipState = if ($status.controller_running -and $status.ui_running) { "Running" } else { "Stopped" }
-  $tip = "Codrex Mobile ($tooltipState)"
+  $tip = "Codrex ($tooltipState)"
   if ($tip.Length -gt 62) {
     $tip = $tip.Substring(0, 62)
   }
@@ -529,10 +530,10 @@ $script:HeaderOpenItem.Enabled = $false
 $script:HeaderPairItem = New-Object System.Windows.Forms.ToolStripMenuItem("Pair and Diagnostics")
 $script:HeaderPairItem.Enabled = $false
 
-$script:StartItem = New-Object System.Windows.Forms.ToolStripMenuItem("Start Mobile Stack")
-$script:StopItem = New-Object System.Windows.Forms.ToolStripMenuItem("Stop Mobile Stack")
-$script:OpenUiLocalItem = New-Object System.Windows.Forms.ToolStripMenuItem("Open Mobile UI (Local)")
-$script:OpenUiNetworkItem = New-Object System.Windows.Forms.ToolStripMenuItem("Open Mobile UI (Network)")
+$script:StartItem = New-Object System.Windows.Forms.ToolStripMenuItem("Start Codrex")
+$script:StopItem = New-Object System.Windows.Forms.ToolStripMenuItem("Stop Codrex")
+$script:OpenUiLocalItem = New-Object System.Windows.Forms.ToolStripMenuItem("Open App (Local)")
+$script:OpenUiNetworkItem = New-Object System.Windows.Forms.ToolStripMenuItem("Open App (Network)")
 $script:PairQrItem = New-Object System.Windows.Forms.ToolStripMenuItem("Show Pair QR (Mobile Login)")
 $script:OpenControllerItem = New-Object System.Windows.Forms.ToolStripMenuItem("Open Controller UI")
 $script:OpenLogsItem = New-Object System.Windows.Forms.ToolStripMenuItem("Open Logs Folder")
@@ -586,7 +587,7 @@ $script:NotifyIcon = New-Object System.Windows.Forms.NotifyIcon
 $script:NotifyIcon.Icon = [System.Drawing.SystemIcons]::Application
 $script:NotifyIcon.Visible = $true
 $script:NotifyIcon.ContextMenuStrip = $script:ContextMenu
-$script:NotifyIcon.Text = "Codrex Mobile Tray"
+$script:NotifyIcon.Text = "Codrex Tray"
 $script:NotifyIcon.BalloonTipTitle = "Codrex"
 $script:NotifyIcon.BalloonTipText = "Tray launcher started."
 $script:NotifyIcon.BalloonTipIcon = [System.Windows.Forms.ToolTipIcon]::Info

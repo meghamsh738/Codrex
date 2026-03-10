@@ -1,8 +1,8 @@
 $ErrorActionPreference = "Stop"
 
-$root = Split-Path -Parent $PSCommandPath
-$startScript = Join-Path $root "start-controller.ps1"
-$watchdogScript = Join-Path $root "watchdog-controller.ps1"
+$scriptRoot = Split-Path -Parent $PSCommandPath
+$startScript = Join-Path $scriptRoot "start-controller.ps1"
+$watchdogScript = Join-Path $scriptRoot "watchdog-controller.ps1"
 $legacyTaskName = "CodrexRemoteController"
 $startupTaskName = "CodrexRemoteController.Startup"
 $watchdogTaskName = "CodrexRemoteController.Watchdog"

@@ -204,15 +204,16 @@ function Open-Url([string]$Url) {
   try { Start-Process $Url | Out-Null } catch {}
 }
 
-$root = Split-Path -Parent $PSCommandPath
+$scriptRoot = Split-Path -Parent $PSCommandPath
+$root = (Resolve-Path (Join-Path $scriptRoot "..\..")).Path
 $runtimeDir = Get-CodrexRuntimeDir -RepoRoot $root
 $stateDir = Join-Path $runtimeDir "state"
 $logsDir = Join-Path $runtimeDir "logs"
 $configPath = Join-Path $root "controller.config.json"
 $script:LocalConfigPath = Join-Path $stateDir "controller.config.local.json"
 $script:LegacyLocalConfigPath = Join-Path $root "controller.config.local.json"
-$startMobileScript = Join-Path $root "start-mobile.ps1"
-$stopMobileScript = Join-Path $root "stop-mobile.ps1"
+$startMobileScript = Join-Path $scriptRoot "start-mobile.ps1"
+$stopMobileScript = Join-Path $scriptRoot "stop-mobile.ps1"
 $uiPort = 4312
 $controllerPort = 8787
 $controllerToken = ""
@@ -328,7 +329,7 @@ function Register-LauncherButtonFeedback {
 }
 
 $form = New-Object System.Windows.Forms.Form
-$form.Text = "Codrex Mobile Launcher"
+$form.Text = "Codrex"
 $form.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
 $form.Size = New-Object System.Drawing.Size(1120, 760)
 $form.MinimumSize = New-Object System.Drawing.Size(1000, 700)
@@ -399,14 +400,14 @@ $titleStack.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Wind
 $titleWrap.Controls.Add($titleStack, 1, 0)
 
 $lblTitle = New-Object System.Windows.Forms.Label
-$lblTitle.Text = "Codrex Mobile Launcher"
+$lblTitle.Text = "Codrex"
 $lblTitle.Dock = "Fill"
 $lblTitle.Font = New-Object System.Drawing.Font("Segoe UI Semibold", 13)
 $lblTitle.TextAlign = "MiddleLeft"
 $titleStack.Controls.Add($lblTitle, 0, 0)
 
 $lblSubtitle = New-Object System.Windows.Forms.Label
-$lblSubtitle.Text = "Start services, open app routes, and pair Android/tablet with QR."
+$lblSubtitle.Text = "Launch the stack, open the app, and pair a phone or tablet."
 $lblSubtitle.Dock = "Fill"
 $lblSubtitle.Font = New-Object System.Drawing.Font("Segoe UI", 9)
 $lblSubtitle.TextAlign = "TopLeft"
@@ -446,11 +447,11 @@ $rowStartStop.WrapContents = $true
 $actionsGrid.Controls.Add($rowStartStop, 0, 0)
 
 $btnStart = New-Object System.Windows.Forms.Button
-$btnStart.Text = "Start Mobile Stack"
+$btnStart.Text = "Start"
 $rowStartStop.Controls.Add($btnStart) | Out-Null
 
 $btnStop = New-Object System.Windows.Forms.Button
-$btnStop.Text = "Stop Mobile Stack"
+$btnStop.Text = "Stop"
 $rowStartStop.Controls.Add($btnStop) | Out-Null
 
 $rowOpen = New-Object System.Windows.Forms.FlowLayoutPanel
@@ -460,15 +461,15 @@ $rowOpen.WrapContents = $true
 $actionsGrid.Controls.Add($rowOpen, 0, 1)
 
 $btnOpenLocal = New-Object System.Windows.Forms.Button
-$btnOpenLocal.Text = "Open App (Local)"
+$btnOpenLocal.Text = "Open App"
 $rowOpen.Controls.Add($btnOpenLocal) | Out-Null
 
 $btnOpenNetwork = New-Object System.Windows.Forms.Button
-$btnOpenNetwork.Text = "Open App (Network)"
+$btnOpenNetwork.Text = "Open Network App"
 $rowOpen.Controls.Add($btnOpenNetwork) | Out-Null
 
 $btnOpenController = New-Object System.Windows.Forms.Button
-$btnOpenController.Text = "Open Controller"
+$btnOpenController.Text = "Open Controller API"
 $rowOpen.Controls.Add($btnOpenController) | Out-Null
 
 $rowPair = New-Object System.Windows.Forms.FlowLayoutPanel
@@ -478,7 +479,7 @@ $rowPair.WrapContents = $true
 $actionsGrid.Controls.Add($rowPair, 0, 2)
 
 $btnGenQr = New-Object System.Windows.Forms.Button
-$btnGenQr.Text = "Generate Pair QR"
+$btnGenQr.Text = "Show Pair QR"
 $rowPair.Controls.Add($btnGenQr) | Out-Null
 
 $btnCopyPair = New-Object System.Windows.Forms.Button
@@ -490,7 +491,7 @@ $btnOpenPair.Text = "Open Pair Link"
 $rowPair.Controls.Add($btnOpenPair) | Out-Null
 
 $lblPairLink = New-Object System.Windows.Forms.Label
-$lblPairLink.Text = "Pair Handoff Link"
+$lblPairLink.Text = "Pair Link"
 $lblPairLink.Dock = "Fill"
 $lblPairLink.TextAlign = "BottomLeft"
 $lblPairLink.Font = New-Object System.Drawing.Font("Segoe UI Semibold", 9)
@@ -537,7 +538,7 @@ $picQr.SizeMode = [System.Windows.Forms.PictureBoxSizeMode]::Zoom
 $qrCard.Controls.Add($picQr)
 
 $lblQrInfo = New-Object System.Windows.Forms.Label
-$lblQrInfo.Text = "Step 1: Generate QR. Step 2: Scan on phone/tablet."
+$lblQrInfo.Text = "Step 1: Show QR. Step 2: Scan on phone/tablet."
 $lblQrInfo.Dock = "Fill"
 $lblQrInfo.TextAlign = "MiddleLeft"
 $right.Controls.Add($lblQrInfo, 0, 2)
@@ -848,7 +849,7 @@ function Safe-Action {
     Append-Log "Error: $msg"
     [System.Windows.Forms.MessageBox]::Show(
       $msg,
-      "Codrex Mobile Launcher",
+      "Codrex",
       [System.Windows.Forms.MessageBoxButtons]::OK,
       [System.Windows.Forms.MessageBoxIcon]::Error
     ) | Out-Null

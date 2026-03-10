@@ -3,7 +3,8 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$root = Split-Path -Parent $PSCommandPath
+$scriptRoot = Split-Path -Parent $PSCommandPath
+$root = (Resolve-Path (Join-Path $scriptRoot "..\..")).Path
 $configPath = Join-Path $root "controller.config.json"
 
 if (Test-Path $configPath) {

@@ -335,13 +335,14 @@ function Get-BaseRouteKind([string]$Base, [string]$LanUrl, [string]$TsUrl) {
   return "unknown"
 }
 
-$root = Split-Path -Parent $PSCommandPath
+$scriptRoot = Split-Path -Parent $PSCommandPath
+$root = (Resolve-Path (Join-Path $scriptRoot "..\..")).Path
 $cfg = Read-ControllerConfig -Root $root
 $port = [int](Coalesce-Value $cfg.port 8787)
 $token = [string](Coalesce-Value $cfg.token "")
 
 $form = New-Object System.Windows.Forms.Form
-$form.Text = "Codrex Remote Controller Launcher"
+$form.Text = "Codrex Controller Tools"
 $form.StartPosition = "CenterScreen"
 $form.Size = New-Object System.Drawing.Size(940, 600)
 $form.MinimumSize = New-Object System.Drawing.Size(760, 500)
@@ -909,9 +910,9 @@ function Refresh-UiStatus {
 }
 
 function Run-Start {
-  $script = Join-Path $root "start-controller.ps1"
+  $script = Join-Path $scriptRoot "start-controller.ps1"
   if (-not (Test-Path $script)) {
-    [System.Windows.Forms.MessageBox]::Show("Missing start-controller.ps1 in $root", "Error") | Out-Null
+    [System.Windows.Forms.MessageBox]::Show("Missing start-controller.ps1 in $scriptRoot", "Error") | Out-Null
     return
   }
   Set-StatusBadge -Label $lblStatus -State "warn" -Text "Controller: starting..."
@@ -943,9 +944,9 @@ function Run-Start {
 }
 
 function Run-Stop {
-  $script = Join-Path $root "stop-controller.ps1"
+  $script = Join-Path $scriptRoot "stop-controller.ps1"
   if (-not (Test-Path $script)) {
-    [System.Windows.Forms.MessageBox]::Show("Missing stop-controller.ps1 in $root", "Error") | Out-Null
+    [System.Windows.Forms.MessageBox]::Show("Missing stop-controller.ps1 in $scriptRoot", "Error") | Out-Null
     return
   }
   Set-StatusBadge -Label $lblStatus -State "warn" -Text "Controller: stopping..."

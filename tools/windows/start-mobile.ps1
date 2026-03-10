@@ -5,6 +5,8 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+$scriptRoot = Split-Path -Parent $PSCommandPath
+$root = (Resolve-Path (Join-Path $scriptRoot "..\..")).Path
 
 function Get-PrimaryIPv4 {
   try {
@@ -148,7 +150,6 @@ function Get-CodrexRuntimeDir {
   return (Join-Path $RepoRoot ".runtime")
 }
 
-$root = Split-Path -Parent $PSCommandPath
 $uiRoot = Join-Path $root "ui"
 $runtimeDir = Get-CodrexRuntimeDir -RepoRoot $root
 $stateDir = Join-Path $runtimeDir "state"
@@ -169,7 +170,7 @@ foreach ($dir in @($runtimeDir, $stateDir, $logsDir)) {
 
 $controllerPort = Read-ControllerPort -ConfigPath $configPath
 
-$startControllerScript = Join-Path $root "start-controller.ps1"
+$startControllerScript = Join-Path $scriptRoot "start-controller.ps1"
 if (-not (Test-Path $startControllerScript)) {
   throw "Missing start script at $startControllerScript"
 }

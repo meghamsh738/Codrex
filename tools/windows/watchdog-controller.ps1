@@ -19,9 +19,10 @@ function Get-CodrexRuntimeDir {
   return (Join-Path $RepoRoot ".runtime")
 }
 
-$root = Split-Path -Parent $PSCommandPath
+$scriptRoot = Split-Path -Parent $PSCommandPath
+$root = (Resolve-Path (Join-Path $scriptRoot "..\..")).Path
 $runtimeDir = Get-CodrexRuntimeDir -RepoRoot $root
-$startScript = Join-Path $root "start-controller.ps1"
+$startScript = Join-Path $scriptRoot "start-controller.ps1"
 $configPath = Join-Path $root "controller.config.json"
 $logsDir = Join-Path $runtimeDir "logs"
 $logPath = Join-Path $logsDir "watchdog.log"

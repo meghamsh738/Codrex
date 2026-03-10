@@ -82,11 +82,11 @@ What this does:
 
 ```powershell
 Set-Location "E:\coding projects\codex-remote-ui"
-.\start-mobile.ps1
+.\Codrex.cmd
 ```
 
-Or use launcher UI:
-- `Start Mobile App.cmd`
+Primary Windows launcher:
+- `Codrex.cmd`
 
 Expected URLs:
 - Controller: `http://<your-lan-ip>:8787`
@@ -121,8 +121,8 @@ Set-Content -Path "$env:LocalAppData\Codrex\remote-ui\secrets\telegram\key.txt" 
 Send one message to your bot from your Telegram account, then restart stack:
 
 ```powershell
-.\stop-mobile.ps1
-.\start-mobile.ps1
+.\tools\windows\stop-mobile.ps1
+.\Codrex.cmd
 ```
 
 Verify from browser:
@@ -188,18 +188,29 @@ Start:
 
 ```powershell
 Set-Location "E:\coding projects\codex-remote-ui"
-.\start-mobile.ps1
+.\Codrex.cmd
 ```
 
 Stop:
 
 ```powershell
 Set-Location "E:\coding projects\codex-remote-ui"
-.\stop-mobile.ps1
+.\tools\windows\stop-mobile.ps1
 ```
 
-Desktop launcher:
-- Start: `Start Mobile App.cmd`
+Primary launcher:
+- `Codrex.cmd`
+
+Advanced Windows tools:
+- `tools/windows/`
+- `tools/windows/legacy-launchers/` keeps the older `.cmd` wrappers for compatibility only
+
+## Windows App Layout
+
+The repo root is intentionally simplified:
+- use `setup.ps1` for first-time machine bootstrap
+- use `Codrex.cmd` for daily launch
+- use `tools/windows/` only for advanced utilities, tray mode, controller-only tools, or autostart setup
 
 ## Security Checklist (Recommended)
 

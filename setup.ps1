@@ -29,7 +29,7 @@ Write-Host "Installing dependencies..."
 & $venvPython -m pip install --upgrade pip
 & $venvPython -m pip install -r (Join-Path $root "requirements.txt")
 
-$startScript = Join-Path $root "start-controller.ps1"
+$startScript = Join-Path $root "tools\windows\start-controller.ps1"
 if (-not (Test-Path $startScript)) {
   throw "Missing start script at $startScript"
 }

@@ -4,6 +4,8 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+$scriptRoot = Split-Path -Parent $PSCommandPath
+$root = (Resolve-Path (Join-Path $scriptRoot "..\..")).Path
 
 function Read-SessionData {
   param([string]$Path)
@@ -87,7 +89,6 @@ function Get-CodrexRuntimeDir {
   return (Join-Path $RepoRoot ".runtime")
 }
 
-$root = Split-Path -Parent $PSCommandPath
 $runtimeDir = Get-CodrexRuntimeDir -RepoRoot $root
 $stateDir = Join-Path $runtimeDir "state"
 $sessionPath = Join-Path $stateDir "mobile.session.json"
@@ -117,7 +118,7 @@ if (-not $uiStoppedBySession -and -not $uiStoppedByPort) {
 }
 
 if (-not $KeepController) {
-  $stopControllerScript = Join-Path $root "stop-controller.ps1"
+  $stopControllerScript = Join-Path $scriptRoot "stop-controller.ps1"
   if (Test-Path $stopControllerScript) {
     & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $stopControllerScript -Port $controllerPort
   } else {
