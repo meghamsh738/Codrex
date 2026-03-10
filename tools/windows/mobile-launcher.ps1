@@ -424,27 +424,88 @@ function Set-ActionStatus {
 function Clear-PendingStart {
   $script:pendingStart = $false
   $script:pendingStartAt = [DateTime]::MinValue
-  $script:pendingStartProcessId = 0
   $script:pendingStartPort = 0
+  $script:pendingStartResultRead = $false
+  if ($script:pendingStartWorker) {
+    try { $script:pendingStartWorker.Dispose() } catch {}
+  }
+  $script:pendingStartWorker = $null
+  $script:pendingStartAsync = $null
 }
 
-function Start-PowerShellScriptAsync {
+function Start-PowerShellScriptTask {
   param(
     [string]$ScriptPath,
-    [string[]]$Arguments = @()
+    [int]$LaunchUiPort
   )
   if (-not (Test-Path $ScriptPath)) {
     throw "Missing $ScriptPath"
   }
-  $argList = @(
-    "-NoProfile",
-    "-ExecutionPolicy", "Bypass",
-    "-File", $ScriptPath
-  )
-  if ($Arguments) {
-    $argList += $Arguments
+  $ps = [powershell]::Create()
+  $null = $ps.AddScript({
+    param(
+      [string]$TaskScriptPath,
+      [int]$TaskUiPort
+    )
+    & $TaskScriptPath -UiPort $TaskUiPort
+  }).AddArgument($ScriptPath).AddArgument($LaunchUiPort)
+  return [pscustomobject]@{
+    worker = $ps
+    async = $ps.BeginInvoke()
   }
-  return Start-Process -FilePath "powershell.exe" -ArgumentList $argList -WorkingDirectory $root -WindowStyle Hidden -PassThru
+}
+
+function Read-PendingStartTaskResult {
+  if (-not $script:pendingStartWorker -or -not $script:pendingStartAsync) {
+    return [pscustomobject]@{
+      completed = $false
+      ok = $false
+      detail = ""
+    }
+  }
+  if (-not $script:pendingStartAsync.IsCompleted) {
+    return [pscustomobject]@{
+      completed = $false
+      ok = $false
+      detail = ""
+    }
+  }
+  if ($script:pendingStartResultRead) {
+    return [pscustomobject]@{
+      completed = $true
+      ok = ($script:lastHelperOutput -eq "")
+      detail = $script:lastHelperOutput
+    }
+  }
+  $detailLines = New-Object System.Collections.Generic.List[string]
+  $ok = $true
+  try {
+    $output = @($script:pendingStartWorker.EndInvoke($script:pendingStartAsync) | ForEach-Object { [string]$_ })
+    foreach ($line in $output) {
+      if ($line -and $line.Trim()) {
+        $detailLines.Add($line.Trim())
+      }
+    }
+  } catch {
+    $ok = $false
+    if ($_.Exception -and $_.Exception.Message) {
+      $detailLines.Add([string]$_.Exception.Message)
+    }
+  }
+  foreach ($err in $script:pendingStartWorker.Streams.Error) {
+    $errText = [string]$err
+    if ($errText -and $errText.Trim()) {
+      $detailLines.Add($errText.Trim())
+      $ok = $false
+    }
+  }
+  $script:lastHelperOutput = ($detailLines | Select-Object -Unique) -join " | "
+  $script:pendingStartResultRead = $true
+  return [pscustomobject]@{
+    completed = $true
+    ok = $ok
+    detail = $script:lastHelperOutput
+  }
 }
 
 $scriptRoot = Split-Path -Parent $PSCommandPath
@@ -485,8 +546,10 @@ $script:lastHelperOutput = ""
 $script:pendingStart = $false
 $script:pendingStartAt = [DateTime]::MinValue
 $script:pendingStartTimeoutSec = 45
-$script:pendingStartProcessId = 0
 $script:pendingStartPort = 0
+$script:pendingStartWorker = $null
+$script:pendingStartAsync = $null
+$script:pendingStartResultRead = $false
 
 function Set-LauncherButtonStyle {
   param(
@@ -959,6 +1022,7 @@ function Refresh-State {
   try {
     $snapshot = Get-LauncherStatusSnapshot
     if ($script:pendingStart) {
+      $taskResult = Read-PendingStartTaskResult
       $elapsedSeconds = if ($script:pendingStartAt -eq [DateTime]::MinValue) {
         0
       } else {
@@ -971,16 +1035,38 @@ function Refresh-State {
         if ($snapshot.local_url -and $snapshot.local_url -ne "offline") {
           Open-Url $snapshot.local_url
         }
-      } elseif ($elapsedSeconds -ge $script:pendingStartTimeoutSec) {
-        $helperStatus = ""
-        if ($script:pendingStartProcessId -gt 0) {
-          $helperProc = Get-CimInstance Win32_Process -Filter ("ProcessId = {0}" -f $script:pendingStartProcessId) -ErrorAction SilentlyContinue
-          $helperStatus = if ($helperProc) {
-            " Helper PID $($script:pendingStartProcessId) is still running."
-          } else {
-            " Helper PID $($script:pendingStartProcessId) already exited."
-          }
+      } elseif ($taskResult.completed -and -not $taskResult.ok) {
+        $detail = if ($taskResult.detail) {
+          "Codrex start failed. $($taskResult.detail) Logs: $logsDir"
+        } else {
+          "Codrex start failed before runtime became ready. Logs: $logsDir"
         }
+        Clear-PendingStart
+        Set-ActionStatus -State "error" -Detail $detail -ControllerPort $snapshot.controller_port
+        Append-Log "Error: $detail"
+        [System.Windows.Forms.MessageBox]::Show(
+          $detail,
+          "Codrex",
+          [System.Windows.Forms.MessageBoxButtons]::OK,
+          [System.Windows.Forms.MessageBoxIcon]::Error
+        ) | Out-Null
+      } elseif ($taskResult.completed -and -not $snapshot.app_built) {
+        $detail = if ($taskResult.detail) {
+          "Codrex helper finished before runtime became ready. $($taskResult.detail) Logs: $logsDir"
+        } else {
+          "Codrex helper finished before runtime became ready. Logs: $logsDir"
+        }
+        Clear-PendingStart
+        Set-ActionStatus -State "error" -Detail $detail -ControllerPort $snapshot.controller_port
+        Append-Log "Error: $detail"
+        [System.Windows.Forms.MessageBox]::Show(
+          $detail,
+          "Codrex",
+          [System.Windows.Forms.MessageBoxButtons]::OK,
+          [System.Windows.Forms.MessageBoxIcon]::Error
+        ) | Out-Null
+      } elseif ($elapsedSeconds -ge $script:pendingStartTimeoutSec) {
+        $helperStatus = if ($taskResult.detail) { " Detail: $($taskResult.detail)" } else { "" }
         Clear-PendingStart
         $detail = "Codrex did not reach running state within $($script:pendingStartTimeoutSec)s.$helperStatus Logs: $logsDir"
         Set-ActionStatus -State "error" -Detail $detail -ControllerPort $snapshot.controller_port
@@ -1036,13 +1122,14 @@ function Start-Stack {
   Set-ActionStatus -State "starting" -Detail "Launching Codrex helper..." -ControllerPort $existingSnapshot.controller_port
   $script:cachedControllerConfigAt = [DateTime]::MinValue
   $script:cachedLanIpAt = [DateTime]::MinValue
-  $helperProc = Start-PowerShellScriptAsync -ScriptPath $startMobileScript -Arguments @(
-    "-UiPort", [string]$uiPort
-  )
+  $task = Start-PowerShellScriptTask -ScriptPath $startMobileScript -LaunchUiPort $uiPort
   $script:pendingStart = $true
   $script:pendingStartAt = Get-Date
-  $script:pendingStartProcessId = if ($helperProc) { [int]$helperProc.Id } else { 0 }
   $script:pendingStartPort = $existingSnapshot.controller_port
+  $script:pendingStartWorker = $task.worker
+  $script:pendingStartAsync = $task.async
+  $script:pendingStartResultRead = $false
+  $script:lastHelperOutput = ""
   Append-Log ("Firewall changes skipped on normal start. Use Setup.cmd if you need firewall rules refreshed.")
   Refresh-State -Force
 }

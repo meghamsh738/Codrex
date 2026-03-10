@@ -136,6 +136,23 @@ function Get-UiOwnerInfo {
   return $owners
 }
 
+function Get-ProcessIdByListeningPort {
+  param(
+    [int]$Port
+  )
+  if ($Port -le 0) {
+    return $null
+  }
+  try {
+    $listener = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue |
+      Select-Object -First 1
+    if ($listener -and $listener.OwningProcess) {
+      return [int]$listener.OwningProcess
+    }
+  } catch {}
+  return $null
+}
+
 function Resolve-DevUiPort {
   param(
     [int]$PreferredPort
@@ -356,12 +373,7 @@ if ($OpenFirewall) {
   }
 }
 
-$controllerPattern = "--port\s+$controllerPort\b"
-$controllerProc = Get-CimInstance Win32_Process |
-  Where-Object { $_.CommandLine -and $_.CommandLine -match "app\.server:app" -and $_.CommandLine -match $controllerPattern } |
-  Sort-Object ProcessId -Descending |
-  Select-Object -First 1
-$controllerPid = if ($controllerProc) { [int]$controllerProc.ProcessId } else { $null }
+$controllerPid = Get-ProcessIdByListeningPort -Port $controllerPort
 
 $lanIp = Get-PrimaryIPv4
 $localAppUrl = ("http://127.0.0.1:{0}/" -f $controllerPort)
