@@ -16,6 +16,22 @@ $logsPath = Join-Path $env:LocalAppData "Codrex\\remote-ui\\logs"
 $summaryLines = New-Object System.Collections.Generic.List[string]
 $setupFailed = $false
 
+function Open-Url {
+  param(
+    [string]$Url
+  )
+  if (-not $Url) { return $false }
+  try {
+    Start-Process -FilePath "explorer.exe" -ArgumentList @($Url) | Out-Null
+    return $true
+  } catch {}
+  try {
+    Start-Process $Url | Out-Null
+    return $true
+  } catch {}
+  return $false
+}
+
 try {
   $pyCmd = Get-Command py -ErrorAction SilentlyContinue
   if (-not $pyCmd) {
@@ -91,8 +107,11 @@ try {
     Start-Process -FilePath $launcherCmd | Out-Null
     $summaryLines.Add("Launcher opened: $launcherCmd")
   }
-  Start-Process $appUrl | Out-Null
-  $summaryLines.Add("Browser opened: $appUrl")
+  if (Open-Url -Url $appUrl) {
+    $summaryLines.Add("Browser opened: $appUrl")
+  } else {
+    $summaryLines.Add("Open browser manually: $appUrl")
+  }
 } catch {
   $setupFailed = $true
   $summaryLines.Add("Setup failed.")

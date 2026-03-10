@@ -232,6 +232,10 @@ function Get-QrPngImage {
 function Open-Url([string]$Url) {
   if (-not $Url) { return $false }
   try {
+    $null = Start-Process -FilePath "explorer.exe" -ArgumentList @($Url) -PassThru
+    return $true
+  } catch {}
+  try {
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = $Url
     $psi.UseShellExecute = $true
