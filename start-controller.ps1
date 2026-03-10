@@ -118,15 +118,35 @@ function Test-ControllerReady {
   return $false
 }
 
+function Get-CodrexRuntimeDir {
+  param(
+    [string]$RepoRoot
+  )
+  $override = [string]$env:CODEX_RUNTIME_DIR
+  if ($override -and $override.Trim()) {
+    return $override.Trim()
+  }
+  $localAppData = [string]$env:LocalAppData
+  if ($localAppData -and $localAppData.Trim()) {
+    return (Join-Path $localAppData "Codrex\remote-ui")
+  }
+  return (Join-Path $RepoRoot ".runtime")
+}
+
 $root = Split-Path -Parent $PSCommandPath
+$runtimeDir = Get-CodrexRuntimeDir -RepoRoot $root
+$stateDir = Join-Path $runtimeDir "state"
+$logsDir = Join-Path $runtimeDir "logs"
 $configPath = Join-Path $root "controller.config.json"
-$localConfigPath = Join-Path $root "controller.config.local.json"
-$logsDir = Join-Path $root "logs"
+$localConfigPath = Join-Path $stateDir "controller.config.local.json"
+$legacyLocalConfigPath = Join-Path $root "controller.config.local.json"
 $outLog = Join-Path $logsDir "controller.out.log"
 $errLog = Join-Path $logsDir "controller.err.log"
 
-if (-not (Test-Path $logsDir)) {
-  New-Item -Path $logsDir -ItemType Directory -Force | Out-Null
+foreach ($dir in @($runtimeDir, $stateDir, $logsDir)) {
+  if (-not (Test-Path $dir)) {
+    New-Item -Path $dir -ItemType Directory -Force | Out-Null
+  }
 }
 
 # Load persisted controller config. Sensitive values are stored in local override file.
@@ -171,6 +191,13 @@ if (Test-Path $localConfigPath) {
       Apply-LoadedConfig -Loaded ($rawLocal | ConvertFrom-Json)
     }
   } catch {}
+} elseif (Test-Path $legacyLocalConfigPath) {
+  try {
+    $rawLegacyLocal = Get-Content $legacyLocalConfigPath -Raw
+    if ($rawLegacyLocal.Trim()) {
+      Apply-LoadedConfig -Loaded ($rawLegacyLocal | ConvertFrom-Json)
+    }
+  } catch {}
 }
 
 if ($PSBoundParameters.ContainsKey("Port")) { $cfg.port = $Port }
@@ -212,6 +239,7 @@ foreach ($p in $existing) {
 
 $python = Join-Path $root ".venv\Scripts\python.exe"
 if (-not (Test-Path $python)) {
+  throw "Python executable not found at $python. Create the Windows venv in the repo root first."
   throw "Python executable not found at $python. Create venv in C:\codrex-remote-ui\.venv first."
 }
 
@@ -219,6 +247,7 @@ if (Test-Path $outLog) { Remove-Item $outLog -Force }
 if (Test-Path $errLog) { Remove-Item $errLog -Force }
 
 $env:CODEX_AUTH_TOKEN = [string]$cfg.token
+$env:CODEX_RUNTIME_DIR = [string]$runtimeDir
 $env:CODEX_WSL_DISTRO = [string]$cfg.distro
 $env:CODEX_WORKDIR = [string]$cfg.workdir
 $env:CODEX_FILE_ROOT = [string]$cfg.fileRoot
@@ -287,5 +316,6 @@ if ($readyHost) {
 }
 Write-Host ("Token: {0}" -f (Mask-Secret -Value ([string]$cfg.token)))
 Write-Host ("Token file: {0}" -f $localConfigPath)
+Write-Host ("Runtime dir: {0}" -f $runtimeDir)
 Write-Host "PID: $($proc.Id)"
 Write-Host "Logs: $outLog"

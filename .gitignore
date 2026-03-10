@@ -13,8 +13,12 @@ venv/
 logs/
 *.log
 backup/
+output/
+tmp/
+.runtime/
 test-results/
 ui/test-results/
+ui/playwright-report/
 
 # OS/editor
 .DS_Store

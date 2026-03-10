@@ -5,6 +5,7 @@ import {
   buildDesktopStreamUrl,
   buildPairConsumeUrl,
   buildPairQrPngUrl,
+  buildSessionStreamUrl,
   buildSuggestedControllerUrl,
   buildWslDownloadUrl,
   bootstrapLocalAuth,
@@ -13,9 +14,9 @@ import {
   closeTmuxSession,
   createThreadRecord,
   createSessionWithOptions,
-  createSharedFile,
   createTmuxSession,
   createPairCode,
+  deleteSessionFile,
   deleteThreadRecord,
   desktopClick,
   desktopScroll,
@@ -27,11 +28,13 @@ import {
   sendSessionKey,
   getDesktopInfo,
   getAuthStatus,
+  listBrowseEntries,
   getCodexOptions,
   getCodexRun,
   getCodexRuns,
   getNetInfo,
-  listSharedFiles,
+  getPowerStatus,
+  listSessionFiles,
   getTelegramStatus,
   getThreadStore,
   getTmuxHealth,
@@ -44,8 +47,9 @@ import {
   login,
   logout,
   reportIpcEvent,
-  sendSharedFileToTelegram,
-  deleteSharedFile,
+  registerSessionFile,
+  sendPowerAction,
+  sendSessionFileToTelegram,
   sendSessionImage,
   sendToPaneKey,
   sendToPane,
@@ -54,16 +58,21 @@ import {
   setIpcObserver,
   startCodexExec,
   updateThreadRecord,
+  uploadSessionFile,
   uploadWslFile,
 } from "./api";
 import type {
   AuthStatus,
+  BrowserEntryInfo,
+  BrowserListResult,
   CodexRunDetail,
   CodexRunSummary,
   DesktopInfoResult,
   NetInfo,
+  PowerStatusResult,
   SharedFileInfo,
   SessionInfo,
+  SessionStreamEvent,
   ThreadInfo,
   ThreadMessageInfo,
   TmuxPaneInfo,
@@ -81,6 +90,7 @@ type OutputFeedState = "off" | "polling" | "connecting" | "live" | "error";
 type TabTransitionClass = "tab-still" | "tab-slide-left" | "tab-slide-right";
 type DesktopStreamProfile = "responsive" | "balanced" | "saver" | "ultra" | "extreme";
 type SessionImageDeliveryMode = "insert_path" | "desktop_clipboard" | "session_path";
+type PowerActionName = "lock" | "sleep" | "hibernate" | "restart" | "shutdown";
 
 type AppEventLevel = "info" | "error";
 type InstallState = "hidden" | "ready" | "prompting" | "installed";
@@ -118,6 +128,11 @@ interface DeferredInstallPromptEvent extends Event {
   userChoice: Promise<{ outcome: "accepted" | "dismissed"; platform?: string }>;
 }
 
+interface TranscriptChunk {
+  id: string;
+  text: string;
+}
+
 const TAB_ORDER: MainTab[] = ["sessions", "threads", "remote", "pair", "settings", "debug"];
 
 const CONTROLLER_BASE_STORAGE = "codrex.ui.controller_base.v1";
@@ -131,11 +146,6 @@ const SWIPE_HINT_SEEN_STORAGE = "codrex.ui.swipe_hint_seen.v1";
 const COMPACT_TRANSCRIPT_STORAGE = "codrex.ui.compact_transcript.v1";
 const TOUCH_COMFORT_STORAGE = "codrex.ui.touch_comfort.v1";
 const IMAGE_DELIVERY_MODE_STORAGE = "codrex.ui.image_delivery_mode.v1";
-const STREAM_PROFILE_INTERVAL_MS: Record<StreamProfile, number> = {
-  fast: 400,
-  balanced: 800,
-  battery: 1400,
-};
 const THREADS_STORAGE = "codrex.ui.threads.v2";
 const THREAD_MESSAGES_STORAGE = "codrex.ui.thread_messages.v2";
 const THREAD_MESSAGES_LEGACY_STORAGE = "codrex.ui.thread_messages.v1";
@@ -145,6 +155,13 @@ const DESKTOP_PROFILE_STREAM: Record<DesktopStreamProfile, { fps: number; level:
   saver: { fps: 4, level: 3, scale: 3, bw: false },
   ultra: { fps: 3, level: 2, scale: 3, bw: true },
   extreme: { fps: 2, level: 3, scale: 4, bw: true },
+};
+const POWER_ACTION_LABELS: Record<"lock" | "sleep" | "hibernate" | "restart" | "shutdown", string> = {
+  lock: "Lock",
+  sleep: "Sleep",
+  hibernate: "Hibernate",
+  restart: "Restart",
+  shutdown: "Shutdown",
 };
 const FALLBACK_MODELS = ["gpt-5-codex", "gpt-5", "gpt-5-mini", "gpt-4.1", "o4-mini"];
 const FALLBACK_REASONING_EFFORTS: ReasoningEffort[] = ["minimal", "low", "medium", "high", "xhigh"];
@@ -576,6 +593,72 @@ function compactAssistantSnapshot(text: string): string {
   return tail.length > 1600 ? tail.slice(tail.length - 1600) : tail;
 }
 
+const TRANSCRIPT_CHUNK_SIZE = 4096;
+const SESSION_STREAM_POLL_FALLBACK_MS: Record<StreamProfile, number> = {
+  fast: 900,
+  balanced: 1400,
+  battery: 2200,
+};
+
+function chunkTranscript(text: string): TranscriptChunk[] {
+  if (!text) {
+    return [];
+  }
+  const chunks: TranscriptChunk[] = [];
+  for (let index = 0; index < text.length; index += TRANSCRIPT_CHUNK_SIZE) {
+    chunks.push({
+      id: `chunk_${index}_${text.length}`,
+      text: text.slice(index, index + TRANSCRIPT_CHUNK_SIZE),
+    });
+  }
+  return chunks;
+}
+
+function transcriptToText(chunks: TranscriptChunk[]): string {
+  return chunks.map((chunk) => chunk.text).join("");
+}
+
+function appendTranscriptChunks(chunks: TranscriptChunk[], text: string): TranscriptChunk[] {
+  if (!text) {
+    return chunks;
+  }
+  const next = chunks.slice();
+  let remaining = text;
+  while (remaining.length > 0) {
+    const last = next[next.length - 1];
+    if (last && last.text.length < TRANSCRIPT_CHUNK_SIZE) {
+      const capacity = TRANSCRIPT_CHUNK_SIZE - last.text.length;
+      const take = remaining.slice(0, capacity);
+      next[next.length - 1] = {
+        ...last,
+        text: `${last.text}${take}`,
+      };
+      remaining = remaining.slice(take.length);
+      continue;
+    }
+    const take = remaining.slice(0, TRANSCRIPT_CHUNK_SIZE);
+    next.push({
+      id: `chunk_${next.length}_${Date.now()}_${take.length}`,
+      text: take,
+    });
+    remaining = remaining.slice(take.length);
+  }
+  return next;
+}
+
+function applySessionStreamEventToChunks(chunks: TranscriptChunk[], event: SessionStreamEvent): TranscriptChunk[] {
+  if (!event.ok && event.type === "error") {
+    return chunks;
+  }
+  if (event.type === "append") {
+    return appendTranscriptChunks(chunks, event.text || "");
+  }
+  if (event.type === "snapshot" || event.type === "replace") {
+    return chunkTranscript(event.text || "");
+  }
+  return chunks;
+}
+
 export default function App() {
   const [activeTab, setActiveTab] = useState<MainTab>(() => parseInitialTab());
   const [tabTransitionClass, setTabTransitionClass] = useState<TabTransitionClass>("tab-still");
@@ -621,21 +704,26 @@ export default function App() {
     parseStreamProfile(safeStorageGet(STREAM_PROFILE_STORAGE)),
   );
   const [outputFeedState, setOutputFeedState] = useState<OutputFeedState>(() => (parseStreamEnabled(safeStorageGet(STREAM_ENABLED_STORAGE)) ? "polling" : "off"));
-  const [screenText, setScreenText] = useState("");
+  const [sessionTranscriptChunks, setSessionTranscriptChunks] = useState<TranscriptChunk[]>([]);
+  const [sessionAutoFollow, setSessionAutoFollow] = useState(true);
+  const [sessionUnreadCount, setSessionUnreadCount] = useState(0);
+  const [lastCopiedSessionPath, setLastCopiedSessionPath] = useState("");
   const [sessionBusy, setSessionBusy] = useState(false);
   const [sessionImageFile, setSessionImageFile] = useState<File | null>(null);
   const [sessionImagePrompt, setSessionImagePrompt] = useState("");
   const [sessionImageDeliveryMode, setSessionImageDeliveryMode] = useState<SessionImageDeliveryMode>(() =>
     parseSessionImageDeliveryMode(safeStorageGet(IMAGE_DELIVERY_MODE_STORAGE)),
   );
-  const [sharedFiles, setSharedFiles] = useState<SharedFileInfo[]>([]);
-  const [sharesLoading, setSharesLoading] = useState(true);
+  const [sessionFiles, setSessionFiles] = useState<SharedFileInfo[]>([]);
+  const [sessionFilesLoading, setSessionFilesLoading] = useState(true);
+  const [sessionFilesBusy, setSessionFilesBusy] = useState(false);
+  const [sessionUploadFile, setSessionUploadFile] = useState<File | null>(null);
+  const [sessionUploadTitle, setSessionUploadTitle] = useState("");
+  const [browserLoading, setBrowserLoading] = useState(true);
+  const [browserState, setBrowserState] = useState<BrowserListResult | null>(null);
+  const [browserRoot, setBrowserRoot] = useState("workspace");
+  const [browserSelectedPath, setBrowserSelectedPath] = useState("");
   const [telegramConfigured, setTelegramConfigured] = useState(false);
-  const [telegramStatusLoading, setTelegramStatusLoading] = useState(true);
-  const [shareBusy, setShareBusy] = useState(false);
-  const [sharePathInput, setSharePathInput] = useState("");
-  const [shareTitleInput, setShareTitleInput] = useState("");
-  const [shareExpiresHours, setShareExpiresHours] = useState("24");
 
   const [threads, setThreads] = useState<ChatThread[]>(() => {
     const stored = parseThreads(safeStorageGet(THREADS_STORAGE));
@@ -685,6 +773,11 @@ export default function App() {
   const [desktopTextInput, setDesktopTextInput] = useState("");
   const [desktopStatus, setDesktopStatus] = useState("");
   const [desktopFocusPoint, setDesktopFocusPoint] = useState<{ x: number; y: number } | null>(null);
+  const [powerStatus, setPowerStatus] = useState<PowerStatusResult | null>(null);
+  const [powerBusy, setPowerBusy] = useState(false);
+  const [powerConfirmAction, setPowerConfirmAction] = useState<PowerActionName | "">("");
+  const [powerConfirmToken, setPowerConfirmToken] = useState("");
+  const [powerConfirmExpiresIn, setPowerConfirmExpiresIn] = useState(0);
 
   const [execPrompt, setExecPrompt] = useState("");
   const [execBusy, setExecBusy] = useState(false);
@@ -734,6 +827,10 @@ export default function App() {
   const [selectedRunLoading, setSelectedRunLoading] = useState(false);
   const screenShellRef = useRef<HTMLElement | null>(null);
   const sessionOutputRef = useRef<HTMLPreElement | null>(null);
+  const sessionTranscriptRef = useRef<TranscriptChunk[]>([]);
+  const sessionStreamQueueRef = useRef<SessionStreamEvent[]>([]);
+  const sessionStreamFrameRef = useRef<number | null>(null);
+  const sessionStreamSeqRef = useRef<Record<string, number>>({});
   const desktopFrameRef = useRef<HTMLImageElement | null>(null);
   const threadLastAssistantAtRef = useRef<Record<string, number>>({});
   const localThreadsRef = useRef<ChatThread[]>([]);
@@ -744,10 +841,7 @@ export default function App() {
   const backendPort = useMemo(parsePort, []);
   const browserHostname = typeof window !== "undefined" ? window.location.hostname || "127.0.0.1" : "127.0.0.1";
   const isLocalBrowser = isLocalHostName(browserHostname);
-  const selectedSessionPaneId = useMemo(() => {
-    const match = sessions.find((session) => session.session === selectedSession);
-    return match?.pane_id || "";
-  }, [selectedSession, sessions]);
+  const sessionTranscriptText = useMemo(() => transcriptToText(sessionTranscriptChunks), [sessionTranscriptChunks]);
   const tailscaleRouteUnavailable = routeHint === "tailscale" && !netInfo?.tailscale_ip;
   const desktopStreamUrl = useMemo(() => {
     const profile = DESKTOP_PROFILE_STREAM[desktopProfile];
@@ -996,6 +1090,19 @@ export default function App() {
     }
   }, [setError]);
 
+  const refreshPowerStatus = useCallback(async () => {
+    try {
+      const response = await getPowerStatus();
+      if (!response.ok) {
+        throw new Error(response.detail || response.error || "Power status unavailable.");
+      }
+      setPowerStatus(response);
+    } catch (error) {
+      addEvent("error", `Could not read power status: ${(error as Error).message}`);
+      setPowerStatus(null);
+    }
+  }, [addEvent]);
+
   const refreshCodexOptions = useCallback(async () => {
     try {
       const response = await getCodexOptions();
@@ -1066,19 +1173,39 @@ export default function App() {
     }
   }, [setError, setStatus]);
 
-  const refreshSharedFiles = useCallback(async () => {
+  const refreshSessionFiles = useCallback(async (session: string) => {
+    if (!session) {
+      setSessionFiles([]);
+      setSessionFilesLoading(false);
+      return;
+    }
     try {
-      const response = await listSharedFiles();
+      const response = await listSessionFiles(session);
       if (!response.ok) {
-        throw new Error(response.detail || response.error || "Failed to read shared files.");
+        throw new Error(response.detail || response.error || "Failed to read session files.");
       }
-      setSharedFiles(response.items || []);
+      setSessionFiles(response.items || []);
     } catch (error) {
-      addEvent("error", `Could not load shared files: ${(error as Error).message}`);
+      addEvent("error", `Could not load session files: ${(error as Error).message}`);
     } finally {
-      setSharesLoading(false);
+      setSessionFilesLoading(false);
     }
   }, [addEvent]);
+
+  const refreshBrowser = useCallback(async (root: string, path = "") => {
+    try {
+      const response = await listBrowseEntries(root, path);
+      if (!response.ok) {
+        throw new Error(response.detail || response.error || "Failed to read files.");
+      }
+      setBrowserState(response);
+      setBrowserRoot(response.root?.id || root);
+    } catch (error) {
+      setError(`Could not browse files: ${(error as Error).message}`);
+    } finally {
+      setBrowserLoading(false);
+    }
+  }, [setError]);
 
   const refreshTelegramStatus = useCallback(async () => {
     try {
@@ -1086,8 +1213,6 @@ export default function App() {
       setTelegramConfigured(Boolean(response.ok && response.configured));
     } catch {
       setTelegramConfigured(false);
-    } finally {
-      setTelegramStatusLoading(false);
     }
   }, []);
 
@@ -1235,6 +1360,22 @@ export default function App() {
     }
   }, []);
 
+  useEffect(() => {
+    if (!powerConfirmToken || powerConfirmExpiresIn <= 0) {
+      if (powerConfirmToken && powerConfirmExpiresIn <= 0) {
+        setPowerConfirmAction("");
+        setPowerConfirmToken("");
+      }
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      setPowerConfirmExpiresIn((current) => (current > 0 ? current - 1 : 0));
+    }, 1000);
+    return () => {
+      window.clearTimeout(timer);
+    };
+  }, [powerConfirmExpiresIn, powerConfirmToken]);
+
   const refreshRunDetail = useCallback(async (runId: string) => {
     if (!runId) {
       setSelectedRun(null);
@@ -1257,7 +1398,8 @@ export default function App() {
 
   const refreshScreen = useCallback(async (session: string) => {
     if (!session) {
-      setScreenText("");
+      setSessionTranscriptChunks([]);
+      sessionStreamSeqRef.current = {};
       return;
     }
     try {
@@ -1265,11 +1407,48 @@ export default function App() {
       if (!response.ok) {
         throw new Error(response.detail || response.error || "Failed to read session screen.");
       }
-      setScreenText(response.text || "");
+      const nextText = response.text || "";
+      setSessionTranscriptChunks(chunkTranscript(nextText));
+      setSessionUnreadCount(0);
     } catch (error) {
       setError(`Could not read screen: ${(error as Error).message}`);
     }
   }, [setError]);
+
+  const flushSessionStreamQueue = useCallback(() => {
+    sessionStreamFrameRef.current = null;
+    const queued = sessionStreamQueueRef.current.splice(0);
+    if (queued.length === 0) {
+      return;
+    }
+
+    let nextChunks = sessionTranscriptRef.current;
+    let didChange = false;
+    let latestText = transcriptToText(nextChunks);
+
+    queued.forEach((event) => {
+      if (typeof event.seq === "number" && event.seq > 0) {
+        sessionStreamSeqRef.current[event.session] = event.seq;
+      }
+      if (event.type === "snapshot" || event.type === "append" || event.type === "replace") {
+        nextChunks = applySessionStreamEventToChunks(nextChunks, event);
+        latestText = transcriptToText(nextChunks);
+        didChange = true;
+      }
+    });
+
+    if (!didChange) {
+      return;
+    }
+
+    setSessionTranscriptChunks(nextChunks);
+    if (threadSession === selectedSession) {
+      captureAssistantSnapshot(selectedSession, latestText);
+    }
+    if (!sessionAutoFollow) {
+      setSessionUnreadCount((current) => current + 1);
+    }
+  }, [captureAssistantSnapshot, selectedSession, sessionAutoFollow, threadSession]);
 
   useEffect(() => {
     void (async () => {
@@ -1277,8 +1456,8 @@ export default function App() {
         refreshAuth(),
         refreshCodexOptions(),
         refreshNet(),
+        refreshPowerStatus(),
         refreshSessions(),
-        refreshSharedFiles(),
         refreshTelegramStatus(),
         refreshThreads(),
         refreshDebugRuns(),
@@ -1287,7 +1466,7 @@ export default function App() {
       ]);
       setStatus("Connected. Ready.");
     })();
-  }, [refreshAuth, refreshCodexOptions, refreshDebugRuns, refreshDesktopState, refreshNet, refreshSessions, refreshSharedFiles, refreshTelegramStatus, refreshThreads, refreshTmuxState, setStatus]);
+  }, [refreshAuth, refreshCodexOptions, refreshDebugRuns, refreshDesktopState, refreshNet, refreshPowerStatus, refreshSessions, refreshTelegramStatus, refreshThreads, refreshTmuxState, setStatus]);
 
   useEffect(() => {
     if (typeof window === "undefined") {
@@ -1365,12 +1544,21 @@ export default function App() {
   }, [addIpc]);
 
   useEffect(() => {
+    sessionTranscriptRef.current = sessionTranscriptChunks;
+  }, [sessionTranscriptChunks]);
+
+  useEffect(() => {
     const node = sessionOutputRef.current;
     if (!node) {
       return;
     }
-    node.scrollTop = node.scrollHeight;
-  }, [screenText, selectedSession]);
+    if (sessionAutoFollow) {
+      node.scrollTop = node.scrollHeight;
+      if (sessionUnreadCount) {
+        setSessionUnreadCount(0);
+      }
+    }
+  }, [selectedSession, sessionAutoFollow, sessionTranscriptChunks, sessionUnreadCount]);
 
   useEffect(() => {
     safeStorageSet(THREADS_STORAGE, JSON.stringify(threads));
@@ -1561,7 +1749,12 @@ export default function App() {
   }, [activeTab, addEvent]);
 
   useEffect(() => {
-    const intervalMs = activeTab === "remote" ? 3500 : 2500;
+    const intervalMs =
+      activeTab === "remote"
+        ? 3500
+        : activeTab === "sessions"
+          ? SESSION_STREAM_POLL_FALLBACK_MS[streamProfile]
+          : 2500;
     const interval = window.setInterval(() => {
       const shouldPollSessions = activeTab === "sessions" || activeTab === "threads" || activeTab === "pair";
       if (shouldPollSessions) {
@@ -1571,12 +1764,14 @@ export default function App() {
       if (activeTab === "sessions") {
         const liveStreamActive =
           streamEnabled &&
-          !!selectedSessionPaneId &&
+          !!selectedSession &&
           (outputFeedState === "connecting" || outputFeedState === "live");
         if (selectedSession && !liveStreamActive) {
           void refreshScreen(selectedSession);
         }
-        void refreshSharedFiles();
+        if (selectedSession) {
+          void refreshSessionFiles(selectedSession);
+        }
       }
 
       if (activeTab === "debug") {
@@ -1605,23 +1800,37 @@ export default function App() {
     refreshRunDetail,
     refreshScreen,
     refreshSessions,
-    refreshSharedFiles,
+    refreshSessionFiles,
     refreshThreads,
     refreshTmuxScreen,
     refreshTmuxState,
     selectedRunId,
     selectedSession,
-    selectedSessionPaneId,
     selectedTmuxPane,
     streamEnabled,
+    streamProfile,
   ]);
 
   useEffect(() => {
     if (!selectedSession) {
+      setSessionTranscriptChunks([]);
+      setSessionFiles([]);
+      setSessionFilesLoading(false);
       return;
     }
+    setSessionAutoFollow(true);
+    setSessionUnreadCount(0);
     void refreshScreen(selectedSession);
-  }, [refreshScreen, selectedSession]);
+    setSessionFilesLoading(true);
+    void refreshSessionFiles(selectedSession);
+  }, [refreshScreen, refreshSessionFiles, selectedSession]);
+
+  useEffect(() => {
+    setBrowserLoading(true);
+    setBrowserSelectedPath("");
+    setLastCopiedSessionPath("");
+    void refreshBrowser(browserRoot, "");
+  }, [browserRoot, refreshBrowser]);
 
   useEffect(() => {
     if (!selectedTmuxPane) {
@@ -1658,99 +1867,125 @@ export default function App() {
   }, [prefersDarkTheme, themeMode]);
 
   useEffect(() => {
-    if (!streamEnabled || activeTab !== "sessions" || !selectedSessionPaneId) {
+    if (!streamEnabled || activeTab !== "sessions" || !selectedSession) {
+      setOutputFeedState(streamEnabled ? "polling" : "off");
       return;
     }
-    if (typeof window === "undefined" || typeof window.EventSource !== "function") {
+    if (typeof window === "undefined" || typeof window.WebSocket !== "function") {
       setOutputFeedState("polling");
       return;
     }
 
-    const intervalMs = STREAM_PROFILE_INTERVAL_MS[streamProfile];
-    const streamUrl = `/tmux/pane/${encodeURIComponent(selectedSessionPaneId)}/stream?interval_ms=${intervalMs}&max_chars=25000`;
+    const streamUrl = buildSessionStreamUrl(selectedSession, {
+      profile: streamProfile,
+      since_seq: sessionStreamSeqRef.current[selectedSession] || 0,
+    });
     let closed = false;
     setOutputFeedState("connecting");
     reportIpcEvent({
-      channel: "sse",
+      channel: "ws",
       direction: "out",
       method: "GET",
       path: streamUrl,
       detail: "connect",
     });
-    const source = new EventSource(streamUrl);
 
-    source.addEventListener("hello", () => {
-      if (!closed) {
-        setOutputFeedState("live");
-        reportIpcEvent({
-          channel: "sse",
-          direction: "in",
-          method: "GET",
-          path: streamUrl,
-          status: 200,
-          detail: "hello",
-        });
+    const socket = new WebSocket(streamUrl);
+
+    const scheduleFlush = () => {
+      if (sessionStreamFrameRef.current != null) {
+        return;
       }
-    });
+      sessionStreamFrameRef.current = window.requestAnimationFrame(() => {
+        flushSessionStreamQueue();
+      });
+    };
 
-    source.addEventListener("screen", (event: Event) => {
+    socket.onmessage = (message) => {
       if (closed) {
         return;
       }
       try {
-        const payload = JSON.parse((event as MessageEvent).data || "{}") as { text?: string };
-        if (typeof payload.text === "string") {
-          setScreenText(payload.text);
+        const payload = JSON.parse(message.data || "{}") as SessionStreamEvent;
+        if (payload.type === "hello") {
           setOutputFeedState("live");
-          if (threadSession === selectedSession) {
-            captureAssistantSnapshot(selectedSession, payload.text);
-          }
-          reportIpcEvent({
-            channel: "sse",
-            direction: "in",
-            method: "GET",
-            path: streamUrl,
-            status: 200,
-            detail: `screen ${payload.text.length} chars`,
-          });
+        } else if (payload.type === "status" && payload.detail === "waiting_for_pane") {
+          setOutputFeedState("connecting");
+        } else if (payload.type === "keepalive") {
+          setOutputFeedState("live");
+        } else if (payload.type === "error" || payload.ok === false) {
+          setOutputFeedState("error");
+        } else {
+          setOutputFeedState("live");
         }
+
+        if (payload.type === "snapshot" || payload.type === "append" || payload.type === "replace") {
+          sessionStreamQueueRef.current.push(payload);
+          scheduleFlush();
+        }
+
+        reportIpcEvent({
+          channel: "ws",
+          direction: payload.type === "error" || payload.ok === false ? "error" : "in",
+          method: "GET",
+          path: streamUrl,
+          status: 200,
+          detail: payload.type,
+          responseBody: payload.text ? `${payload.type} ${payload.text.length} chars` : payload.detail,
+        });
       } catch {
         setOutputFeedState("error");
         reportIpcEvent({
-          channel: "sse",
+          channel: "ws",
           direction: "error",
           method: "GET",
           path: streamUrl,
           detail: "parse_error",
         });
       }
-    });
+    };
 
-    source.addEventListener("error", () => {
+    socket.onerror = () => {
       if (closed) {
         return;
       }
       setOutputFeedState("error");
       reportIpcEvent({
-        channel: "sse",
+        channel: "ws",
         direction: "error",
         method: "GET",
         path: streamUrl,
         detail: "stream_error",
       });
-      try {
-        source.close();
-      } catch {}
-    });
+    };
+
+    socket.onclose = () => {
+      if (closed) {
+        return;
+      }
+      setOutputFeedState(streamEnabled ? "polling" : "off");
+      reportIpcEvent({
+        channel: "ws",
+        direction: "error",
+        method: "GET",
+        path: streamUrl,
+        detail: "closed",
+      });
+    };
 
     return () => {
       closed = true;
+      if (sessionStreamFrameRef.current != null) {
+        window.cancelAnimationFrame(sessionStreamFrameRef.current);
+        sessionStreamFrameRef.current = null;
+      }
+      sessionStreamQueueRef.current = [];
       try {
-        source.close();
+        socket.close();
       } catch {}
       setOutputFeedState(streamEnabled ? "polling" : "off");
     };
-  }, [activeTab, captureAssistantSnapshot, selectedSession, selectedSessionPaneId, streamEnabled, streamProfile, threadSession]);
+  }, [activeTab, flushSessionStreamQueue, selectedSession, streamEnabled, streamProfile]);
 
   useEffect(() => {
     if (!selectedRunId) {
@@ -1887,6 +2122,12 @@ export default function App() {
   }, [filteredSessions]);
 
   const selectedSessionInfo = sessions.find((session) => session.session === selectedSession) || null;
+  const selectedBrowserEntry = useMemo(
+    () => (browserState?.items || []).find((item) => item.wsl_path === browserSelectedPath) || null,
+    [browserSelectedPath, browserState],
+  );
+  const browserRoots = browserState?.roots || [];
+  const sessionFileCountLabel = `${sessionFiles.length} file${sessionFiles.length === 1 ? "" : "s"}`;
   const authSummary = authLoading
     ? "Checking auth..."
     : auth?.auth_required
@@ -1895,6 +2136,12 @@ export default function App() {
         : "Login required"
       : "Auth disabled";
   const networkSummary = `LAN ${netInfo?.lan_ip || "n/a"} | Tailscale ${netInfo?.tailscale_ip || "n/a"}`;
+  const powerWakeInstruction = (powerStatus?.wake_instruction || `${powerStatus?.wake_command || "/wake"} laptop`).trim();
+  const powerRelayBadge = powerStatus?.relay_reachable
+    ? "relay: reachable"
+    : powerStatus?.wake_relay_configured
+      ? "relay: offline"
+      : "relay: unconfigured";
   const sessionCountLabel = `${sessions.length} session${sessions.length === 1 ? "" : "s"}`;
   const visibleSessionCountLabel = `${filteredSessions.length} visible`;
   const runningRuns = debugRuns.filter((run) => run.status === "running").length;
@@ -1953,8 +2200,8 @@ export default function App() {
       refreshAuth(),
       refreshCodexOptions(),
       refreshNet(),
+      refreshPowerStatus(),
       refreshSessions(),
-      refreshSharedFiles(),
       refreshTelegramStatus(),
       refreshThreads(),
       refreshDebugRuns(),
@@ -1971,7 +2218,7 @@ export default function App() {
       await refreshRunDetail(selectedRunId);
     }
     setStatus("Synced.");
-  }, [refreshAuth, refreshCodexOptions, refreshDebugRuns, refreshDesktopState, refreshNet, refreshRunDetail, refreshScreen, refreshSessions, refreshSharedFiles, refreshTelegramStatus, refreshThreads, refreshTmuxScreen, refreshTmuxState, selectedRunId, selectedSession, selectedTmuxPane, setStatus]);
+  }, [refreshAuth, refreshCodexOptions, refreshDebugRuns, refreshDesktopState, refreshNet, refreshPowerStatus, refreshRunDetail, refreshScreen, refreshSessions, refreshTelegramStatus, refreshThreads, refreshTmuxScreen, refreshTmuxState, selectedRunId, selectedSession, selectedTmuxPane, setStatus]);
 
   const onLogin = useCallback(async () => {
     if (!tokenInput.trim()) {
@@ -2239,10 +2486,10 @@ export default function App() {
       if (!response.ok) {
         throw new Error(response.detail || response.error || "Prompt send failed.");
       }
-      if (response.shared_file) {
+      if (response.shared_file || response.session_file) {
         setPromptText("");
-        setStatus(response.detail || `Shared ${response.shared_file.file_name} to mobile inbox.`);
-        await refreshSharedFiles();
+        setStatus(response.detail || `Attached ${(response.session_file || response.shared_file)?.file_name || "item"} to session files.`);
+        await refreshSessionFiles(selectedSession);
         await refreshSessions();
         return;
       }
@@ -2256,6 +2503,7 @@ export default function App() {
       }
       setStatus(`Sent prompt to ${selectedSession}.`);
       await refreshScreen(selectedSession);
+      await refreshSessionFiles(selectedSession);
       await refreshSessions();
       window.setTimeout(async () => {
         try {
@@ -2270,7 +2518,7 @@ export default function App() {
     } finally {
       setSessionBusy(false);
     }
-  }, [addThreadMessage, captureAssistantSnapshot, ensureThreadForSession, promptText, refreshScreen, refreshSessions, refreshSharedFiles, selectedSession, setError, setStatus, syncThreadMessage]);
+  }, [addThreadMessage, captureAssistantSnapshot, ensureThreadForSession, promptText, refreshScreen, refreshSessionFiles, refreshSessions, selectedSession, setError, setStatus, syncThreadMessage]);
 
   const onSendEnter = useCallback(async () => {
     if (!selectedSession) {
@@ -2396,7 +2644,9 @@ export default function App() {
       }
       setStatus(`Closed ${selectedSession}.`);
       await refreshSessions();
-      setScreenText("");
+      setSessionTranscriptChunks([]);
+      setSessionFiles([]);
+      delete sessionStreamSeqRef.current[selectedSession];
     } catch (error) {
       setError(`Close session failed: ${(error as Error).message}`);
     } finally {
@@ -2431,6 +2681,7 @@ export default function App() {
         setStatus(`Image sent to ${selectedSession}.`);
       }
       await refreshScreen(selectedSession);
+      await refreshSessionFiles(selectedSession);
     } catch (error) {
       setError(`Send image failed: ${(error as Error).message}`);
     } finally {
@@ -2444,67 +2695,150 @@ export default function App() {
     sessionImagePrompt,
     setError,
     setStatus,
+    refreshSessionFiles,
   ]);
 
-  const onCreateSharedFile = useCallback(async () => {
-    const path = sharePathInput.trim();
-    if (!path) {
-      setError("Enter a file path to share.");
+  const onUploadSessionFile = useCallback(async () => {
+    if (!selectedSession) {
+      setError("Select a session first.");
       return;
     }
-    const expires = Number.parseInt(shareExpiresHours, 10);
-    if (!Number.isFinite(expires) || expires <= 0) {
-      setError("Expiry must be a positive number of hours.");
+    if (!sessionUploadFile) {
+      setError("Choose a file first.");
       return;
     }
-    setShareBusy(true);
+    setSessionFilesBusy(true);
     try {
-      const response = await createSharedFile({
-        path,
-        title: shareTitleInput.trim() || undefined,
-        expires_hours: expires,
-        created_by: selectedSession ? `session:${selectedSession}` : "manual",
+      const response = await uploadSessionFile(selectedSession, sessionUploadFile, sessionUploadTitle);
+      if (!response.ok || !response.item) {
+        throw new Error(response.detail || response.error || "Upload failed.");
+      }
+      setSessionUploadFile(null);
+      setSessionUploadTitle("");
+      setStatus(`Attached ${response.item.file_name} to ${selectedSession}.`);
+      await refreshSessionFiles(selectedSession);
+    } catch (error) {
+      setError(`Upload failed: ${(error as Error).message}`);
+    } finally {
+      setSessionFilesBusy(false);
+    }
+  }, [refreshSessionFiles, selectedSession, sessionUploadFile, sessionUploadTitle, setError, setStatus]);
+
+  const onBrowseOpen = useCallback(async (entry: BrowserEntryInfo) => {
+    if (entry.kind !== "directory") {
+      setBrowserSelectedPath(entry.wsl_path);
+      return;
+    }
+    setBrowserLoading(true);
+    setBrowserSelectedPath(entry.wsl_path);
+    await refreshBrowser(browserRoot, entry.wsl_path);
+  }, [browserRoot, refreshBrowser]);
+
+  const onBrowseUp = useCallback(async () => {
+    if (!browserState?.root?.path || !browserState.current_path) {
+      return;
+    }
+    const current = browserState.current_path;
+    const rootPath = browserState.root.path;
+    if (current === rootPath) {
+      return;
+    }
+    const trimmed = current.replace(/\/+$/, "");
+    const parent = trimmed.slice(0, trimmed.lastIndexOf("/")) || rootPath;
+    setBrowserLoading(true);
+    await refreshBrowser(browserRoot, parent);
+  }, [browserRoot, browserState, refreshBrowser]);
+
+  const onRegisterBrowserItem = useCallback(async (entry: BrowserEntryInfo) => {
+    if (!selectedSession) {
+      setError("Select a session first.");
+      return;
+    }
+    setSessionFilesBusy(true);
+    try {
+      const response = await registerSessionFile(selectedSession, {
+        path: entry.wsl_path,
+        title: entry.name,
+        allow_directory: entry.kind === "directory",
       });
       if (!response.ok || !response.item) {
-        throw new Error(response.detail || response.error || "Share creation failed.");
+        throw new Error(response.detail || response.error || "Attach failed.");
       }
-      setSharePathInput("");
-      setShareTitleInput("");
-      setStatus(`Shared ${response.item.file_name}.`);
-      await refreshSharedFiles();
+      setBrowserSelectedPath(entry.wsl_path);
+      setStatus(`Attached ${entry.name} to ${selectedSession}.`);
+      await refreshSessionFiles(selectedSession);
     } catch (error) {
-      setError(`Share failed: ${(error as Error).message}`);
+      setError(`Attach failed: ${(error as Error).message}`);
     } finally {
-      setShareBusy(false);
+      setSessionFilesBusy(false);
     }
-  }, [refreshSharedFiles, selectedSession, setError, setStatus, shareExpiresHours, sharePathInput, shareTitleInput]);
+  }, [refreshSessionFiles, selectedSession, setError, setStatus]);
 
-  const onDeleteSharedFile = useCallback(async (itemId: string) => {
-    if (!itemId) {
+  const onCopySessionPath = useCallback(async (item: { wsl_path: string }) => {
+    const path = item.wsl_path || "";
+    if (!path) {
       return;
     }
-    setShareBusy(true);
     try {
-      const response = await deleteSharedFile(itemId);
+      await navigator.clipboard.writeText(path);
+      setLastCopiedSessionPath(path);
+      setStatus(`Copied path: ${path}`);
+    } catch (error) {
+      setError(`Could not copy path: ${(error as Error).message}`);
+    }
+  }, [setError, setStatus]);
+
+  const onUseSessionPath = useCallback((item: { wsl_path: string }) => {
+    const path = item.wsl_path || "";
+    if (!path) {
+      return;
+    }
+    setPromptText((current) => (current.trim() ? `${current.trim()} ${path}` : path));
+    setStatus(`Path inserted into composer: ${path}`);
+  }, [setStatus]);
+
+  const onSessionOutputScroll = useCallback(() => {
+    const node = sessionOutputRef.current;
+    if (!node) {
+      return;
+    }
+    const nearBottom = node.scrollHeight - node.scrollTop - node.clientHeight < 40;
+    setSessionAutoFollow(nearBottom);
+    if (nearBottom) {
+      setSessionUnreadCount(0);
+    }
+  }, []);
+
+  const onDeleteSessionFileRow = useCallback(async (item: SharedFileInfo) => {
+    if (!selectedSession) {
+      return;
+    }
+    setSessionFilesBusy(true);
+    try {
+      const response = await deleteSessionFile(selectedSession, item.id);
       if (!response.ok) {
-        throw new Error(response.detail || response.error || "Delete failed.");
+        throw new Error(response.detail || response.error || "Remove failed.");
       }
-      setStatus("Shared file removed.");
-      await refreshSharedFiles();
+      setStatus(
+        response.deleted_source
+          ? `Removed ${item.file_name} and deleted uploaded source.`
+          : `Detached ${item.file_name} from ${selectedSession}.`,
+      );
+      await refreshSessionFiles(selectedSession);
     } catch (error) {
-      setError(`Delete failed: ${(error as Error).message}`);
+      setError(`Remove failed: ${(error as Error).message}`);
     } finally {
-      setShareBusy(false);
+      setSessionFilesBusy(false);
     }
-  }, [refreshSharedFiles, setError, setStatus]);
+  }, [refreshSessionFiles, selectedSession, setError, setStatus]);
 
-  const onSendSharedToTelegram = useCallback(async (item: SharedFileInfo) => {
-    if (!item?.id) {
+  const onSendSessionFileRowToTelegram = useCallback(async (item: SharedFileInfo) => {
+    if (!selectedSession) {
       return;
     }
-    setShareBusy(true);
+    setSessionFilesBusy(true);
     try {
-      const response = await sendSharedFileToTelegram(item.id, item.title || item.file_name);
+      const response = await sendSessionFileToTelegram(selectedSession, item.id, item.title || item.file_name);
       if (!response.ok) {
         throw new Error(response.detail || response.error || "Telegram send failed.");
       }
@@ -2512,61 +2846,9 @@ export default function App() {
     } catch (error) {
       setError(`Telegram send failed: ${(error as Error).message}`);
     } finally {
-      setShareBusy(false);
+      setSessionFilesBusy(false);
     }
-  }, [setError, setStatus]);
-
-  const buildCodrexSendCommand = useCallback((includeTelegram: boolean) => {
-    const path = sharePathInput.trim();
-    if (!path) {
-      return { ok: false as const, detail: "Enter a file path first to build command." };
-    }
-    const title = shareTitleInput.trim();
-    const escapedPath = path.replace(/"/g, '\\"');
-    const escapedTitle = title.replace(/"/g, '\\"');
-    const parts: string[] = [`codrex-send "${escapedPath}"`];
-    if (title) {
-      parts.push(`--title "${escapedTitle}"`);
-    }
-    const expires = Number.parseInt(shareExpiresHours, 10);
-    if (Number.isFinite(expires) && expires > 0) {
-      parts.push(`--expires ${expires}`);
-    }
-    if (includeTelegram) {
-      parts.push("--telegram");
-      if (title) {
-        parts.push(`--caption "${escapedTitle}"`);
-      }
-    }
-    return { ok: true as const, cmd: parts.join(" ") };
-  }, [shareExpiresHours, sharePathInput, shareTitleInput]);
-
-  const onCopyShareCommand = useCallback(async () => {
-    const built = buildCodrexSendCommand(false);
-    if (!built.ok) {
-      setError(built.detail);
-      return;
-    }
-    try {
-      await navigator.clipboard.writeText(built.cmd);
-      setStatus("Share command copied.");
-    } catch (error) {
-      setError(`Could not copy command: ${(error as Error).message}`);
-    }
-  }, [buildCodrexSendCommand, setError, setStatus]);
-
-  const onCopyShareLink = useCallback(async (item: SharedFileInfo) => {
-    const base = (controllerBase || "").trim() || (typeof window !== "undefined" ? window.location.origin : "");
-    const normalizedBase = base.replace(/\/$/, "");
-    const path = item.download_url.startsWith("/") ? item.download_url : `/${item.download_url}`;
-    const full = `${normalizedBase}${path}`;
-    try {
-      await navigator.clipboard.writeText(full);
-      setStatus("Share link copied.");
-    } catch (error) {
-      setError(`Could not copy share link: ${(error as Error).message}`);
-    }
-  }, [controllerBase, setError, setStatus]);
+  }, [selectedSession, setError, setStatus]);
 
   const onApplySessionProfile = useCallback(async () => {
     if (!selectedSession) {
@@ -3074,6 +3356,59 @@ export default function App() {
       setError(`Desktop key failed: ${(error as Error).message}`);
     }
   }, [desktopEnabled, desktopKeyInput, setError]);
+
+  const onRequestPowerAction = useCallback(async (action: PowerActionName, confirmToken = "") => {
+    setPowerBusy(true);
+    try {
+      const response = await sendPowerAction(
+        action,
+        confirmToken ? { confirm_token: confirmToken } : undefined,
+      );
+      if (!response.ok) {
+        if (response.error === "confirmation_required" && response.confirm_token) {
+          setPowerConfirmAction(action);
+          setPowerConfirmToken(response.confirm_token);
+          setPowerConfirmExpiresIn(response.confirm_expires_in || 0);
+          setStatus(response.detail || `Confirm ${POWER_ACTION_LABELS[action]} before sending it to the host.`);
+          return;
+        }
+        throw new Error(response.detail || response.error || "Power action failed.");
+      }
+      setPowerConfirmAction("");
+      setPowerConfirmToken("");
+      setPowerConfirmExpiresIn(0);
+      if (action === "lock") {
+        setDesktopStatus(response.detail || "Laptop locked.");
+        await refreshPowerStatus();
+      }
+      setStatus(response.detail || `${POWER_ACTION_LABELS[action]} sent.`);
+    } catch (error) {
+      setError(`Power action failed: ${(error as Error).message}`);
+    } finally {
+      setPowerBusy(false);
+    }
+  }, [refreshPowerStatus, setError, setStatus]);
+
+  const onCancelPowerConfirmation = useCallback(() => {
+    setPowerConfirmAction("");
+    setPowerConfirmToken("");
+    setPowerConfirmExpiresIn(0);
+    setStatus("Pending power action canceled.");
+  }, [setStatus]);
+
+  const onCopyPowerValue = useCallback(async (value: string, label: string) => {
+    const text = value.trim();
+    if (!text) {
+      setError(`No ${label.toLowerCase()} available to copy.`);
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(text);
+      setStatus(`${label} copied: ${text}`);
+    } catch (error) {
+      setError(`Copy failed: ${(error as Error).message}`);
+    }
+  }, [setError, setStatus]);
 
   const onRunExec = useCallback(async () => {
     const prompt = execPrompt.trim();
@@ -3617,248 +3952,385 @@ export default function App() {
                       </label>
                     </div>
 
-                    <div className="prompt-composer">
-                      <label className="field">
-                        <span>Prompt Composer</span>
-                        <div className="composer-input-wrap">
-                          <textarea
-                            value={promptText}
-                            onChange={(event) => setPromptText(event.target.value)}
-                            rows={5}
-                            placeholder="Type your prompt. Codrex will send Enter + Enter to submit."
-                          />
-                          <button
-                            type="button"
-                            className="composer-send-btn"
-                            data-testid="composer-send-prompt"
-                            aria-label={sessionBusy ? "Sending prompt" : "Send prompt"}
-                            onClick={() => void onSendPrompt()}
-                            disabled={sessionBusy || !canSendPrompt}
-                          >
-                            <svg viewBox="0 0 24 24" aria-hidden="true">
-                              <path
-                                d="M3 11.8 20.6 4.3a1 1 0 0 1 1.3 1.3L14.4 23.2a1 1 0 0 1-1.9-.3l-1-6-6-1a1 1 0 0 1-.3-1.9Z"
-                                fill="currentColor"
+                    <div className="session-workspace">
+                      <div className="session-main-pane">
+                        <div className="prompt-composer">
+                          <label className="field">
+                            <span>Prompt Composer</span>
+                            <div className="composer-input-wrap">
+                              <textarea
+                                value={promptText}
+                                onChange={(event) => setPromptText(event.target.value)}
+                                rows={5}
+                                placeholder="Type your prompt. Codrex will send Enter + Enter to submit."
                               />
-                            </svg>
-                          </button>
-                        </div>
-                      </label>
-                    </div>
-
-                    <div className="quick-open-card">
-                      <h3>Image Upload</h3>
-                      <p className="small">Upload an image, then choose how to deliver it into your active Codex workflow.</p>
-                      <div className="row">
-                        <input
-                          type="file"
-                          accept="image/*"
-                          onChange={(event) => setSessionImageFile(event.target.files?.[0] || null)}
-                        />
-                        <input
-                          type="text"
-                          value={sessionImagePrompt}
-                          onChange={(event) => setSessionImagePrompt(event.target.value)}
-                          placeholder="Optional instruction for this image"
-                        />
-                        <label className="field inline">
-                          <span>Mode</span>
-                          <select
-                            value={sessionImageDeliveryMode}
-                            onChange={(event) => setSessionImageDeliveryMode(parseSessionImageDeliveryMode(event.target.value))}
-                          >
-                            <option value="insert_path">Insert path in composer</option>
-                            <option value="desktop_clipboard">Paste image (Ctrl+V)</option>
-                            <option value="session_path">Send path as message</option>
-                          </select>
-                        </label>
-                        <button type="button" className="button soft compact" onClick={() => void onSendSessionImage()} disabled={sessionBusy || !sessionImageFile}>
-                          Send Image
-                        </button>
-                      </div>
-                      <p className="small">
-                        {sessionImageDeliveryMode === "insert_path"
-                          ? "Inserts the local image path into Codex composer without submitting; continue typing and press Send."
-                          : sessionImageDeliveryMode === "desktop_clipboard"
-                            ? "Requires Codex input focused on laptop; copies image to clipboard and sends Ctrl+V."
-                            : "Sends a path message directly to session transcript and submits immediately."}
-                      </p>
-                    </div>
-
-                    {!telegramStatusLoading && !telegramConfigured ? (
-                      <div className="quick-open-card" data-testid="shared-files-card">
-                        <h3>Shared Files Inbox</h3>
-                        <p className="small">
-                          Deterministic route: send `codrex-send` command instead of relying on model memory.
-                        </p>
-                        <div className="row">
-                          <input
-                            type="text"
-                            data-testid="share-path-input"
-                            value={sharePathInput}
-                            onChange={(event) => setSharePathInput(event.target.value)}
-                            placeholder="/home/megha/codrex-work/output/result.png"
-                          />
-                          <input
-                            type="text"
-                            data-testid="share-title-input"
-                            value={shareTitleInput}
-                            onChange={(event) => setShareTitleInput(event.target.value)}
-                            placeholder="Optional title"
-                          />
-                          <label className="field inline">
-                            <span>Expires</span>
-                            <select
-                              data-testid="share-expiry-select"
-                              value={shareExpiresHours}
-                              onChange={(event) => setShareExpiresHours(event.target.value)}
-                            >
-                              <option value="1">1h</option>
-                              <option value="24">24h</option>
-                              <option value="72">72h</option>
-                              <option value="168">7d</option>
-                            </select>
+                              <button
+                                type="button"
+                                className="composer-send-btn"
+                                data-testid="composer-send-prompt"
+                                aria-label={sessionBusy ? "Sending prompt" : "Send prompt"}
+                                onClick={() => void onSendPrompt()}
+                                disabled={sessionBusy || !canSendPrompt}
+                              >
+                                <svg viewBox="0 0 24 24" aria-hidden="true">
+                                  <path
+                                    d="M3 11.8 20.6 4.3a1 1 0 0 1 1.3 1.3L14.4 23.2a1 1 0 0 1-1.9-.3l-1-6-6-1a1 1 0 0 1-.3-1.9Z"
+                                    fill="currentColor"
+                                  />
+                                </svg>
+                              </button>
+                            </div>
                           </label>
                         </div>
-                        <div className="row">
-                          <button type="button" className="button soft compact" onClick={() => void onCopyShareCommand()}>
-                            Copy `codrex-send`
+
+                        <div className="quick-open-card">
+                          <h3>Image Upload</h3>
+                          <p className="small">Upload an image, then choose how to deliver it into your active Codex workflow.</p>
+                          <div className="row">
+                            <input
+                              type="file"
+                              accept="image/*"
+                              onChange={(event) => setSessionImageFile(event.target.files?.[0] || null)}
+                            />
+                            <input
+                              type="text"
+                              value={sessionImagePrompt}
+                              onChange={(event) => setSessionImagePrompt(event.target.value)}
+                              placeholder="Optional instruction for this image"
+                            />
+                            <label className="field inline">
+                              <span>Mode</span>
+                              <select
+                                value={sessionImageDeliveryMode}
+                                onChange={(event) => setSessionImageDeliveryMode(parseSessionImageDeliveryMode(event.target.value))}
+                              >
+                                <option value="insert_path">Insert path in composer</option>
+                                <option value="desktop_clipboard">Paste image (Ctrl+V)</option>
+                                <option value="session_path">Send path as message</option>
+                              </select>
+                            </label>
+                            <button type="button" className="button soft compact" onClick={() => void onSendSessionImage()} disabled={sessionBusy || !sessionImageFile}>
+                              Send Image
+                            </button>
+                          </div>
+                          <p className="small">
+                            {sessionImageDeliveryMode === "insert_path"
+                              ? "Inserts the local image path into Codex composer without submitting; continue typing and press Send."
+                              : sessionImageDeliveryMode === "desktop_clipboard"
+                                ? "Requires Codex input focused on laptop; copies image to clipboard and sends Ctrl+V."
+                                : "Sends a path message directly to session transcript and submits immediately."}
+                          </p>
+                        </div>
+
+                        <div className="session-console-card">
+                          <div className="session-console-head">
+                            <div>
+                              <h3>Live Transcript</h3>
+                              <p className="small">
+                                {streamEnabled ? "Structured session stream over WebSocket." : "Polling snapshot fallback only."}
+                              </p>
+                            </div>
+                            <div className="row">
+                              {!sessionAutoFollow && sessionUnreadCount > 0 ? (
+                                <button
+                                  type="button"
+                                  className="button soft compact"
+                                  onClick={() => {
+                                    setSessionAutoFollow(true);
+                                    setSessionUnreadCount(0);
+                                  }}
+                                >
+                                  Jump to Live ({sessionUnreadCount})
+                                </button>
+                              ) : null}
+                              <span className={`badge ${sessionAutoFollow ? "" : "muted"}`}>
+                                {sessionAutoFollow ? "Auto-follow" : "Reader mode"}
+                              </span>
+                            </div>
+                          </div>
+                          <pre
+                            ref={sessionOutputRef}
+                            className="console session-console"
+                            onScroll={onSessionOutputScroll}
+                            data-testid="session-console"
+                          >
+                            {sessionTranscriptChunks.length > 0
+                              ? sessionTranscriptChunks.map((chunk) => <span key={chunk.id}>{chunk.text}</span>)
+                              : "(No screen output captured yet)"}
+                          </pre>
+                        </div>
+
+                        <div className="session-action-dock" data-testid="session-action-dock">
+                          <button
+                            type="button"
+                            className="button soft compact"
+                            data-short="REF"
+                            onClick={() => void refreshScreen(selectedSessionInfo.session)}
+                          >
+                            <span className="btn-text">Refresh</span>
                           </button>
-                          <button type="button" className="button soft compact" onClick={() => void onCreateSharedFile()} disabled={shareBusy || !sharePathInput.trim()}>
-                            Share Now
+                          <button type="button" className="button soft compact" data-short="ENT" onClick={() => void onSendEnter()} disabled={sessionBusy}>
+                            <span className="btn-text">Enter</span>
                           </button>
-                          <button type="button" className="button soft compact" onClick={() => void refreshSharedFiles()}>
-                            Refresh Inbox
+                          <button type="button" className="button soft compact" data-short="UP" onClick={() => void onSendArrowKey("up")} disabled={sessionBusy}>
+                            <span className="btn-text">Up</span>
+                          </button>
+                          <button type="button" className="button soft compact" data-short="DN" onClick={() => void onSendArrowKey("down")} disabled={sessionBusy}>
+                            <span className="btn-text">Down</span>
+                          </button>
+                          <button type="button" className="button soft compact" data-short="LT" onClick={() => void onSendArrowKey("left")} disabled={sessionBusy}>
+                            <span className="btn-text">Left</span>
+                          </button>
+                          <button type="button" className="button soft compact" data-short="RT" onClick={() => void onSendArrowKey("right")} disabled={sessionBusy}>
+                            <span className="btn-text">Right</span>
+                          </button>
+                          <button type="button" className="button warn compact" data-short="INT" onClick={() => void onInterrupt()} disabled={sessionBusy}>
+                            <span className="btn-text">Interrupt</span>
+                          </button>
+                          <button type="button" className="button danger compact" data-short="C^C" onClick={() => void onCtrlC()} disabled={sessionBusy}>
+                            <span className="btn-text">Ctrl+C</span>
+                          </button>
+                          <button type="button" className="button danger compact" data-short="CLS" onClick={() => void onCloseSession()} disabled={sessionBusy}>
+                            <span className="btn-text">Close</span>
                           </button>
                         </div>
-                        <p className="small">
-                          Example: <code>codrex-send "/home/megha/codrex-work/output/result.png" --title "Result" --expires 24</code>
-                        </p>
-                        {sharesLoading ? <p className="small">Loading shared files...</p> : null}
-                        {!sharesLoading && sharedFiles.length === 0 ? (
-                          <div className="empty-state panel-empty">
-                            <h3>No shared files yet</h3>
-                            <p>Run `codrex-send` from prompt composer or use Share Now above.</p>
+
+                        <div className="quick-open-card">
+                          <h3>Model Selection</h3>
+                          <p className="small">Defaults for new sessions. Apply to current session only when you choose.</p>
+                          <div className="row">
+                            <label className="field inline">
+                              <span>Model</span>
+                              <select
+                                data-testid="session-model-select"
+                                value={selectedModel}
+                                onChange={(event) => setSelectedModel(event.target.value)}
+                              >
+                                {modelOptions.map((model) => (
+                                  <option key={model} value={model}>
+                                    {model}
+                                  </option>
+                                ))}
+                              </select>
+                            </label>
+                            <label className="field inline">
+                              <span>Reasoning</span>
+                              <select
+                                data-testid="session-reasoning-select"
+                                value={selectedReasoningEffort}
+                                onChange={(event) => setSelectedReasoningEffort(parseReasoningEffort(event.target.value))}
+                              >
+                                {sessionAllowedReasoningOptions.map((effort) => (
+                                  <option key={effort} value={effort}>
+                                    {effort}
+                                  </option>
+                                ))}
+                              </select>
+                            </label>
+                            <button
+                              type="button"
+                              className="button soft compact"
+                              onClick={() => void onApplySessionProfile()}
+                              disabled={sessionBusy || !selectedSession}
+                            >
+                              Apply to Current Session
+                            </button>
                           </div>
-                        ) : null}
-                        {!sharesLoading && sharedFiles.length > 0 ? (
-                          <div className="run-list" role="list" aria-label="Shared files inbox">
-                            {sharedFiles.map((item) => (
-                              <div key={item.id} className="run-item">
-                                <div className="session-row">
-                                  <strong>{item.title || item.file_name}</strong>
-                                  <span className="badge muted">{formatFileSize(item.size_bytes)}</span>
-                                </div>
-                                <p>{item.file_name}</p>
-                                <small>
-                                  Added {formatClock(item.created_at)} | Expires {new Date(item.expires_at).toLocaleString()}
-                                </small>
-                                <div className="row">
-                                  <button
-                                    type="button"
-                                    className="button soft compact"
-                                    onClick={() => window.open(item.download_url, "_blank", "noopener,noreferrer")}
+                        </div>
+                      </div>
+
+                      <aside className="session-files-pane" data-testid="session-files-panel">
+                        <div className="session-files-head">
+                          <div>
+                            <h3>Session Files</h3>
+                            <p className="small">Each Codex session keeps its own attachments and registered paths.</p>
+                          </div>
+                          <span className="badge muted">{sessionFileCountLabel}</span>
+                        </div>
+
+                        <div className="quick-open-card">
+                          <h3>Upload</h3>
+                          <div className="row">
+                            <input
+                              type="file"
+                              data-testid="session-file-upload-input"
+                              onChange={(event) => setSessionUploadFile(event.target.files?.[0] || null)}
+                            />
+                            <input
+                              type="text"
+                              value={sessionUploadTitle}
+                              onChange={(event) => setSessionUploadTitle(event.target.value)}
+                              placeholder="Optional title"
+                            />
+                            <button
+                              type="button"
+                              className="button soft compact"
+                              onClick={() => void onUploadSessionFile()}
+                              disabled={sessionFilesBusy || !sessionUploadFile}
+                            >
+                              Attach
+                            </button>
+                          </div>
+                        </div>
+
+                        <div className="quick-open-card">
+                          <div className="session-files-subhead">
+                            <h3>Browse</h3>
+                            <div className="row">
+                              <label className="field inline">
+                                <span>Root</span>
+                                <select
+                                  data-testid="browser-root-select"
+                                  value={browserRoot}
+                                  onChange={(event) => setBrowserRoot(event.target.value)}
+                                >
+                                  {browserRoots.map((root) => (
+                                    <option key={root.id} value={root.id}>
+                                      {root.label}
+                                    </option>
+                                  ))}
+                                </select>
+                              </label>
+                              <button type="button" className="button soft compact" onClick={() => void onBrowseUp()}>
+                                Up
+                              </button>
+                              <button type="button" className="button soft compact" onClick={() => void refreshBrowser(browserRoot, browserState?.current_path || "")}>
+                                Refresh
+                              </button>
+                            </div>
+                          </div>
+                          <p className="small">
+                            {browserState?.display_path || "Loading browser..."}
+                          </p>
+                          {selectedBrowserEntry ? (
+                            <div className="session-path-pill">
+                              <strong>{selectedBrowserEntry.name}</strong>
+                              <span>{selectedBrowserEntry.wsl_path}</span>
+                            </div>
+                          ) : null}
+                          {lastCopiedSessionPath ? <p className="small">Copied path: <code>{lastCopiedSessionPath}</code></p> : null}
+                          {browserLoading ? <p className="small">Loading browser...</p> : null}
+                          {!browserLoading && (!browserState?.items || browserState.items.length === 0) ? (
+                            <div className="empty-state panel-empty">
+                              <h3>No items here</h3>
+                              <p>Select another root or move up a directory.</p>
+                            </div>
+                          ) : null}
+                          {!browserLoading && browserState?.items?.length ? (
+                            <div className="session-file-list" role="list" aria-label="Browser entries">
+                              {browserState.items.map((item) => {
+                                const selected = item.wsl_path === browserSelectedPath;
+                                return (
+                                  <div
+                                    key={item.wsl_path}
+                                    className={`session-file-item ${selected ? "selected" : ""}`}
+                                    role="button"
+                                    tabIndex={0}
+                                    onClick={() => setBrowserSelectedPath(item.wsl_path)}
+                                    onKeyDown={(event) => {
+                                      if (event.key === "Enter" || event.key === " ") {
+                                        event.preventDefault();
+                                        setBrowserSelectedPath(item.wsl_path);
+                                      }
+                                    }}
                                   >
-                                    Open
-                                  </button>
-                                  <button type="button" className="button soft compact" onClick={() => void onSendSharedToTelegram(item)} disabled={shareBusy}>
-                                    Send Telegram
-                                  </button>
-                                  <button type="button" className="button soft compact" onClick={() => void onCopyShareLink(item)}>
-                                    Copy Link
-                                  </button>
-                                  <button type="button" className="button danger compact" onClick={() => void onDeleteSharedFile(item.id)} disabled={shareBusy}>
-                                    Remove
-                                  </button>
-                                </div>
-                              </div>
-                            ))}
+                                    <div className="session-row">
+                                      <strong>{item.name}</strong>
+                                      <span className="badge muted">{item.kind}</span>
+                                    </div>
+                                    <p>{item.display_path}</p>
+                                    <small>{item.kind === "directory" ? "Folder path available to Codex" : formatFileSize(item.size_bytes)}</small>
+                                    <div className="row">
+                                      {item.kind === "directory" ? (
+                                        <button type="button" className="button soft compact" onClick={() => void onBrowseOpen(item)}>
+                                          Open
+                                        </button>
+                                      ) : null}
+                                      <button type="button" className="button soft compact" onClick={() => void onCopySessionPath(item)}>
+                                        Copy Path
+                                      </button>
+                                      <button type="button" className="button soft compact" onClick={() => onUseSessionPath(item)}>
+                                        Use Path
+                                      </button>
+                                      <button type="button" className="button soft compact" onClick={() => void onRegisterBrowserItem(item)} disabled={sessionFilesBusy}>
+                                        Attach
+                                      </button>
+                                    </div>
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          ) : null}
+                        </div>
+
+                        <div className="quick-open-card">
+                          <div className="session-files-subhead">
+                            <h3>Attached to {selectedSessionInfo.session}</h3>
+                            <button type="button" className="button soft compact" onClick={() => void refreshSessionFiles(selectedSessionInfo.session)}>
+                              Refresh
+                            </button>
                           </div>
-                        ) : null}
-                      </div>
-                    ) : null}
-
-                    <label className="field">
-                      <span>Live screen output</span>
-                      <pre ref={sessionOutputRef} className="console">{screenText || "(No screen output captured yet)"}</pre>
-                    </label>
-
-                    <div className="session-action-dock" data-testid="session-action-dock">
-                      <button
-                        type="button"
-                        className="button soft compact"
-                        data-short="REF"
-                        onClick={() => void refreshScreen(selectedSessionInfo.session)}
-                      >
-                        <span className="btn-text">Refresh</span>
-                      </button>
-                      <button type="button" className="button soft compact" data-short="ENT" onClick={() => void onSendEnter()} disabled={sessionBusy}>
-                        <span className="btn-text">Enter</span>
-                      </button>
-                      <button type="button" className="button soft compact" data-short="UP" onClick={() => void onSendArrowKey("up")} disabled={sessionBusy}>
-                        <span className="btn-text">Up</span>
-                      </button>
-                      <button type="button" className="button soft compact" data-short="DN" onClick={() => void onSendArrowKey("down")} disabled={sessionBusy}>
-                        <span className="btn-text">Down</span>
-                      </button>
-                      <button type="button" className="button soft compact" data-short="LT" onClick={() => void onSendArrowKey("left")} disabled={sessionBusy}>
-                        <span className="btn-text">Left</span>
-                      </button>
-                      <button type="button" className="button soft compact" data-short="RT" onClick={() => void onSendArrowKey("right")} disabled={sessionBusy}>
-                        <span className="btn-text">Right</span>
-                      </button>
-                      <button type="button" className="button warn compact" data-short="INT" onClick={() => void onInterrupt()} disabled={sessionBusy}>
-                        <span className="btn-text">Interrupt</span>
-                      </button>
-                      <button type="button" className="button danger compact" data-short="C^C" onClick={() => void onCtrlC()} disabled={sessionBusy}>
-                        <span className="btn-text">Ctrl+C</span>
-                      </button>
-                      <button type="button" className="button danger compact" data-short="CLS" onClick={() => void onCloseSession()} disabled={sessionBusy}>
-                        <span className="btn-text">Close</span>
-                      </button>
-                    </div>
-
-                    <div className="quick-open-card">
-                      <h3>Model Selection</h3>
-                      <p className="small">Defaults for new sessions. Apply to current session only when you choose.</p>
-                      <div className="row">
-                        <label className="field inline">
-                          <span>Model</span>
-                          <select
-                            data-testid="session-model-select"
-                            value={selectedModel}
-                            onChange={(event) => setSelectedModel(event.target.value)}
-                          >
-                            {modelOptions.map((model) => (
-                              <option key={model} value={model}>
-                                {model}
-                              </option>
-                            ))}
-                          </select>
-                        </label>
-                        <label className="field inline">
-                          <span>Reasoning</span>
-                          <select
-                            data-testid="session-reasoning-select"
-                            value={selectedReasoningEffort}
-                            onChange={(event) => setSelectedReasoningEffort(parseReasoningEffort(event.target.value))}
-                          >
-                            {sessionAllowedReasoningOptions.map((effort) => (
-                              <option key={effort} value={effort}>
-                                {effort}
-                              </option>
-                            ))}
-                          </select>
-                        </label>
-                        <button
-                          type="button"
-                          className="button soft compact"
-                          onClick={() => void onApplySessionProfile()}
-                          disabled={sessionBusy || !selectedSession}
-                        >
-                          Apply to Current Session
-                        </button>
-                      </div>
+                          {!telegramConfigured ? (
+                            <p className="small">Telegram is not configured yet. You can still attach and copy paths now.</p>
+                          ) : null}
+                          {sessionFilesLoading ? <p className="small">Loading session files...</p> : null}
+                          {!sessionFilesLoading && sessionFiles.length === 0 ? (
+                            <div className="empty-state panel-empty">
+                              <h3>No files attached</h3>
+                              <p>Upload a file or attach a path from the browser above.</p>
+                            </div>
+                          ) : null}
+                          {!sessionFilesLoading && sessionFiles.length > 0 ? (
+                            <div className="session-file-list" role="list" aria-label="Session files">
+                              {sessionFiles.map((item) => (
+                                <div key={item.id} className="session-file-item">
+                                  <div className="session-row">
+                                    <strong>{item.title || item.file_name}</strong>
+                                    <span className="badge muted">{item.item_kind || "file"}</span>
+                                  </div>
+                                  <p>{item.display_path || item.wsl_path}</p>
+                                  <small>
+                                    {item.source_kind || "registered"} | {item.item_kind === "directory" ? "folder" : formatFileSize(item.size_bytes)}
+                                  </small>
+                                  <div className="row">
+                                    <button type="button" className="button soft compact" onClick={() => void onCopySessionPath(item)}>
+                                      Copy Path
+                                    </button>
+                                    <button type="button" className="button soft compact" onClick={() => onUseSessionPath(item)}>
+                                      Use Path
+                                    </button>
+                                    {item.item_kind !== "directory" && item.download_url ? (
+                                      <button
+                                        type="button"
+                                        className="button soft compact"
+                                        onClick={() => window.open(item.download_url, "_blank", "noopener,noreferrer")}
+                                      >
+                                        Open
+                                      </button>
+                                    ) : null}
+                                    <button
+                                      type="button"
+                                      className="button soft compact"
+                                      onClick={() => void onSendSessionFileRowToTelegram(item)}
+                                      disabled={sessionFilesBusy || !telegramConfigured || item.item_kind === "directory"}
+                                    >
+                                      Send via Telegram
+                                    </button>
+                                    <button
+                                      type="button"
+                                      className="button danger compact"
+                                      onClick={() => void onDeleteSessionFileRow(item)}
+                                      disabled={sessionFilesBusy}
+                                    >
+                                      {item.source_kind === "upload" ? "Delete" : "Detach"}
+                                    </button>
+                                  </div>
+                                </div>
+                              ))}
+                            </div>
+                          ) : null}
+                        </div>
+                      </aside>
                     </div>
                   </>
                 )}
@@ -4225,7 +4697,7 @@ export default function App() {
                       <span>Live Session Snapshot</span>
                       <pre className="console">
                         {activeThread.session && activeThread.session === selectedSession
-                          ? screenText || "(No live output yet)"
+                          ? sessionTranscriptText || "(No live output yet)"
                           : "Open this session in Sessions tab to stream live output."}
                       </pre>
                     </label>
@@ -4374,6 +4846,100 @@ export default function App() {
                       <p>Tap capture to preview `/shot` output here.</p>
                     </div>
                   )}
+                </div>
+
+                <div className="debug-block" data-testid="power-card">
+                  <div className="session-files-head">
+                    <div>
+                      <h3>Power Control</h3>
+                      <p className="small">Shutdown controls live here. True boot-from-off is routed through the wake relay and Telegram.</p>
+                    </div>
+                    <button type="button" className="button soft compact" onClick={() => void refreshPowerStatus()} disabled={powerBusy}>
+                      Refresh Power
+                    </button>
+                  </div>
+                  <div className="row">
+                    <span className="badge">{powerStatus?.online ? "host: online" : "host: unknown"}</span>
+                    <span className="badge muted">{powerRelayBadge}</span>
+                  </div>
+                  <p className="small">{powerStatus?.relay_detail || "Wake relay diagnostics are not available yet."}</p>
+                  <div className="remote-power-grid">
+                    {(powerStatus?.actions || []).map((actionName) => {
+                      const powerAction = actionName as PowerActionName;
+                      return (
+                        <button
+                          key={powerAction}
+                          type="button"
+                          className={`button compact ${powerAction === "shutdown" || powerAction === "restart" ? "warn" : "soft"}`}
+                          data-testid={`power-action-${powerAction}`}
+                          onClick={() => void onRequestPowerAction(powerAction)}
+                          disabled={powerBusy}
+                        >
+                          {POWER_ACTION_LABELS[powerAction]}
+                        </button>
+                      );
+                    })}
+                  </div>
+                  {powerConfirmAction && powerConfirmToken ? (
+                    <div className="power-confirm-banner" data-testid="power-confirm-banner">
+                      <strong>Confirm {POWER_ACTION_LABELS[powerConfirmAction]}</strong>
+                      <span>This action is armed for {powerConfirmExpiresIn}s.</span>
+                      <div className="row">
+                        <button
+                          type="button"
+                          className="button warn compact"
+                          data-testid="power-confirm-accept"
+                          onClick={() => void onRequestPowerAction(powerConfirmAction, powerConfirmToken)}
+                          disabled={powerBusy}
+                        >
+                          Confirm {POWER_ACTION_LABELS[powerConfirmAction]}
+                        </button>
+                        <button
+                          type="button"
+                          className="button soft compact"
+                          data-testid="power-confirm-cancel"
+                          onClick={onCancelPowerConfirmation}
+                          disabled={powerBusy}
+                        >
+                          Cancel
+                        </button>
+                      </div>
+                    </div>
+                  ) : null}
+                  <div className="remote-power-diagnostics">
+                    <label className="field">
+                      <span>Wake Instruction</span>
+                      <div className="row">
+                        <input type="text" readOnly value={powerWakeInstruction} />
+                        <button
+                          type="button"
+                          className="button soft compact"
+                          onClick={() => void onCopyPowerValue(powerWakeInstruction, "Wake instruction")}
+                        >
+                          Copy
+                        </button>
+                      </div>
+                    </label>
+                    <label className="field">
+                      <span>Primary MAC</span>
+                      <div className="row">
+                        <input type="text" readOnly value={powerStatus?.primary_mac || netInfo?.primary_mac || ""} />
+                        <button
+                          type="button"
+                          className="button soft compact"
+                          onClick={() => void onCopyPowerValue(powerStatus?.primary_mac || netInfo?.primary_mac || "", "Primary MAC")}
+                        >
+                          Copy
+                        </button>
+                      </div>
+                    </label>
+                    <p className="small">
+                      Wake candidates: <strong>{(powerStatus?.wake_candidate_macs || netInfo?.wake_candidate_macs || []).join(", ") || "n/a"}</strong>
+                    </p>
+                    <p className="small">
+                      Wake surface: <strong>{powerStatus?.wake_surface || "telegram"}</strong>. Use <strong>{powerWakeInstruction}</strong> from the dedicated wake bot when the laptop is off.
+                    </p>
+                  </div>
                 </div>
               </div>
             </div>

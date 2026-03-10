@@ -10,25 +10,50 @@ function Coalesce-Value($Value, $Default) {
   return $Value
 }
 
+function Get-CodrexRuntimeDir {
+  param(
+    [string]$RepoRoot
+  )
+  $override = [string]$env:CODEX_RUNTIME_DIR
+  if ($override -and $override.Trim()) {
+    return $override.Trim()
+  }
+  $localAppData = [string]$env:LocalAppData
+  if ($localAppData -and $localAppData.Trim()) {
+    return (Join-Path $localAppData "Codrex\remote-ui")
+  }
+  return (Join-Path $RepoRoot ".runtime")
+}
+
 function Read-ControllerConfig([string]$Root) {
   $path = Join-Path $Root "controller.config.json"
-  if (-not (Test-Path $path)) {
-    return [pscustomobject]@{
-      port = 8787
-      token = ""
-    }
+  $runtimeDir = Get-CodrexRuntimeDir -RepoRoot $Root
+  $localConfigPath = Join-Path (Join-Path $runtimeDir "state") "controller.config.local.json"
+  $legacyLocalConfigPath = Join-Path $Root "controller.config.local.json"
+  $cfg = [ordered]@{
+    port = 8787
+    token = ""
   }
-  try {
-    $raw = Get-Content -Path $path -Raw
-    if (-not $raw.Trim()) { throw "Empty config" }
-    $cfg = $raw | ConvertFrom-Json
-    return $cfg
-  } catch {
-    return [pscustomobject]@{
-      port = 8787
-      token = ""
-    }
+  if (Test-Path $path) {
+    try {
+      $raw = Get-Content -Path $path -Raw
+      if ($raw.Trim()) {
+        $loaded = $raw | ConvertFrom-Json
+        if ($loaded -and $loaded.port) { $cfg.port = [int]$loaded.port }
+        if ($loaded -and $loaded.token) { $cfg.token = [string]$loaded.token }
+      }
+    } catch {}
   }
+  foreach ($overridePath in @($localConfigPath, $legacyLocalConfigPath)) {
+    if (-not (Test-Path $overridePath)) { continue }
+    try {
+      $loadedLocal = Get-Content -Path $overridePath -Raw | ConvertFrom-Json
+      if ($loadedLocal -and $loadedLocal.port) { $cfg.port = [int]$loadedLocal.port }
+      if ($loadedLocal -and $loadedLocal.token) { $cfg.token = [string]$loadedLocal.token }
+      break
+    } catch {}
+  }
+  return [pscustomobject]$cfg
 }
 
 function Get-LanIPv4 {
@@ -588,7 +613,7 @@ $pairOutLayout.Controls.Add($lblPairStatus, 0, 1)
 $pairOutLayout.SetColumnSpan($lblPairStatus, 2)
 
 $footer = New-Object System.Windows.Forms.Label
-$footer.Text = "Launcher reads controller.config.json for port/token and route defaults."
+$footer.Text = "Launcher reads controller.config.json plus the runtime token file for port/token and route defaults."
 $footer.Dock = "Fill"
 $footer.TextAlign = "MiddleLeft"
 $left.Controls.Add($footer, 0, 5)

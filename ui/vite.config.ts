@@ -80,6 +80,15 @@ export default defineConfig({
   },
   test: {
     environment: "jsdom",
-    setupFiles: ["./src/test-setup.ts"]
+    setupFiles: ["./src/test-setup.ts"],
+    include: ["src/**/*.test.ts", "src/**/*.test.tsx", "src/**/*.spec.ts", "src/**/*.spec.tsx"],
+    exclude: [
+      "e2e/**",
+      "playwright.config.*",
+      "test-results/**",
+      "playwright-report/**",
+      "e2e/**/*.spec.ts",
+      "e2e/**/*.spec.tsx",
+    ],
   }
 });

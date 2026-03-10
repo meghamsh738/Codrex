@@ -43,6 +43,11 @@ def _install_fastapi_stubs():
                 return fn
             return decorator
 
+        def websocket(self, *args, **kwargs):
+            def decorator(fn):
+                return fn
+            return decorator
+
         def middleware(self, *args, **kwargs):
             def decorator(fn):
                 return fn
@@ -57,13 +62,36 @@ def _install_fastapi_stubs():
             self.cookies = {}
             self.url = SimpleNamespace(path="/")
 
+    class DummyWebSocket:
+        def __init__(self, *args, **kwargs):
+            self.headers = {}
+            self.cookies = {}
+            self.query_params = {}
+
+        async def accept(self):
+            return None
+
+        async def send_json(self, *_args, **_kwargs):
+            return None
+
+        async def close(self, *_args, **_kwargs):
+            return None
+
+    class DummyHTTPException(Exception):
+        def __init__(self, status_code=400, detail="error", *args, **kwargs):
+            super().__init__(detail)
+            self.status_code = status_code
+            self.detail = detail
+
     fastapi.FastAPI = DummyFastAPI
-    fastapi.HTTPException = Exception
+    fastapi.HTTPException = DummyHTTPException
     fastapi.Body = _identity
     fastapi.UploadFile = object
     fastapi.File = _identity
     fastapi.Form = _identity
     fastapi.Request = DummyRequest
+    fastapi.WebSocket = DummyWebSocket
+    fastapi.WebSocketDisconnect = Exception
 
     responses.HTMLResponse = DummyResponse
     responses.Response = DummyResponse
@@ -737,6 +765,8 @@ class CodexSessionConfigTests(unittest.TestCase):
             title="Result",
             expires_hours=24,
             created_by="session:codex_demo",
+            session="codex_demo",
+            source_kind="command",
         )
         send_mock.assert_not_called()
 
@@ -1069,10 +1099,28 @@ class SharedOutboxTests(unittest.TestCase):
             with mock.patch.object(server_mod, "SHARED_OUTBOX_FILE", str(outbox)), \
                  mock.patch.object(server_mod, "SHARED_OUTBOX_LOADED", False), \
                  mock.patch.object(server_mod, "SHARED_OUTBOX_DATA", {"version": 1, "items": []}), \
-                 mock.patch.object(server_mod, "_resolve_wsl_path", return_value=str(fake_png)), \
+                 mock.patch.object(server_mod, "_resolve_session_access_path", return_value=str(fake_png)), \
                  mock.patch.object(server_mod, "_wsl_unc_path", return_value=str(fake_png)):
                 item = server_mod._create_shared_outbox_item(str(fake_png), title="", expires_hours=24, created_by="test")
         self.assertEqual(item["mime_type"], "application/pdf")
+        self.assertFalse(item["is_image"])
+
+    def test_create_shared_item_keeps_docx_mime_for_zip_container(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_docx = Path(tmp) / "draft.docx"
+            # DOCX files are ZIP containers and begin with PK.
+            fake_docx.write_bytes(b"PK\x03\x04\x14\x00\x00\x00\x08\x00")
+            outbox = Path(tmp) / "shared-outbox.json"
+            with mock.patch.object(server_mod, "SHARED_OUTBOX_FILE", str(outbox)), \
+                 mock.patch.object(server_mod, "SHARED_OUTBOX_LOADED", False), \
+                 mock.patch.object(server_mod, "SHARED_OUTBOX_DATA", {"version": 1, "items": []}), \
+                 mock.patch.object(server_mod, "_resolve_session_access_path", return_value=str(fake_docx)), \
+                 mock.patch.object(server_mod, "_wsl_unc_path", return_value=str(fake_docx)):
+                item = server_mod._create_shared_outbox_item(str(fake_docx), title="", expires_hours=24, created_by="test")
+        self.assertEqual(
+            item["mime_type"],
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        )
         self.assertFalse(item["is_image"])
 
     def test_telegram_send_corrects_mime_and_filename_from_content(self):
@@ -1110,6 +1158,46 @@ class SharedOutboxTests(unittest.TestCase):
         self.assertTrue(out["mime_corrected"])
         self.assertEqual(out["mime_type"], "application/pdf")
         self.assertTrue(str(out["file_name"]).endswith(".pdf"))
+
+    def test_telegram_send_keeps_docx_mime_for_zip_container(self):
+        class _DummyResp:
+            def __init__(self, body: bytes):
+                self.status = 200
+                self._body = body
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return self._body
+
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_docx = Path(tmp) / "draft.docx"
+            # DOCX files are ZIP containers and begin with PK.
+            fake_docx.write_bytes(b"PK\x03\x04\x14\x00\x00\x00\x08\x00")
+            item = {
+                "id": "shr_docx",
+                "title": "Draft",
+                "file_name": "draft.docx",
+                "mime_type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                "wsl_path": "/home/megha/codrex-work/output/draft.docx",
+            }
+            with mock.patch.object(server_mod, "TELEGRAM_BOT_TOKEN", "123:abc"), \
+                 mock.patch.object(server_mod, "_telegram_resolve_chat_id", return_value="12345"), \
+                 mock.patch.object(server_mod, "_resolve_wsl_path", return_value=str(fake_docx)), \
+                 mock.patch.object(server_mod, "_wsl_unc_path", return_value=str(fake_docx)), \
+                 mock.patch.object(server_mod.urllib.request, "urlopen", return_value=_DummyResp(b'{"ok":true,"result":{"message_id":9}}')):
+                out = server_mod._telegram_send_shared_item(item)
+        self.assertTrue(out["ok"])
+        self.assertFalse(out["mime_corrected"])
+        self.assertEqual(
+            out["mime_type"],
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        )
+        self.assertTrue(str(out["file_name"]).endswith(".docx"))
 
     def test_parse_telegram_secret_text(self):
         raw = """
@@ -1464,6 +1552,156 @@ class ThreadStoreTests(unittest.TestCase):
 
                 snap = server_mod.threads_store_get()
                 self.assertEqual(len(snap["messages"].get(tid, [])), 1)
+
+
+class SessionFilesTests(unittest.TestCase):
+    def _reset_session_files_store(self):
+        server_mod.SESSION_FILES_LOADED = False
+        server_mod.SESSION_FILES_DATA = {"items": []}
+
+    def test_public_session_file_item_uses_session_download_route(self):
+        item = {
+            "id": "sf_demo",
+            "session": "codex_demo",
+            "title": "Result",
+            "wsl_path": "/home/megha/codrex-work/.remote_uploads/codex_demo/result.txt",
+            "file_name": "result.txt",
+            "mime_type": "text/plain",
+            "size_bytes": 12,
+            "created_at": 1,
+            "expires_at": 2,
+            "created_by": "session:codex_demo",
+            "is_image": False,
+            "item_kind": "file",
+            "source_kind": "upload",
+            "windows_path": r"C:\result.txt",
+            "display_path": r"C:\result.txt",
+        }
+
+        public = server_mod._public_session_file_item("codex_demo", item)
+        self.assertIsNotNone(public)
+        self.assertEqual(
+            public["download_url"],
+            "/codex/session/codex_demo/files/sf_demo/download",
+        )
+
+    def test_session_file_delete_removes_managed_upload_source(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "result.txt"
+            source.write_text("hello", encoding="utf-8")
+            item = {
+                "id": "sf_demo",
+                "session": "codex_demo",
+                "title": "Result",
+                "wsl_path": "/home/megha/codrex-work/.remote_uploads/codex_demo/result.txt",
+                "file_name": "result.txt",
+                "mime_type": "text/plain",
+                "size_bytes": source.stat().st_size,
+                "created_at": 1,
+                "expires_at": 9999999999999,
+                "created_by": "session:codex_demo",
+                "is_image": False,
+                "item_kind": "file",
+                "source_kind": "upload",
+                "windows_path": r"C:\result.txt",
+                "display_path": r"C:\result.txt",
+            }
+            self._reset_session_files_store()
+            server_mod.SESSION_FILES_LOADED = True
+            server_mod.SESSION_FILES_DATA = {"items": [item]}
+
+            with mock.patch.object(server_mod, "_wsl_unc_path", return_value=str(source)):
+                result = server_mod.codex_session_files_delete("codex_demo", "sf_demo")
+
+            self.assertTrue(result["ok"])
+            self.assertTrue(result["deleted_source"])
+            self.assertFalse(source.exists())
+            self.assertEqual(server_mod.SESSION_FILES_DATA["items"], [])
+
+
+class PowerControlTests(unittest.TestCase):
+    def test_net_info_includes_wake_mac_fields(self):
+        with mock.patch.object(server_mod, "guess_lan_ipv4", return_value="192.168.1.15"), \
+             mock.patch.object(server_mod, "get_tailscale_ipv4", return_value="100.64.0.9"), \
+             mock.patch.object(server_mod, "_wake_mac_info", return_value={
+                 "primary_mac": "AA:BB:CC:DD:EE:FF",
+                 "wake_candidate_macs": ["AA:BB:CC:DD:EE:FF"],
+                 "wake_supported": True,
+             }):
+            out = server_mod.net_info()
+
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["primary_mac"], "AA:BB:CC:DD:EE:FF")
+        self.assertEqual(out["wake_candidate_macs"], ["AA:BB:CC:DD:EE:FF"])
+        self.assertTrue(out["wake_supported"])
+
+    def test_power_status_reports_relay_health(self):
+        with mock.patch.object(server_mod.os, "name", "nt"), \
+             mock.patch.object(server_mod, "_ensure_windows_host"), \
+             mock.patch.object(server_mod, "_wake_mac_info", return_value={
+                 "primary_mac": "AA:BB:CC:DD:EE:FF",
+                 "wake_candidate_macs": ["AA:BB:CC:DD:EE:FF"],
+                 "wake_supported": True,
+             }), \
+             mock.patch.object(server_mod, "_wake_relay_health", return_value={
+                 "configured": True,
+                 "reachable": True,
+                 "detail": "relay_online",
+                 "wake_surface": "telegram",
+                 "wake_command": "/wake",
+             }):
+            out = server_mod.power_status()
+
+        self.assertTrue(out["ok"])
+        self.assertTrue(out["relay_reachable"])
+        self.assertEqual(out["wake_command"], "/wake")
+        self.assertEqual(out["wake_instruction"], "/wake laptop")
+        self.assertEqual(out["wake_surface"], "telegram")
+        self.assertIn("shutdown", out["actions"])
+
+    def test_power_action_requires_confirmation_for_shutdown(self):
+        with mock.patch.object(server_mod, "_ensure_windows_host"), \
+             mock.patch.object(server_mod, "_create_power_confirmation", return_value={
+                 "confirm_required": True,
+                 "confirm_token": "tok_123",
+                 "confirm_expires_in": 60,
+             }) as confirm_mock, \
+             mock.patch.object(server_mod, "_schedule_power_action") as schedule_mock:
+            out = server_mod.power_action({"action": "shutdown"})
+
+        self.assertFalse(out["ok"])
+        self.assertEqual(out["error"], "confirmation_required")
+        self.assertEqual(out["confirm_token"], "tok_123")
+        confirm_mock.assert_called_once_with("shutdown")
+        schedule_mock.assert_not_called()
+
+    def test_power_action_accepts_valid_confirmation(self):
+        with mock.patch.object(server_mod, "_ensure_windows_host"), \
+             mock.patch.object(server_mod, "_consume_power_confirmation", return_value=True) as consume_mock, \
+             mock.patch.object(server_mod, "_schedule_power_action", return_value={
+                 "ok": True,
+                 "action": "restart",
+                 "accepted": True,
+             }) as schedule_mock:
+            out = server_mod.power_action({"action": "restart", "confirm_token": "tok_123"})
+
+        self.assertTrue(out["ok"])
+        self.assertTrue(out["accepted"])
+        consume_mock.assert_called_once_with("restart", "tok_123")
+        schedule_mock.assert_called_once_with("restart")
+
+    def test_power_action_lock_skips_confirmation(self):
+        with mock.patch.object(server_mod, "_ensure_windows_host"), \
+             mock.patch.object(server_mod, "_schedule_power_action", return_value={
+                 "ok": True,
+                 "action": "lock",
+                 "accepted": True,
+             }) as schedule_mock:
+            out = server_mod.power_action({"action": "lock"})
+
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["action"], "lock")
+        schedule_mock.assert_called_once_with("lock")
 
 
 if __name__ == "__main__":

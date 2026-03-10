@@ -11,6 +11,7 @@ vi.mock("../api", async (importOriginal) => {
     buildDesktopStreamUrl: vi.fn(() => "/desktop/stream?fps=3&level=3"),
     buildPairConsumeUrl: vi.fn(() => "http://controller/auth/pair/consume?code=abc123"),
     buildPairQrPngUrl: vi.fn(() => "http://controller/auth/pair/qr.png?data=abc123"),
+    buildSessionStreamUrl: vi.fn(() => "ws://controller/codex/session/codex_demo/ws?profile=balanced"),
     buildScreenshotUrl: vi.fn(() => "/shot?ts=1"),
     buildSuggestedControllerUrl: vi.fn(() => "http://127.0.0.1:8787"),
     buildWslDownloadUrl: vi.fn(() => "/wsl/file?path=/tmp/demo.txt"),
@@ -18,10 +19,10 @@ vi.mock("../api", async (importOriginal) => {
     closeSession: vi.fn(),
     closeTmuxSession: vi.fn(),
     createPairCode: vi.fn(),
-    createSharedFile: vi.fn(),
     createSessionWithOptions: vi.fn(),
     createTmuxSession: vi.fn(),
     ctrlcSession: vi.fn(),
+    deleteSessionFile: vi.fn(),
     desktopClick: vi.fn(),
     desktopScroll: vi.fn(),
     desktopSendKey: vi.fn(),
@@ -33,7 +34,9 @@ vi.mock("../api", async (importOriginal) => {
     getCodexRuns: vi.fn(),
     getDesktopInfo: vi.fn(),
     getNetInfo: vi.fn(),
+    getPowerStatus: vi.fn(),
     getTelegramStatus: vi.fn(),
+    listBrowseEntries: vi.fn(),
     getSessionScreen: vi.fn(),
     getSessions: vi.fn(),
     getThreadStore: vi.fn(),
@@ -42,24 +45,27 @@ vi.mock("../api", async (importOriginal) => {
     getTmuxPanes: vi.fn(),
     interruptPane: vi.fn(),
     interruptSession: vi.fn(),
+    listSessionFiles: vi.fn(),
     login: vi.fn(),
     logout: vi.fn(),
-    listSharedFiles: vi.fn(),
     reportIpcEvent: vi.fn(),
-    sendSharedFileToTelegram: vi.fn(),
-    sendTelegramText: vi.fn(),
-    deleteSharedFile: vi.fn(),
+    registerSessionFile: vi.fn(),
+    sendSessionFileToTelegram: vi.fn(),
     sendSessionImage: vi.fn(),
+    sendTelegramText: vi.fn(),
+    sendPowerAction: vi.fn(),
     addThreadRecordMessage: vi.fn(),
     createThreadRecord: vi.fn(),
     deleteThreadRecord: vi.fn(),
     sendSessionKey: vi.fn(),
+    sendToPaneKey: vi.fn(),
     sendToPane: vi.fn(),
     sendToSession: vi.fn(),
     setDesktopMode: vi.fn(),
     setIpcObserver: vi.fn(),
     startCodexExec: vi.fn(),
     updateThreadRecord: vi.fn(),
+    uploadSessionFile: vi.fn(),
     uploadWslFile: vi.fn(),
   };
 });
@@ -72,12 +78,13 @@ const getNetInfoMock = vi.mocked(api.getNetInfo);
 const getTelegramStatusMock = vi.mocked(api.getTelegramStatus);
 const getSessionsMock = vi.mocked(api.getSessions);
 const getSessionScreenMock = vi.mocked(api.getSessionScreen);
+const listBrowseEntriesMock = vi.mocked(api.listBrowseEntries);
+const listSessionFilesMock = vi.mocked(api.listSessionFiles);
 const getThreadStoreMock = vi.mocked(api.getThreadStore);
 const createSessionMock = vi.mocked(api.createSessionWithOptions);
-const createSharedFileMock = vi.mocked(api.createSharedFile);
-const deleteSharedFileMock = vi.mocked(api.deleteSharedFile);
-const listSharedFilesMock = vi.mocked(api.listSharedFiles);
-const sendSharedFileToTelegramMock = vi.mocked(api.sendSharedFileToTelegram);
+const registerSessionFileMock = vi.mocked(api.registerSessionFile);
+const deleteSessionFileMock = vi.mocked(api.deleteSessionFile);
+const sendSessionFileToTelegramMock = vi.mocked(api.sendSessionFileToTelegram);
 const createThreadRecordMock = vi.mocked(api.createThreadRecord);
 const updateThreadRecordMock = vi.mocked(api.updateThreadRecord);
 const deleteThreadRecordMock = vi.mocked(api.deleteThreadRecord);
@@ -95,6 +102,7 @@ const getTmuxHealthMock = vi.mocked(api.getTmuxHealth);
 const getTmuxPanesMock = vi.mocked(api.getTmuxPanes);
 const getTmuxPaneScreenMock = vi.mocked(api.getTmuxPaneScreen);
 const getDesktopInfoMock = vi.mocked(api.getDesktopInfo);
+const getPowerStatusMock = vi.mocked(api.getPowerStatus);
 const setDesktopModeMock = vi.mocked(api.setDesktopMode);
 const desktopClickMock = vi.mocked(api.desktopClick);
 const desktopScrollMock = vi.mocked(api.desktopScroll);
@@ -103,12 +111,15 @@ const desktopSendKeyMock = vi.mocked(api.desktopSendKey);
 const createTmuxSessionMock = vi.mocked(api.createTmuxSession);
 const closeTmuxSessionMock = vi.mocked(api.closeTmuxSession);
 const sendToPaneMock = vi.mocked(api.sendToPane);
+const sendToPaneKeyMock = vi.mocked(api.sendToPaneKey);
 const interruptPaneMock = vi.mocked(api.interruptPane);
 const closeSessionMock = vi.mocked(api.closeSession);
 const sendSessionImageMock = vi.mocked(api.sendSessionImage);
+const sendPowerActionMock = vi.mocked(api.sendPowerAction);
+const uploadSessionFileMock = vi.mocked(api.uploadSessionFile);
 const startCodexExecMock = vi.mocked(api.startCodexExec);
-const uploadWslFileMock = vi.mocked(api.uploadWslFile);
 const setIpcObserverMock = vi.mocked(api.setIpcObserver);
+const uploadWslFileMock = vi.mocked(api.uploadWslFile);
 
 function setupDefaultMocks(): void {
   window.localStorage.removeItem("codrex.ui.controller_base.v1");
@@ -159,13 +170,33 @@ function setupDefaultMocks(): void {
     ok: true,
     text: "",
   });
-  listSharedFilesMock.mockResolvedValue({
+  listSessionFilesMock.mockResolvedValue({
     ok: true,
     items: [],
   });
-  sendSharedFileToTelegramMock.mockResolvedValue({
+  sendSessionFileToTelegramMock.mockResolvedValue({
     ok: true,
     detail: "Sent to Telegram.",
+  });
+  listBrowseEntriesMock.mockResolvedValue({
+    ok: true,
+    root: {
+      id: "workspace",
+      label: "Workspace",
+      path: "/home/megha/codrex-work",
+    },
+    roots: [
+      {
+        id: "workspace",
+        label: "Workspace",
+        path: "/home/megha/codrex-work",
+      },
+    ],
+    current_path: "/home/megha/codrex-work",
+    current_relative_path: "",
+    display_path: "/home/megha/codrex-work",
+    windows_path: "",
+    items: [],
   });
   getThreadStoreMock.mockResolvedValue({
     ok: true,
@@ -190,13 +221,28 @@ function setupDefaultMocks(): void {
     width: 0,
     height: 0,
   });
+  getPowerStatusMock.mockResolvedValue({
+    ok: true,
+    online: true,
+    actions: ["lock", "sleep", "hibernate", "restart", "shutdown"],
+    confirm_required_actions: ["sleep", "hibernate", "restart", "shutdown"],
+    wake_surface: "telegram",
+    wake_command: "/wake",
+    wake_instruction: "/wake laptop",
+    wake_relay_configured: true,
+    relay_reachable: true,
+    relay_detail: "Relay reachable.",
+    primary_mac: "AA:BB:CC:DD:EE:FF",
+    wake_candidate_macs: ["AA:BB:CC:DD:EE:FF"],
+    wake_supported: true,
+  });
 
   createSessionMock.mockResolvedValue({ ok: true, session: "dev-main" });
-  createSharedFileMock.mockResolvedValue({
+  registerSessionFileMock.mockResolvedValue({
     ok: true,
     item: {
-      id: "shr_1",
-      title: "Shared",
+      id: "sf_1",
+      title: "Attached",
       file_name: "demo.png",
       mime_type: "image/png",
       size_bytes: 1024,
@@ -205,10 +251,10 @@ function setupDefaultMocks(): void {
       created_by: "session:codex_demo",
       is_image: true,
       wsl_path: "/home/megha/codrex-work/demo.png",
-      download_url: "/share/file/shr_1",
+      download_url: "/codex/session/codex_demo/files/sf_1/download",
     },
   });
-  deleteSharedFileMock.mockResolvedValue({ ok: true });
+  deleteSessionFileMock.mockResolvedValue({ ok: true });
   loginMock.mockResolvedValue({ ok: true });
   bootstrapLocalAuthMock.mockResolvedValue({
     ok: false,
@@ -230,9 +276,11 @@ function setupDefaultMocks(): void {
   createTmuxSessionMock.mockResolvedValue({ ok: true });
   closeTmuxSessionMock.mockResolvedValue({ ok: true });
   sendToPaneMock.mockResolvedValue({ ok: true });
+  sendToPaneKeyMock.mockResolvedValue({ ok: true });
   interruptPaneMock.mockResolvedValue({ ok: true });
   closeSessionMock.mockResolvedValue({ ok: true });
   sendSessionImageMock.mockResolvedValue({ ok: true });
+  uploadSessionFileMock.mockResolvedValue({ ok: true, item: undefined });
   startCodexExecMock.mockResolvedValue({ ok: true, id: "run-2" });
   uploadWslFileMock.mockResolvedValue({ ok: true, saved_path: "/tmp/uploaded.txt" });
   setIpcObserverMock.mockImplementation(() => {});
@@ -350,6 +398,48 @@ describe("app shell tabs", () => {
     expect(screen.queryByRole("button", { name: "Send Telegram" })).not.toBeInTheDocument();
   });
 
+  it("arms and confirms destructive power actions from remote tab", async () => {
+    sendPowerActionMock
+      .mockResolvedValueOnce({
+        ok: false,
+        action: "shutdown",
+        error: "confirmation_required",
+        detail: "Confirm shutdown before it is sent to the host.",
+        confirm_required: true,
+        confirm_token: "tok_123",
+        confirm_expires_in: 30,
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        action: "shutdown",
+        accepted: true,
+        detail: "Power action scheduled.",
+      });
+
+    render(<App />);
+
+    fireEvent.click(await screen.findByTestId("tab-remote"));
+    expect(await screen.findByTestId("power-card")).toBeInTheDocument();
+    expect(screen.getByDisplayValue("/wake laptop")).toBeInTheDocument();
+    expect(screen.getByDisplayValue("AA:BB:CC:DD:EE:FF")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId("power-action-shutdown"));
+
+    const confirmBanner = await screen.findByTestId("power-confirm-banner");
+    expect(confirmBanner).toHaveTextContent("Confirm Shutdown");
+
+    fireEvent.click(screen.getByTestId("power-confirm-accept"));
+
+    await waitFor(() => {
+      expect(sendPowerActionMock).toHaveBeenNthCalledWith(1, "shutdown", undefined);
+      expect(sendPowerActionMock).toHaveBeenNthCalledWith(2, "shutdown", { confirm_token: "tok_123" });
+    });
+
+    await waitFor(() => {
+      expect(screen.queryByTestId("power-confirm-banner")).not.toBeInTheDocument();
+    });
+  });
+
   it("creates a session from sessions tab", async () => {
     render(<App />);
 
@@ -366,6 +456,31 @@ describe("app shell tabs", () => {
         cwd: "",
         model: "gpt-5-codex",
         reasoning_effort: "high",
+      });
+    });
+  });
+
+  it("starts resume-last session from sessions tab", async () => {
+    createSessionMock.mockResolvedValueOnce({
+      ok: true,
+      session: "codex_resume_demo",
+      resume_last: true,
+    });
+    render(<App />);
+    await screen.findByTestId("tab-panel-sessions");
+
+    fireEvent.change(screen.getByTestId("new-session-input"), {
+      target: { value: "resume-session" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Resume Last" }));
+
+    await waitFor(() => {
+      expect(createSessionMock).toHaveBeenCalledWith({
+        name: "resume-session",
+        cwd: "",
+        model: "gpt-5-codex",
+        reasoning_effort: "high",
+        resume_last: true,
       });
     });
   });
@@ -550,7 +665,7 @@ describe("app shell tabs", () => {
     });
   });
 
-  it("creates a shared file from sessions panel", async () => {
+  it("attaches a browser path to the selected session", async () => {
     getSessionsMock.mockResolvedValue({
       ok: true,
       sessions: [
@@ -562,35 +677,57 @@ describe("app shell tabs", () => {
           state: "idle",
           updated_at: Date.now(),
           snippet: "",
+        },
+      ],
+    });
+    listBrowseEntriesMock.mockResolvedValue({
+      ok: true,
+      root: {
+        id: "workspace",
+        label: "Workspace",
+        path: "/home/megha/codrex-work",
+      },
+      roots: [
+        {
+          id: "workspace",
+          label: "Workspace",
+          path: "/home/megha/codrex-work",
+        },
+      ],
+      current_path: "/home/megha/codrex-work",
+      current_relative_path: "",
+      display_path: "/home/megha/codrex-work",
+      windows_path: "",
+      items: [
+        {
+          name: "result.png",
+          kind: "file",
+          display_path: "/home/megha/codrex-work/output/result.png",
+          wsl_path: "/home/megha/codrex-work/output/result.png",
+          windows_path: "",
+          size_bytes: 1024,
+          mtime: Date.now(),
         },
       ],
     });
 
     render(<App />);
-    await screen.findByTestId("shared-files-card");
+    const panel = await screen.findByTestId("session-files-panel");
+    const itemCard = within(panel).getByText("/home/megha/codrex-work/output/result.png").closest(".session-file-item");
+    expect(itemCard).not.toBeNull();
 
-    fireEvent.change(screen.getByTestId("share-path-input"), {
-      target: { value: "/home/megha/codrex-work/output/result.png" },
-    });
-    fireEvent.change(screen.getByTestId("share-title-input"), {
-      target: { value: "Result Plot" },
-    });
-    fireEvent.change(screen.getByTestId("share-expiry-select"), {
-      target: { value: "72" },
-    });
-    fireEvent.click(screen.getByRole("button", { name: "Share Now" }));
+    fireEvent.click(within(itemCard as HTMLElement).getByRole("button", { name: "Attach" }));
 
     await waitFor(() => {
-      expect(createSharedFileMock).toHaveBeenCalledWith({
+      expect(registerSessionFileMock).toHaveBeenCalledWith("codex_demo", {
         path: "/home/megha/codrex-work/output/result.png",
-        title: "Result Plot",
-        expires_hours: 72,
-        created_by: "session:codex_demo",
+        title: "result.png",
+        allow_directory: false,
       });
     });
   });
 
-  it("sends a shared file to telegram from the inbox", async () => {
+  it("sends a session file to telegram from the session files panel", async () => {
     getSessionsMock.mockResolvedValue({
       ok: true,
       sessions: [
@@ -605,11 +742,15 @@ describe("app shell tabs", () => {
         },
       ],
     });
-    listSharedFilesMock.mockResolvedValue({
+    getTelegramStatusMock.mockResolvedValueOnce({
+      ok: true,
+      configured: true,
+    });
+    listSessionFilesMock.mockResolvedValue({
       ok: true,
       items: [
         {
-          id: "shr_abc",
+          id: "sf_abc",
           title: "Result Plot",
           file_name: "result.png",
           mime_type: "image/png",
@@ -619,22 +760,23 @@ describe("app shell tabs", () => {
           created_by: "session:codex_demo",
           is_image: true,
           wsl_path: "/home/megha/codrex-work/output/result.png",
-          download_url: "/share/file/shr_abc",
+          download_url: "/codex/session/codex_demo/files/sf_abc/download",
         },
       ],
     });
 
     render(<App />);
-    await screen.findByTestId("shared-files-card");
+    const panel = await screen.findByTestId("session-files-panel");
+    await within(panel).findByText("Result Plot");
 
-    fireEvent.click(screen.getByRole("button", { name: "Send Telegram" }));
+    fireEvent.click(within(panel).getByRole("button", { name: "Send via Telegram" }));
 
     await waitFor(() => {
-      expect(sendSharedFileToTelegramMock).toHaveBeenCalledWith("shr_abc", "Result Plot");
+      expect(sendSessionFileToTelegramMock).toHaveBeenCalledWith("codex_demo", "sf_abc", "Result Plot");
     });
   });
 
-  it("hides shared files inbox when telegram is configured", async () => {
+  it("keeps session files panel visible when telegram is configured", async () => {
     getSessionsMock.mockResolvedValue({
       ok: true,
       sessions: [
@@ -655,8 +797,7 @@ describe("app shell tabs", () => {
     });
 
     render(<App />);
-    expect(screen.queryByTestId("shared-files-card")).not.toBeInTheDocument();
-    expect(screen.queryByTestId("telegram-direct-delivery-card")).not.toBeInTheDocument();
+    expect(await screen.findByTestId("session-files-panel")).toBeInTheDocument();
   });
 
   it("enables live output automatically when creating a session", async () => {
@@ -764,6 +905,69 @@ describe("app shell tabs", () => {
     expect(screen.queryByRole("button", { name: "Show Legacy Panels" })).not.toBeInTheDocument();
     expect(screen.queryByTestId("thread-session-input-select")).not.toBeInTheDocument();
     expect(screen.queryByText("Codex Transcript Threads")).not.toBeInTheDocument();
+  });
+
+  it("sends resume-last command to selected tmux pane", async () => {
+    getTmuxPanesMock.mockResolvedValue({
+      ok: true,
+      panes: [
+        {
+          session: "shell_ops",
+          window_index: "0",
+          pane_index: "1",
+          pane_id: "%2",
+          active: true,
+          current_command: "bash",
+          current_path: "/home/megha/work",
+        },
+      ],
+    });
+    render(<App />);
+    fireEvent.click(await screen.findByTestId("tab-threads"));
+    await screen.findByTestId("tab-panel-threads");
+
+    fireEvent.change(screen.getByTestId("threads-pane-select"), {
+      target: { value: "%2" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Resume Last" }));
+
+    await waitFor(() => {
+      expect(sendToPaneMock).toHaveBeenCalledWith("%2", "codex resume --last");
+    });
+  });
+
+  it("sends arrow and enter keys to selected tmux pane", async () => {
+    getTmuxPanesMock.mockResolvedValue({
+      ok: true,
+      panes: [
+        {
+          session: "shell_ops",
+          window_index: "0",
+          pane_index: "1",
+          pane_id: "%2",
+          active: true,
+          current_command: "bash",
+          current_path: "/home/megha/work",
+        },
+      ],
+    });
+    render(<App />);
+    fireEvent.click(await screen.findByTestId("tab-threads"));
+    await screen.findByTestId("tab-panel-threads");
+
+    fireEvent.change(screen.getByTestId("threads-pane-select"), {
+      target: { value: "%2" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Up" }));
+
+    await waitFor(() => {
+      expect(sendToPaneKeyMock).toHaveBeenCalledWith("%2", "up");
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Enter" }));
+    await waitFor(() => {
+      expect(sendToPaneKeyMock).toHaveBeenCalledWith("%2", "enter");
+    });
   });
 
   it("filters Codex panes out of Threads tmux pane selector", async () => {

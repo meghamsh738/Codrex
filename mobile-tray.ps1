@@ -4,6 +4,21 @@ $ErrorActionPreference = "Stop"
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
+function Get-CodrexRuntimeDir {
+  param(
+    [string]$RepoRoot
+  )
+  $override = [string]$env:CODEX_RUNTIME_DIR
+  if ($override -and $override.Trim()) {
+    return $override.Trim()
+  }
+  $localAppData = [string]$env:LocalAppData
+  if ($localAppData -and $localAppData.Trim()) {
+    return (Join-Path $localAppData "Codrex\remote-ui")
+  }
+  return (Join-Path $RepoRoot ".runtime")
+}
+
 $createdNew = $false
 $mutex = New-Object System.Threading.Mutex($true, "Codrex.MobileTray.Singleton", [ref]$createdNew)
 if (-not $createdNew) {
@@ -17,10 +32,14 @@ if (-not $createdNew) {
 }
 
 $script:Root = Split-Path -Parent $PSCommandPath
-$script:LogsDir = Join-Path $script:Root "logs"
+$script:RuntimeDir = Get-CodrexRuntimeDir -RepoRoot $script:Root
+$script:StateDir = Join-Path $script:RuntimeDir "state"
+$script:LogsDir = Join-Path $script:RuntimeDir "logs"
 $script:StartScript = Join-Path $script:Root "start-mobile.ps1"
 $script:StopScript = Join-Path $script:Root "stop-mobile.ps1"
 $script:ConfigPath = Join-Path $script:Root "controller.config.json"
+$script:LocalConfigPath = Join-Path $script:StateDir "controller.config.local.json"
+$script:LegacyLocalConfigPath = Join-Path $script:Root "controller.config.local.json"
 $script:UiPort = 4312
 $script:PendingAction = ""
 $script:PendingProc = $null
@@ -48,26 +67,39 @@ function Get-PrimaryIPv4 {
 }
 
 function Read-ControllerConfig {
-  if (-not (Test-Path $script:ConfigPath)) {
-    return [pscustomobject]@{
-      port = 8787
-      token = ""
-    }
-  }
-  try {
-    $cfg = Get-Content -Path $script:ConfigPath -Raw | ConvertFrom-Json
-    if ($cfg) { return $cfg }
-  } catch {}
-  return [pscustomobject]@{
+  $cfg = [ordered]@{
     port = 8787
     token = ""
   }
+  if (Test-Path $script:ConfigPath) {
+    try {
+      $loaded = Get-Content -Path $script:ConfigPath -Raw | ConvertFrom-Json
+      if ($loaded -and $loaded.port) { $cfg.port = [int]$loaded.port }
+      if ($loaded -and $loaded.token) { $cfg.token = [string]$loaded.token }
+    } catch {}
+  }
+  foreach ($path in @($script:LocalConfigPath, $script:LegacyLocalConfigPath)) {
+    if (-not (Test-Path $path)) { continue }
+    try {
+      $loadedLocal = Get-Content -Path $path -Raw | ConvertFrom-Json
+      if ($loadedLocal -and $loadedLocal.port) { $cfg.port = [int]$loadedLocal.port }
+      if ($loadedLocal -and $loadedLocal.token) { $cfg.token = [string]$loadedLocal.token }
+      break
+    } catch {}
+  }
+  return [pscustomobject]$cfg
 }
 
 function Read-ControllerPort {
   $cfg = Read-ControllerConfig
   if ($cfg -and $cfg.port) { return [int]$cfg.port }
   return 8787
+}
+
+foreach ($dir in @($script:RuntimeDir, $script:StateDir, $script:LogsDir)) {
+  if (-not (Test-Path $dir)) {
+    New-Item -Path $dir -ItemType Directory -Force | Out-Null
+  }
 }
 
 function Get-TailscaleIPv4 {
@@ -152,7 +184,7 @@ function Show-PairQrWindow {
   $token = [string]$cfg.token
   if (-not $token) {
     [System.Windows.Forms.MessageBox]::Show(
-      "No token found in controller.config.json. Pairing requires token auth enabled.",
+      "No controller token found. Start the controller once so it writes the runtime token file.",
       "Codrex",
       [System.Windows.Forms.MessageBoxButtons]::OK,
       [System.Windows.Forms.MessageBoxIcon]::Warning

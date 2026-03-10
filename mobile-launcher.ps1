@@ -50,21 +50,43 @@ function Get-TailscaleIPv4 {
   return ""
 }
 
-function Read-ControllerConfig([string]$Path) {
-  if (-not (Test-Path $Path)) {
-    return [pscustomobject]@{
-      port = 8787
-      token = ""
-    }
+function Get-CodrexRuntimeDir {
+  param(
+    [string]$RepoRoot
+  )
+  $override = [string]$env:CODEX_RUNTIME_DIR
+  if ($override -and $override.Trim()) {
+    return $override.Trim()
   }
-  try {
-    $cfg = Get-Content -Path $Path -Raw | ConvertFrom-Json
-    if ($cfg) { return $cfg }
-  } catch {}
-  return [pscustomobject]@{
+  $localAppData = [string]$env:LocalAppData
+  if ($localAppData -and $localAppData.Trim()) {
+    return (Join-Path $localAppData "Codrex\remote-ui")
+  }
+  return (Join-Path $RepoRoot ".runtime")
+}
+
+function Read-ControllerConfig([string]$Path) {
+  $cfg = [ordered]@{
     port = 8787
     token = ""
   }
+  if (Test-Path $Path) {
+    try {
+      $loaded = Get-Content -Path $Path -Raw | ConvertFrom-Json
+      if ($loaded -and $loaded.port) { $cfg.port = [int]$loaded.port }
+      if ($loaded -and $loaded.token) { $cfg.token = [string]$loaded.token }
+    } catch {}
+  }
+  foreach ($localPath in @($script:LocalConfigPath, $script:LegacyLocalConfigPath)) {
+    if (-not (Test-Path $localPath)) { continue }
+    try {
+      $loadedLocal = Get-Content -Path $localPath -Raw | ConvertFrom-Json
+      if ($loadedLocal -and $loadedLocal.port) { $cfg.port = [int]$loadedLocal.port }
+      if ($loadedLocal -and $loadedLocal.token) { $cfg.token = [string]$loadedLocal.token }
+      break
+    } catch {}
+  }
+  return [pscustomobject]$cfg
 }
 
 function Test-HttpReady([string]$Url) {
@@ -183,10 +205,14 @@ function Open-Url([string]$Url) {
 }
 
 $root = Split-Path -Parent $PSCommandPath
+$runtimeDir = Get-CodrexRuntimeDir -RepoRoot $root
+$stateDir = Join-Path $runtimeDir "state"
+$logsDir = Join-Path $runtimeDir "logs"
 $configPath = Join-Path $root "controller.config.json"
+$script:LocalConfigPath = Join-Path $stateDir "controller.config.local.json"
+$script:LegacyLocalConfigPath = Join-Path $root "controller.config.local.json"
 $startMobileScript = Join-Path $root "start-mobile.ps1"
 $stopMobileScript = Join-Path $root "stop-mobile.ps1"
-$logsDir = Join-Path $root "logs"
 $uiPort = 4312
 $controllerPort = 8787
 $controllerToken = ""
@@ -754,7 +780,7 @@ function Generate-PairQr {
     throw "Controller is not reachable."
   }
   if (-not (Ensure-LauncherAuth -ControllerPort $controllerPort -FallbackToken $controllerToken)) {
-    throw "Could not authenticate launcher session. Open app locally once, or set token in controller.config.json."
+    throw "Could not authenticate launcher session. Open the app locally once, or start the controller so it writes the runtime token file."
   }
 
   $tailscale = Get-TailscaleIPv4

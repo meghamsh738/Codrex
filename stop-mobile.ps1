@@ -72,12 +72,32 @@ function Read-ControllerPort {
   return 8787
 }
 
+function Get-CodrexRuntimeDir {
+  param(
+    [string]$RepoRoot
+  )
+  $override = [string]$env:CODEX_RUNTIME_DIR
+  if ($override -and $override.Trim()) {
+    return $override.Trim()
+  }
+  $localAppData = [string]$env:LocalAppData
+  if ($localAppData -and $localAppData.Trim()) {
+    return (Join-Path $localAppData "Codrex\remote-ui")
+  }
+  return (Join-Path $RepoRoot ".runtime")
+}
+
 $root = Split-Path -Parent $PSCommandPath
-$logsDir = Join-Path $root "logs"
-$sessionPath = Join-Path $logsDir "mobile.session.json"
+$runtimeDir = Get-CodrexRuntimeDir -RepoRoot $root
+$stateDir = Join-Path $runtimeDir "state"
+$sessionPath = Join-Path $stateDir "mobile.session.json"
+$legacySessionPath = Join-Path (Join-Path $root "logs") "mobile.session.json"
 $configPath = Join-Path $root "controller.config.json"
 
 $session = Read-SessionData -Path $sessionPath
+if (-not $session -and (Test-Path $legacySessionPath)) {
+  $session = Read-SessionData -Path $legacySessionPath
+}
 $controllerPort = Read-ControllerPort -ConfigPath $configPath
 
 if ($session -and $session.controller_port) {
@@ -107,6 +127,9 @@ if (-not $KeepController) {
 
 if (Test-Path $sessionPath) {
   Remove-Item $sessionPath -Force -ErrorAction SilentlyContinue
+}
+if (Test-Path $legacySessionPath) {
+  Remove-Item $legacySessionPath -Force -ErrorAction SilentlyContinue
 }
 
 Write-Host "Done."

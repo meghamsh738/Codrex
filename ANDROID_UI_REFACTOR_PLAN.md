@@ -1,7 +1,7 @@
 # Android UX Refactor Plan
 
 Date: 2026-03-03
-Repo: `C:\codex-remote-ui`
+Repo: `E:\coding projects\codex-remote-ui`
 
 ## Progress Snapshot
 - Phase 1: Done

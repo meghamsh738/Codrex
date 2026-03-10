@@ -133,19 +133,38 @@ function Resolve-LogTargetPath {
   }
 }
 
+function Get-CodrexRuntimeDir {
+  param(
+    [string]$RepoRoot
+  )
+  $override = [string]$env:CODEX_RUNTIME_DIR
+  if ($override -and $override.Trim()) {
+    return $override.Trim()
+  }
+  $localAppData = [string]$env:LocalAppData
+  if ($localAppData -and $localAppData.Trim()) {
+    return (Join-Path $localAppData "Codrex\remote-ui")
+  }
+  return (Join-Path $RepoRoot ".runtime")
+}
+
 $root = Split-Path -Parent $PSCommandPath
 $uiRoot = Join-Path $root "ui"
-$logsDir = Join-Path $root "logs"
+$runtimeDir = Get-CodrexRuntimeDir -RepoRoot $root
+$stateDir = Join-Path $runtimeDir "state"
+$logsDir = Join-Path $runtimeDir "logs"
 $configPath = Join-Path $root "controller.config.json"
-$sessionPath = Join-Path $logsDir "mobile.session.json"
+$sessionPath = Join-Path $stateDir "mobile.session.json"
 $uiOutLog = Join-Path $logsDir "ui.out.log"
 $uiErrLog = Join-Path $logsDir "ui.err.log"
 
 if (-not (Test-Path $uiRoot)) {
   throw "UI folder not found at $uiRoot"
 }
-if (-not (Test-Path $logsDir)) {
-  New-Item -Path $logsDir -ItemType Directory -Force | Out-Null
+foreach ($dir in @($runtimeDir, $stateDir, $logsDir)) {
+  if (-not (Test-Path $dir)) {
+    New-Item -Path $dir -ItemType Directory -Force | Out-Null
+  }
 }
 
 $controllerPort = Read-ControllerPort -ConfigPath $configPath
@@ -252,6 +271,7 @@ if ($lanIp -and $lanIp -ne "127.0.0.1") {
 Write-Host ("Controller PID: {0}" -f ($(if ($controllerPid) { $controllerPid } else { "unknown" })))
 Write-Host ("UI PID:         {0}" -f ($(if ($uiPid) { $uiPid } else { "unknown" })))
 Write-Host ("Session file:   {0}" -f $sessionPath)
+Write-Host ("Runtime dir:    {0}" -f $runtimeDir)
 if (-not $OpenFirewall) {
   Write-Host "Tip: if phone/tablet cannot open network URL, rerun with -OpenFirewall."
 }

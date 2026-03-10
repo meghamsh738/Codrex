@@ -1,6 +1,7 @@
 import type {
   AuthStatus,
   BasicResult,
+  BrowserListResult,
   CodexOptionsResult,
   CodexExecStartResult,
   CodexRunDetail,
@@ -10,7 +11,10 @@ import type {
   DesktopModeResult,
   NetInfo,
   PairCreateResult,
+  PowerActionResult,
+  PowerStatusResult,
   SessionCreateResult,
+  SessionFilesResult,
   SessionProfileApplyResult,
   SessionImageResult,
   SessionCloseResult,
@@ -34,7 +38,7 @@ const JSON_HEADERS = {
 };
 
 export type IpcDirection = "out" | "in" | "error";
-export type IpcChannel = "http" | "sse";
+export type IpcChannel = "http" | "sse" | "ws";
 
 export interface IpcEvent {
   seq: number;
@@ -290,8 +294,9 @@ export function createSessionWithOptions(options: {
   cwd?: string;
   model?: string;
   reasoning_effort?: string;
+  resume_last?: boolean;
 }): Promise<SessionCreateResult> {
-  const payload: Record<string, string> = {};
+  const payload: Record<string, string | boolean> = {};
   if (options.name && options.name.trim()) {
     payload.name = options.name.trim();
   }
@@ -303,6 +308,9 @@ export function createSessionWithOptions(options: {
   }
   if (options.reasoning_effort && options.reasoning_effort.trim()) {
     payload.reasoning_effort = options.reasoning_effort.trim();
+  }
+  if (options.resume_last) {
+    payload.resume_last = true;
   }
   return requestJson<SessionCreateResult>("/codex/session", {
     method: "POST",
@@ -381,6 +389,24 @@ export function getSessionScreen(session: string): Promise<SessionScreenResult> 
   return requestJson<SessionScreenResult>(`/codex/session/${encodeURIComponent(session)}/screen`);
 }
 
+export function buildSessionStreamUrl(
+  session: string,
+  options?: { profile?: "fast" | "balanced" | "battery"; since_seq?: number },
+): string {
+  const base =
+    typeof window !== "undefined" && window.location
+      ? `${window.location.protocol === "https:" ? "wss:" : "ws:"}//${window.location.host}`
+      : "ws://127.0.0.1";
+  const url = new URL(`/codex/session/${encodeURIComponent(session)}/ws`, base);
+  if (options?.profile) {
+    url.searchParams.set("profile", options.profile);
+  }
+  if (typeof options?.since_seq === "number" && Number.isFinite(options.since_seq) && options.since_seq > 0) {
+    url.searchParams.set("since_seq", String(options.since_seq));
+  }
+  return url.toString();
+}
+
 export function sendSessionImage(
   session: string,
   file: File,
@@ -406,6 +432,56 @@ export function sendSessionImage(
 
 export function listSharedFiles(): Promise<SharedFilesResult> {
   return requestJson<SharedFilesResult>("/shares");
+}
+
+export function listSessionFiles(session: string): Promise<SessionFilesResult> {
+  return requestJson<SessionFilesResult>(`/codex/session/${encodeURIComponent(session)}/files`);
+}
+
+export function registerSessionFile(
+  session: string,
+  payload: { path: string; title?: string; allow_directory?: boolean; expires_hours?: number },
+): Promise<SessionFilesResult> {
+  return requestJson<SessionFilesResult>(`/codex/session/${encodeURIComponent(session)}/files/register`, {
+    method: "POST",
+    headers: JSON_HEADERS,
+    body: JSON.stringify(payload),
+  });
+}
+
+export function uploadSessionFile(session: string, file: File, title = ""): Promise<SessionFilesResult> {
+  const formData = new FormData();
+  formData.append("file", file);
+  if (title.trim()) {
+    formData.append("title", title.trim());
+  }
+  return requestJson<SessionFilesResult>(`/codex/session/${encodeURIComponent(session)}/files/upload`, {
+    method: "POST",
+    body: formData,
+  });
+}
+
+export function deleteSessionFile(session: string, fileId: string): Promise<SessionFilesResult> {
+  return requestJson<SessionFilesResult>(`/codex/session/${encodeURIComponent(session)}/files/${encodeURIComponent(fileId)}`, {
+    method: "DELETE",
+  });
+}
+
+export function sendSessionFileToTelegram(session: string, fileId: string, caption = ""): Promise<SessionFilesResult> {
+  return requestJson<SessionFilesResult>(`/codex/session/${encodeURIComponent(session)}/files/${encodeURIComponent(fileId)}/telegram`, {
+    method: "POST",
+    headers: JSON_HEADERS,
+    body: JSON.stringify(caption.trim() ? { caption: caption.trim() } : {}),
+  });
+}
+
+export function listBrowseEntries(root = "workspace", path = ""): Promise<BrowserListResult> {
+  const query = new URLSearchParams();
+  query.set("root", root);
+  if (path.trim()) {
+    query.set("path", path.trim());
+  }
+  return requestJson<BrowserListResult>(`/fs/list?${query.toString()}`);
 }
 
 export function createSharedFile(payload: {
@@ -545,6 +621,14 @@ export function sendToPane(paneId: string, text: string): Promise<BasicResult> {
   });
 }
 
+export function sendToPaneKey(paneId: string, key: "up" | "down" | "left" | "right" | "enter"): Promise<BasicResult> {
+  return requestJson<BasicResult>(`/tmux/pane/${encodeURIComponent(paneId)}/key`, {
+    method: "POST",
+    headers: JSON_HEADERS,
+    body: JSON.stringify({ key }),
+  });
+}
+
 export function interruptPane(paneId: string): Promise<BasicResult> {
   return requestJson<BasicResult>(`/tmux/pane/${encodeURIComponent(paneId)}/ctrlc`, {
     method: "POST",
@@ -555,6 +639,25 @@ export function interruptPane(paneId: string): Promise<BasicResult> {
 
 export function getDesktopInfo(): Promise<DesktopInfoResult> {
   return requestJson<DesktopInfoResult>("/desktop/info");
+}
+
+export function getPowerStatus(): Promise<PowerStatusResult> {
+  return requestJson<PowerStatusResult>("/power/status");
+}
+
+export function sendPowerAction(
+  action: "lock" | "sleep" | "hibernate" | "restart" | "shutdown",
+  options?: { confirm_token?: string },
+): Promise<PowerActionResult> {
+  const payload: Record<string, string> = { action };
+  if (options?.confirm_token && options.confirm_token.trim()) {
+    payload.confirm_token = options.confirm_token.trim();
+  }
+  return requestJson<PowerActionResult>("/power/action", {
+    method: "POST",
+    headers: JSON_HEADERS,
+    body: JSON.stringify(payload),
+  });
 }
 
 export function setDesktopMode(enabled: boolean): Promise<DesktopModeResult> {

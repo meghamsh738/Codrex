@@ -18,6 +18,11 @@ export interface SharedFileInfo {
   is_image?: boolean;
   wsl_path: string;
   download_url: string;
+  session?: string;
+  item_kind?: "file" | "directory";
+  source_kind?: string;
+  windows_path?: string;
+  display_path?: string;
 }
 
 export interface TelegramDeliveryResult {
@@ -35,6 +40,7 @@ export interface BasicResult {
   error?: string;
   detail?: string;
   shared_file?: SharedFileInfo;
+  session_file?: SharedFileInfo | null;
   telegram?: TelegramDeliveryResult | null;
 }
 
@@ -57,6 +63,9 @@ export interface NetInfo {
   ok: boolean;
   lan_ip: string;
   tailscale_ip: string;
+  primary_mac?: string;
+  wake_candidate_macs?: string[];
+  wake_supported?: boolean;
 }
 
 export interface PairCreateResult extends BasicResult {
@@ -85,6 +94,7 @@ export interface SessionCreateResult extends BasicResult {
   cwd?: string;
   model?: string;
   reasoning_effort?: string;
+  resume_last?: boolean;
 }
 
 export interface SessionProfileApplyResult extends BasicResult {
@@ -172,8 +182,81 @@ export interface DesktopInputResult extends BasicResult {
   delta?: number;
 }
 
+export interface PowerStatusResult extends BasicResult {
+  online?: boolean;
+  actions?: string[];
+  confirm_required_actions?: string[];
+  wake_surface?: string;
+  wake_command?: string;
+  wake_instruction?: string;
+  wake_relay_configured?: boolean;
+  relay_reachable?: boolean;
+  relay_detail?: string;
+  primary_mac?: string;
+  wake_candidate_macs?: string[];
+  wake_supported?: boolean;
+}
+
+export interface PowerActionResult extends BasicResult {
+  action?: string;
+  accepted?: boolean;
+  confirm_required?: boolean;
+  confirm_token?: string;
+  confirm_expires_in?: number;
+  scheduled_at?: number;
+}
+
 export interface WslUploadResult extends BasicResult {
   saved_path?: string;
+}
+
+export interface SessionFilesResult extends BasicResult {
+  session?: string;
+  items?: SharedFileInfo[];
+  item?: SharedFileInfo;
+  deleted_source?: boolean;
+}
+
+export interface BrowserRootInfo {
+  id: string;
+  label: string;
+  path: string;
+}
+
+export interface BrowserEntryInfo {
+  name: string;
+  kind: "file" | "directory";
+  display_path: string;
+  wsl_path: string;
+  windows_path?: string;
+  size_bytes: number;
+  mtime: number;
+}
+
+export interface BrowserListResult extends BasicResult {
+  root?: BrowserRootInfo;
+  roots?: BrowserRootInfo[];
+  current_path?: string;
+  current_relative_path?: string;
+  display_path?: string;
+  windows_path?: string;
+  items?: BrowserEntryInfo[];
+}
+
+export type SessionStreamEventType = "hello" | "snapshot" | "append" | "replace" | "status" | "keepalive" | "error";
+
+export interface SessionStreamEvent {
+  ok?: boolean;
+  session: string;
+  pane_id: string;
+  seq: number;
+  type: SessionStreamEventType;
+  text: string;
+  detail?: string;
+  ts?: number;
+  profile?: string;
+  state?: SessionState;
+  current_command?: string;
 }
 
 export type ThreadRole = "user" | "assistant" | "system";

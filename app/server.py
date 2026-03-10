@@ -1,4 +1,4 @@
-﻿from fastapi import FastAPI, HTTPException, Body, UploadFile, File, Form, Request
+﻿from fastapi import FastAPI, HTTPException, Body, UploadFile, File, Form, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, Response, FileResponse, JSONResponse, StreamingResponse, RedirectResponse
 import asyncio
 import json
@@ -40,6 +40,27 @@ CODEX_AUTH_REQUIRED = bool(CODEX_AUTH_TOKEN)
 BLANK_IMAGE_DATA_URL = "data:image/gif;base64,R0lGODlhAQABAAD/ACwAAAAAAQABAAACADs="
 DEFAULT_CODEX_MODELS = ["gpt-5-codex", "gpt-5", "gpt-5-mini", "gpt-4.1", "o4-mini"]
 DEFAULT_REASONING_EFFORTS = ["minimal", "low", "medium", "high", "xhigh"]
+
+
+def _default_runtime_dir() -> str:
+    override = (
+        str(os.environ.get("CODEX_RUNTIME_DIR", "") or "").strip()
+        or str(os.environ.get("CODEX_RUNTIME_ROOT", "") or "").strip()
+    )
+    if override:
+        return os.path.abspath(override)
+    if os.name == "nt":
+        base = (
+            os.environ.get("LOCALAPPDATA")
+            or os.environ.get("APPDATA")
+            or os.path.expanduser("~")
+        )
+        return os.path.abspath(os.path.join(base, "Codrex", "remote-ui"))
+    base = (
+        os.environ.get("XDG_STATE_HOME")
+        or os.path.join(os.path.expanduser("~"), ".local", "state")
+    )
+    return os.path.abspath(os.path.join(base, "codrex-remote-ui"))
 
 
 def _parse_csv_config(raw: str, fallback: List[str]) -> List[str]:
@@ -246,9 +267,136 @@ def guess_lan_ipv4() -> str:
     except Exception:
         return ""
 
+
+def _normalize_mac_address(value: str) -> str:
+    raw = re.sub(r"[^0-9A-Fa-f]", "", str(value or ""))
+    if len(raw) != 12:
+        return ""
+    raw = raw.upper()
+    return ":".join(raw[i:i + 2] for i in range(0, 12, 2))
+
+
+def _wake_mac_info() -> Dict[str, Any]:
+    if os.name != "nt":
+        return {
+            "primary_mac": "",
+            "wake_candidate_macs": [],
+            "wake_supported": False,
+        }
+    script = (
+        "$ErrorActionPreference = 'Stop'; "
+        "$primary = $null; "
+        "try { "
+        "$route = Get-NetRoute -DestinationPrefix '0.0.0.0/0' "
+        "| Where-Object { $_.NextHop -and $_.NextHop -ne '0.0.0.0' } "
+        "| Sort-Object RouteMetric, ifMetric | Select-Object -First 1; "
+        "if ($route) { $primary = Get-NetAdapter -InterfaceIndex $route.ifIndex -ErrorAction SilentlyContinue | Select-Object -First 1 } "
+        "} catch {} "
+        "$adapters = @(Get-NetAdapter | Where-Object { $_.MacAddress -and $_.Status -ne 'Disabled' } | Select-Object -First 12); "
+        "[pscustomobject]@{ "
+        "primary_mac = if ($primary) { $primary.MacAddress } else { '' }; "
+        "candidates = @($adapters | ForEach-Object { $_.MacAddress }); "
+        "} | ConvertTo-Json -Compress"
+    )
+    r = _run_powershell(script, timeout_s=6)
+    if r.get("exit_code") != 0:
+        return {
+            "primary_mac": "",
+            "wake_candidate_macs": [],
+            "wake_supported": False,
+        }
+    try:
+        data = json.loads(r.get("stdout") or "{}")
+    except Exception:
+        data = {}
+    primary = _normalize_mac_address(data.get("primary_mac", ""))
+    candidates: List[str] = []
+    seen: set[str] = set()
+    for raw in data.get("candidates") or []:
+        mac = _normalize_mac_address(str(raw or ""))
+        if not mac or mac in seen:
+            continue
+        seen.add(mac)
+        candidates.append(mac)
+    if primary and primary not in seen:
+        candidates.insert(0, primary)
+    return {
+        "primary_mac": primary,
+        "wake_candidate_macs": candidates,
+        "wake_supported": bool(primary or candidates),
+    }
+
+
+def _request_json_url(url: str, method: str = "GET", payload: Optional[Dict[str, Any]] = None, headers: Optional[Dict[str, str]] = None, timeout_s: float = 5.0) -> Tuple[Optional[int], Dict[str, Any]]:
+    req_headers = dict(headers or {})
+    data: Optional[bytes] = None
+    if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+        req_headers.setdefault("Content-Type", "application/json")
+    req = urllib.request.Request(url, data=data, headers=req_headers, method=method.upper())
+    try:
+        with urllib.request.urlopen(req, timeout=max(0.5, timeout_s)) as resp:
+            raw = (resp.read() or b"").decode("utf-8", errors="replace")
+            try:
+                parsed = json.loads(raw) if raw.strip() else {}
+            except Exception:
+                parsed = {"detail": raw.strip()}
+            return getattr(resp, "status", 200), parsed if isinstance(parsed, dict) else {"value": parsed}
+    except urllib.error.HTTPError as e:
+        raw = (e.read() or b"").decode("utf-8", errors="replace")
+        try:
+            parsed = json.loads(raw) if raw.strip() else {}
+        except Exception:
+            parsed = {"detail": raw.strip() or str(e)}
+        return int(getattr(e, "code", 500) or 500), parsed if isinstance(parsed, dict) else {"value": parsed}
+    except Exception as e:
+        return None, {"detail": f"{type(e).__name__}: {e}"}
+
+
+def _wake_relay_health() -> Dict[str, Any]:
+    if not CODEX_WAKE_RELAY_URL:
+        return {
+            "configured": False,
+            "reachable": False,
+            "detail": "Wake relay URL is not configured.",
+            "wake_surface": "telegram",
+            "wake_command": CODEX_WAKE_TELEGRAM_COMMAND,
+        }
+    headers: Dict[str, str] = {}
+    if CODEX_WAKE_RELAY_TOKEN:
+        headers["x-relay-token"] = CODEX_WAKE_RELAY_TOKEN
+    status, payload = _request_json_url(
+        f"{CODEX_WAKE_RELAY_URL}/health",
+        method="GET",
+        headers=headers,
+        timeout_s=CODEX_WAKE_RELAY_TIMEOUT_SECONDS,
+    )
+    if status is None:
+        return {
+            "configured": True,
+            "reachable": False,
+            "detail": str(payload.get("detail") or "relay_unreachable"),
+            "wake_surface": "telegram",
+            "wake_command": str(payload.get("wake_command") or CODEX_WAKE_TELEGRAM_COMMAND),
+        }
+    return {
+        "configured": True,
+        "reachable": 200 <= status < 300 and bool(payload.get("ok", True)),
+        "detail": str(payload.get("detail") or "").strip(),
+        "wake_surface": str(payload.get("wake_surface") or "telegram"),
+        "wake_command": str(payload.get("wake_command") or CODEX_WAKE_TELEGRAM_COMMAND),
+    }
+
 # WSL file access is restricted to this root by default (safer).
 # You can widen later by setting CODEX_FILE_ROOT to e.g. "/home/megha"
 CODEX_FILE_ROOT = os.environ.get("CODEX_FILE_ROOT", CODEX_WORKDIR)
+CODEX_RUNTIME_DIR = _default_runtime_dir()
+CODEX_RUNTIME_ROOT = CODEX_RUNTIME_DIR
+CODEX_RUNTIME_STATE_DIR = os.path.join(CODEX_RUNTIME_DIR, "state")
+CODEX_RUNTIME_LOGS_DIR = os.path.join(CODEX_RUNTIME_DIR, "logs")
+CODEX_RUNTIME_SECRETS_DIR = os.path.join(CODEX_RUNTIME_DIR, "secrets")
+CODEX_RUNTIME_TELEGRAM_DIR = os.path.join(CODEX_RUNTIME_SECRETS_DIR, "telegram")
+LEGACY_RUNTIME_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
 VALID_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 VALID_PANE_RE = re.compile(r"^%\d+$")
@@ -274,14 +422,23 @@ if _cookie_secure_raw in {"auto", "always", "never", "on", "off", "true", "false
     CODEX_COOKIE_SECURE_MODE = _cookie_secure_raw
 else:
     CODEX_COOKIE_SECURE_MODE = "auto"
+CODEX_WAKE_RELAY_URL = str(os.environ.get("CODEX_WAKE_RELAY_URL", "") or "").strip().rstrip("/")
+CODEX_WAKE_RELAY_TOKEN = str(os.environ.get("CODEX_WAKE_RELAY_TOKEN", "") or "").strip()
+CODEX_WAKE_TELEGRAM_COMMAND = str(os.environ.get("CODEX_WAKE_TELEGRAM_COMMAND", "/wake") or "/wake").strip() or "/wake"
+CODEX_WAKE_RELAY_TIMEOUT_SECONDS = float(os.environ.get("CODEX_WAKE_RELAY_TIMEOUT_SECONDS", "3.5") or "3.5")
+CODEX_POWER_CONFIRM_TTL_SECONDS = int(os.environ.get("CODEX_POWER_CONFIRM_TTL_SECONDS", "60") or "60")
+CODEX_POWER_ACTION_DELAY_SECONDS = max(0.5, float(os.environ.get("CODEX_POWER_ACTION_DELAY_SECONDS", "2.0") or "2.0"))
+POWER_CONFIRM_LOCK = threading.Lock()
+POWER_CONFIRMATIONS: Dict[str, Dict[str, Any]] = {}
 
 # -------------------------
 # Thread transcript store
 # -------------------------
+LEGACY_THREADS_FILE = os.path.abspath(os.path.join(LEGACY_RUNTIME_DIR, "logs", "threads-store.json"))
 DEFAULT_THREADS_FILE = os.path.abspath(
     os.environ.get(
         "CODEX_THREADS_FILE",
-        os.path.join(os.path.dirname(__file__), "..", "logs", "threads-store.json"),
+        os.path.join(CODEX_RUNTIME_STATE_DIR, "threads-store.json"),
     )
 )
 THREADS_FILE = DEFAULT_THREADS_FILE
@@ -298,10 +455,11 @@ THREADS_DATA: Dict[str, Any] = {
 # -------------------------
 # Shared file outbox store
 # -------------------------
+LEGACY_SHARED_OUTBOX_FILE = os.path.abspath(os.path.join(LEGACY_RUNTIME_DIR, "logs", "shared-outbox.json"))
 DEFAULT_SHARED_OUTBOX_FILE = os.path.abspath(
     os.environ.get(
         "CODEX_SHARED_OUTBOX_FILE",
-        os.path.join(os.path.dirname(__file__), "..", "logs", "shared-outbox.json"),
+        os.path.join(CODEX_RUNTIME_STATE_DIR, "shared-outbox.json"),
     )
 )
 SHARED_OUTBOX_FILE = DEFAULT_SHARED_OUTBOX_FILE
@@ -316,12 +474,38 @@ SHARED_OUTBOX_DATA: Dict[str, Any] = {
 }
 
 # -------------------------
+# Session file store
+# -------------------------
+DEFAULT_SESSION_FILES_FILE = os.path.abspath(
+    os.environ.get(
+        "CODEX_SESSION_FILES_FILE",
+        os.path.join(CODEX_RUNTIME_STATE_DIR, "session-files.json"),
+    )
+)
+SESSION_FILES_FILE = DEFAULT_SESSION_FILES_FILE
+SESSION_FILES_LOCK = threading.Lock()
+SESSION_FILES_LOADED = False
+SESSION_FILES_MAX_KEEP = int(os.environ.get("CODEX_SESSION_FILES_MAX_KEEP", "600") or "600")
+SESSION_FILES_MAX_FILE_MB = int(os.environ.get("CODEX_SESSION_FILES_MAX_FILE_MB", "200") or "200")
+SESSION_FILES_DATA: Dict[str, Any] = {
+    "items": [],
+}
+
+# -------------------------
+# Session output stream state
+# -------------------------
+SESSION_STREAM_LOCK = threading.Lock()
+SESSION_STREAM_REPLAY_MAX = int(os.environ.get("CODEX_SESSION_STREAM_REPLAY_MAX", "240") or "240")
+SESSION_STREAM_STATES: Dict[str, Dict[str, Any]] = {}
+
+# -------------------------
 # Telegram delivery (optional)
 # -------------------------
+LEGACY_TELEGRAM_SECRETS_DIR = os.path.abspath(os.path.join(LEGACY_RUNTIME_DIR, "Telegram bot"))
 DEFAULT_TELEGRAM_SECRETS_DIR = os.path.abspath(
     os.environ.get(
         "CODEX_TELEGRAM_SECRETS_DIR",
-        os.path.join(os.path.dirname(__file__), "..", "Telegram bot"),
+        CODEX_RUNTIME_TELEGRAM_DIR,
     )
 )
 DEFAULT_TELEGRAM_SECRET_FILE = os.path.join(DEFAULT_TELEGRAM_SECRETS_DIR, "key.txt")
@@ -333,6 +517,18 @@ TELEGRAM_TIMEOUT_SECONDS = float(os.environ.get("CODEX_TELEGRAM_TIMEOUT_SECONDS"
 TELEGRAM_MAX_FILE_MB = int(os.environ.get("CODEX_TELEGRAM_MAX_FILE_MB", "45") or "45")
 CODEX_TELEGRAM_DEFAULT_SEND = str(os.environ.get("CODEX_TELEGRAM_DEFAULT_SEND", "0") or "0").strip().lower() in {"1", "true", "yes", "on"}
 
+for _runtime_dir in (
+    CODEX_RUNTIME_DIR,
+    CODEX_RUNTIME_STATE_DIR,
+    CODEX_RUNTIME_LOGS_DIR,
+    CODEX_RUNTIME_SECRETS_DIR,
+    CODEX_RUNTIME_TELEGRAM_DIR,
+):
+    try:
+        os.makedirs(_runtime_dir, exist_ok=True)
+    except Exception:
+        pass
+
 
 def _read_text_file(path: str) -> str:
     p = str(path or "").strip()
@@ -343,6 +539,26 @@ def _read_text_file(path: str) -> str:
             return f.read()
     except Exception:
         return ""
+
+
+def _read_text_with_fallback(*paths: str) -> str:
+    for candidate in paths:
+        text = _read_text_file(candidate)
+        if text:
+            return text
+    return ""
+
+
+def _read_json_file(path: str) -> Dict[str, Any]:
+    p = str(path or "").strip()
+    if not p:
+        return {}
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            parsed = json.load(f)
+    except Exception:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
 
 
 def _parse_telegram_secret_text(raw: str) -> Dict[str, str]:
@@ -380,11 +596,16 @@ def _parse_telegram_secret_text(raw: str) -> Dict[str, str]:
 
 def _load_telegram_file_values(secret_file: str, chat_file: str) -> Dict[str, str]:
     out: Dict[str, str] = {}
-    out.update(_parse_telegram_secret_text(_read_text_file(secret_file)))
+    runtime_secret = _parse_telegram_secret_text(
+        _read_text_with_fallback(secret_file, os.path.join(LEGACY_TELEGRAM_SECRETS_DIR, "key.txt"))
+    )
+    out.update(runtime_secret)
     secret_abs = os.path.abspath(secret_file or "")
     chat_abs = os.path.abspath(chat_file or "")
     if chat_abs and chat_abs != secret_abs:
-        chat_values = _parse_telegram_secret_text(_read_text_file(chat_file))
+        chat_values = _parse_telegram_secret_text(
+            _read_text_with_fallback(chat_file, os.path.join(LEGACY_TELEGRAM_SECRETS_DIR, "chat_id.txt"))
+        )
         if chat_values.get("chat_id"):
             out["chat_id"] = chat_values["chat_id"]
     return out
@@ -533,13 +754,10 @@ def _load_threads_store_unlocked() -> None:
     THREADS_DATA["threads"] = []
     THREADS_DATA["messages"] = {}
 
-    if not os.path.exists(THREADS_FILE):
+    source_path = THREADS_FILE if os.path.exists(THREADS_FILE) else LEGACY_THREADS_FILE
+    if not os.path.exists(source_path):
         return
-    try:
-        with open(THREADS_FILE, "r", encoding="utf-8") as f:
-            raw = json.load(f)
-    except Exception:
-        return
+    raw = _read_json_file(source_path)
     if not isinstance(raw, dict):
         return
 
@@ -595,6 +813,16 @@ def _find_thread_unlocked(thread_id: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+def _session_id_from_created_by(created_by: str) -> str:
+    marker = str(created_by or "").strip()
+    if not marker.lower().startswith("session:"):
+        return ""
+    candidate = marker.split(":", 1)[1].strip()
+    if not VALID_NAME_RE.fullmatch(candidate):
+        return ""
+    return candidate
+
+
 def _normalize_share_title(raw: Any, fallback_name: str) -> str:
     text = re.sub(r"\s+", " ", str(raw or "").strip())
     if text:
@@ -632,7 +860,18 @@ def _shared_item_from_raw(raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     except Exception:
         size_bytes = 0
     created_by = str(raw.get("created_by") or "").strip()[:64]
-    is_image = bool(raw.get("is_image")) or mime_type.startswith("image/")
+    session = str(raw.get("session") or "").strip()
+    if not session:
+        session = _session_id_from_created_by(created_by)
+    if session and not VALID_NAME_RE.fullmatch(session):
+        session = ""
+    item_kind = str(raw.get("item_kind") or "").strip().lower()
+    if item_kind not in {"file", "directory"}:
+        item_kind = "directory" if bool(raw.get("is_directory")) else "file"
+    source_kind = str(raw.get("source_kind") or "").strip().lower() or "registered"
+    windows_path = str(raw.get("windows_path") or _wsl_to_windows_path(wsl_path) or "").strip()
+    display_path = str(raw.get("display_path") or windows_path or wsl_path).strip()
+    is_image = item_kind == "file" and (bool(raw.get("is_image")) or mime_type.startswith("image/"))
     return {
         "id": item_id,
         "title": _normalize_share_title(raw.get("title"), file_name),
@@ -644,6 +883,11 @@ def _shared_item_from_raw(raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         "expires_at": expires_at,
         "created_by": created_by,
         "is_image": is_image,
+        "session": session,
+        "item_kind": item_kind,
+        "source_kind": source_kind,
+        "windows_path": windows_path,
+        "display_path": display_path,
     }
 
 
@@ -687,13 +931,10 @@ def _load_shared_outbox_unlocked() -> None:
         return
     SHARED_OUTBOX_LOADED = True
     SHARED_OUTBOX_DATA["items"] = []
-    if not os.path.exists(SHARED_OUTBOX_FILE):
+    source_path = SHARED_OUTBOX_FILE if os.path.exists(SHARED_OUTBOX_FILE) else LEGACY_SHARED_OUTBOX_FILE
+    if not os.path.exists(source_path):
         return
-    try:
-        with open(SHARED_OUTBOX_FILE, "r", encoding="utf-8") as f:
-            raw = json.load(f)
-    except Exception:
-        return
+    raw = _read_json_file(source_path)
     if not isinstance(raw, dict):
         return
     items = raw.get("items")
@@ -728,9 +969,31 @@ def _public_shared_item(item: Dict[str, Any]) -> Dict[str, Any]:
         "expires_at": item.get("expires_at"),
         "created_by": item.get("created_by"),
         "is_image": bool(item.get("is_image")),
+        "session": item.get("session") or "",
+        "item_kind": item.get("item_kind") or "file",
+        "source_kind": item.get("source_kind") or "registered",
         "wsl_path": item.get("wsl_path"),
-        "download_url": f"/share/file/{item.get('id')}",
+        "windows_path": item.get("windows_path") or "",
+        "display_path": item.get("display_path") or item.get("wsl_path") or "",
+        "download_url": (
+            f"/share/file/{item.get('id')}"
+            if (item.get("item_kind") or "file") == "file"
+            else ""
+        ),
     }
+
+
+def _public_session_file_item(session: str, item: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not item:
+        return None
+    public = _public_shared_item(item)
+    if (item.get("item_kind") or "file") == "file":
+        public["download_url"] = (
+            f"/codex/session/{quote(_validate_session_name(session))}/files/{quote(str(item.get('id') or ''))}/download"
+        )
+    else:
+        public["download_url"] = ""
+    return public
 
 
 def _create_shared_outbox_item(
@@ -739,15 +1002,19 @@ def _create_shared_outbox_item(
     title: str = "",
     expires_hours: Optional[int] = None,
     created_by: str = "",
+    session: str = "",
+    allow_directory: bool = False,
+    source_kind: str = "registered",
 ) -> Dict[str, Any]:
-    wsl_abs = _resolve_wsl_path(path)
+    wsl_abs = _resolve_session_access_path(path)
     unc = _wsl_unc_path(wsl_abs)
     if not os.path.exists(unc):
         raise HTTPException(status_code=404, detail="File not found.")
-    if os.path.isdir(unc):
+    is_directory = os.path.isdir(unc)
+    if is_directory and not allow_directory:
         raise HTTPException(status_code=400, detail="Path is a directory. Provide a file path.")
     try:
-        size_bytes = int(os.path.getsize(unc))
+        size_bytes = 0 if is_directory else int(os.path.getsize(unc))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Could not stat file: {type(e).__name__}: {e}")
     max_bytes = max(1, SHARED_OUTBOX_MAX_FILE_MB) * 1024 * 1024
@@ -757,17 +1024,25 @@ def _create_shared_outbox_item(
             detail=f"File too large ({size_bytes} bytes). Limit is {max_bytes} bytes.",
         )
     file_name = os.path.basename(wsl_abs.rstrip("/")) or "shared.bin"
-    claimed_mime = (mimetypes.guess_type(file_name)[0] or "application/octet-stream").strip() or "application/octet-stream"
-    detected_mime = ""
-    try:
-        with open(unc, "rb") as f:
-            detected_mime = _detect_mime_from_bytes(f.read(512))
-    except Exception:
+    if is_directory:
+        mime_type = "inode/directory"
+    else:
+        claimed_mime = (mimetypes.guess_type(file_name)[0] or "application/octet-stream").strip() or "application/octet-stream"
         detected_mime = ""
-    mime_type = detected_mime or claimed_mime
+        try:
+            with open(unc, "rb") as f:
+                detected_mime = _detect_mime_from_bytes(f.read(512))
+        except Exception:
+            detected_mime = ""
+        mime_type = _choose_effective_mime_type(claimed_mime, detected_mime)
     now_ms = _now_ms()
     expires_h = _normalize_share_expires_hours(expires_hours)
     expires_at = now_ms + int(expires_h * 3600 * 1000)
+    normalized_session = session.strip() if isinstance(session, str) else ""
+    if not normalized_session:
+        normalized_session = _session_id_from_created_by(created_by)
+    if normalized_session and not VALID_NAME_RE.fullmatch(normalized_session):
+        raise HTTPException(status_code=400, detail="Invalid session name.")
     item = {
         "id": f"shr_{uuid.uuid4().hex[:12]}",
         "title": _normalize_share_title(title, file_name),
@@ -779,12 +1054,204 @@ def _create_shared_outbox_item(
         "expires_at": expires_at,
         "created_by": (created_by or "manual")[:64],
         "is_image": mime_type.startswith("image/"),
+        "session": normalized_session,
+        "item_kind": "directory" if is_directory else "file",
+        "source_kind": (source_kind or "registered")[:32],
+        "windows_path": _wsl_to_windows_path(wsl_abs),
+        "display_path": _display_path_for_wsl(wsl_abs),
     }
     with SHARED_OUTBOX_LOCK:
         _load_shared_outbox_unlocked()
         SHARED_OUTBOX_DATA["items"].insert(0, item)
         _persist_shared_outbox_unlocked()
     return item
+
+
+def _sort_and_trim_session_files_unlocked() -> None:
+    items = SESSION_FILES_DATA.get("items") or []
+    now_ms = _now_ms()
+    cleaned: List[Dict[str, Any]] = []
+    seen_ids = set()
+    for raw in items:
+        if not isinstance(raw, dict):
+            continue
+        item = _shared_item_from_raw(raw)
+        if not item:
+            continue
+        session_id = str(item.get("session") or "").strip()
+        if not session_id or not VALID_NAME_RE.fullmatch(session_id):
+            continue
+        item_id = item["id"]
+        if item_id in seen_ids or _share_expired(item, now_ms=now_ms):
+            continue
+        seen_ids.add(item_id)
+        cleaned.append(item)
+    cleaned.sort(key=lambda x: int(x.get("created_at") or 0), reverse=True)
+    SESSION_FILES_DATA["items"] = cleaned[: max(1, SESSION_FILES_MAX_KEEP)]
+
+
+def _persist_session_files_unlocked() -> None:
+    _sort_and_trim_session_files_unlocked()
+    parent = os.path.dirname(SESSION_FILES_FILE)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    payload = {"items": SESSION_FILES_DATA.get("items") or []}
+    temp_path = SESSION_FILES_FILE + ".tmp"
+    with open(temp_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    os.replace(temp_path, SESSION_FILES_FILE)
+
+
+def _load_session_files_unlocked() -> None:
+    global SESSION_FILES_LOADED
+    if SESSION_FILES_LOADED:
+        return
+    SESSION_FILES_LOADED = True
+    SESSION_FILES_DATA["items"] = []
+    source_path = ""
+    for candidate in (SESSION_FILES_FILE, SHARED_OUTBOX_FILE, LEGACY_SHARED_OUTBOX_FILE):
+        if candidate and os.path.exists(candidate):
+            source_path = candidate
+            break
+    if not source_path:
+        return
+    raw = _read_json_file(source_path)
+    if not isinstance(raw, dict):
+        return
+    items = raw.get("items")
+    if isinstance(items, list):
+        SESSION_FILES_DATA["items"] = items
+    _sort_and_trim_session_files_unlocked()
+
+
+def _session_files_snapshot_unlocked(session: str) -> Dict[str, Any]:
+    _sort_and_trim_session_files_unlocked()
+    session_id = session.strip()
+    items = [
+        item
+        for item in (SESSION_FILES_DATA.get("items") or [])
+        if str((item or {}).get("session") or "").strip() == session_id
+    ]
+    return {"items": json.loads(json.dumps(items))}
+
+
+def _find_session_file_unlocked(session: str, file_id: str) -> Optional[Dict[str, Any]]:
+    session_id = session.strip()
+    clean_id = _clean_entity_id(file_id)
+    if not session_id or not clean_id:
+        return None
+    for item in SESSION_FILES_DATA.get("items") or []:
+        if (
+            str((item or {}).get("id") or "").strip() == clean_id
+            and str((item or {}).get("session") or "").strip() == session_id
+        ):
+            return item
+    return None
+
+
+def _create_session_file_item(
+    session: str,
+    path: str,
+    *,
+    title: str = "",
+    expires_hours: Optional[int] = None,
+    created_by: str = "",
+    allow_directory: bool = False,
+    source_kind: str = "registered",
+) -> Dict[str, Any]:
+    session_id = _validate_session_name(session)
+    wsl_abs = _resolve_session_access_path(path)
+    unc = _wsl_unc_path(wsl_abs)
+    if not os.path.exists(unc):
+        raise HTTPException(status_code=404, detail="Path not found.")
+    is_directory = os.path.isdir(unc)
+    if is_directory and not allow_directory:
+        raise HTTPException(status_code=400, detail="Select a file or enable directory registration.")
+    if not is_directory:
+        try:
+            size_bytes = int(os.path.getsize(unc))
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Could not stat file: {type(e).__name__}: {e}")
+    else:
+        size_bytes = 0
+    max_bytes = max(1, SESSION_FILES_MAX_FILE_MB) * 1024 * 1024
+    if size_bytes > max_bytes:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File too large ({size_bytes} bytes). Limit is {max_bytes} bytes.",
+        )
+    file_name = os.path.basename(wsl_abs.rstrip("/")) or "session-item"
+    if is_directory:
+        mime_type = "inode/directory"
+    else:
+        claimed_mime = (mimetypes.guess_type(file_name)[0] or "application/octet-stream").strip() or "application/octet-stream"
+        detected_mime = ""
+        try:
+            with open(unc, "rb") as f:
+                detected_mime = _detect_mime_from_bytes(f.read(512))
+        except Exception:
+            detected_mime = ""
+        mime_type = _choose_effective_mime_type(claimed_mime, detected_mime)
+    now_ms = _now_ms()
+    expires_h = _normalize_share_expires_hours(expires_hours)
+    item = {
+        "id": f"sf_{uuid.uuid4().hex[:12]}",
+        "session": session_id,
+        "title": _normalize_share_title(title, file_name),
+        "wsl_path": wsl_abs,
+        "file_name": file_name,
+        "mime_type": mime_type,
+        "size_bytes": size_bytes,
+        "created_at": now_ms,
+        "expires_at": now_ms + int(expires_h * 3600 * 1000),
+        "created_by": (created_by or f"session:{session_id}")[:64],
+        "is_image": mime_type.startswith("image/"),
+        "item_kind": "directory" if is_directory else "file",
+        "source_kind": (source_kind or "registered")[:32],
+        "windows_path": _wsl_to_windows_path(wsl_abs),
+        "display_path": _display_path_for_wsl(wsl_abs),
+    }
+    with SESSION_FILES_LOCK:
+        _load_session_files_unlocked()
+        SESSION_FILES_DATA["items"].insert(0, item)
+        _persist_session_files_unlocked()
+    return item
+
+
+def _remove_session_file_unlocked(session: str, file_id: str) -> Optional[Dict[str, Any]]:
+    existing = _find_session_file_unlocked(session, file_id)
+    if not existing:
+        return None
+    SESSION_FILES_DATA["items"] = [
+        item
+        for item in (SESSION_FILES_DATA.get("items") or [])
+        if not (
+            str((item or {}).get("id") or "").strip() == existing.get("id")
+            and str((item or {}).get("session") or "").strip() == existing.get("session")
+        )
+    ]
+    return existing
+
+
+def _session_upload_root(session: str) -> str:
+    session_id = _validate_session_name(session)
+    return _norm_posix(posixpath.join(CODEX_WORKDIR.rstrip("/"), ".remote_uploads", session_id))
+
+
+def _session_upload_path(session: str, base_name: str) -> str:
+    safe_name = _safe_name(base_name or "upload.bin")
+    ts = int(time.time() * 1000)
+    return _norm_posix(posixpath.join(_session_upload_root(session), f"{ts}_{safe_name}"))
+
+
+def _session_file_is_managed_upload(item: Dict[str, Any]) -> bool:
+    if str(item.get("source_kind") or "").strip().lower() not in {"upload", "session_upload", "managed"}:
+        return False
+    session_id = str(item.get("session") or "").strip()
+    wsl_path = str(item.get("wsl_path") or "").strip()
+    if not session_id or not wsl_path.startswith("/"):
+        return False
+    return _path_under_root(wsl_path, _session_upload_root(session_id))
 
 
 def _telegram_get_updates(token: str) -> Dict[str, Any]:
@@ -959,6 +1426,38 @@ def _mime_preferred_extension(mime_type: str) -> str:
     return mapping.get(m, "")
 
 
+def _is_known_zip_container_document_mime(mime_type: str) -> bool:
+    m = str(mime_type or "").strip().lower()
+    if not m:
+        return False
+    if m.startswith("application/vnd.openxmlformats-officedocument."):
+        return True
+    if m.startswith("application/vnd.oasis.opendocument."):
+        return True
+    return m in {
+        "application/epub+zip",
+        "application/vnd.ms-word.document.macroenabled.12",
+        "application/vnd.ms-word.template.macroenabled.12",
+        "application/vnd.ms-excel.sheet.macroenabled.12",
+        "application/vnd.ms-excel.template.macroenabled.12",
+        "application/vnd.ms-excel.sheet.binary.macroenabled.12",
+        "application/vnd.ms-powerpoint.presentation.macroenabled.12",
+        "application/vnd.ms-powerpoint.template.macroenabled.12",
+        "application/vnd.ms-powerpoint.slideshow.macroenabled.12",
+    }
+
+
+def _choose_effective_mime_type(claimed_mime: str, detected_mime: str) -> str:
+    claimed = str(claimed_mime or "").strip() or "application/octet-stream"
+    detected = str(detected_mime or "").strip()
+    if not detected:
+        return claimed
+    # DOCX/ODT/PPTX/XLSX are ZIP containers; keep the specific office MIME.
+    if detected == "application/zip" and _is_known_zip_container_document_mime(claimed):
+        return claimed
+    return detected
+
+
 def _build_multipart_form_data(
     fields: Dict[str, str],
     *,
@@ -1011,7 +1510,7 @@ def _telegram_send_shared_item(item: Dict[str, Any], caption_override: str = "")
     if not wsl_path:
         return {"ok": False, "error": "telegram_missing_path", "detail": "Shared item has no source path."}
 
-    wsl_abs = _resolve_wsl_path(wsl_path)
+    wsl_abs = _resolve_session_access_path(wsl_path)
     unc = _wsl_unc_path(wsl_abs)
     if not os.path.exists(unc):
         return {"ok": False, "error": "telegram_file_missing", "detail": "Shared file is no longer available."}
@@ -1042,7 +1541,7 @@ def _telegram_send_shared_item(item: Dict[str, Any], caption_override: str = "")
         return {"ok": False, "error": "telegram_read_failed", "detail": f"Could not read file: {type(e).__name__}: {e}"}
 
     detected_mime = _detect_mime_from_bytes(file_bytes[:512])
-    effective_mime = detected_mime or claimed_mime
+    effective_mime = _choose_effective_mime_type(claimed_mime, detected_mime)
     effective_file_name = file_name_raw
     preferred_ext = _mime_preferred_extension(effective_mime)
     if preferred_ext:
@@ -1117,7 +1616,7 @@ def _telegram_send_shared_item(item: Dict[str, Any], caption_override: str = "")
         "file_name": effective_file_name,
         "claimed_mime_type": claimed_mime,
         "mime_type": effective_mime,
-        "mime_corrected": bool(detected_mime and detected_mime != claimed_mime),
+        "mime_corrected": bool(effective_mime and effective_mime != claimed_mime),
         "size_bytes": size_bytes,
     }
 
@@ -1502,10 +2001,66 @@ def run_wsl_bash(command: str, timeout_s: int = 30) -> Dict[str, Any]:
             return {"exit_code": 125, "stdout": "", "stderr": f"exception: {type(e).__name__}: {e}", "attempts": attempt}
 
 # -------------------------
-# WSL path helpers (restricted to CODEX_FILE_ROOT)
+# WSL path helpers
 # -------------------------
 def _norm_posix(p: str) -> str:
     return posixpath.normpath(p).replace("\\", "/")
+
+
+def _windows_to_wsl_path(path: str) -> str:
+    text = str(path or "").strip()
+    if not text:
+        return ""
+    if len(text) >= 3 and text[1] == ":" and text[2] in {"\\", "/"}:
+        drive = text[0].lower()
+        rest = text[2:].replace("\\", "/").lstrip("/")
+        return _norm_posix(f"/mnt/{drive}/{rest}")
+    if text.startswith(r"\\wsl$\\"):
+        parts = text.split("\\")
+        if len(parts) >= 5:
+            return _norm_posix("/" + "/".join(parts[4:]))
+    return text
+
+
+def _wsl_to_windows_path(wsl_abs_path: str) -> str:
+    path = _norm_posix(str(wsl_abs_path or ""))
+    match = re.match(r"^/mnt/([a-zA-Z])(?:/(.*))?$", path)
+    if not match:
+        return ""
+    drive = match.group(1).upper()
+    rest = (match.group(2) or "").replace("/", "\\")
+    return f"{drive}:\\{rest}" if rest else f"{drive}:\\"
+
+
+def _display_path_for_wsl(wsl_abs_path: str) -> str:
+    return _wsl_to_windows_path(wsl_abs_path) or _norm_posix(wsl_abs_path)
+
+
+def _path_under_root(path_value: str, root_value: str) -> bool:
+    norm_path = _norm_posix(path_value)
+    norm_root = _norm_posix(root_value)
+    return norm_path == norm_root or norm_path.startswith(norm_root.rstrip("/") + "/")
+
+
+def _browse_roots() -> List[Dict[str, str]]:
+    candidates = [
+        {"id": "workspace", "label": "Workspace", "path": _norm_posix(CODEX_FILE_ROOT)},
+        {"id": "mnt-c", "label": "Windows C:", "path": "/mnt/c"},
+        {"id": "mnt-d", "label": "Windows D:", "path": "/mnt/d"},
+        {"id": "mnt-e", "label": "Windows E:", "path": "/mnt/e"},
+    ]
+    roots: List[Dict[str, str]] = []
+    seen = set()
+    for item in candidates:
+        root_path = _norm_posix(item["path"])
+        if not root_path.startswith("/") or root_path in seen:
+            continue
+        unc = _wsl_unc_path(root_path)
+        if os.path.exists(unc):
+            seen.add(root_path)
+            roots.append({"id": item["id"], "label": item["label"], "path": root_path})
+    return roots
+
 
 def _resolve_wsl_path(user_path: str) -> str:
     """
@@ -1519,20 +2074,56 @@ def _resolve_wsl_path(user_path: str) -> str:
     if not root.startswith("/"):
         raise HTTPException(status_code=500, detail="CODEX_FILE_ROOT must be an absolute WSL path.")
 
-    p = user_path.strip()
+    p = _windows_to_wsl_path(user_path.strip())
     if p.startswith("/"):
         resolved = _norm_posix(p)
     else:
         resolved = _norm_posix(posixpath.join(root, p))
 
-    # enforce root containment
-    if resolved != root and not resolved.startswith(root.rstrip("/") + "/"):
+    if not _path_under_root(resolved, root):
         raise HTTPException(status_code=403, detail=f"Path is outside allowed root: {root}")
-
     return resolved
 
+
+def _resolve_session_access_path(user_path: str) -> str:
+    if not user_path:
+        raise HTTPException(status_code=400, detail="Missing path.")
+    converted = _windows_to_wsl_path(user_path.strip())
+    if not converted:
+        raise HTTPException(status_code=400, detail="Missing path.")
+    if converted.startswith("/"):
+        resolved = _norm_posix(converted)
+    else:
+        resolved = _resolve_wsl_path(converted)
+    allowed_roots = [root["path"] for root in _browse_roots()]
+    if not any(_path_under_root(resolved, allowed_root) for allowed_root in allowed_roots):
+        raise HTTPException(status_code=403, detail="Path is outside allowed browse roots.")
+    return resolved
+
+
+def _resolve_browser_root(root_id: str) -> Dict[str, str]:
+    normalized = str(root_id or "workspace").strip().lower() or "workspace"
+    for root in _browse_roots():
+        if root["id"] == normalized:
+            return root
+    raise HTTPException(status_code=404, detail="Browse root not available.")
+
+
+def _resolve_browser_path(root_id: str, relative_path: str = "") -> str:
+    root = _resolve_browser_root(root_id)
+    rel = _windows_to_wsl_path(relative_path).strip()
+    if not rel or rel == ".":
+        return root["path"]
+    if rel.startswith("/"):
+        resolved = _norm_posix(rel)
+    else:
+        resolved = _norm_posix(posixpath.join(root["path"], rel))
+    if not _path_under_root(resolved, root["path"]):
+        raise HTTPException(status_code=403, detail="Browse path is outside the selected root.")
+    return resolved
+
+
 def _wsl_unc_path(wsl_abs_path: str) -> str:
-    # Convert /home/megha/x -> \\wsl$\Ubuntu\home\megha\x
     if not wsl_abs_path.startswith("/"):
         raise HTTPException(status_code=500, detail="Internal error: expected absolute WSL path.")
     return r"\\wsl$\%s%s" % (WSL_DISTRO, wsl_abs_path.replace("/", "\\"))
@@ -1546,6 +2137,69 @@ def _auth_token_from_request(request: Request) -> str:
         or request.cookies.get(CODEX_AUTH_COOKIE)
         or ""
     ).strip()
+
+
+def _auth_token_from_websocket(websocket: WebSocket) -> str:
+    header_token = str(websocket.headers.get("x-auth-token") or "").strip()
+    cookie_token = str(websocket.cookies.get(CODEX_AUTH_COOKIE) or "").strip()
+    query_token = str(websocket.query_params.get("token") or "").strip()
+    return header_token or cookie_token or query_token
+
+
+def _browser_entry_for_path(wsl_path: str) -> Dict[str, Any]:
+    unc = _wsl_unc_path(wsl_path)
+    is_dir = os.path.isdir(unc)
+    stat_result = os.stat(unc)
+    return {
+        "name": os.path.basename(wsl_path.rstrip("/")) or wsl_path,
+        "kind": "directory" if is_dir else "file",
+        "display_path": _display_path_for_wsl(wsl_path),
+        "wsl_path": wsl_path,
+        "windows_path": _wsl_to_windows_path(wsl_path),
+        "size_bytes": 0 if is_dir else int(stat_result.st_size),
+        "mtime": int(stat_result.st_mtime * 1000),
+    }
+
+
+def _list_browser_entries(root_id: str, relative_path: str = "") -> Dict[str, Any]:
+    root = _resolve_browser_root(root_id)
+    current_wsl_path = _resolve_browser_path(root_id, relative_path)
+    current_unc = _wsl_unc_path(current_wsl_path)
+    if not os.path.exists(current_unc):
+        raise HTTPException(status_code=404, detail="Browse path not found.")
+    if not os.path.isdir(current_unc):
+        raise HTTPException(status_code=400, detail="Browse path is not a directory.")
+
+    items: List[Dict[str, Any]] = []
+    try:
+        names = sorted(os.listdir(current_unc), key=lambda value: value.lower())
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not list directory: {type(e).__name__}: {e}")
+
+    for name in names:
+        child_wsl = _norm_posix(posixpath.join(current_wsl_path, name))
+        child_unc = _wsl_unc_path(child_wsl)
+        try:
+            items.append(_browser_entry_for_path(child_wsl))
+        except Exception:
+            continue
+
+    relative = ""
+    if current_wsl_path != root["path"]:
+        relative = posixpath.relpath(current_wsl_path, root["path"])
+        if relative == ".":
+            relative = ""
+
+    return {
+        "ok": True,
+        "root": root,
+        "roots": _browse_roots(),
+        "current_path": current_wsl_path,
+        "current_relative_path": relative,
+        "display_path": _display_path_for_wsl(current_wsl_path),
+        "windows_path": _wsl_to_windows_path(current_wsl_path),
+        "items": items,
+    }
 
 def _is_valid_auth_token(token: str) -> bool:
     if not CODEX_AUTH_REQUIRED:
@@ -1893,6 +2547,108 @@ def _run_powershell(script: str, timeout_s: int = 10, sta: bool = False) -> Dict
         return {"exit_code": 124, "stdout": "", "stderr": f"timeout after {timeout_s}s"}
     except Exception as e:
         return {"exit_code": 125, "stdout": "", "stderr": f"exception: {type(e).__name__}: {e}"}
+
+
+def _spawn_windows_background_process(args: List[str]) -> Dict[str, Any]:
+    _ensure_windows_host()
+    kwargs: Dict[str, Any] = {
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+    }
+    if os.name == "nt":
+        creationflags = 0
+        creationflags |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        creationflags |= getattr(subprocess, "DETACHED_PROCESS", 0)
+        creationflags |= getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        if creationflags:
+            kwargs["creationflags"] = creationflags
+        if hasattr(subprocess, "STARTUPINFO"):
+            startupinfo = subprocess.STARTUPINFO()
+            if hasattr(subprocess, "STARTF_USESHOWWINDOW"):
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                startupinfo.wShowWindow = 0
+            kwargs["startupinfo"] = startupinfo
+    try:
+        proc = subprocess.Popen(args, **kwargs)
+        return {"ok": True, "pid": int(getattr(proc, "pid", 0) or 0)}
+    except Exception as e:
+        return {"ok": False, "detail": f"{type(e).__name__}: {e}"}
+
+
+def _create_power_confirmation(action: str) -> Dict[str, Any]:
+    expires_in = max(10, CODEX_POWER_CONFIRM_TTL_SECONDS)
+    token = secrets.token_urlsafe(24)
+    expires_at = time.time() + expires_in
+    with POWER_CONFIRM_LOCK:
+        now = time.time()
+        for existing, entry in list(POWER_CONFIRMATIONS.items()):
+            if float(entry.get("expires_at", 0) or 0) <= now:
+                POWER_CONFIRMATIONS.pop(existing, None)
+        POWER_CONFIRMATIONS[token] = {
+            "action": action,
+            "expires_at": expires_at,
+        }
+    return {
+        "confirm_required": True,
+        "confirm_token": token,
+        "confirm_expires_in": expires_in,
+    }
+
+
+def _consume_power_confirmation(action: str, token: str) -> bool:
+    candidate = str(token or "").strip()
+    if not candidate:
+        return False
+    with POWER_CONFIRM_LOCK:
+        now = time.time()
+        for existing, entry in list(POWER_CONFIRMATIONS.items()):
+            if float(entry.get("expires_at", 0) or 0) <= now:
+                POWER_CONFIRMATIONS.pop(existing, None)
+        entry = POWER_CONFIRMATIONS.get(candidate)
+        if not entry or str(entry.get("action") or "") != action:
+            return False
+        POWER_CONFIRMATIONS.pop(candidate, None)
+        return True
+
+
+def _schedule_power_action(action: str) -> Dict[str, Any]:
+    _ensure_windows_host()
+    action_name = str(action or "").strip().lower()
+    destructive = {"sleep", "hibernate", "restart", "shutdown"}
+    if action_name not in {"lock", *destructive}:
+        raise HTTPException(status_code=400, detail="Unsupported power action.")
+    delay_ms = int(max(0.5, CODEX_POWER_ACTION_DELAY_SECONDS) * 1000)
+    if action_name == "lock":
+        script = "rundll32.exe user32.dll,LockWorkStation"
+        args = ["powershell", "-NoProfile", "-Command", script]
+    elif action_name == "sleep":
+        script = (
+            f"Start-Sleep -Milliseconds {delay_ms}; "
+            "Add-Type -AssemblyName System.Windows.Forms; "
+            "[System.Windows.Forms.Application]::SetSuspendState([System.Windows.Forms.PowerState]::Suspend, $false, $false) | Out-Null"
+        )
+        args = ["powershell", "-NoProfile", "-STA", "-Command", script]
+    elif action_name == "hibernate":
+        script = f"Start-Sleep -Milliseconds {delay_ms}; shutdown.exe /h"
+        args = ["powershell", "-NoProfile", "-Command", script]
+    elif action_name == "restart":
+        script = f"Start-Sleep -Milliseconds {delay_ms}; shutdown.exe /r /t 0 /f"
+        args = ["powershell", "-NoProfile", "-Command", script]
+    else:
+        script = f"Start-Sleep -Milliseconds {delay_ms}; shutdown.exe /s /t 0 /f"
+        args = ["powershell", "-NoProfile", "-Command", script]
+    started = _spawn_windows_background_process(args)
+    if not started.get("ok"):
+        raise HTTPException(status_code=500, detail=str(started.get("detail") or "power_action_failed"))
+    return {
+        "ok": True,
+        "action": action_name,
+        "accepted": True,
+        "scheduled_at": time.time() + (0 if action_name == "lock" else CODEX_POWER_ACTION_DELAY_SECONDS),
+        "detail": "Power action scheduled." if action_name != "lock" else "Desktop locked.",
+        "pid": started.get("pid", 0),
+    }
 
 def _desktop_send_text(text: str) -> Dict[str, Any]:
     # Clipboard + Ctrl+V handles large text and special chars better than raw SendKeys.
@@ -5168,13 +5924,38 @@ def legacy_auth_logout(next: str = Form("/")):
 # -------------------------
 # Pairing + QR endpoints
 # -------------------------
+def _power_status_payload() -> Dict[str, Any]:
+    mac_info = _wake_mac_info()
+    relay = _wake_relay_health()
+    wake_command = str(relay.get("wake_command") or CODEX_WAKE_TELEGRAM_COMMAND)
+    return {
+        "ok": True,
+        "online": True,
+        "actions": ["lock", "sleep", "hibernate", "restart", "shutdown"] if os.name == "nt" else [],
+        "confirm_required_actions": ["sleep", "hibernate", "restart", "shutdown"],
+        "wake_surface": str(relay.get("wake_surface") or "telegram"),
+        "wake_command": wake_command,
+        "wake_instruction": f"{wake_command} laptop",
+        "wake_relay_configured": bool(relay.get("configured")),
+        "relay_reachable": bool(relay.get("reachable")),
+        "relay_detail": str(relay.get("detail") or "").strip(),
+        "primary_mac": str(mac_info.get("primary_mac") or ""),
+        "wake_candidate_macs": list(mac_info.get("wake_candidate_macs") or []),
+        "wake_supported": bool(mac_info.get("wake_supported")),
+    }
+
+
 @app.get("/net/info")
 def net_info():
     # Helper for UI to suggest reachable base URLs (LAN vs Tailscale).
+    mac_info = _wake_mac_info()
     return {
         "ok": True,
         "lan_ip": guess_lan_ipv4(),
         "tailscale_ip": get_tailscale_ipv4(),
+        "primary_mac": str(mac_info.get("primary_mac") or ""),
+        "wake_candidate_macs": list(mac_info.get("wake_candidate_macs") or []),
+        "wake_supported": bool(mac_info.get("wake_supported")),
     }
 
 
@@ -5654,6 +6435,30 @@ def desktop_input_key(request: Request, payload: Dict[str, Any] = Body(...)):
         return {"ok": False, "error": "key_failed", "raw": r}
     return {"ok": True, "key": key}
 
+
+@app.get("/power/status")
+def power_status():
+    _ensure_windows_host()
+    return _power_status_payload()
+
+
+@app.post("/power/action")
+def power_action(payload: Dict[str, Any] = Body(...)):
+    _ensure_windows_host()
+    action = str(payload.get("action") or "").strip().lower()
+    if action not in {"lock", "sleep", "hibernate", "restart", "shutdown"}:
+        raise HTTPException(status_code=400, detail="Unsupported power action.")
+    destructive = {"sleep", "hibernate", "restart", "shutdown"}
+    if action in destructive and not _consume_power_confirmation(action, str(payload.get("confirm_token") or "")):
+        return {
+            "ok": False,
+            "action": action,
+            "error": "confirmation_required",
+            "detail": f"Confirm {action} before it is sent to the host.",
+            **_create_power_confirmation(action),
+        }
+    return _schedule_power_action(action)
+
 # -------------------------
 # Codex multi-session endpoints
 # -------------------------
@@ -5811,7 +6616,8 @@ def codex_session_create(payload: Optional[Dict[str, Any]] = Body(default=None))
         payload.get("reasoning_effort") or payload.get("model_reasoning_effort"),
         model=model,
     )
-    codex_cmd = _build_codex_launch_command(model, reasoning_effort)
+    resume_last = bool(payload.get("resume_last"))
+    codex_cmd = "codex resume --last" if resume_last else _build_codex_launch_command(model, reasoning_effort)
     cmd = f"tmux new-session -d -s {name} -c " + _bash_quote(cwd) + " " + _bash_quote(codex_cmd)
     r = run_wsl_bash(cmd, timeout_s=45)
     if r.get("exit_code") != 0:
@@ -5829,6 +6635,7 @@ def codex_session_create(payload: Optional[Dict[str, Any]] = Body(default=None))
             "last_text": "",
             "model": model,
             "reasoning_effort": reasoning_effort,
+            "resume_last": resume_last,
         }
     return {
         "ok": True,
@@ -5836,6 +6643,7 @@ def codex_session_create(payload: Optional[Dict[str, Any]] = Body(default=None))
         "cwd": cwd,
         "model": model,
         "reasoning_effort": reasoning_effort,
+        "resume_last": resume_last,
     }
 
 @app.delete("/codex/session/{session}")
@@ -5857,6 +6665,127 @@ def _session_pane(session: str) -> Optional[Dict[str, Any]]:
         return None
     panes.sort(key=lambda p: p.get("active"), reverse=True)
     return panes[0]
+
+
+def _session_stream_interval_ms(profile: str) -> int:
+    selected = str(profile or "").strip().lower()
+    if selected == "fast":
+        return 220
+    if selected == "battery":
+        return 850
+    return 420
+
+
+def _session_stream_state_unlocked(session: str) -> Dict[str, Any]:
+    session_id = _validate_session_name(session)
+    state = SESSION_STREAM_STATES.get(session_id)
+    if state is None:
+        state = {
+            "seq": 0,
+            "last_text": "",
+            "events": [],
+            "updated_at": time.time(),
+        }
+        SESSION_STREAM_STATES[session_id] = state
+    return state
+
+
+def _session_stream_event_payload(
+    *,
+    session: str,
+    pane_id: str,
+    seq: int,
+    event_type: str,
+    text: str,
+    profile: str = "",
+    detail: str = "",
+    state: str = "",
+    current_command: str = "",
+) -> Dict[str, Any]:
+    payload = {
+        "session": session,
+        "pane_id": pane_id,
+        "seq": seq,
+        "type": event_type,
+        "text": text,
+        "detail": detail,
+        "ts": time.time(),
+    }
+    if profile:
+        payload["profile"] = profile
+    if state:
+        payload["state"] = state
+    if current_command:
+        payload["current_command"] = current_command
+    return payload
+
+
+def _publish_session_stream_snapshot(
+    session: str,
+    pane_id: str,
+    text: str,
+    *,
+    screen_state: str = "",
+    current_command: str = "",
+) -> Optional[Dict[str, Any]]:
+    session_id = _validate_session_name(session)
+    pane_value = _validate_pane_id(pane_id)
+    with SESSION_STREAM_LOCK:
+        stream_state = _session_stream_state_unlocked(session_id)
+        previous = str(stream_state.get("last_text") or "")
+        if text == previous:
+            return None
+        if stream_state["seq"] == 0:
+            event_type = "snapshot"
+            payload_text = text
+        elif text.startswith(previous):
+            event_type = "append"
+            payload_text = text[len(previous):]
+        else:
+            event_type = "replace"
+            payload_text = text
+        stream_state["seq"] = int(stream_state.get("seq") or 0) + 1
+        event = _session_stream_event_payload(
+            session=session_id,
+            pane_id=pane_value,
+            seq=stream_state["seq"],
+            event_type=event_type,
+            text=payload_text,
+            state=screen_state,
+            current_command=current_command,
+        )
+        stream_state["last_text"] = text
+        stream_state["updated_at"] = time.time()
+        stream_state["events"].append(event)
+        if len(stream_state["events"]) > SESSION_STREAM_REPLAY_MAX:
+            stream_state["events"] = stream_state["events"][-SESSION_STREAM_REPLAY_MAX:]
+        return dict(event)
+
+
+def _session_stream_replay(session: str, since_seq: int) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    with SESSION_STREAM_LOCK:
+        state = _session_stream_state_unlocked(session)
+        events = list(state.get("events") or [])
+        if since_seq <= 0:
+            return [], None
+        replay = [dict(event) for event in events if int(event.get("seq") or 0) > since_seq]
+        if replay:
+            oldest = int(replay[0].get("seq") or 0)
+            if oldest <= since_seq + 1:
+                return replay, None
+        if int(state.get("seq") or 0) <= 0:
+            return [], None
+        pane = _session_pane(session)
+        pane_id = _validate_pane_id(str((pane or {}).get("pane_id") or "%0")) if pane else "%0"
+        snapshot = _session_stream_event_payload(
+            session=session,
+            pane_id=pane_id,
+            seq=int(state.get("seq") or 0),
+            event_type="snapshot",
+            text=str(state.get("last_text") or ""),
+            detail="replay_reset",
+        )
+        return [], snapshot
 
 
 def _maybe_repair_codex_session_reasoning(session: str, pane_id: str) -> Dict[str, Any]:
@@ -6029,9 +6958,24 @@ def codex_session_send(session: str, text: str = Body(..., media_type="text/plai
                 title=share_cmd.get("title") or "",
                 expires_hours=share_cmd.get("expires_hours"),
                 created_by=f"session:{session}",
+                session=session,
+                source_kind="command",
             )
         except HTTPException as e:
             return {"ok": False, "error": "share_create_failed", "detail": str(e.detail)}
+        session_file = None
+        try:
+            session_file = _create_session_file_item(
+                session,
+                str(item.get("wsl_path") or ""),
+                title=str(item.get("title") or ""),
+                expires_hours=share_cmd.get("expires_hours"),
+                created_by=f"session:{session}",
+                allow_directory=bool(item.get("item_kind") == "directory"),
+                source_kind="command",
+            )
+        except HTTPException:
+            session_file = None
         telegram_result = None
         detail = "Shared file added to mobile inbox."
         if share_cmd.get("send_telegram"):
@@ -6044,6 +6988,7 @@ def codex_session_send(session: str, text: str = Body(..., media_type="text/plai
             "ok": True,
             "session": session,
             "shared_file": _public_shared_item(item),
+            "session_file": _public_session_file_item(session, session_file),
             "telegram": telegram_result,
             "detail": detail,
         }
@@ -6211,6 +7156,13 @@ def codex_session_screen(session: str):
             "model": prev.get("model") or CODEX_DEFAULT_MODEL,
             "reasoning_effort": prev.get("reasoning_effort") or CODEX_DEFAULT_REASONING_EFFORT,
         }
+    _publish_session_stream_snapshot(
+        session,
+        pane["pane_id"],
+        text or snippet,
+        screen_state=state,
+        current_command=pane.get("current_command", ""),
+    )
     return {
         "ok": True,
         "session": session,
@@ -6219,6 +7171,169 @@ def codex_session_screen(session: str):
         "state": state,
         "text": text or snippet,
     }
+
+
+@app.websocket("/codex/session/{session}/ws")
+async def codex_session_stream(websocket: WebSocket, session: str):
+    session_id = str(session or "").strip()
+    try:
+        session_id = _validate_session_name(session_id)
+    except HTTPException as exc:
+        await websocket.accept()
+        await websocket.send_json({"ok": False, "type": "error", "detail": exc.detail})
+        await websocket.close(code=4400)
+        return
+
+    await websocket.accept()
+    if not _is_valid_auth_token(_auth_token_from_websocket(websocket)):
+        await websocket.send_json({"ok": False, "type": "error", "detail": "Login required."})
+        await websocket.close(code=4401)
+        return
+
+    selected_profile = str(websocket.query_params.get("profile") or "balanced").strip().lower()
+    if selected_profile not in {"fast", "balanced", "battery"}:
+        selected_profile = "balanced"
+    try:
+        since_seq = int(str(websocket.query_params.get("since_seq") or "0").strip() or "0")
+    except Exception:
+        since_seq = 0
+    interval_ms = _session_stream_interval_ms(selected_profile)
+    last_keepalive = 0.0
+    waiting_for_pane = False
+
+    try:
+        with SESSION_STREAM_LOCK:
+            state = _session_stream_state_unlocked(session_id)
+            hello_payload = _session_stream_event_payload(
+                session=session_id,
+                pane_id="",
+                seq=int(state.get("seq") or 0),
+                event_type="hello",
+                text="",
+                profile=selected_profile,
+                detail="connected",
+            )
+        await websocket.send_json({"ok": True, **hello_payload})
+
+        replay_events, replay_snapshot = _session_stream_replay(session_id, since_seq)
+        for event in replay_events:
+            await websocket.send_json({"ok": True, **event})
+        if replay_snapshot:
+            await websocket.send_json({"ok": True, **replay_snapshot})
+
+        if not replay_events and not replay_snapshot:
+            pane = _session_pane(session_id)
+            if pane:
+                initial = await asyncio.to_thread(_stream_capture_pane_text, pane["pane_id"], 25000)
+                if initial.get("ok"):
+                    current_text = str(initial.get("text") or "")
+                    current_state = _infer_progress_state(current_text, pane.get("current_command", ""))
+                    event = await asyncio.to_thread(
+                        _publish_session_stream_snapshot,
+                        session_id,
+                        pane["pane_id"],
+                        current_text,
+                        screen_state=current_state,
+                        current_command=pane.get("current_command", ""),
+                    )
+                    if event:
+                        await websocket.send_json({"ok": True, **event, "profile": selected_profile})
+
+        while True:
+            pane = _session_pane(session_id)
+            if not pane:
+                if not waiting_for_pane:
+                    waiting_for_pane = True
+                    await websocket.send_json(
+                        {
+                            "ok": True,
+                            **_session_stream_event_payload(
+                                session=session_id,
+                                pane_id="",
+                                seq=0,
+                                event_type="status",
+                                text="",
+                                profile=selected_profile,
+                                detail="waiting_for_pane",
+                                state="starting",
+                            ),
+                        }
+                    )
+                await asyncio.sleep(max(0.6, interval_ms / 1000.0))
+                continue
+
+            waiting_for_pane = False
+            capture = await asyncio.to_thread(_stream_capture_pane_text, pane["pane_id"], 25000)
+            if not capture.get("ok"):
+                await websocket.send_json(
+                    {
+                        "ok": False,
+                        **_session_stream_event_payload(
+                            session=session_id,
+                            pane_id=pane["pane_id"],
+                            seq=0,
+                            event_type="error",
+                            text="",
+                            profile=selected_profile,
+                            detail=str(capture.get("error") or "capture_failed"),
+                        ),
+                    }
+                )
+                await asyncio.sleep(max(1.0, interval_ms / 1000.0))
+                continue
+
+            text = str(capture.get("text") or "")
+            current_command = str(pane.get("current_command") or "")
+            current_state = _infer_progress_state(text, current_command)
+            with SESSIONS_LOCK:
+                prev = SESSIONS.get(session_id, {})
+                SESSIONS[session_id] = {
+                    **prev,
+                    "session": session_id,
+                    "pane_id": pane["pane_id"],
+                    "current_command": current_command,
+                    "cwd": pane.get("current_path", ""),
+                    "state": current_state,
+                    "updated_at": time.time(),
+                    "snippet": text.splitlines()[-1][:240] if text else "",
+                    "last_text": text,
+                    "model": prev.get("model") or CODEX_DEFAULT_MODEL,
+                    "reasoning_effort": prev.get("reasoning_effort") or CODEX_DEFAULT_REASONING_EFFORT,
+                }
+            event = await asyncio.to_thread(
+                _publish_session_stream_snapshot,
+                session_id,
+                pane["pane_id"],
+                text,
+                screen_state=current_state,
+                current_command=current_command,
+            )
+            if event:
+                await websocket.send_json({"ok": True, **event, "profile": selected_profile})
+                last_keepalive = time.time()
+            elif time.time() - last_keepalive > 10:
+                with SESSION_STREAM_LOCK:
+                    seq = int((_session_stream_state_unlocked(session_id).get("seq") or 0))
+                await websocket.send_json(
+                    {
+                        "ok": True,
+                        **_session_stream_event_payload(
+                            session=session_id,
+                            pane_id=pane["pane_id"],
+                            seq=seq,
+                            event_type="keepalive",
+                            text="",
+                            profile=selected_profile,
+                            detail="idle",
+                            state=current_state,
+                            current_command=current_command,
+                        ),
+                    }
+                )
+                last_keepalive = time.time()
+            await asyncio.sleep(interval_ms / 1000.0)
+    except WebSocketDisconnect:
+        return
 
 @app.get("/codex/sessions")
 def codex_sessions_live():
@@ -6304,9 +7419,7 @@ async def codex_session_image(
         return {"ok": False, "error": "not_found", "detail": f"Session '{session}' has no panes."}
 
     base_name = _safe_name(file.filename or "image")
-    ts = int(time.time())
-    rel = f".remote_uploads/{session}_{ts}_{base_name}"
-    wsl_abs = posixpath.join(CODEX_WORKDIR.rstrip("/"), rel)
+    wsl_abs = _session_upload_path(session, base_name)
     unc = _wsl_unc_path(wsl_abs)
     os.makedirs(os.path.dirname(unc), exist_ok=True)
     with open(unc, "wb") as f:
@@ -6315,6 +7428,20 @@ async def codex_session_image(
             if not chunk:
                 break
             f.write(chunk)
+    try:
+        session_file = _create_session_file_item(
+            session,
+            wsl_abs,
+            title=base_name,
+            created_by=f"session:{session}",
+            source_kind="upload",
+        )
+    except HTTPException as exc:
+        try:
+            os.remove(unc)
+        except Exception:
+            pass
+        return {"ok": False, "error": "upload_register_failed", "detail": str(exc.detail)}
 
     msg = (prompt or "").strip()
     mode = str(delivery_mode or "").strip().lower()
@@ -6330,6 +7457,7 @@ async def codex_session_image(
                 "error": "clipboard_paste_unavailable",
                 "detail": "Desktop clipboard paste is available only on Windows host.",
                 "saved_path": wsl_abs,
+                "session_file": _public_session_file_item(session, session_file),
             }
         _require_desktop_enabled(request)
         pasted = _desktop_paste_image_file(unc)
@@ -6339,11 +7467,13 @@ async def codex_session_image(
                 "error": "clipboard_paste_failed",
                 "detail": (pasted.get("stderr") or pasted.get("stdout") or "clipboard_paste_failed").strip(),
                 "saved_path": wsl_abs,
+                "session_file": _public_session_file_item(session, session_file),
             }
         return {
             "ok": True,
             "session": session,
             "saved_path": wsl_abs,
+            "session_file": _public_session_file_item(session, session_file),
             "paste_attempted": True,
             "paste_ok": True,
             "paste_error": "",
@@ -6360,11 +7490,18 @@ async def codex_session_image(
             timeout_s=20,
         )
         if insert.get("exit_code") != 0:
-            return {"ok": False, "error": "insert_failed", "saved_path": wsl_abs, "raw": insert}
+            return {
+                "ok": False,
+                "error": "insert_failed",
+                "saved_path": wsl_abs,
+                "session_file": _public_session_file_item(session, session_file),
+                "raw": insert,
+            }
         return {
             "ok": True,
             "session": session,
             "saved_path": wsl_abs,
+            "session_file": _public_session_file_item(session, session_file),
             "paste_attempted": False,
             "paste_ok": False,
             "paste_error": "",
@@ -6374,6 +7511,9 @@ async def codex_session_image(
 
     repair = _maybe_repair_codex_session_reasoning(session, pane["pane_id"])
     repair_applied = bool(repair.get("applied"))
+    repair_warning = ""
+    if not repair.get("ok"):
+        repair_warning = "Could not auto-repair session profile before image send."
 
     if msg:
         text = f"{msg}\n\nImage path: {wsl_abs}"
@@ -6387,11 +7527,18 @@ async def codex_session_image(
     )
     send = run_wsl_bash(cmd, timeout_s=20)
     if send.get("exit_code") != 0:
-        return {"ok": False, "error": "send_failed", "saved_path": wsl_abs, "raw": send}
+        return {
+            "ok": False,
+            "error": "send_failed",
+            "saved_path": wsl_abs,
+            "session_file": _public_session_file_item(session, session_file),
+            "raw": send,
+        }
     out: Dict[str, Any] = {
         "ok": True,
         "session": session,
         "saved_path": wsl_abs,
+        "session_file": _public_session_file_item(session, session_file),
         "paste_attempted": False,
         "paste_ok": False,
         "paste_error": "",
@@ -6401,6 +7548,165 @@ async def codex_session_image(
     if repair_warning:
         out["profile_repair_warning"] = repair_warning
     return out
+
+
+@app.get("/fs/list")
+def fs_list(root: str = "workspace", path: str = ""):
+    return _list_browser_entries(root, path)
+
+
+@app.get("/codex/session/{session}/files")
+def codex_session_files(session: str):
+    session = _validate_session_name(session)
+    with SESSION_FILES_LOCK:
+        _load_session_files_unlocked()
+        snapshot = _session_files_snapshot_unlocked(session)
+    return {
+        "ok": True,
+        "session": session,
+        "items": [_public_session_file_item(session, item) for item in snapshot.get("items") or []],
+    }
+
+
+@app.post("/codex/session/{session}/files/register")
+def codex_session_files_register(session: str, payload: Optional[Dict[str, Any]] = Body(default=None)):
+    session = _validate_session_name(session)
+    payload = payload or {}
+    path = str(payload.get("path") or "").strip()
+    if not path:
+        raise HTTPException(status_code=400, detail="path is required.")
+    title = str(payload.get("title") or "").strip()
+    allow_directory = bool(payload.get("allow_directory"))
+    item = _create_session_file_item(
+        session,
+        path,
+        title=title,
+        expires_hours=payload.get("expires_hours"),
+        created_by=str(payload.get("created_by") or f"session:{session}")[:64],
+        allow_directory=allow_directory,
+        source_kind="registered",
+    )
+    return {"ok": True, "session": session, "item": _public_session_file_item(session, item)}
+
+
+@app.post("/codex/session/{session}/files/upload")
+async def codex_session_files_upload(
+    session: str,
+    file: UploadFile = File(...),
+    title: str = Form(""),
+):
+    session = _validate_session_name(session)
+    base_name = _safe_name(file.filename or "upload.bin")
+    wsl_abs = _session_upload_path(session, base_name)
+    unc = _wsl_unc_path(wsl_abs)
+    os.makedirs(os.path.dirname(unc), exist_ok=True)
+    try:
+        with open(unc, "wb") as handle:
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                handle.write(chunk)
+        item = _create_session_file_item(
+            session,
+            wsl_abs,
+            title=title or base_name,
+            created_by=f"session:{session}",
+            source_kind="upload",
+        )
+    except HTTPException:
+        try:
+            if os.path.exists(unc):
+                os.remove(unc)
+        except Exception:
+            pass
+        raise
+    except Exception as exc:
+        try:
+            if os.path.exists(unc):
+                os.remove(unc)
+        except Exception:
+            pass
+        raise HTTPException(status_code=500, detail=f"Failed to upload file: {type(exc).__name__}: {exc}")
+    return {"ok": True, "session": session, "item": _public_session_file_item(session, item)}
+
+
+@app.post("/codex/session/{session}/files/{file_id}/telegram")
+def codex_session_files_telegram(session: str, file_id: str, payload: Optional[Dict[str, Any]] = Body(default=None)):
+    session = _validate_session_name(session)
+    payload = payload or {}
+    caption = str(payload.get("caption") or "").strip()
+    with SESSION_FILES_LOCK:
+        _load_session_files_unlocked()
+        item = _find_session_file_unlocked(session, file_id)
+        if not item:
+            raise HTTPException(status_code=404, detail="Session file not found.")
+        snap = json.loads(json.dumps(item))
+    telegram_result = _telegram_send_shared_item(snap, caption_override=caption)
+    return {
+        "ok": bool(telegram_result.get("ok")),
+        "session": session,
+        "item": _public_session_file_item(session, snap),
+        "telegram": telegram_result,
+        "detail": (
+            "Sent to Telegram."
+            if telegram_result.get("ok")
+            else (telegram_result.get("detail") or telegram_result.get("error") or "Telegram send failed.")
+        ),
+    }
+
+
+@app.delete("/codex/session/{session}/files/{file_id}")
+def codex_session_files_delete(session: str, file_id: str):
+    session = _validate_session_name(session)
+    with SESSION_FILES_LOCK:
+        _load_session_files_unlocked()
+        existing = _find_session_file_unlocked(session, file_id)
+        if not existing:
+            return {"ok": False, "error": "not_found", "detail": "Session file not found."}
+        item = _remove_session_file_unlocked(session, file_id)
+        _persist_session_files_unlocked()
+    if not item:
+        return {"ok": False, "error": "not_found", "detail": "Session file not found."}
+
+    deleted_source = False
+    if _session_file_is_managed_upload(item):
+        unc = _wsl_unc_path(str(item.get("wsl_path") or ""))
+        try:
+            if os.path.isdir(unc):
+                shutil.rmtree(unc)
+            elif os.path.exists(unc):
+                os.remove(unc)
+            deleted_source = True
+        except Exception:
+            deleted_source = False
+    return {
+        "ok": True,
+        "session": session,
+        "item": _public_session_file_item(session, item),
+        "deleted_source": deleted_source,
+    }
+
+
+@app.get("/codex/session/{session}/files/{file_id}/download")
+def codex_session_files_download(session: str, file_id: str):
+    session = _validate_session_name(session)
+    with SESSION_FILES_LOCK:
+        _load_session_files_unlocked()
+        item = _find_session_file_unlocked(session, file_id)
+        if not item:
+            raise HTTPException(status_code=404, detail="Session file not found.")
+        if _share_expired(item):
+            raise HTTPException(status_code=410, detail="Session file has expired.")
+        snap = json.loads(json.dumps(item))
+    wsl_abs = _resolve_session_access_path(str(snap.get("wsl_path") or ""))
+    unc = _wsl_unc_path(wsl_abs)
+    if not os.path.exists(unc):
+        raise HTTPException(status_code=404, detail="Session file is no longer available.")
+    if os.path.isdir(unc):
+        raise HTTPException(status_code=400, detail="Session path is a directory.")
+    filename = str(snap.get("file_name") or os.path.basename(wsl_abs.rstrip("/")) or "download.bin")
+    return FileResponse(unc, filename=filename)
 
 def _legacy_result_page(title: str, payload: Dict[str, Any], status_code: int = 200) -> HTMLResponse:
     pretty = html_std.escape(json.dumps(payload, ensure_ascii=False, indent=2))
@@ -6970,6 +8276,31 @@ def pane_send(pane_id: str, text: str = Body(..., media_type="text/plain")):
 
     return {"ok": False, "error": "send_failed", "raw": r}
 
+@app.post("/tmux/pane/{pane_id}/key")
+def pane_send_key(pane_id: str, payload: Dict[str, Any] = Body(...)):
+    pane_id = _validate_pane_id(pane_id)
+    raw_key = str((payload or {}).get("key") or "").strip().lower()
+    key_map = {
+        "up": "Up",
+        "down": "Down",
+        "left": "Left",
+        "right": "Right",
+        "enter": "Enter",
+        "arrowup": "Up",
+        "arrowdown": "Down",
+        "arrowleft": "Left",
+        "arrowright": "Right",
+    }
+    tmux_key = key_map.get(raw_key)
+    if not tmux_key:
+        raise HTTPException(status_code=400, detail="Unsupported key. Use: up, down, left, right, enter.")
+    r = run_wsl_bash(f"tmux send-keys -t {pane_id} {tmux_key}", timeout_s=20)
+    if r.get("exit_code") == 0:
+        return {"ok": True, "pane_id": pane_id, "key": raw_key}
+    if not _tmux_server_running(r.get("stderr") or ""):
+        return {"ok": False, "error": "tmux_server_not_running", "raw": r}
+    return {"ok": False, "error": "key_failed", "raw": r}
+
 @app.post("/tmux/pane/{pane_id}/ctrlc")
 def pane_ctrlc(pane_id: str):
     pane_id = _validate_pane_id(pane_id)
@@ -7106,7 +8437,7 @@ def share_file_download(share_id: str):
         if _share_expired(item):
             raise HTTPException(status_code=410, detail="Share has expired.")
         wsl_path = str(item.get("wsl_path") or "")
-    wsl_abs = _resolve_wsl_path(wsl_path)
+    wsl_abs = _resolve_session_access_path(wsl_path)
     unc = _wsl_unc_path(wsl_abs)
     if not os.path.exists(unc):
         raise HTTPException(status_code=404, detail="Shared file is no longer available.")

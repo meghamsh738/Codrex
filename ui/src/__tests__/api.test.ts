@@ -4,10 +4,13 @@ import {
   buildPairConsumeUrl,
   buildPairQrPngUrl,
   buildSuggestedControllerUrl,
+  createSessionWithOptions,
   createSharedFile,
   deleteSharedFile,
+  getPowerStatus,
   getTelegramStatus,
   listSharedFiles,
+  sendPowerAction,
   sendSessionKey,
   sendTelegramText,
   sendSharedFileToTelegram,
@@ -114,6 +117,40 @@ describe("session profile apply API", () => {
           "Content-Type": "application/json",
         },
         body: JSON.stringify({ key: "up" }),
+      }),
+    );
+  });
+
+  it("posts resume_last flag when creating resume session", async () => {
+    fetchMock.mockResolvedValue({
+      ok: true,
+      status: 200,
+      text: async () => JSON.stringify({ ok: true, session: "codex_resume_demo" }),
+    });
+
+    const out = await createSessionWithOptions({
+      name: "codex_resume_demo",
+      cwd: "/home/megha/codrex-work",
+      model: "gpt-5-codex",
+      reasoning_effort: "high",
+      resume_last: true,
+    });
+    expect(out.ok).toBe(true);
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/codex/session",
+      expect.objectContaining({
+        method: "POST",
+        credentials: "include",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          name: "codex_resume_demo",
+          cwd: "/home/megha/codrex-work",
+          model: "gpt-5-codex",
+          reasoning_effort: "high",
+          resume_last: true,
+        }),
       }),
     );
   });
@@ -241,6 +278,42 @@ describe("shared files API", () => {
           "Content-Type": "application/json",
         },
         body: JSON.stringify({ text: "hello from remote" }),
+      }),
+    );
+  });
+
+  it("reads power status", async () => {
+    fetchMock.mockResolvedValue({
+      ok: true,
+      status: 200,
+      text: async () => JSON.stringify({ ok: true, online: true }),
+    });
+    const out = await getPowerStatus();
+    expect(out.ok).toBe(true);
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/power/status",
+      expect.objectContaining({
+        credentials: "include",
+      }),
+    );
+  });
+
+  it("posts power action payload", async () => {
+    fetchMock.mockResolvedValue({
+      ok: true,
+      status: 200,
+      text: async () => JSON.stringify({ ok: true, accepted: true }),
+    });
+    const out = await sendPowerAction("shutdown", { confirm_token: "tok_123" });
+    expect(out.ok).toBe(true);
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/power/action",
+      expect.objectContaining({
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ action: "shutdown", confirm_token: "tok_123" }),
       }),
     );
   });

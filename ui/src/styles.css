@@ -1087,6 +1087,110 @@ button:active,
   position: relative;
 }
 
+.session-workspace {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 12px;
+}
+
+.session-main-pane,
+.session-files-pane {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-width: 0;
+}
+
+.session-files-pane {
+  padding: 0;
+}
+
+.session-files-head,
+.session-files-subhead,
+.session-console-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.session-files-head h3,
+.session-console-head h3 {
+  margin: 0;
+  font-family: "Space Grotesk", "Manrope", sans-serif;
+  font-size: 0.98rem;
+}
+
+.session-console-card {
+  border: 1px solid var(--console-border);
+  border-radius: var(--radius-m);
+  background: linear-gradient(180deg, color-mix(in srgb, var(--surface-soft) 88%, transparent), color-mix(in srgb, var(--surface) 95%, transparent));
+  padding: 11px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.session-console {
+  min-height: 38vh;
+  max-height: 58vh;
+}
+
+.session-file-list {
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+}
+
+.session-file-item {
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: linear-gradient(175deg, color-mix(in srgb, var(--surface) 98%, transparent), color-mix(in srgb, var(--surface-soft) 94%, transparent));
+  padding: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  transition: border-color 120ms ease, transform 120ms ease, box-shadow 120ms ease;
+}
+
+.session-file-item[role="button"] {
+  cursor: pointer;
+}
+
+.session-file-item:hover {
+  border-color: color-mix(in srgb, var(--brand-accent) 56%, var(--border) 44%);
+  transform: translateY(-1px);
+  box-shadow: 0 8px 14px rgba(2, 132, 199, 0.1);
+}
+
+.session-file-item.selected {
+  border-color: color-mix(in srgb, var(--brand-accent) 72%, var(--border) 28%);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--brand-accent) 68%, var(--border) 32%);
+}
+
+.session-file-item p,
+.session-file-item small {
+  margin: 0;
+  color: var(--muted);
+}
+
+.session-path-pill {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  border-radius: 14px;
+  border: 1px solid var(--border);
+  background: color-mix(in srgb, var(--surface-soft) 88%, transparent);
+  padding: 10px;
+}
+
+.session-path-pill span {
+  font-family: "JetBrains Mono", "Iosevka", "Consolas", monospace;
+  font-size: 0.76rem;
+  word-break: break-word;
+}
+
 .detail-head {
   display: flex;
   justify-content: space-between;
@@ -1346,6 +1450,50 @@ button:active,
   min-width: 220px;
 }
 
+.remote-power-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(132px, 1fr));
+  gap: 8px;
+}
+
+.power-confirm-banner {
+  border: 1px solid color-mix(in srgb, var(--warn) 46%, var(--border) 54%);
+  border-radius: var(--radius-m);
+  background: color-mix(in srgb, var(--warn) 14%, var(--surface-panel-strong) 86%);
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.power-confirm-banner strong {
+  font-size: 0.92rem;
+}
+
+.power-confirm-banner span {
+  color: var(--muted);
+  font-size: 0.86rem;
+}
+
+.remote-power-diagnostics {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.remote-power-diagnostics .field {
+  margin: 0;
+}
+
+.remote-power-diagnostics .field > span {
+  display: block;
+  margin-bottom: 6px;
+}
+
+.remote-power-diagnostics input[readonly] {
+  flex: 1 1 240px;
+}
+
 @media (max-width: 760px) {
   .app-shell {
     padding: calc(env(safe-area-inset-top) + 10px) calc(env(safe-area-inset-right) + 6px)
@@ -1397,6 +1545,10 @@ button:active,
     background: transparent;
     padding: 0;
     box-shadow: none;
+  }
+
+  .session-workspace {
+    grid-template-columns: 1fr;
   }
 
   .session-action-dock {
@@ -1953,6 +2105,11 @@ button.event-item:hover {
     align-items: start;
   }
 
+  .session-workspace {
+    grid-template-columns: minmax(0, 1.55fr) minmax(320px, 0.95fr);
+    align-items: start;
+  }
+
   .pair-layout,
   .settings-layout {
     grid-template-columns: minmax(320px, 1fr) 1fr;
@@ -1983,6 +2140,11 @@ button.event-item:hover {
 
   .console {
     max-height: 54vh;
+  }
+
+  .session-files-pane {
+    position: sticky;
+    top: 12px;
   }
 
   .session-action-dock {

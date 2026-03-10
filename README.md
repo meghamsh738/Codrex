@@ -15,23 +15,25 @@ It includes:
 
 ## Screenshots
 
-### Laptop WebUI (React)
+### WebUI Tabs (Latest)
 
-![Codrex Laptop WebUI](screenshots/webui-laptop.png)
+#### Sessions
+![Codrex Sessions Tab](screenshots/webui-tab-sessions.png)
 
-### Mobile WebUI (React/PWA)
+#### Threads
+![Codrex Threads Tab](screenshots/webui-tab-threads.png)
 
-![Codrex Mobile WebUI](screenshots/webui-mobile.png)
+#### Remote
+![Codrex Remote Tab](screenshots/webui-tab-remote.png)
 
-### Pairing Tab (WebUI)
+#### Pair
+![Codrex Pair Tab](screenshots/webui-tab-pair.png)
 
-![Codrex Pairing WebUI](screenshots/webui-pair.png)
+#### Settings
+![Codrex Settings Tab](screenshots/webui-tab-settings.png)
 
-### Legacy UI Archive
-
-![Legacy Desktop UI](screenshots/legacy/codrex-desktop.png)
-![Legacy Mobile UI](screenshots/legacy/codrex-mobile.png)
-![Legacy Pairing UI](screenshots/legacy/codrex-pairing.png)
+#### Debug
+![Codrex Debug Tab](screenshots/webui-tab-debug.png)
 
 ## A-to-Z Setup (Fresh Clone)
 
@@ -52,8 +54,8 @@ Optional but recommended:
 ### 2) Clone
 
 ```powershell
-git clone git@github.com:meghamsh738/Codrex.git C:\codex-remote-ui
-Set-Location C:\codex-remote-ui
+git clone git@github.com:meghamsh738/Codrex.git "E:\coding projects\codex-remote-ui"
+Set-Location "E:\coding projects\codex-remote-ui"
 ```
 
 ### 3) Prepare WSL workdir
@@ -79,7 +81,7 @@ What this does:
 ### 5) Start full mobile stack
 
 ```powershell
-Set-Location C:\codex-remote-ui
+Set-Location "E:\coding projects\codex-remote-ui"
 .\start-mobile.ps1
 ```
 
@@ -101,18 +103,19 @@ On laptop browser:
 
 Important:
 - `controller.config.json` ships with empty token; `start-controller.ps1` auto-generates a strong token on first run.
-- Generated token is stored in untracked `controller.config.local.json` (not in the tracked main config).
+- Generated token is stored in `%LocalAppData%\Codrex\remote-ui\state\controller.config.local.json`.
 - Pair QR uses short-lived one-time code exchange and does not place the long token in URL.
 - LAN/current pairing routes are intentionally restricted for localhost browser sessions only.
 - `/docs`, `/redoc`, and `/openapi.json` are auth-protected whenever auth is enabled.
+- Runtime logs and mobile session state also live under `%LocalAppData%\Codrex\remote-ui\`.
 
 ### 7) Telegram delivery (optional)
 
 Create bot with BotFather, then save token locally:
 
 ```powershell
-Set-Location C:\codex-remote-ui
-Set-Content -Path ".\Telegram bot\key.txt" -Value "<BOT_TOKEN>"
+New-Item -ItemType Directory -Force -Path "$env:LocalAppData\Codrex\remote-ui\secrets\telegram" | Out-Null
+Set-Content -Path "$env:LocalAppData\Codrex\remote-ui\secrets\telegram\key.txt" -Value "<BOT_TOKEN>"
 ```
 
 Send one message to your bot from your Telegram account, then restart stack:
@@ -127,17 +130,26 @@ Verify from browser:
 
 ### 8) Use Codex + shell monitors
 
-- **Sessions tab**: Codex sessions (create, prompt, screen stream, interrupt, Ctrl+C, close)
+- **Sessions tab**: Codex sessions with smoother incremental streaming, session-scoped file attachments, `Copy Path`, `Use Path`, and `Send via Telegram`
 - **Threads tab**: tmux shell monitor (Ubuntu/PowerShell/CMD panes)
 - **Remote tab**: desktop controls and screenshot capture
 - **Pair tab**: QR auth/pairing
 
-### 9) File send to Telegram from Codex
+### 9) Session files and Telegram send
 
-In a Codex session prompt, you can ask naturally:
-- `Send that graph to Telegram.`
+Use the `Files` panel in the selected session to:
+- upload a file directly into that session
+- attach an existing file or folder from the browser
+- copy the translated WSL path and reuse it in prompts
+- send a selected file to Telegram from the UI without typing a custom instruction
 
-Or deterministic command:
+Session uploads are isolated per Codex session under:
+
+```text
+/home/megha/codrex-work/.remote_uploads/<session>/
+```
+
+You can still send files from inside the Codex session with the CLI helper:
 
 ```bash
 tgsend "/home/megha/codrex-work/output/result.png" --title "Result" --expires 24
@@ -156,14 +168,14 @@ When Telegram is configured, `codrex-send` defaults to Telegram send if `telegra
 Start:
 
 ```powershell
-Set-Location C:\codex-remote-ui
+Set-Location "E:\coding projects\codex-remote-ui"
 .\start-mobile.ps1
 ```
 
 Stop:
 
 ```powershell
-Set-Location C:\codex-remote-ui
+Set-Location "E:\coding projects\codex-remote-ui"
 .\stop-mobile.ps1
 ```
 
@@ -172,10 +184,10 @@ Desktop launcher:
 
 ## Security Checklist (Recommended)
 
-1. Keep auth enabled (`controller.config.local.json` should contain a non-empty `token` after first start).
+1. Keep auth enabled (`%LocalAppData%\Codrex\remote-ui\state\controller.config.local.json` should contain a non-empty `token` after first start).
 2. Prefer Tailscale/private LAN; do not expose controller/UI ports directly to public internet.
 3. Use Pair QR from an authenticated laptop session only.
-4. Keep `Telegram bot/key.txt` local only (it is gitignored).
+4. Keep Telegram secrets under `%LocalAppData%\Codrex\remote-ui\secrets\telegram\` only.
 5. Rotate token if machine is shared or token was exposed.
 6. Keep firewall rules scoped to trusted network profiles.
 7. Keep `CODEX_COOKIE_SECURE=auto` (default). Use `always` behind HTTPS reverse proxies; avoid `never` except local HTTP testing.
