@@ -74,6 +74,15 @@ function Read-ControllerPort {
   return 48787
 }
 
+function Test-PortListening {
+  param([int]$Port)
+  try {
+    $listeners = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue
+    return [bool]$listeners
+  } catch {}
+  return $false
+}
+
 function Get-CodrexRuntimeDir {
   param(
     [string]$RepoRoot
@@ -100,9 +109,13 @@ if (-not $session -and (Test-Path $legacySessionPath)) {
   $session = Read-SessionData -Path $legacySessionPath
 }
 $controllerPort = Read-ControllerPort -ConfigPath $configPath
+$controllerPid = $null
 
 if ($session -and $session.controller_port) {
   $controllerPort = [int]$session.controller_port
+}
+if ($session -and $session.controller_pid) {
+  $controllerPid = [int]$session.controller_pid
 }
 if ($session -and $session.ui_port) {
   $UiPort = [int]$session.ui_port
@@ -120,7 +133,16 @@ if (-not $uiStoppedBySession -and -not $uiStoppedByPort) {
 if (-not $KeepController) {
   $stopControllerScript = Join-Path $scriptRoot "stop-controller.ps1"
   if (Test-Path $stopControllerScript) {
-    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $stopControllerScript -Port $controllerPort
+    $controllerArgs = @(
+      "-NoProfile",
+      "-ExecutionPolicy", "Bypass",
+      "-File", $stopControllerScript,
+      "-Port", [string]$controllerPort
+    )
+    if ($controllerPid) {
+      $controllerArgs += @("-ProcId", [string]$controllerPid)
+    }
+    & powershell.exe @controllerArgs
   } else {
     Write-Host "Missing stop script at $stopControllerScript"
   }
@@ -133,4 +155,17 @@ if (Test-Path $legacySessionPath) {
   Remove-Item $legacySessionPath -Force -ErrorAction SilentlyContinue
 }
 
-Write-Host "Done."
+$controllerListening = Test-PortListening -Port $controllerPort
+$uiListening = if ($UiPort -gt 0) { Test-PortListening -Port $UiPort } else { $false }
+$result = [ordered]@{
+  ok = (-not $controllerListening) -and (-not $uiListening)
+  controller_port = $controllerPort
+  controller_status = if ($controllerListening) { "controller_stop_failed" } elseif ($controllerPid) { "controller_stopped" } else { "controller_already_gone" }
+  ui_port = $UiPort
+  ui_stopped = (-not $uiListening)
+  stale_session_file_removed = (-not (Test-Path $sessionPath)) -and (-not (Test-Path $legacySessionPath))
+}
+$result | ConvertTo-Json -Compress | Write-Output
+if (-not $result.ok) {
+  exit 1
+}

@@ -28,7 +28,7 @@ from mss import mss
 from mss.tools import to_png
 
 START_TIME = time.time()
-app = FastAPI(title="Codrex Remote UI", version="1.4.1")
+app = FastAPI(title="Codrex Remote UI", version="1.5.0")
 APP_ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 UI_DIST_DIR = os.path.join(APP_ROOT_DIR, "ui", "dist")
 UI_DIST_ASSETS_DIR = os.path.join(UI_DIST_DIR, "assets")
@@ -759,6 +759,13 @@ SESSION_FILES_MAX_FILE_MB = int(os.environ.get("CODEX_SESSION_FILES_MAX_FILE_MB"
 SESSION_FILES_DATA: Dict[str, Any] = {
     "items": [],
 }
+APP_RUNTIME_SESSION_FILE = os.path.abspath(
+    os.environ.get(
+        "CODEX_APP_RUNTIME_SESSION_FILE",
+        os.path.join(CODEX_RUNTIME_STATE_DIR, "mobile.session.json"),
+    )
+)
+LEGACY_APP_RUNTIME_SESSION_FILE = os.path.abspath(os.path.join(LEGACY_RUNTIME_DIR, "logs", "mobile.session.json"))
 
 # -------------------------
 # Session output stream state
@@ -2653,6 +2660,7 @@ async def auth_middleware(request: Request, call_next):
     public_paths = {
         "/",
         "/app/health",
+        "/app/runtime",
         "/mobile",
         "/diag/js",
         "/diag/status",
@@ -2704,6 +2712,48 @@ def app_health():
     if payload["ui_mode"] != "built":
         payload["detail"] = "Built app is unavailable. Use /legacy until the UI is built."
     return payload
+
+
+@app.get("/app/runtime")
+def app_runtime(request: Request):
+    payload = _built_ui_health_payload()
+    session = _read_json_file(APP_RUNTIME_SESSION_FILE)
+    if not session:
+        session = _read_json_file(LEGACY_APP_RUNTIME_SESSION_FILE)
+    persisted = _read_json_file(os.path.join(APP_ROOT_DIR, "controller.config.json"))
+    local_cfg = _read_json_file(os.path.join(CODEX_RUNTIME_STATE_DIR, "controller.config.local.json"))
+    controller_port = None
+    try:
+        controller_port = int(getattr(request.url, "port", None) or 0) or None
+    except Exception:
+        controller_port = None
+    if controller_port is None:
+        try:
+            controller_port = int((session or {}).get("controller_port") or 0) or None
+        except Exception:
+            controller_port = None
+    if controller_port is None:
+        try:
+            controller_port = int((persisted or {}).get("port") or 0) or None
+        except Exception:
+            controller_port = None
+
+    return {
+        **payload,
+        "ok": True,
+        "version": str(getattr(app, "version", "") or "").strip(),
+        "launcher_mode": "controller-served",
+        "repo_root": APP_ROOT_DIR,
+        "runtime_dir": CODEX_RUNTIME_DIR,
+        "state_dir": CODEX_RUNTIME_STATE_DIR,
+        "session_file": APP_RUNTIME_SESSION_FILE,
+        "session_present": bool(session),
+        "session": session if isinstance(session, dict) and session else None,
+        "controller_port": controller_port,
+        "controller_origin": _mobile_ui_target_url(request).rstrip("/"),
+        "config_port": (persisted or {}).get("port"),
+        "runtime_token_present": bool(str((local_cfg or {}).get("token") or "").strip()),
+    }
 
 
 @app.get("/assets/{asset_path:path}")

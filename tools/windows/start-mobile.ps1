@@ -46,6 +46,19 @@ function Read-ControllerPort {
   return $script:DefaultControllerPort
 }
 
+function Read-SessionData {
+  param(
+    [string]$Path
+  )
+  if (-not (Test-Path $Path)) {
+    return $null
+  }
+  try {
+    return (Get-Content -Path $Path -Raw | ConvertFrom-Json)
+  } catch {}
+  return $null
+}
+
 function Ensure-UiDependencies {
   param(
     [string]$UiRoot,
@@ -351,6 +364,8 @@ $controllerProc = Get-CimInstance Win32_Process |
 $controllerPid = if ($controllerProc) { [int]$controllerProc.ProcessId } else { $null }
 
 $lanIp = Get-PrimaryIPv4
+$localAppUrl = ("http://127.0.0.1:{0}/" -f $controllerPort)
+$networkAppUrl = if ($lanIp -and $lanIp -ne "127.0.0.1") { ("http://{0}:{1}/" -f $lanIp, $controllerPort) } else { "" }
 $sessionData = [ordered]@{
   started_at = (Get-Date).ToString("o")
   controller_port = $controllerPort
@@ -358,15 +373,24 @@ $sessionData = [ordered]@{
   ui_port = if ($DevUi) { $UiPort } else { $null }
   ui_pid = $uiPid
   ui_mode = if ($DevUi) { "dev" } else { "built" }
+  repo_root = $root
+  runtime_dir = $runtimeDir
+  session_file = $sessionPath
+  app_url = $localAppUrl
+  network_app_url = $networkAppUrl
 }
 $sessionData | ConvertTo-Json | Set-Content -Path $sessionPath -Encoding UTF8
+$persistedSession = Read-SessionData -Path $sessionPath
+if (-not $persistedSession -or [int]$persistedSession.controller_port -ne $controllerPort) {
+  throw "Codrex runtime session file was not written correctly at $sessionPath"
+}
 
 Write-Host ""
 Write-Host "Mobile stack ready."
 Write-Host ("Controller URL: http://{0}:{1}" -f $lanIp, $controllerPort)
-Write-Host ("App Local URL:  http://127.0.0.1:{0}" -f $controllerPort)
+Write-Host ("App Local URL:  {0}" -f $localAppUrl.TrimEnd("/"))
 if ($lanIp -and $lanIp -ne "127.0.0.1") {
-  Write-Host ("App Network URL: http://{0}:{1}" -f $lanIp, $controllerPort)
+  Write-Host ("App Network URL: {0}" -f $networkAppUrl.TrimEnd("/"))
 }
 if ($DevUi) {
   Write-Host ("Dev UI Local URL: http://127.0.0.1:{0}" -f $UiPort)

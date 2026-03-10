@@ -183,6 +183,26 @@ function Get-AppHealth {
   return Invoke-Json -Url ("http://127.0.0.1:{0}/app/health" -f $ControllerPort) -Method "GET" -BodyObj $null -Token "" -Session $null
 }
 
+function Get-AppRuntime {
+  param(
+    [int]$ControllerPort
+  )
+  return Invoke-Json -Url ("http://127.0.0.1:{0}/app/runtime" -f $ControllerPort) -Method "GET" -BodyObj $null -Token "" -Session $null
+}
+
+function Read-MobileSession {
+  foreach ($candidate in @($script:SessionPath, $script:LegacySessionPath)) {
+    if (-not (Test-Path $candidate)) { continue }
+    try {
+      $session = Get-Content -Path $candidate -Raw | ConvertFrom-Json
+      if ($session) {
+        return $session
+      }
+    } catch {}
+  }
+  return $null
+}
+
 function Get-QrPngImage {
   param(
     [string]$Url,
@@ -222,6 +242,8 @@ $logsDir = Join-Path $runtimeDir "logs"
 $configPath = Join-Path $root "controller.config.json"
 $script:LocalConfigPath = Join-Path $stateDir "controller.config.local.json"
 $script:LegacyLocalConfigPath = Join-Path $root "controller.config.local.json"
+$script:SessionPath = Join-Path $stateDir "mobile.session.json"
+$script:LegacySessionPath = Join-Path (Join-Path $root "logs") "mobile.session.json"
 $startMobileScript = Join-Path $scriptRoot "start-mobile.ps1"
 $stopMobileScript = Join-Path $scriptRoot "stop-mobile.ps1"
 $uiPort = $script:DefaultDevUiPort
@@ -417,7 +439,7 @@ $lblTitle.TextAlign = "MiddleLeft"
 $titleStack.Controls.Add($lblTitle, 0, 0)
 
 $lblSubtitle = New-Object System.Windows.Forms.Label
-$lblSubtitle.Text = "Launch the stack, open the app, and pair a phone or tablet."
+$lblSubtitle.Text = "Launcher shell only. Start/stop Codrex here, then use the browser app for sessions, files, notes, and remote control."
 $lblSubtitle.Dock = "Fill"
 $lblSubtitle.Font = New-Object System.Drawing.Font("Segoe UI", 9)
 $lblSubtitle.TextAlign = "TopLeft"
@@ -554,7 +576,7 @@ $lblQrInfo.TextAlign = "MiddleLeft"
 $right.Controls.Add($lblQrInfo, 0, 2)
 
 $lblHint = New-Object System.Windows.Forms.Label
-$lblHint.Text = "No manual token typing needed on phone. QR performs one-time auth."
+$lblHint.Text = "Main app lives in the browser. This window is the local launcher and status shell."
 $lblHint.Dock = "Fill"
 $lblHint.TextAlign = "TopLeft"
 $right.Controls.Add($lblHint, 0, 3)
@@ -697,22 +719,46 @@ function Get-CachedLanIp {
   return $script:cachedLanIp
 }
 
+function Resolve-LauncherControllerPort {
+  $session = Read-MobileSession
+  if ($session -and $session.controller_port) {
+    return [int]$session.controller_port
+  }
+  $cfg = Get-CachedControllerConfig
+  if ($cfg.port) {
+    return [int]$cfg.port
+  }
+  return $script:DefaultControllerPort
+}
+
 function Refresh-State {
   if ($script:refreshInProgress -or $script:actionInProgress) { return }
   $script:refreshInProgress = $true
   try {
     $cfg = Get-CachedControllerConfig
-    $controllerPort = if ($cfg.port) { [int]$cfg.port } else { $script:DefaultControllerPort }
-    $controllerToken = [string]$cfg.token
+    $session = Read-MobileSession
+    $controllerPort = Resolve-LauncherControllerPort
     $lanIp = Get-CachedLanIp
 
     $listening = Get-ListeningStateMap -Ports @($controllerPort, $uiPort)
     $controllerOn = [bool]$listening[[int]$controllerPort]
-    $appHealth = if ($controllerOn) { Get-AppHealth -ControllerPort $controllerPort } else { $null }
+    $appRuntime = if ($controllerOn) { Get-AppRuntime -ControllerPort $controllerPort } else { $null }
+    $appHealth = if ($appRuntime) { $appRuntime } elseif ($controllerOn) { Get-AppHealth -ControllerPort $controllerPort } else { $null }
     $appBuilt = [bool]($appHealth -and $appHealth.ok -and $appHealth.ui_mode -eq "built")
     $appMode = if ($appHealth -and $appHealth.ui_mode) { [string]$appHealth.ui_mode } else { "offline" }
+    $version = if ($appRuntime -and $appRuntime.version) { [string]$appRuntime.version } else { "n/a" }
+    $repoRoot = ""
+    if ($appRuntime -and $appRuntime.repo_root) {
+      $repoRoot = [string]$appRuntime.repo_root
+    } elseif ($session -and $session.repo_root) {
+      $repoRoot = [string]$session.repo_root
+    }
+    $repoLabel = if ($repoRoot) { Split-Path -Leaf $repoRoot } else { "n/a" }
+    $sessionState = if ($session) { "present" } else { "missing" }
+    $localUrl = if ($controllerOn) { "http://127.0.0.1:$controllerPort/" } else { "offline" }
+    $networkUrl = if ($lanIp -and $lanIp -ne "127.0.0.1") { "http://$lanIp`:$controllerPort/" } else { "n/a" }
     $status = if ($appBuilt) { "running" } elseif ($controllerOn) { "error" } else { "stopped" }
-    $lblStatus.Text = "State: $status`r`nController:$controllerPort  App:$controllerPort  LAN:$lanIp  Mode:$appMode"
+    $lblStatus.Text = "Launcher shell | State: $status | Mode: $appMode`r`nBuild: v$version | Port: $controllerPort | Session: $sessionState`r`nApp: $localUrl`r`nLAN: $networkUrl | Repo: $repoLabel"
     if ($appBuilt) {
       $statusCard.BackColor = [System.Drawing.ColorTranslator]::FromHtml("#0d2f53")
       $lblStatus.ForeColor = $colorAccent
@@ -726,7 +772,8 @@ function Refresh-State {
 
     $busy = $script:actionInProgress
     $btnStop.Enabled = (-not $busy) -and $controllerOn
-    $btnStart.Enabled = (-not $busy) -and (-not $appBuilt)
+    $btnStart.Enabled = (-not $busy)
+    $btnStart.Text = if ($appBuilt) { "Open App" } else { "Start" }
     $btnOpenLocal.Enabled = (-not $busy) -and $controllerOn
     $btnOpenNetwork.Enabled = (-not $busy) -and $controllerOn -and ($lanIp -ne "127.0.0.1")
     $btnOpenController.Enabled = (-not $busy) -and $controllerOn
@@ -743,54 +790,51 @@ function Start-Stack {
   if (-not (Test-Path $startMobileScript)) {
     throw "Missing $startMobileScript"
   }
-  $cfg = Get-CachedControllerConfig
-  $controllerPort = if ($cfg.port) { [int]$cfg.port } else { $script:DefaultControllerPort }
-  Append-Log "Starting mobile stack..."
-  # Request firewall rules on start so LAN pairing/open-app links are reachable from Android.
-  $p = Start-Process -FilePath "powershell.exe" -ArgumentList @("-NoProfile","-ExecutionPolicy","Bypass","-File",$startMobileScript,"-UiPort",[string]$uiPort,"-OpenFirewall") -WorkingDirectory $root -WindowStyle Hidden -PassThru
-  $appReady = $false
-  $appHealth = $null
-  for ($i = 0; $i -lt 70; $i++) {
-    Start-Sleep -Milliseconds 250
-    [System.Windows.Forms.Application]::DoEvents()
-    $listening = Get-ListeningStateMap -Ports @($controllerPort)
-    $okController = [bool]$listening[[int]$controllerPort]
-    if ($okController) {
-      $appHealth = Get-AppHealth -ControllerPort $controllerPort
-      if ($appHealth -and $appHealth.ok -and $appHealth.ui_mode -eq "built") {
-        $appReady = $true
-        break
-      }
+  $existingPort = Resolve-LauncherControllerPort
+  $existingListening = Get-ListeningStateMap -Ports @($existingPort)
+  if ([bool]$existingListening[[int]$existingPort]) {
+    $existingHealth = Get-AppRuntime -ControllerPort $existingPort
+    if ($existingHealth -and $existingHealth.ok -and $existingHealth.ui_mode -eq "built") {
+      Open-Url ("http://127.0.0.1:{0}/" -f $existingPort)
+      Append-Log ("App already running on port {0}." -f $existingPort)
+      return
     }
-    if ($p.HasExited -and $p.ExitCode -ne 0) { break }
   }
-  # Force refresh of cached network/config for next paint.
+  Append-Log "Starting mobile stack..."
+  $p = Start-Process -FilePath "powershell.exe" -ArgumentList @(
+    "-NoProfile","-ExecutionPolicy","Bypass","-File",$startMobileScript,"-UiPort",[string]$uiPort,"-OpenFirewall"
+  ) -WorkingDirectory $root -WindowStyle Hidden -PassThru -Wait
+  if ($p.ExitCode -ne 0) {
+    throw "Codrex start script failed with exit code $($p.ExitCode). Run Setup.cmd again if this is a fresh checkout."
+  }
   $script:cachedControllerConfigAt = [DateTime]::MinValue
   $script:cachedLanIpAt = [DateTime]::MinValue
+  $controllerPort = Resolve-LauncherControllerPort
+  $appHealth = Get-AppRuntime -ControllerPort $controllerPort
   Refresh-State
-  if (-not $appReady) {
+  if (-not ($appHealth -and $appHealth.ok -and $appHealth.ui_mode -eq "built")) {
     $detail = if ($appHealth -and $appHealth.detail) { [string]$appHealth.detail } else { "Run Setup.cmd if this is a fresh checkout. Use Open Fallback for the legacy controller." }
     throw "Codrex app did not reach running state. $detail"
   }
   Open-Url ("http://127.0.0.1:{0}/" -f $controllerPort)
-  Append-Log "Start complete."
+  $runtimeVersion = if ($appHealth -and $appHealth.version) { [string]$appHealth.version } else { "n/a" }
+  Append-Log ("Start complete. App ready on port {0} (v{1})." -f $controllerPort, $runtimeVersion)
 }
 
 function Stop-Stack {
   if (-not (Test-Path $stopMobileScript)) {
     throw "Missing $stopMobileScript"
   }
-  $cfg = Get-CachedControllerConfig
-  $controllerPort = if ($cfg.port) { [int]$cfg.port } else { $script:DefaultControllerPort }
+  $controllerPort = Resolve-LauncherControllerPort
   Append-Log "Stopping mobile stack..."
-  Start-Process -FilePath "powershell.exe" -ArgumentList @("-NoProfile","-ExecutionPolicy","Bypass","-File",$stopMobileScript,"-UiPort",[string]$uiPort) -WorkingDirectory $root -WindowStyle Hidden | Out-Null
-  for ($i = 0; $i -lt 50; $i++) {
-    Start-Sleep -Milliseconds 250
-    [System.Windows.Forms.Application]::DoEvents()
-    $listening = Get-ListeningStateMap -Ports @($controllerPort, $uiPort)
-    $okController = [bool]$listening[[int]$controllerPort]
-    $okUi = [bool]$listening[[int]$uiPort]
-    if ((-not $okController) -and (-not $okUi)) { break }
+  $p = Start-Process -FilePath "powershell.exe" -ArgumentList @(
+    "-NoProfile","-ExecutionPolicy","Bypass","-File",$stopMobileScript,"-UiPort",[string]$uiPort
+  ) -WorkingDirectory $root -WindowStyle Hidden -PassThru -Wait
+  $listening = Get-ListeningStateMap -Ports @($controllerPort, $uiPort)
+  $okController = [bool]$listening[[int]$controllerPort]
+  $okUi = [bool]$listening[[int]$uiPort]
+  if ($p.ExitCode -ne 0 -or $okController -or $okUi) {
+    throw "Codrex stop did not complete cleanly. Use Open Fallback or inspect runtime logs."
   }
   $script:cachedControllerConfigAt = [DateTime]::MinValue
   $script:cachedLanIpAt = [DateTime]::MinValue
@@ -800,7 +844,7 @@ function Stop-Stack {
 
 function Generate-PairQr {
   $cfg = Get-CachedControllerConfig
-  $controllerPort = if ($cfg.port) { [int]$cfg.port } else { $script:DefaultControllerPort }
+  $controllerPort = Resolve-LauncherControllerPort
   $controllerToken = [string]$cfg.token
 
   $listening = Get-ListeningStateMap -Ports @($controllerPort)
@@ -897,19 +941,16 @@ function Safe-Action {
 $btnStart.Add_Click({ Safe-Action -Action { Start-Stack } -Button $btnStart })
 $btnStop.Add_Click({ Safe-Action -Action { Stop-Stack } -Button $btnStop })
 $btnOpenLocal.Add_Click({
-  $cfg = Get-CachedControllerConfig
-  $port = if ($cfg.port) { [int]$cfg.port } else { $script:DefaultControllerPort }
+  $port = Resolve-LauncherControllerPort
   Open-Url ("http://127.0.0.1:{0}/" -f $port)
 })
 $btnOpenNetwork.Add_Click({
-  $cfg = Get-CachedControllerConfig
-  $port = if ($cfg.port) { [int]$cfg.port } else { $script:DefaultControllerPort }
+  $port = Resolve-LauncherControllerPort
   $ip = Get-CachedLanIp
   Open-Url ("http://{0}:{1}/" -f $ip, $port)
 })
 $btnOpenController.Add_Click({
-  $cfg = Get-CachedControllerConfig
-  $port = if ($cfg.port) { [int]$cfg.port } else { $script:DefaultControllerPort }
+  $port = Resolve-LauncherControllerPort
   Open-Url ("http://127.0.0.1:{0}/legacy" -f $port)
 })
 $btnGenQr.Add_Click({ Safe-Action -Action { Generate-PairQr } -Button $btnGenQr })

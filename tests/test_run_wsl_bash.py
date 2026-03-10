@@ -1847,7 +1847,54 @@ class BuiltUiRoutingTests(unittest.TestCase):
         self.assertEqual(out, "missing-response")
         missing_mock.assert_called_once()
 
+    def test_app_runtime_reports_runtime_session_metadata(self):
+        request = SimpleNamespace(
+            url=SimpleNamespace(hostname="127.0.0.1", scheme="http", port=48787),
+            base_url="http://127.0.0.1:48787/",
+        )
+        with tempfile.TemporaryDirectory() as td, \
+             mock.patch.object(server_mod.app, "version", "1.5.0", create=True), \
+             mock.patch.object(server_mod, "APP_ROOT_DIR", td), \
+             mock.patch.object(server_mod, "CODEX_RUNTIME_DIR", td), \
+             mock.patch.object(server_mod, "CODEX_RUNTIME_STATE_DIR", td), \
+             mock.patch.object(server_mod, "APP_RUNTIME_SESSION_FILE", str(Path(td) / "mobile.session.json")), \
+             mock.patch.object(server_mod, "LEGACY_APP_RUNTIME_SESSION_FILE", str(Path(td) / "legacy-mobile.session.json")), \
+             mock.patch.object(server_mod, "UI_DIST_DIR", td):
+            Path(td, "index.html").write_text("<!doctype html>", encoding="utf-8")
+            Path(td, "controller.config.json").write_text('{"port": 48787}', encoding="utf-8")
+            Path(td, "mobile.session.json").write_text(
+                '{"controller_port": 48787, "repo_root": "E:/coding projects/codex-remote-ui"}',
+                encoding="utf-8",
+            )
+            out = server_mod.app_runtime(request)
+
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["ui_mode"], "built")
+        self.assertEqual(out["version"], "1.5.0")
+        self.assertTrue(out["session_present"])
+        self.assertEqual(out["controller_port"], 48787)
+        self.assertEqual(out["controller_origin"], "http://127.0.0.1:48787")
+
+    def test_app_runtime_uses_legacy_session_fallback_when_primary_missing(self):
+        request = SimpleNamespace(
+            url=SimpleNamespace(hostname="127.0.0.1", scheme="http", port=48787),
+            base_url="http://127.0.0.1:48787/",
+        )
+        with tempfile.TemporaryDirectory() as td, \
+             mock.patch.object(server_mod.app, "version", "1.5.0", create=True), \
+             mock.patch.object(server_mod, "APP_ROOT_DIR", td), \
+             mock.patch.object(server_mod, "CODEX_RUNTIME_DIR", td), \
+             mock.patch.object(server_mod, "CODEX_RUNTIME_STATE_DIR", td), \
+             mock.patch.object(server_mod, "APP_RUNTIME_SESSION_FILE", str(Path(td) / "mobile.session.json")), \
+             mock.patch.object(server_mod, "LEGACY_APP_RUNTIME_SESSION_FILE", str(Path(td) / "legacy-mobile.session.json")), \
+             mock.patch.object(server_mod, "UI_DIST_DIR", td):
+            Path(td, "legacy-mobile.session.json").write_text('{"controller_port": 48787}', encoding="utf-8")
+            out = server_mod.app_runtime(request)
+
+        self.assertTrue(out["ok"])
+        self.assertTrue(out["session_present"])
+        self.assertEqual(out["session"]["controller_port"], 48787)
+
 
 if __name__ == "__main__":
     unittest.main()
-
