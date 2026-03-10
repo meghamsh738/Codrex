@@ -132,7 +132,7 @@ Verify from browser:
 
 - **Sessions tab**: Codex sessions with smoother incremental streaming, session-scoped file attachments, `Copy Path`, `Use Path`, and `Send via Telegram`
 - **Threads tab**: tmux shell monitor (Ubuntu/PowerShell/CMD panes)
-- **Remote tab**: desktop controls and screenshot capture
+- **Remote tab**: desktop controls, screenshot capture, and power/wake diagnostics
 - **Pair tab**: QR auth/pairing
 
 ### 9) Session files and Telegram send
@@ -162,6 +162,25 @@ codrex-send "/home/megha/codrex-work/output/result.png" --title "Result" --expir
 ```
 
 When Telegram is configured, `codrex-send` defaults to Telegram send if `telegramDefaultSend` is enabled.
+
+### 10) Remote power and wake relay
+
+The **Remote** tab exposes desktop power actions (`lock`, `sleep`, `hibernate`, `restart`, `shutdown`) and a wake diagnostics card.
+
+Important:
+- wake from off/sleep is **best effort** and depends on hardware, BIOS/UEFI, driver, and adapter power settings
+- the web UI does **not** wake the laptop directly; wake runs through the separate always-on relay in `tools/wake-relay/`
+- Wi-Fi wake should not be assumed on laptops; Ethernet is usually the only reliable path
+
+The power card now reports:
+- relay reachability
+- wake readiness: `ready`, `partial`, or `unsupported`
+- preferred transport hint: `ethernet`, `wifi`, or `unknown`
+- a machine-specific warning when wake is not confirmed
+
+Maintainer note:
+- on the current `Acer Predator Helios 300 G3-572`, the present Windows adapter state does not confirm Wake-on-LAN support
+- do not rely on Wi-Fi wake on that machine; Ethernet would be the first thing to test if wake is ever needed
 
 ## Daily Operations
 

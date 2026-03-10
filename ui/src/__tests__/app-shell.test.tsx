@@ -229,6 +229,9 @@ function setupDefaultMocks(): void {
     wake_surface: "telegram",
     wake_command: "/wake",
     wake_instruction: "/wake laptop",
+    wake_readiness: "ready",
+    wake_warning: "",
+    wake_transport_hint: "ethernet",
     wake_relay_configured: true,
     relay_reachable: true,
     relay_detail: "Relay reachable.",
@@ -438,6 +441,37 @@ describe("app shell tabs", () => {
     await waitFor(() => {
       expect(screen.queryByTestId("power-confirm-banner")).not.toBeInTheDocument();
     });
+  });
+
+  it("shows wake warning when host readiness is unsupported", async () => {
+    getPowerStatusMock.mockResolvedValueOnce({
+      ok: true,
+      online: true,
+      actions: ["lock", "sleep", "hibernate", "restart", "shutdown"],
+      confirm_required_actions: ["sleep", "hibernate", "restart", "shutdown"],
+      wake_surface: "telegram",
+      wake_command: "/wake",
+      wake_instruction: "/wake laptop",
+      wake_readiness: "unsupported",
+      wake_warning: "Wake is not confirmed on this host. An Ethernet adapter exists, but Windows is not exposing Wake-on-Magic-Packet yet.",
+      wake_transport_hint: "ethernet",
+      wake_relay_configured: true,
+      relay_reachable: true,
+      relay_detail: "Relay reachable.",
+      primary_mac: "AA:BB:CC:DD:EE:FF",
+      wake_candidate_macs: ["AA:BB:CC:DD:EE:FF"],
+      wake_supported: true,
+    });
+
+    render(<App />);
+
+    fireEvent.click(await screen.findByTestId("tab-remote"));
+
+    const warningBanner = await screen.findByTestId("power-warning-banner");
+    expect(warningBanner).toHaveTextContent("Wake is best effort on this machine");
+    expect(warningBanner).toHaveTextContent("Windows is not exposing Wake-on-Magic-Packet yet.");
+    expect(screen.getByText("wake: unsupported")).toBeInTheDocument();
+    expect(screen.getByText(/Preferred transport:/)).toHaveTextContent("ethernet");
   });
 
   it("creates a session from sessions tab", async () => {

@@ -189,6 +189,9 @@ export interface PowerStatusResult extends BasicResult {
   wake_surface?: string;
   wake_command?: string;
   wake_instruction?: string;
+  wake_readiness?: "ready" | "partial" | "unsupported";
+  wake_warning?: string;
+  wake_transport_hint?: "ethernet" | "wifi" | "unknown";
   wake_relay_configured?: boolean;
   relay_reachable?: boolean;
   relay_detail?: string;

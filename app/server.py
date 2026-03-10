@@ -327,6 +327,191 @@ def _wake_mac_info() -> Dict[str, Any]:
     }
 
 
+def _wake_adapter_kind(name: str, description: str) -> str:
+    haystack = f"{name or ''} {description or ''}".strip().lower()
+    if re.search(r"\b(wi-?fi|wireless|wlan|802\.11)\b", haystack):
+        return "wifi"
+    if re.search(r"\b(ethernet|gigabit|gbe|lan)\b", haystack):
+        return "ethernet"
+    return "unknown"
+
+
+def _normalize_wake_label(value: str) -> str:
+    return re.sub(r"\s+", " ", str(value or "").strip()).lower()
+
+
+def _wake_adapter_matches_line(adapter: Dict[str, Any], line: str) -> bool:
+    target = _normalize_wake_label(line)
+    if not target:
+        return False
+    candidates = {
+        _normalize_wake_label(adapter.get("name", "")),
+        _normalize_wake_label(adapter.get("interface_description", "")),
+    }
+    candidates.discard("")
+    for candidate in candidates:
+        if target == candidate or target in candidate or candidate in target:
+            return True
+    return False
+
+
+def _classify_wake_local_capabilities(snapshot: Dict[str, Any]) -> Dict[str, Any]:
+    adapters_raw = snapshot.get("adapters") or []
+    wake_armed_lines = [
+        str(line or "").strip()
+        for line in (snapshot.get("wake_armed") or [])
+        if str(line or "").strip() and str(line or "").strip().upper() != "NONE"
+    ]
+    primary_name = str(snapshot.get("primary_name") or "").strip()
+    primary_desc = str(snapshot.get("primary_desc") or "").strip()
+
+    adapters: List[Dict[str, Any]] = []
+    for raw in adapters_raw if isinstance(adapters_raw, list) else []:
+        if not isinstance(raw, dict):
+            continue
+        name = str(raw.get("name") or "").strip()
+        interface_description = str(raw.get("interface_description") or raw.get("desc") or "").strip()
+        adapter = {
+            "name": name,
+            "interface_description": interface_description,
+            "status": str(raw.get("status") or "").strip(),
+            "kind": _wake_adapter_kind(name, interface_description),
+            "wake_magic": str(raw.get("wake_magic") or "").strip().lower(),
+            "wake_pattern": str(raw.get("wake_pattern") or "").strip().lower(),
+        }
+        adapter["wake_capable"] = adapter["wake_magic"] not in {"", "unsupported", "notsupported"}
+        adapter["wake_armed"] = any(_wake_adapter_matches_line(adapter, line) for line in wake_armed_lines)
+        adapter["is_primary"] = bool(
+            (primary_name and _normalize_wake_label(primary_name) == _normalize_wake_label(name))
+            or (primary_desc and _normalize_wake_label(primary_desc) == _normalize_wake_label(interface_description))
+        )
+        adapters.append(adapter)
+
+    has_ethernet = any(adapter["kind"] == "ethernet" for adapter in adapters)
+    has_wifi = any(adapter["kind"] == "wifi" for adapter in adapters)
+    capable_adapters = [adapter for adapter in adapters if bool(adapter.get("wake_capable"))]
+    armed_adapters = [adapter for adapter in capable_adapters if bool(adapter.get("wake_armed"))]
+    primary_adapter = next((adapter for adapter in adapters if adapter.get("is_primary")), None)
+
+    if armed_adapters:
+        readiness = "ready"
+        warning = ""
+    elif capable_adapters:
+        readiness = "partial"
+        if transport_hint == "ethernet":
+            warning = (
+                "Wake support is present but not armed on this host. Confirm BIOS/UEFI Wake-on-LAN and "
+                "Windows adapter power settings, then test with Ethernet connected."
+            )
+        elif transport_hint == "wifi":
+            warning = (
+                "Wake support is present but not armed on this host. Confirm BIOS/UEFI wake settings and do not "
+                "rely on Wi-Fi wake; Ethernet is preferred."
+            )
+        else:
+            warning = "Wake support is present but not armed on this host. Confirm BIOS/UEFI and Windows wake settings."
+    else:
+        readiness = "unsupported"
+        if has_ethernet:
+            warning = (
+                "Wake is not confirmed on this host. An Ethernet adapter exists, but Windows is not exposing "
+                "Wake-on-Magic-Packet yet."
+            )
+        elif has_wifi:
+            warning = (
+                "Wake is not confirmed on this host. This machine appears to rely on Wi-Fi, and Wake-on-WLAN is "
+                "often unsupported."
+            )
+        else:
+            warning = "Wake is not confirmed on this host. No wake-capable physical adapter was detected."
+
+    transport_hint = "unknown"
+    if readiness != "ready" and has_ethernet:
+        transport_hint = "ethernet"
+    elif primary_adapter and primary_adapter.get("kind") != "unknown":
+        transport_hint = str(primary_adapter.get("kind") or "unknown")
+    elif has_ethernet:
+        transport_hint = "ethernet"
+    elif has_wifi:
+        transport_hint = "wifi"
+
+    return {
+        "wake_readiness": readiness,
+        "wake_warning": warning,
+        "wake_transport_hint": transport_hint,
+        "wake_capable": bool(capable_adapters),
+        "wake_armed": bool(armed_adapters),
+    }
+
+
+def _wake_local_capabilities() -> Dict[str, Any]:
+    if os.name != "nt":
+        return {
+            "wake_readiness": "unsupported",
+            "wake_warning": "Wake diagnostics are only available on Windows hosts.",
+            "wake_transport_hint": "unknown",
+            "wake_capable": False,
+            "wake_armed": False,
+        }
+    script = (
+        "$ErrorActionPreference = 'Stop'; "
+        "$primary = $null; "
+        "try { "
+        "$route = Get-NetRoute -DestinationPrefix '0.0.0.0/0' "
+        "| Where-Object { $_.NextHop -and $_.NextHop -ne '0.0.0.0' } "
+        "| Sort-Object RouteMetric, ifMetric | Select-Object -First 1; "
+        "if ($route) { $primary = Get-NetAdapter -InterfaceIndex $route.ifIndex -ErrorAction SilentlyContinue | Select-Object -First 1 } "
+        "} catch {} "
+        "$wakeArmed = @(); "
+        "try { $wakeArmed = @((powercfg /devicequery wake_armed 2>$null) | Where-Object { $_ -and $_.Trim() -and $_.Trim().ToUpper() -ne 'NONE' } | ForEach-Object { $_.Trim() }) } catch {} "
+        "$adapters = @(Get-NetAdapter | Where-Object { $_.HardwareInterface -and $_.MacAddress -and $_.Status -ne 'Disabled' }); "
+        "$details = @($adapters | ForEach-Object { "
+        "$pm = Get-NetAdapterPowerManagement -Name $_.Name -ErrorAction SilentlyContinue; "
+        "[pscustomobject]@{ "
+        "name = $_.Name; "
+        "interface_description = $_.InterfaceDescription; "
+        "status = $_.Status; "
+        "wake_magic = if ($pm) { [string]$pm.WakeOnMagicPacket } else { '' }; "
+        "wake_pattern = if ($pm) { [string]$pm.WakeOnPattern } else { '' }; "
+        "} "
+        "}); "
+        "[pscustomobject]@{ "
+        "primary_name = if ($primary) { $primary.Name } else { '' }; "
+        "primary_desc = if ($primary) { $primary.InterfaceDescription } else { '' }; "
+        "wake_armed = $wakeArmed; "
+        "adapters = $details; "
+        "} | ConvertTo-Json -Compress -Depth 5"
+    )
+    result = _run_powershell(script, timeout_s=8)
+    if result.get("exit_code") != 0:
+        return {
+            "wake_readiness": "partial",
+            "wake_warning": "Wake diagnostics could not read Windows adapter power state. Verify BIOS/UEFI and adapter wake settings manually.",
+            "wake_transport_hint": "unknown",
+            "wake_capable": False,
+            "wake_armed": False,
+        }
+    try:
+        snapshot = json.loads(result.get("stdout") or "{}")
+    except Exception:
+        snapshot = {}
+    if not isinstance(snapshot, dict):
+        snapshot = {}
+    return _classify_wake_local_capabilities(snapshot)
+
+
+def _merge_wake_warning(base: str, extra: str) -> str:
+    primary = str(base or "").strip()
+    secondary = str(extra or "").strip()
+    if not primary:
+        return secondary
+    if not secondary:
+        return primary
+    if secondary in primary:
+        return primary
+    return f"{primary} {secondary}".strip()
+
+
 def _request_json_url(url: str, method: str = "GET", payload: Optional[Dict[str, Any]] = None, headers: Optional[Dict[str, str]] = None, timeout_s: float = 5.0) -> Tuple[Optional[int], Dict[str, Any]]:
     req_headers = dict(headers or {})
     data: Optional[bytes] = None
@@ -5927,7 +6112,27 @@ def legacy_auth_logout(next: str = Form("/")):
 def _power_status_payload() -> Dict[str, Any]:
     mac_info = _wake_mac_info()
     relay = _wake_relay_health()
+    local_wake = _wake_local_capabilities()
     wake_command = str(relay.get("wake_command") or CODEX_WAKE_TELEGRAM_COMMAND)
+    wake_readiness = str(local_wake.get("wake_readiness") or "partial")
+    wake_warning = str(local_wake.get("wake_warning") or "").strip()
+    if wake_readiness == "ready" and not bool(relay.get("configured")):
+        wake_readiness = "partial"
+        wake_warning = _merge_wake_warning(
+            wake_warning,
+            "Local wake support looks ready, but the wake relay is not configured.",
+        )
+    elif wake_readiness == "ready" and not bool(relay.get("reachable")):
+        wake_readiness = "partial"
+        wake_warning = _merge_wake_warning(
+            wake_warning,
+            "Local wake support looks ready, but the wake relay is currently unreachable.",
+        )
+    elif wake_readiness == "partial" and not bool(relay.get("configured")):
+        wake_warning = _merge_wake_warning(
+            wake_warning,
+            "The wake relay is not configured yet.",
+        )
     return {
         "ok": True,
         "online": True,
@@ -5939,6 +6144,9 @@ def _power_status_payload() -> Dict[str, Any]:
         "wake_relay_configured": bool(relay.get("configured")),
         "relay_reachable": bool(relay.get("reachable")),
         "relay_detail": str(relay.get("detail") or "").strip(),
+        "wake_readiness": wake_readiness,
+        "wake_warning": wake_warning,
+        "wake_transport_hint": str(local_wake.get("wake_transport_hint") or "unknown"),
         "primary_mac": str(mac_info.get("primary_mac") or ""),
         "wake_candidate_macs": list(mac_info.get("wake_candidate_macs") or []),
         "wake_supported": bool(mac_info.get("wake_supported")),

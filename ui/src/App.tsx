@@ -2142,6 +2142,10 @@ export default function App() {
     : powerStatus?.wake_relay_configured
       ? "relay: offline"
       : "relay: unconfigured";
+  const powerWakeReadiness = powerStatus?.wake_readiness || "partial";
+  const powerWakeBadge = `wake: ${powerWakeReadiness}`;
+  const powerWakeTransport = powerStatus?.wake_transport_hint || "unknown";
+  const powerWakeWarning = (powerStatus?.wake_warning || "").trim();
   const sessionCountLabel = `${sessions.length} session${sessions.length === 1 ? "" : "s"}`;
   const visibleSessionCountLabel = `${filteredSessions.length} visible`;
   const runningRuns = debugRuns.filter((run) => run.status === "running").length;
@@ -4861,8 +4865,15 @@ export default function App() {
                   <div className="row">
                     <span className="badge">{powerStatus?.online ? "host: online" : "host: unknown"}</span>
                     <span className="badge muted">{powerRelayBadge}</span>
+                    <span className={`badge power-readiness ${powerWakeReadiness}`}>{powerWakeBadge}</span>
                   </div>
                   <p className="small">{powerStatus?.relay_detail || "Wake relay diagnostics are not available yet."}</p>
+                  {powerWakeWarning && powerWakeReadiness !== "ready" ? (
+                    <div className={`power-warning-banner ${powerWakeReadiness}`} data-testid="power-warning-banner">
+                      <strong>Wake is best effort on this machine</strong>
+                      <p>{powerWakeWarning}</p>
+                    </div>
+                  ) : null}
                   <div className="remote-power-grid">
                     {(powerStatus?.actions || []).map((actionName) => {
                       const powerAction = actionName as PowerActionName;
@@ -4937,7 +4948,7 @@ export default function App() {
                       Wake candidates: <strong>{(powerStatus?.wake_candidate_macs || netInfo?.wake_candidate_macs || []).join(", ") || "n/a"}</strong>
                     </p>
                     <p className="small">
-                      Wake surface: <strong>{powerStatus?.wake_surface || "telegram"}</strong>. Use <strong>{powerWakeInstruction}</strong> from the dedicated wake bot when the laptop is off.
+                      Wake surface: <strong>{powerStatus?.wake_surface || "telegram"}</strong>. Preferred transport: <strong>{powerWakeTransport}</strong>. Use <strong>{powerWakeInstruction}</strong> from the dedicated wake bot when the laptop is off.
                     </p>
                   </div>
                 </div>

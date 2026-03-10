@@ -1620,6 +1620,47 @@ class SessionFilesTests(unittest.TestCase):
 
 
 class PowerControlTests(unittest.TestCase):
+    def test_classify_wake_local_capabilities_prefers_ethernet_warning_when_wake_not_supported(self):
+        out = server_mod._classify_wake_local_capabilities({
+            "primary_name": "Wi-Fi",
+            "primary_desc": "Qualcomm Atheros QCA61x4A Wireless Network Adapter",
+            "wake_armed": [],
+            "adapters": [
+                {
+                    "name": "Ethernet",
+                    "interface_description": "Realtek PCIe GbE Family Controller",
+                    "wake_magic": "Unsupported",
+                },
+                {
+                    "name": "Wi-Fi",
+                    "interface_description": "Qualcomm Atheros QCA61x4A Wireless Network Adapter",
+                    "wake_magic": "Unsupported",
+                },
+            ],
+        })
+
+        self.assertEqual(out["wake_readiness"], "unsupported")
+        self.assertEqual(out["wake_transport_hint"], "ethernet")
+        self.assertIn("Ethernet adapter exists", out["wake_warning"])
+
+    def test_classify_wake_local_capabilities_reports_ready_when_armed(self):
+        out = server_mod._classify_wake_local_capabilities({
+            "primary_name": "Ethernet",
+            "primary_desc": "Realtek PCIe GbE Family Controller",
+            "wake_armed": ["Realtek PCIe GbE Family Controller"],
+            "adapters": [
+                {
+                    "name": "Ethernet",
+                    "interface_description": "Realtek PCIe GbE Family Controller",
+                    "wake_magic": "Enabled",
+                },
+            ],
+        })
+
+        self.assertEqual(out["wake_readiness"], "ready")
+        self.assertEqual(out["wake_transport_hint"], "ethernet")
+        self.assertEqual(out["wake_warning"], "")
+
     def test_net_info_includes_wake_mac_fields(self):
         with mock.patch.object(server_mod, "guess_lan_ipv4", return_value="192.168.1.15"), \
              mock.patch.object(server_mod, "get_tailscale_ipv4", return_value="100.64.0.9"), \
@@ -1649,6 +1690,11 @@ class PowerControlTests(unittest.TestCase):
                  "detail": "relay_online",
                  "wake_surface": "telegram",
                  "wake_command": "/wake",
+             }), \
+             mock.patch.object(server_mod, "_wake_local_capabilities", return_value={
+                 "wake_readiness": "ready",
+                 "wake_warning": "",
+                 "wake_transport_hint": "ethernet",
              }):
             out = server_mod.power_status()
 
@@ -1657,7 +1703,35 @@ class PowerControlTests(unittest.TestCase):
         self.assertEqual(out["wake_command"], "/wake")
         self.assertEqual(out["wake_instruction"], "/wake laptop")
         self.assertEqual(out["wake_surface"], "telegram")
+        self.assertEqual(out["wake_readiness"], "ready")
+        self.assertEqual(out["wake_transport_hint"], "ethernet")
         self.assertIn("shutdown", out["actions"])
+
+    def test_power_status_warns_when_local_wake_is_unsupported(self):
+        with mock.patch.object(server_mod.os, "name", "nt"), \
+             mock.patch.object(server_mod, "_ensure_windows_host"), \
+             mock.patch.object(server_mod, "_wake_mac_info", return_value={
+                 "primary_mac": "AA:BB:CC:DD:EE:FF",
+                 "wake_candidate_macs": ["AA:BB:CC:DD:EE:FF"],
+                 "wake_supported": True,
+             }), \
+             mock.patch.object(server_mod, "_wake_relay_health", return_value={
+                 "configured": True,
+                 "reachable": True,
+                 "detail": "relay_online",
+                 "wake_surface": "telegram",
+                 "wake_command": "/wake",
+             }), \
+             mock.patch.object(server_mod, "_wake_local_capabilities", return_value={
+                 "wake_readiness": "unsupported",
+                 "wake_warning": "Wake is not confirmed on this host. An Ethernet adapter exists, but Windows is not exposing Wake-on-Magic-Packet yet.",
+                 "wake_transport_hint": "ethernet",
+             }):
+            out = server_mod.power_status()
+
+        self.assertEqual(out["wake_readiness"], "unsupported")
+        self.assertEqual(out["wake_transport_hint"], "ethernet")
+        self.assertIn("Wake-on-Magic-Packet", out["wake_warning"])
 
     def test_power_action_requires_confirmation_for_shutdown(self):
         with mock.patch.object(server_mod, "_ensure_windows_host"), \

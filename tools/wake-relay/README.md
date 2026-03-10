@@ -46,3 +46,5 @@ curl -X POST -H 'x-relay-token: change-me' http://127.0.0.1:8765/wake
 - Keep this relay on a device that stays online when the laptop is powered off.
 - The wake bot should be separate from the laptop-hosted Telegram file delivery bot.
 - Wake-on-LAN still depends on BIOS/UEFI and Windows adapter power settings being configured correctly.
+- On many laptops, Wi-Fi wake is unsupported or unreliable. Prefer Ethernet when validating remote wake.
+- The Codrex Remote tab shows `ready`, `partial`, or `unsupported` wake diagnostics; treat `partial` and `unsupported` as warnings, not guarantees.
