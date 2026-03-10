@@ -5,6 +5,7 @@
 - Canonical repo: `E:\coding projects\codex-remote-ui`
 - Daily launch: `Setup.cmd` once, then `Codrex.cmd`
 - Launcher shell: `Codrex.cmd` opens the Windows launcher and the main web app after setup/start succeeds
+- Windows lifecycle path: `Setup.cmd` and the launcher both go through `tools/windows/codrex-runtime.ps1`
 - Preferred controller port: `48787`, with automatic fallback to the next free port if that range is occupied
 - Main app URL: `http://127.0.0.1:<active-port>/`
 - Fallback controls: `http://127.0.0.1:<active-port>/legacy`
@@ -20,12 +21,14 @@
   - tmux thread monitor
   - browser-based remote desktop controls with fullscreen mode, trackpad/direct pointer modes, and quick-key actions
   - power controls and wake-readiness diagnostics
-  - launcher/runtime health reporting via `/app/runtime`
+- launcher/runtime health reporting via `/app/runtime`
+- runtime-local state now lives under `%LocalAppData%\Codrex\remote-ui\state`; tracked `controller.config.json` is defaults-only
 
 ## Latest Milestones
 
 - `faeed21`: stabilized launcher/runtime state, authoritative session record, setup auto-launch, and launcher health handling
-- current working tree: session notes, runtime/version visibility in the web app, fullscreen remote controls, and project tracking refresh
+- `85e0d64`: fixed launcher startup session handoff so background start writes the runtime session correctly
+- current working tree: headless Windows lifecycle script, launcher thin-shell conversion, detached launcher start/stop requests, repo-config drift removal, and runtime contract tests
 
 ## Security Status
 
@@ -42,9 +45,9 @@
 ## Current TODO
 
 - Manual Windows verification:
-  - confirm `Setup.cmd` leaves a readable success/failure summary instead of closing too fast
-  - confirm launcher `Stop` truly clears the controller and session file in real usage
-  - confirm the web app clearly feels separate from the launcher shell
+  - confirm the launcher transitions cleanly from `starting` to `running` in a live `Codrex.cmd` session
+  - confirm `Stop` truly clears the controller and session file in real launcher usage
+  - confirm launch/stop does not dirty tracked `controller.config.json`
 - Polish the browser-based remote control further:
   - add better drag/selection handling
   - add richer quick-key/modifier combinations for tablet use

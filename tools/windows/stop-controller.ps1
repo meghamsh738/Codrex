@@ -7,14 +7,27 @@ $ErrorActionPreference = "Stop"
 $scriptRoot = Split-Path -Parent $PSCommandPath
 $root = (Resolve-Path (Join-Path $scriptRoot "..\..")).Path
 $configPath = Join-Path $root "controller.config.json"
+$runtimeDir = if ($env:CODEX_RUNTIME_DIR -and $env:CODEX_RUNTIME_DIR.Trim()) {
+  $env:CODEX_RUNTIME_DIR.Trim()
+} elseif ($env:LocalAppData -and $env:LocalAppData.Trim()) {
+  Join-Path $env:LocalAppData "Codrex\remote-ui"
+} else {
+  Join-Path $root ".runtime"
+}
+$localConfigPath = Join-Path (Join-Path $runtimeDir "state") "controller.config.local.json"
+$legacyLocalConfigPath = Join-Path $root "controller.config.local.json"
 
-if ((-not $PSBoundParameters.ContainsKey("Port")) -and (Test-Path $configPath)) {
-  try {
-    $loaded = Get-Content $configPath -Raw | ConvertFrom-Json
-    if ($loaded -and $loaded.port) {
-      $Port = [int]$loaded.port
-    }
-  } catch {}
+if (-not $PSBoundParameters.ContainsKey("Port")) {
+  foreach ($candidate in @($localConfigPath, $legacyLocalConfigPath, $configPath)) {
+    if (-not (Test-Path $candidate)) { continue }
+    try {
+      $loaded = Get-Content $candidate -Raw | ConvertFrom-Json
+      if ($loaded -and $loaded.port) {
+        $Port = [int]$loaded.port
+        break
+      }
+    } catch {}
+  }
 }
 
 function Get-CodrexControllerProcesses {
@@ -68,3 +81,4 @@ if (-not $procs) {
 foreach ($p in $procs) {
   $stoppedAny = (Stop-CodrexProcess -ProcessObject $p) -or $stoppedAny
 }
+exit 0

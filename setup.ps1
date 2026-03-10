@@ -10,25 +10,7 @@ $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSCommandPath
 Set-Location $root
 
-function Read-ControllerPort {
-  param(
-    [string]$ConfigPath,
-    [int]$FallbackPort
-  )
-  if (-not (Test-Path $ConfigPath)) {
-    return $FallbackPort
-  }
-  try {
-    $cfg = Get-Content -Path $ConfigPath -Raw | ConvertFrom-Json
-    if ($cfg -and $cfg.port) {
-      return [int]$cfg.port
-    }
-  } catch {}
-  return $FallbackPort
-}
-
-$configPath = Join-Path $root "controller.config.json"
-$startMobileScript = Join-Path $root "tools\windows\start-mobile.ps1"
+$runtimeScript = Join-Path $root "tools\windows\codrex-runtime.ps1"
 $launcherCmd = Join-Path $root "Codrex.cmd"
 $logsPath = Join-Path $env:LocalAppData "Codrex\\remote-ui\\logs"
 $summaryLines = New-Object System.Collections.Generic.List[string]
@@ -68,28 +50,41 @@ try {
   Write-Host "Building UI..."
   & $npmCmd run build --prefix $uiRoot
 
-  if (-not (Test-Path $startMobileScript)) {
-    throw "Missing start script at $startMobileScript"
+  if (-not (Test-Path $runtimeScript)) {
+    throw "Missing runtime script at $runtimeScript"
   }
 
   $args = @(
     "-NoProfile",
     "-ExecutionPolicy", "Bypass",
-    "-File", $startMobileScript,
+    "-File", $runtimeScript,
+    "-Action", "start",
     "-UiPort", "54312"
   )
   if ($OpenFirewall) {
     $args += "-OpenFirewall"
   }
   Write-Host "Starting Codrex app stack..."
-  & powershell.exe @args
+  $runtimeOutput = @(& powershell.exe @args 2>&1 | ForEach-Object { [string]$_ })
   $startExitCode = if ($LASTEXITCODE -is [int]) { [int]$LASTEXITCODE } else { 0 }
+  $runtimeJson = ($runtimeOutput | Select-Object -Last 1)
+  $startPayload = $null
+  if ($runtimeJson) {
+    try {
+      $startPayload = $runtimeJson | ConvertFrom-Json
+    } catch {}
+  }
   if ($startExitCode -ne 0) {
-    throw "Codrex start script exited with code $startExitCode."
+    $detail = if ($startPayload -and $startPayload.detail) { [string]$startPayload.detail } else { ($runtimeOutput -join "`n").Trim() }
+    throw "Codrex start failed. $detail"
   }
 
-  $resolvedPort = Read-ControllerPort -ConfigPath $configPath -FallbackPort $Port
-  $appUrl = "http://127.0.0.1:$resolvedPort/"
+  if (-not $startPayload -or -not $startPayload.ok) {
+    throw "Codrex start returned an invalid runtime payload."
+  }
+
+  $resolvedPort = if ($startPayload.controller_port) { [int]$startPayload.controller_port } else { $Port }
+  $appUrl = if ($startPayload.local_url) { [string]$startPayload.local_url } else { "http://127.0.0.1:$resolvedPort/" }
   $summaryLines.Add("Setup complete.")
   $summaryLines.Add("App URL: $appUrl")
   if (Test-Path $launcherCmd) {

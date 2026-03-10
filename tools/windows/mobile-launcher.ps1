@@ -261,6 +261,55 @@ function Invoke-HiddenPowerShellScript {
   return 0
 }
 
+function Invoke-RuntimeAction {
+  param(
+    [string]$ActionName
+  )
+  $args = @("-Action", $ActionName, "-UiPort", [string]$uiPort)
+  if ($ActionName -eq "start" -and $script:applyFirewallOnStart) {
+    $args += "-OpenFirewall"
+  }
+  $exitCode = Invoke-HiddenPowerShellScript -ScriptPath $runtimeScript -Arguments $args
+  $jsonText = [string]$script:lastHelperOutput
+  if (-not $jsonText) {
+    throw "Codrex runtime '$ActionName' returned no output."
+  }
+  try {
+    $payload = $jsonText | ConvertFrom-Json
+  } catch {
+    throw "Codrex runtime '$ActionName' returned invalid JSON. Output: $jsonText"
+  }
+  if (-not $payload) {
+    throw "Codrex runtime '$ActionName' returned an empty payload."
+  }
+  if ($exitCode -ne 0 -or (-not $payload.ok)) {
+    $detail = if ($payload.detail) { [string]$payload.detail } else { $jsonText }
+    throw "Codrex runtime '$ActionName' failed. $detail"
+  }
+  return $payload
+}
+
+function Start-DetachedRuntimeAction {
+  param(
+    [string]$ActionName
+  )
+  if (-not (Test-Path $runtimeScript)) {
+    throw "Missing $runtimeScript"
+  }
+  $invokeArgs = @(
+    "-NoProfile",
+    "-ExecutionPolicy", "Bypass",
+    "-File", $runtimeScript,
+    "-Action", $ActionName,
+    "-UiPort", [string]$uiPort
+  )
+  if ($ActionName -eq "start" -and $script:applyFirewallOnStart) {
+    $invokeArgs += "-OpenFirewall"
+  }
+  $proc = Start-Process -FilePath "powershell.exe" -ArgumentList $invokeArgs -WindowStyle Hidden -PassThru
+  return [int]$proc.Id
+}
+
 function Wait-ForPortsReleased {
   param(
     [int[]]$Ports,
@@ -303,72 +352,27 @@ function Wait-ForSessionCleared {
 }
 
 function Get-LauncherStatusSnapshot {
-  $cfg = Get-CachedControllerConfig
-  $session = Read-MobileSession
-  $controllerPort = if ($session -and $session.controller_port) {
-    [int]$session.controller_port
-  } elseif ($cfg.port) {
-    [int]$cfg.port
-  } else {
-    $script:DefaultControllerPort
-  }
-  $lanIp = Get-CachedLanIp
-  $listening = Get-ListeningStateMap -Ports @($controllerPort, $uiPort)
-  $controllerOn = [bool]$listening[[int]$controllerPort]
-  $appRuntime = if ($controllerOn) { Get-AppRuntime -ControllerPort $controllerPort } else { $null }
-  $appHealth = if ($appRuntime) { $appRuntime } elseif ($controllerOn) { Get-AppHealth -ControllerPort $controllerPort } else { $null }
-  $appBuilt = [bool]($appHealth -and $appHealth.ok -and $appHealth.ui_mode -eq "built")
-  $appMode = if ($appHealth -and $appHealth.ui_mode) {
-    [string]$appHealth.ui_mode
-  } elseif ($session -and $session.ui_mode) {
-    [string]$session.ui_mode
-  } elseif ($session) {
-    "checking"
-  } else {
-    "offline"
-  }
-  $version = if ($appRuntime -and $appRuntime.version) {
-    [string]$appRuntime.version
-  } else {
-    "n/a"
-  }
-  $repoRoot = ""
-  if ($appRuntime -and $appRuntime.repo_root) {
-    $repoRoot = [string]$appRuntime.repo_root
-  } elseif ($session -and $session.repo_root) {
-    $repoRoot = [string]$session.repo_root
-  }
+  $payload = Invoke-RuntimeAction -ActionName "status"
+  $repoRoot = if ($payload.repo_root) { [string]$payload.repo_root } else { "" }
   $repoLabel = if ($repoRoot) { Split-Path -Leaf $repoRoot } else { "n/a" }
-  $sessionState = if ($session) { "present" } else { "missing" }
-  $localUrl = if ($controllerOn -or $session) { "http://127.0.0.1:$controllerPort/" } else { "offline" }
-  $networkUrl = if ($lanIp -and $lanIp -ne "127.0.0.1") { "http://$lanIp`:$controllerPort/" } else { "n/a" }
-  $status = if ($appBuilt) {
-    "running"
-  } elseif ($controllerOn -and $session) {
-    "checking"
-  } elseif ($controllerOn) {
-    "error"
-  } elseif ($session) {
-    "recovering"
-  } else {
-    "stopped"
-  }
   return [pscustomobject]@{
-    session = $session
-    controller_port = $controllerPort
-    controller_on = $controllerOn
-    app_runtime = $appRuntime
-    app_health = $appHealth
-    app_built = $appBuilt
-    app_mode = $appMode
-    version = $version
+    session = $payload.session
+    controller_port = [int]$payload.controller_port
+    controller_on = [bool]$payload.controller_pid
+    app_runtime = $null
+    app_health = $null
+    app_built = [bool]$payload.app_ready
+    app_mode = if ($payload.ui_mode) { [string]$payload.ui_mode } else { "offline" }
+    version = if ($payload.app_version) { [string]$payload.app_version } else { "n/a" }
     repo_root = $repoRoot
     repo_label = $repoLabel
-    session_state = $sessionState
-    local_url = $localUrl
-    network_url = $networkUrl
-    status = $status
-    lan_ip = $lanIp
+    repo_rev = if ($payload.repo_rev) { [string]$payload.repo_rev } else { "" }
+    session_state = if ($payload.session_present) { "present" } else { "missing" }
+    local_url = if ($payload.local_url) { [string]$payload.local_url } else { "offline" }
+    network_url = if ($payload.network_url) { [string]$payload.network_url } else { "n/a" }
+    status = if ($payload.status) { [string]$payload.status } else { "stopped" }
+    lan_ip = Get-CachedLanIp
+    detail = if ($payload.detail) { [string]$payload.detail } else { "" }
   }
 }
 
@@ -379,7 +383,8 @@ function Apply-LauncherStatus {
   if (-not $Snapshot) {
     return
   }
-  $lblStatus.Text = "Launcher shell | State: $($Snapshot.status) | Mode: $($Snapshot.app_mode)`r`nBuild: v$($Snapshot.version) | Port: $($Snapshot.controller_port) | Session: $($Snapshot.session_state)`r`nApp: $($Snapshot.local_url)`r`nLAN: $($Snapshot.network_url) | Repo: $($Snapshot.repo_label)"
+  $revSuffix = if ($Snapshot.repo_rev) { " | Rev: $($Snapshot.repo_rev)" } else { "" }
+  $lblStatus.Text = "Launcher shell | State: $($Snapshot.status) | Mode: $($Snapshot.app_mode)`r`nBuild: v$($Snapshot.version)$revSuffix | Port: $($Snapshot.controller_port) | Session: $($Snapshot.session_state)`r`nApp: $($Snapshot.local_url)`r`nLAN: $($Snapshot.network_url) | Repo: $($Snapshot.repo_label)`r`nDetail: $($Snapshot.detail)"
   switch ([string]$Snapshot.status) {
     "running" {
       $statusCard.BackColor = [System.Drawing.ColorTranslator]::FromHtml("#0d2f53")
@@ -520,11 +525,13 @@ $script:SessionPath = Join-Path $stateDir "mobile.session.json"
 $script:LegacySessionPath = Join-Path (Join-Path $root "logs") "mobile.session.json"
 $startMobileScript = Join-Path $scriptRoot "start-mobile.ps1"
 $stopMobileScript = Join-Path $scriptRoot "stop-mobile.ps1"
+$runtimeScript = Join-Path $scriptRoot "codrex-runtime.ps1"
 $uiPort = $script:DefaultDevUiPort
 $controllerPort = $script:DefaultControllerPort
 $controllerToken = ""
 $pairUrl = ""
 $authSession = New-Object Microsoft.PowerShell.Commands.WebRequestSession
+$script:applyFirewallOnStart = $false
 $colorBg = [System.Drawing.ColorTranslator]::FromHtml("#040915")
 $colorSurface = [System.Drawing.ColorTranslator]::FromHtml("#0a1426")
 $colorSurfaceSoft = [System.Drawing.ColorTranslator]::FromHtml("#0e1b33")
@@ -543,6 +550,9 @@ $script:actionInProgress = $false
 $script:refreshTimer = $null
 $script:launcherButtons = @()
 $script:lastHelperOutput = ""
+$script:pendingRuntimeAction = ""
+$script:pendingRuntimeActionAt = [DateTime]::MinValue
+$script:pendingRuntimeTimeoutSec = 45
 $script:pendingStart = $false
 $script:pendingStartAt = [DateTime]::MinValue
 $script:pendingStartTimeoutSec = 45
@@ -1002,15 +1012,8 @@ function Get-CachedLanIp {
 }
 
 function Resolve-LauncherControllerPort {
-  $session = Read-MobileSession
-  if ($session -and $session.controller_port) {
-    return [int]$session.controller_port
-  }
-  $cfg = Get-CachedControllerConfig
-  if ($cfg.port) {
-    return [int]$cfg.port
-  }
-  return $script:DefaultControllerPort
+  $snapshot = Get-LauncherStatusSnapshot
+  return [int]$snapshot.controller_port
 }
 
 function Refresh-State {
@@ -1021,79 +1024,41 @@ function Refresh-State {
   $script:refreshInProgress = $true
   try {
     $snapshot = Get-LauncherStatusSnapshot
-    if ($script:pendingStart) {
-      $taskResult = Read-PendingStartTaskResult
-      $elapsedSeconds = if ($script:pendingStartAt -eq [DateTime]::MinValue) {
-        0
-      } else {
-        [int]((Get-Date) - $script:pendingStartAt).TotalSeconds
-      }
-      if ($snapshot.app_built) {
-        Clear-PendingStart
-        Apply-LauncherStatus -Snapshot $snapshot
-        Append-Log ("Start complete. App ready on port {0} (v{1})." -f $snapshot.controller_port, $snapshot.version)
-        if ($snapshot.local_url -and $snapshot.local_url -ne "offline") {
-          Open-Url $snapshot.local_url
-        }
-      } elseif ($taskResult.completed -and -not $taskResult.ok) {
-        $detail = if ($taskResult.detail) {
-          "Codrex start failed. $($taskResult.detail) Logs: $logsDir"
+    $pendingAction = [string]$script:pendingRuntimeAction
+    if ($pendingAction) {
+      $ageSeconds = [int]([DateTime]::UtcNow - $script:pendingRuntimeActionAt).TotalSeconds
+      if ($pendingAction -eq "start") {
+        if ($snapshot.status -eq "running") {
+          $script:pendingRuntimeAction = ""
+          if ($snapshot.local_url) {
+            Append-Log ("Start complete. App ready on port {0} (v{1})." -f $snapshot.controller_port, $(if ($snapshot.version) { $snapshot.version } else { "n/a" }))
+            Open-Url ([string]$snapshot.local_url)
+          }
+        } elseif ($ageSeconds -le $script:pendingRuntimeTimeoutSec) {
+          $snapshot.status = "starting"
+          $snapshot.detail = "Waiting for Codrex runtime to report ready..."
         } else {
-          "Codrex start failed before runtime became ready. Logs: $logsDir"
+          Append-Log "Start request timed out while waiting for runtime readiness."
+          $script:pendingRuntimeAction = ""
         }
-        Clear-PendingStart
-        Set-ActionStatus -State "error" -Detail $detail -ControllerPort $snapshot.controller_port
-        Append-Log "Error: $detail"
-        [System.Windows.Forms.MessageBox]::Show(
-          $detail,
-          "Codrex",
-          [System.Windows.Forms.MessageBoxButtons]::OK,
-          [System.Windows.Forms.MessageBoxIcon]::Error
-        ) | Out-Null
-      } elseif ($taskResult.completed -and -not $snapshot.app_built) {
-        $detail = if ($taskResult.detail) {
-          "Codrex helper finished before runtime became ready. $($taskResult.detail) Logs: $logsDir"
+      } elseif ($pendingAction -eq "stop") {
+        if ($snapshot.status -eq "stopped") {
+          $script:pendingRuntimeAction = ""
+          Append-Log "Stop complete."
+        } elseif ($ageSeconds -le $script:pendingRuntimeTimeoutSec) {
+          $snapshot.status = "checking"
+          $snapshot.detail = "Waiting for Codrex runtime to stop..."
         } else {
-          "Codrex helper finished before runtime became ready. Logs: $logsDir"
+          Append-Log "Stop request timed out while waiting for runtime shutdown."
+          $script:pendingRuntimeAction = ""
         }
-        Clear-PendingStart
-        Set-ActionStatus -State "error" -Detail $detail -ControllerPort $snapshot.controller_port
-        Append-Log "Error: $detail"
-        [System.Windows.Forms.MessageBox]::Show(
-          $detail,
-          "Codrex",
-          [System.Windows.Forms.MessageBoxButtons]::OK,
-          [System.Windows.Forms.MessageBoxIcon]::Error
-        ) | Out-Null
-      } elseif ($elapsedSeconds -ge $script:pendingStartTimeoutSec) {
-        $helperStatus = if ($taskResult.detail) { " Detail: $($taskResult.detail)" } else { "" }
-        Clear-PendingStart
-        $detail = "Codrex did not reach running state within $($script:pendingStartTimeoutSec)s.$helperStatus Logs: $logsDir"
-        Set-ActionStatus -State "error" -Detail $detail -ControllerPort $snapshot.controller_port
-        Append-Log "Error: $detail"
-        [System.Windows.Forms.MessageBox]::Show(
-          $detail,
-          "Codrex",
-          [System.Windows.Forms.MessageBoxButtons]::OK,
-          [System.Windows.Forms.MessageBoxIcon]::Error
-        ) | Out-Null
-      } elseif ($snapshot.session_state -eq "present") {
-        Set-ActionStatus -State "checking" -Detail "Runtime session written. Waiting for browser app readiness..." -ControllerPort $snapshot.controller_port
-      } elseif ($snapshot.controller_on) {
-        Set-ActionStatus -State "checking" -Detail "Controller reachable. Waiting for runtime session..." -ControllerPort $snapshot.controller_port
-      } else {
-        $statusPort = if ($script:pendingStartPort -gt 0) { $script:pendingStartPort } else { $snapshot.controller_port }
-        Set-ActionStatus -State "starting" -Detail "Launching Codrex helper..." -ControllerPort $statusPort
       }
-    } else {
-      Apply-LauncherStatus -Snapshot $snapshot
     }
-
-    $busy = $script:actionInProgress
-    $starting = $script:pendingStart
-    $btnStop.Enabled = (-not $busy) -and (-not $starting) -and ($snapshot.controller_on -or $snapshot.session_state -eq "present")
-    $btnStart.Enabled = (-not $busy) -and (-not $starting)
-    $btnStart.Text = if ($starting) { "Starting..." } elseif ($snapshot.app_built) { "Open App" } else { "Start" }
+    Apply-LauncherStatus -Snapshot $snapshot
+    $busy = ($script:actionInProgress -or [bool]$script:pendingRuntimeAction)
+    $btnStop.Enabled = (-not $busy) -and ($snapshot.controller_on -or $snapshot.session_state -eq "present")
+    $btnStart.Enabled = (-not $busy)
+    $btnStart.Text = if ($snapshot.app_built) { "Open App" } else { "Start" }
     $btnOpenLocal.Enabled = (-not $busy) -and $snapshot.controller_on
     $btnOpenNetwork.Enabled = (-not $busy) -and $snapshot.controller_on -and ($snapshot.lan_ip -ne "127.0.0.1")
     $btnOpenController.Enabled = (-not $busy) -and $snapshot.controller_on
@@ -1101,6 +1066,10 @@ function Refresh-State {
     $hasPair = [bool]$pairUrl
     $btnCopyPair.Enabled = (-not $busy) -and $hasPair
     $btnOpenPair.Enabled = (-not $busy) -and $hasPair
+  } catch {
+    $msg = [string]$_.Exception.Message
+    if (-not $msg) { $msg = "Could not refresh launcher state." }
+    Set-ActionStatus -State "error" -Detail $msg
   } finally {
     $script:refreshInProgress = $false
   }
@@ -1113,52 +1082,20 @@ function Start-Stack {
     Append-Log ("App already running on port {0}." -f $existingSnapshot.controller_port)
     return
   }
-  if ($script:pendingStart) {
-    Append-Log "Start already in progress."
-    return
-  }
-
   Append-Log "Starting mobile stack..."
-  Set-ActionStatus -State "starting" -Detail "Launching Codrex helper..." -ControllerPort $existingSnapshot.controller_port
-  $script:cachedControllerConfigAt = [DateTime]::MinValue
-  $script:cachedLanIpAt = [DateTime]::MinValue
-  $task = Start-PowerShellScriptTask -ScriptPath $startMobileScript -LaunchUiPort $uiPort
-  $script:pendingStart = $true
-  $script:pendingStartAt = Get-Date
-  $script:pendingStartPort = $existingSnapshot.controller_port
-  $script:pendingStartWorker = $task.worker
-  $script:pendingStartAsync = $task.async
-  $script:pendingStartResultRead = $false
-  $script:lastHelperOutput = ""
-  Append-Log ("Firewall changes skipped on normal start. Use Setup.cmd if you need firewall rules refreshed.")
-  Refresh-State -Force
+  Set-ActionStatus -State "starting" -Detail "Launching Codrex runtime..." -ControllerPort $existingSnapshot.controller_port
+  $procId = Start-DetachedRuntimeAction -ActionName "start"
+  $script:pendingRuntimeAction = "start"
+  $script:pendingRuntimeActionAt = [DateTime]::UtcNow
+  Append-Log ("Start requested via runtime helper PID {0}." -f $procId)
 }
 
 function Stop-Stack {
-  $controllerPort = Resolve-LauncherControllerPort
   Append-Log "Stopping mobile stack..."
-  $stopExitCode = Invoke-HiddenPowerShellScript -ScriptPath $stopMobileScript -Arguments @(
-    "-UiPort", [string]$uiPort
-  )
-  $portsReleased = Wait-ForPortsReleased -Ports @($controllerPort, $uiPort)
-  $sessionCleared = Wait-ForSessionCleared
-  $listening = Get-ListeningStateMap -Ports @($controllerPort, $uiPort)
-  $controllerStillListening = [bool]$listening[[int]$controllerPort]
-  $uiStillListening = [bool]$listening[[int]$uiPort]
-  if ($stopExitCode -ne 0 -or -not $portsReleased -or -not $sessionCleared -or $controllerStillListening -or $uiStillListening) {
-    $reasons = New-Object System.Collections.Generic.List[string]
-    if ($stopExitCode -ne 0) { $reasons.Add("stop script exit $stopExitCode") }
-    if ($controllerStillListening) { $reasons.Add("controller still listening on $controllerPort") }
-    if ($uiStillListening) { $reasons.Add("UI still listening on $uiPort") }
-    if (-not $sessionCleared) { $reasons.Add("runtime session file still present") }
-    if ($script:lastHelperOutput) { $reasons.Add($script:lastHelperOutput) }
-    $detail = if ($reasons.Count -gt 0) { $reasons -join "; " } else { "unknown stop state" }
-    throw "Codrex stop did not complete cleanly: $detail. Use Open Fallback or inspect runtime logs."
-  }
-  $script:cachedControllerConfigAt = [DateTime]::MinValue
-  $script:cachedLanIpAt = [DateTime]::MinValue
-  Refresh-State
-  Append-Log "Stop complete."
+  $procId = Start-DetachedRuntimeAction -ActionName "stop"
+  $script:pendingRuntimeAction = "stop"
+  $script:pendingRuntimeActionAt = [DateTime]::UtcNow
+  Append-Log ("Stop requested via runtime helper PID {0}." -f $procId)
 }
 
 function Generate-PairQr {

@@ -317,18 +317,14 @@ if ($resolvedPort -ne [int]$cfg.port) {
   $cfg.port = $resolvedPort
 }
 
-$persistMain = [ordered]@{
+$persistLocal = [ordered]@{
   port = [int]$cfg.port
   distro = [string]$cfg.distro
   workdir = [string]$cfg.workdir
   fileRoot = [string]$cfg.fileRoot
-  token = ""
+  token = [string]$cfg.token
   telegramDefaultSend = [bool]$cfg.telegramDefaultSend
 }
-$persistLocal = [ordered]@{
-  token = [string]$cfg.token
-}
-$persistMain | ConvertTo-Json | Set-Content -Path $configPath -Encoding UTF8
 $persistLocal | ConvertTo-Json | Set-Content -Path $localConfigPath -Encoding UTF8
 
 # Ensure `codrex-send` helper exists inside WSL for Codex sessions.
@@ -359,8 +355,8 @@ $env:CODEX_FILE_ROOT = [string]$cfg.fileRoot
 $env:CODEX_MOBILE_UI_PORT = [string]$UiPort
 $env:CODEX_TELEGRAM_DEFAULT_SEND = if ($cfg.telegramDefaultSend) { "1" } else { "0" }
 
-$args = @("-m", "uvicorn", "app.server:app", "--host", "0.0.0.0", "--port", [string]$cfg.port)
-$proc = Start-Process -FilePath $python -ArgumentList $args -WorkingDirectory $root -WindowStyle Hidden -RedirectStandardOutput $outLog -RedirectStandardError $errLog -PassThru
+$launchCommand = 'start "" /b "{0}" -m uvicorn app.server:app --host 0.0.0.0 --port {1} 1>>"{2}" 2>>"{3}"' -f $python, $cfg.port, $outLog, $errLog
+$null = Start-Process -FilePath "cmd.exe" -ArgumentList @("/d", "/c", $launchCommand) -WorkingDirectory $root -WindowStyle Hidden -PassThru
 
 # Wait until endpoint responds.
 $ok = $false
@@ -414,6 +410,11 @@ if ($OpenFirewall) {
 }
 
 $ip = Get-PrimaryIPv4
+$controllerProc = Get-PortOwners -Port ([int]$cfg.port) |
+  Where-Object { $_.CommandLine -and $_.CommandLine -match "app\.server:app" } |
+  Sort-Object ProcessId -Descending |
+  Select-Object -First 1
+$controllerPid = if ($controllerProc) { [int]$controllerProc.ProcessId } else { 0 }
 Write-Host "Controller started."
 Write-Host ("URL: http://{0}:{1}" -f $ip, $cfg.port)
 if ($readyHost) {
@@ -422,5 +423,6 @@ if ($readyHost) {
 Write-Host ("Token: {0}" -f (Mask-Secret -Value ([string]$cfg.token)))
 Write-Host ("Token file: {0}" -f $localConfigPath)
 Write-Host ("Runtime dir: {0}" -f $runtimeDir)
-Write-Host "PID: $($proc.Id)"
+Write-Host "PID: $controllerPid"
 Write-Host "Logs: $outLog"
+exit 0

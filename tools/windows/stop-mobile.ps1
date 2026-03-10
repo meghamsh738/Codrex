@@ -65,12 +65,18 @@ function Stop-UiByPort {
 }
 
 function Read-ControllerPort {
-  param([string]$ConfigPath)
-  if (-not (Test-Path $ConfigPath)) { return 48787 }
-  try {
-    $cfg = Get-Content -Path $ConfigPath -Raw | ConvertFrom-Json
-    if ($cfg -and $cfg.port) { return [int]$cfg.port }
-  } catch {}
+  param(
+    [string]$ConfigPath,
+    [string]$LocalConfigPath = "",
+    [string]$LegacyLocalConfigPath = ""
+  )
+  foreach ($candidate in @($LocalConfigPath, $LegacyLocalConfigPath, $ConfigPath)) {
+    if (-not $candidate -or -not (Test-Path $candidate)) { continue }
+    try {
+      $cfg = Get-Content -Path $candidate -Raw | ConvertFrom-Json
+      if ($cfg -and $cfg.port) { return [int]$cfg.port }
+    } catch {}
+  }
   return 48787
 }
 
@@ -103,12 +109,14 @@ $stateDir = Join-Path $runtimeDir "state"
 $sessionPath = Join-Path $stateDir "mobile.session.json"
 $legacySessionPath = Join-Path (Join-Path $root "logs") "mobile.session.json"
 $configPath = Join-Path $root "controller.config.json"
+$localConfigPath = Join-Path $stateDir "controller.config.local.json"
+$legacyLocalConfigPath = Join-Path $root "controller.config.local.json"
 
 $session = Read-SessionData -Path $sessionPath
 if (-not $session -and (Test-Path $legacySessionPath)) {
   $session = Read-SessionData -Path $legacySessionPath
 }
-$controllerPort = Read-ControllerPort -ConfigPath $configPath
+$controllerPort = Read-ControllerPort -ConfigPath $configPath -LocalConfigPath $localConfigPath -LegacyLocalConfigPath $legacyLocalConfigPath
 $controllerPid = $null
 
 if ($session -and $session.controller_port) {
@@ -169,3 +177,4 @@ $result | ConvertTo-Json -Compress | Write-Output
 if (-not $result.ok) {
   exit 1
 }
+exit 0

@@ -34,15 +34,19 @@ function Get-PrimaryIPv4 {
 
 function Read-ControllerPort {
   param(
-    [string]$ConfigPath
+    [string]$ConfigPath,
+    [string]$LocalConfigPath = "",
+    [string]$LegacyLocalConfigPath = ""
   )
-  if (-not (Test-Path $ConfigPath)) { return $script:DefaultControllerPort }
-  try {
-    $cfg = Get-Content -Path $ConfigPath -Raw | ConvertFrom-Json
-    if ($cfg -and $cfg.port) {
-      return [int]$cfg.port
-    }
-  } catch {}
+  foreach ($candidate in @($LocalConfigPath, $LegacyLocalConfigPath, $ConfigPath)) {
+    if (-not $candidate -or -not (Test-Path $candidate)) { continue }
+    try {
+      $cfg = Get-Content -Path $candidate -Raw | ConvertFrom-Json
+      if ($cfg -and $cfg.port) {
+        return [int]$cfg.port
+      }
+    } catch {}
+  }
   return $script:DefaultControllerPort
 }
 
@@ -245,6 +249,8 @@ $runtimeDir = Get-CodrexRuntimeDir -RepoRoot $root
 $stateDir = Join-Path $runtimeDir "state"
 $logsDir = Join-Path $runtimeDir "logs"
 $configPath = Join-Path $root "controller.config.json"
+$localConfigPath = Join-Path $stateDir "controller.config.local.json"
+$legacyLocalConfigPath = Join-Path $root "controller.config.local.json"
 $sessionPath = Join-Path $stateDir "mobile.session.json"
 $uiOutLog = Join-Path $logsDir "ui.out.log"
 $uiErrLog = Join-Path $logsDir "ui.err.log"
@@ -258,7 +264,7 @@ foreach ($dir in @($runtimeDir, $stateDir, $logsDir)) {
   }
 }
 
-$controllerPort = Read-ControllerPort -ConfigPath $configPath
+$controllerPort = Read-ControllerPort -ConfigPath $configPath -LocalConfigPath $localConfigPath -LegacyLocalConfigPath $legacyLocalConfigPath
 if ($controllerPort -eq $script:LegacyControllerPort) {
   $controllerPort = $script:DefaultControllerPort
 }
@@ -352,7 +358,7 @@ if ($DevUi) {
   $appHealth = $null
   for ($i = 0; $i -lt 40; $i++) {
     Start-Sleep -Milliseconds 300
-    $controllerPort = Read-ControllerPort -ConfigPath $configPath
+    $controllerPort = Read-ControllerPort -ConfigPath $configPath -LocalConfigPath $localConfigPath -LegacyLocalConfigPath $legacyLocalConfigPath
     $appHealth = Get-AppHealth -Port $controllerPort
     if ($appHealth -and $appHealth.ok -and $appHealth.ui_mode -eq "built") {
       $appReady = $true
@@ -365,7 +371,7 @@ if ($DevUi) {
   }
 }
 
-$controllerPort = Read-ControllerPort -ConfigPath $configPath
+$controllerPort = Read-ControllerPort -ConfigPath $configPath -LocalConfigPath $localConfigPath -LegacyLocalConfigPath $legacyLocalConfigPath
 
 if ($OpenFirewall) {
   if ($DevUi) {
@@ -414,3 +420,4 @@ Write-Host ("Runtime dir:    {0}" -f $runtimeDir)
 if ((-not $OpenFirewall) -and ($lanIp -and $lanIp -ne "127.0.0.1")) {
   Write-Host "Tip: if phone/tablet cannot open network URL, rerun with -OpenFirewall."
 }
+exit 0
