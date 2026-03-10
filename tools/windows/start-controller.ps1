@@ -209,6 +209,27 @@ function Get-CodrexRuntimeDir {
   return (Join-Path $RepoRoot ".runtime")
 }
 
+function Resolve-LogTargetPath {
+  param(
+    [string]$Path
+  )
+  if (-not $Path) {
+    return ""
+  }
+  if (-not (Test-Path $Path)) {
+    return $Path
+  }
+  try {
+    Remove-Item $Path -Force -ErrorAction Stop
+    return $Path
+  } catch {
+    $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
+    $alt = "{0}.{1}.run.log" -f $Path, $stamp
+    Write-Host "Warning: log file '$Path' is locked. Using '$alt' for this run."
+    return $alt
+  }
+}
+
 $runtimeDir = Get-CodrexRuntimeDir -RepoRoot $root
 $stateDir = Join-Path $runtimeDir "state"
 $logsDir = Join-Path $runtimeDir "logs"
@@ -327,8 +348,8 @@ if (-not (Test-Path $python)) {
   throw "Python executable not found at $python. Create venv in C:\codrex-remote-ui\.venv first."
 }
 
-if (Test-Path $outLog) { Remove-Item $outLog -Force }
-if (Test-Path $errLog) { Remove-Item $errLog -Force }
+$outLog = Resolve-LogTargetPath -Path $outLog
+$errLog = Resolve-LogTargetPath -Path $errLog
 
 $env:CODEX_AUTH_TOKEN = [string]$cfg.token
 $env:CODEX_RUNTIME_DIR = [string]$runtimeDir
