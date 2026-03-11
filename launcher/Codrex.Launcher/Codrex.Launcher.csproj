@@ -15,8 +15,6 @@
   </ItemGroup>
 
   <ItemGroup>
-    <None Include="Assets\launcher.html">
-      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-    </None>
+    <EmbeddedResource Include="Assets\launcher.html" />
   </ItemGroup>
 </Project>

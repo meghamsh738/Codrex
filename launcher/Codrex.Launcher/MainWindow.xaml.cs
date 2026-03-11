@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Reflection;
 using System.Text.Json;
 using System.Windows;
 using System.Windows.Threading;
@@ -48,7 +49,7 @@ public partial class MainWindow : Window
                 _webReady = true;
                 await PublishStateAsync();
             };
-            var html = await File.ReadAllTextAsync(Path.Combine(AppContext.BaseDirectory, "Assets", "launcher.html"));
+            var html = await LoadLauncherHtmlAsync();
             LauncherView.NavigateToString(html);
             _refreshTimer.Start();
             await RefreshStateAsync();
@@ -167,6 +168,15 @@ public partial class MainWindow : Window
             _errorDetail = ex.Message;
             await PublishStateAsync();
         }
+    }
+
+    private static async Task<string> LoadLauncherHtmlAsync()
+    {
+        const string resourceName = "Codrex.Launcher.Assets.launcher.html";
+        await using var stream = Assembly.GetExecutingAssembly().GetManifestResourceStream(resourceName)
+            ?? throw new InvalidOperationException($"Missing embedded launcher asset: {resourceName}");
+        using var reader = new StreamReader(stream);
+        return await reader.ReadToEndAsync();
     }
 
     private async Task RunRuntimeActionAsync(string action)
