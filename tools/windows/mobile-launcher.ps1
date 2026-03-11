@@ -379,6 +379,19 @@ function Start-DetachedRuntimeAction {
   return [int]$proc.Id
 }
 
+function Test-LauncherProcessAlive {
+  param(
+    [int]$Pid
+  )
+  if ($Pid -le 0) {
+    return $false
+  }
+  try {
+    return [bool](Get-Process -Id $Pid -ErrorAction SilentlyContinue)
+  } catch {}
+  return $false
+}
+
 function Wait-ForPortsReleased {
   param(
     [int[]]$Ports,
@@ -691,6 +704,7 @@ $script:lastRuntimeActionPayload = $null
 $script:lastRuntimeErrorPath = ""
 $script:lastActionLogPath = ""
 $script:pendingRuntimeAction = ""
+$script:pendingRuntimeHelperPid = 0
 $script:pendingRuntimeActionAt = [DateTime]::MinValue
 $script:pendingRuntimeTimeoutSec = 45
 $script:advancedVisible = $false
@@ -1502,30 +1516,35 @@ function Refresh-State {
     $script:lastKnownTailnetIp = if ($snapshot.tailscale_ip) { [string]$snapshot.tailscale_ip } else { "" }
     $stackActive = ($snapshot.controller_on -or $snapshot.session_state -eq "present")
     $pendingAction = [string]$script:pendingRuntimeAction
+    $helperAlive = Test-LauncherProcessAlive -Pid ([int]$script:pendingRuntimeHelperPid)
     if ($pendingAction) {
       $ageSeconds = [int]([DateTime]::UtcNow - $script:pendingRuntimeActionAt).TotalSeconds
       if ($pendingAction -eq "start") {
-        if ($snapshot.status -eq "running") {
+        if ($snapshot.status -eq "running" -and -not $helperAlive) {
           $script:pendingRuntimeAction = ""
+          $script:pendingRuntimeHelperPid = 0
           Append-Log ("Start complete. App ready on port {0} (v{1}). Click Open App to launch the browser UI." -f $snapshot.controller_port, $(if ($snapshot.version) { $snapshot.version } else { "n/a" }))
         } elseif ($ageSeconds -le $script:pendingRuntimeTimeoutSec) {
           $snapshot.status = "starting"
-          $snapshot.detail = "Waiting for Codrex runtime to report ready..."
+          $snapshot.detail = if ($snapshot.status -eq "running") { "Finalizing Codrex runtime start..." } else { "Waiting for Codrex runtime to report ready..." }
         } else {
           Append-Log "Start request timed out while waiting for runtime readiness."
           $script:pendingRuntimeAction = ""
+          $script:pendingRuntimeHelperPid = 0
         }
       } elseif ($pendingAction -eq "stop") {
-        if ($snapshot.status -eq "stopped") {
+        if ($snapshot.status -eq "stopped" -and -not $helperAlive) {
           $script:pendingRuntimeAction = ""
+          $script:pendingRuntimeHelperPid = 0
           Clear-PairingState
           Append-Log "Stop complete."
         } elseif ($ageSeconds -le $script:pendingRuntimeTimeoutSec) {
           $snapshot.status = "checking"
-          $snapshot.detail = "Waiting for Codrex runtime to stop..."
+          $snapshot.detail = if ($snapshot.status -eq "stopped") { "Finalizing Codrex runtime stop..." } else { "Waiting for Codrex runtime to stop..." }
         } else {
           Append-Log "Stop request timed out while waiting for runtime shutdown."
           $script:pendingRuntimeAction = ""
+          $script:pendingRuntimeHelperPid = 0
         }
       }
     }
@@ -1567,8 +1586,10 @@ function Start-Stack {
   Append-Log "Starting mobile stack..." -Action "start"
   Set-ActionStatus -State "starting" -Detail "Launching Codrex runtime..." -ControllerPort $existingSnapshot.controller_port
   $script:pendingRuntimeAction = "start"
+  $script:pendingRuntimeHelperPid = 0
   $script:pendingRuntimeActionAt = [DateTime]::UtcNow
   $helperPid = Start-DetachedRuntimeAction -ActionName "start"
+  $script:pendingRuntimeHelperPid = $helperPid
   Append-Log ("Start requested via runtime helper PID {0}." -f $helperPid) -Action "start"
 }
 
@@ -1582,8 +1603,10 @@ function Stop-Stack {
   Append-Log "Stopping mobile stack..." -Action "stop"
   Set-ActionStatus -State "stopping" -Detail "Stopping Codrex runtime..." -ControllerPort $existingSnapshot.controller_port
   $script:pendingRuntimeAction = "stop"
+  $script:pendingRuntimeHelperPid = 0
   $script:pendingRuntimeActionAt = [DateTime]::UtcNow
   $helperPid = Start-DetachedRuntimeAction -ActionName "stop"
+  $script:pendingRuntimeHelperPid = $helperPid
   Append-Log ("Stop requested via runtime helper PID {0}." -f $helperPid) -Action "stop"
 }
 
