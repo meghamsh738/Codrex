@@ -381,30 +381,30 @@ function Start-DetachedRuntimeAction {
 
 function Test-LauncherProcessAlive {
   param(
-    [int]$Pid
+    [int]$ProcessId
   )
-  if ($Pid -le 0) {
+  if ($ProcessId -le 0) {
     return $false
   }
   try {
-    return [bool](Get-Process -Id $Pid -ErrorAction SilentlyContinue)
+    return [bool](Get-Process -Id $ProcessId -ErrorAction SilentlyContinue)
   } catch {}
   return $false
 }
 
 function Stop-LauncherProcess {
   param(
-    [int]$Pid
+    [int]$ProcessId
   )
-  if ($Pid -le 0) {
+  if ($ProcessId -le 0) {
     return $false
   }
   try {
-    $proc = Get-Process -Id $Pid -ErrorAction SilentlyContinue
+    $proc = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
     if (-not $proc) {
       return $false
     }
-    Stop-Process -Id $Pid -Force -ErrorAction Stop
+    Stop-Process -Id $ProcessId -Force -ErrorAction Stop
     return $true
   } catch {}
   return $false
@@ -422,8 +422,8 @@ function Abort-StaleRuntimeHelper {
   )
   $helperPid = [int]$script:pendingRuntimeHelperPid
   $pendingAction = [string]$script:pendingRuntimeAction
-  if ($helperPid -gt 0 -and (Test-LauncherProcessAlive -Pid $helperPid)) {
-    $stopped = Stop-LauncherProcess -Pid $helperPid
+  if ($helperPid -gt 0 -and (Test-LauncherProcessAlive -ProcessId $helperPid)) {
+    $stopped = Stop-LauncherProcess -ProcessId $helperPid
     if ($stopped) {
       Append-Log ("Stopped stale Codrex runtime helper PID {0} ({1}, reason: {2})." -f $helperPid, $(if ($pendingAction) { $pendingAction } else { "unknown" }), $Reason) -Action "runtime-helper"
     }
@@ -1555,7 +1555,7 @@ function Refresh-State {
     $script:lastKnownTailnetIp = if ($snapshot.tailscale_ip) { [string]$snapshot.tailscale_ip } else { "" }
     $stackActive = ($snapshot.controller_on -or $snapshot.session_state -eq "present")
     $pendingAction = [string]$script:pendingRuntimeAction
-    $helperAlive = Test-LauncherProcessAlive -Pid ([int]$script:pendingRuntimeHelperPid)
+    $helperAlive = Test-LauncherProcessAlive -ProcessId ([int]$script:pendingRuntimeHelperPid)
     if ($pendingAction) {
       $ageSeconds = [int]([DateTime]::UtcNow - $script:pendingRuntimeActionAt).TotalSeconds
       if ($pendingAction -eq "start") {
@@ -1613,7 +1613,7 @@ function Refresh-State {
 }
 
 function Start-Stack {
-  if ([bool]$script:pendingRuntimeAction -or (Test-LauncherProcessAlive -Pid ([int]$script:pendingRuntimeHelperPid))) {
+  if ([bool]$script:pendingRuntimeAction -or (Test-LauncherProcessAlive -ProcessId ([int]$script:pendingRuntimeHelperPid))) {
     Abort-StaleRuntimeHelper -Reason "start-replaced"
   }
   $existingSnapshot = Get-LauncherStatusSnapshot
@@ -1631,7 +1631,7 @@ function Start-Stack {
 }
 
 function Stop-Stack {
-  if ([bool]$script:pendingRuntimeAction -or (Test-LauncherProcessAlive -Pid ([int]$script:pendingRuntimeHelperPid))) {
+  if ([bool]$script:pendingRuntimeAction -or (Test-LauncherProcessAlive -ProcessId ([int]$script:pendingRuntimeHelperPid))) {
     Abort-StaleRuntimeHelper -Reason "stop-replaced"
   }
   $existingSnapshot = Get-LauncherStatusSnapshot
