@@ -1,5 +1,16 @@
-Set-StrictMode -Version Latest
+﻿Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+
+if ([Threading.Thread]::CurrentThread.ApartmentState -ne [Threading.ApartmentState]::STA) {
+  $launcherArgs = @(
+    "-NoProfile",
+    "-ExecutionPolicy", "Bypass",
+    "-STA",
+    "-File", $PSCommandPath
+  )
+  Start-Process -FilePath "powershell.exe" -WorkingDirectory (Split-Path -Parent $PSCommandPath) -ArgumentList $launcherArgs | Out-Null
+  exit 0
+}
 
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
@@ -286,6 +297,7 @@ function Invoke-RuntimeAction {
   }
   $exitCode = Invoke-HiddenPowerShellScript -ScriptPath $runtimeScript -Arguments $args
   $jsonText = [string]$script:lastHelperOutput
+  $script:lastRuntimeActionPayload = $null
   if (-not $jsonText) {
     throw "Codrex runtime '$ActionName' returned no output."
   }
@@ -297,9 +309,13 @@ function Invoke-RuntimeAction {
   if (-not $payload) {
     throw "Codrex runtime '$ActionName' returned an empty payload."
   }
+  $script:lastRuntimeActionPayload = $payload
+  if ($payload.last_action_path) { $script:lastActionLogPath = [string]$payload.last_action_path }
+  if ($payload.last_error_path) { $script:lastRuntimeErrorPath = [string]$payload.last_error_path }
   if ($exitCode -ne 0 -or (-not $payload.ok)) {
     $detail = if ($payload.detail) { [string]$payload.detail } else { $jsonText }
-    throw "Codrex runtime '$ActionName' failed. $detail"
+    $errorPath = if ($payload.last_error_path) { [string]$payload.last_error_path } else { $script:DiagnosticsLayout.last_error_path }
+    throw "Codrex runtime '$ActionName' failed. $detail See: $errorPath"
   }
   return $payload
 }
@@ -529,10 +545,15 @@ function Read-PendingStartTaskResult {
 }
 
 $scriptRoot = Split-Path -Parent $PSCommandPath
+$diagnosticsScript = Join-Path $scriptRoot "codrex-diagnostics.ps1"
+if (Test-Path $diagnosticsScript) {
+  . $diagnosticsScript
+}
 $root = (Resolve-Path (Join-Path $scriptRoot "..\..")).Path
 $runtimeDir = Get-CodrexRuntimeDir -RepoRoot $root
 $stateDir = Join-Path $runtimeDir "state"
 $logsDir = Join-Path $runtimeDir "logs"
+$script:DiagnosticsLayout = Ensure-CodrexDiagnosticsLayout -RuntimeDir $runtimeDir
 $configPath = Join-Path $root "controller.config.json"
 $script:LocalConfigPath = Join-Path $stateDir "controller.config.local.json"
 $script:LegacyLocalConfigPath = Join-Path $root "controller.config.local.json"
@@ -565,6 +586,9 @@ $script:actionInProgress = $false
 $script:refreshTimer = $null
 $script:launcherButtons = @()
 $script:lastHelperOutput = ""
+$script:lastRuntimeActionPayload = $null
+$script:lastRuntimeErrorPath = ""
+$script:lastActionLogPath = ""
 $script:pendingRuntimeAction = ""
 $script:pendingRuntimeActionAt = [DateTime]::MinValue
 $script:pendingRuntimeTimeoutSec = 45
@@ -816,6 +840,10 @@ $btnOpenController = New-Object System.Windows.Forms.Button
 $btnOpenController.Text = "Open Fallback"
 $rowOpen.Controls.Add($btnOpenController) | Out-Null
 
+$btnOpenLogs = New-Object System.Windows.Forms.Button
+$btnOpenLogs.Text = "Open Logs"
+$rowOpen.Controls.Add($btnOpenLogs) | Out-Null
+
 $rowPair = New-Object System.Windows.Forms.FlowLayoutPanel
 $rowPair.Dock = "Fill"
 $rowPair.FlowDirection = [System.Windows.Forms.FlowDirection]::LeftToRight
@@ -829,6 +857,14 @@ $rowPair.Controls.Add($btnCopyPair) | Out-Null
 $btnOpenPair = New-Object System.Windows.Forms.Button
 $btnOpenPair.Text = "Open Pair Link"
 $rowPair.Controls.Add($btnOpenPair) | Out-Null
+
+$btnCopyLogPath = New-Object System.Windows.Forms.Button
+$btnCopyLogPath.Text = "Copy Log Path"
+$rowPair.Controls.Add($btnCopyLogPath) | Out-Null
+
+$btnCopyLastError = New-Object System.Windows.Forms.Button
+$btnCopyLastError.Text = "Copy Last Error"
+$rowPair.Controls.Add($btnCopyLastError) | Out-Null
 
 $lblPairLink = New-Object System.Windows.Forms.Label
 $lblPairLink.Text = "Pair Link"
@@ -927,18 +963,24 @@ Set-LauncherButtonStyle -Button $btnOpenLocal
 Set-LauncherButtonStyle -Button $btnAdvanced
 Set-LauncherButtonStyle -Button $btnOpenNetwork
 Set-LauncherButtonStyle -Button $btnOpenController
+Set-LauncherButtonStyle -Button $btnOpenLogs
 Set-LauncherButtonStyle -Button $btnGenQr -Primary $true
 Set-LauncherButtonStyle -Button $btnCopyPair
 Set-LauncherButtonStyle -Button $btnOpenPair
+Set-LauncherButtonStyle -Button $btnCopyLogPath
+Set-LauncherButtonStyle -Button $btnCopyLastError
 @(
   $btnStart,
   $btnOpenLocal,
   $btnAdvanced,
   $btnOpenNetwork,
   $btnOpenController,
+  $btnOpenLogs,
   $btnGenQr,
   $btnCopyPair,
-  $btnOpenPair
+  $btnOpenPair,
+  $btnCopyLogPath,
+  $btnCopyLastError
 ) | ForEach-Object { Register-LauncherButtonFeedback -Button $_ }
 $script:launcherButtons = @(
   $btnStart,
@@ -946,9 +988,12 @@ $script:launcherButtons = @(
   $btnAdvanced,
   $btnOpenNetwork,
   $btnOpenController,
+  $btnOpenLogs,
   $btnGenQr,
   $btnCopyPair,
-  $btnOpenPair
+  $btnOpenPair,
+  $btnCopyLogPath,
+  $btnCopyLastError
 )
 
 function Set-SplitLayout {
@@ -1009,9 +1054,78 @@ function Clear-PairingState {
   $lblHint.Text = "Browser app opens only when you click Open App. This window is the local launcher and status shell."
 }
 
-function Append-Log([string]$Line) {
+function Append-Log {
+  param(
+    [string]$Line,
+    [string]$Level = "info",
+    [string]$Action = "launcher",
+    [AllowNull()]
+    [object]$Context = $null
+  )
   $ts = (Get-Date).ToString("HH:mm:ss")
   $txtLog.AppendText("[$ts] $Line`r`n")
+  Write-CodrexEventLog -RuntimeDir $runtimeDir -Source "launcher" -Action $Action -Level $Level -Message $Line -Context $Context | Out-Null
+}
+
+function Load-EventLogTail {
+  if (-not (Test-Path $script:DiagnosticsLayout.events_log)) { return }
+  try {
+    $tail = Get-Content -Path $script:DiagnosticsLayout.events_log -Tail 120 -ErrorAction Stop
+    if ($tail) {
+      $txtLog.Text = (($tail | ForEach-Object { [string]$_ }) -join "`r`n") + "`r`n"
+      $txtLog.SelectionStart = $txtLog.TextLength
+      $txtLog.ScrollToCaret()
+    }
+  } catch {}
+}
+
+function Get-LastErrorSummaryText {
+  if (-not (Test-Path $script:DiagnosticsLayout.last_error_path)) {
+    return "No last-error log found. Logs: $($script:DiagnosticsLayout.logs_dir)"
+  }
+  try {
+    $payload = Get-Content -Path $script:DiagnosticsLayout.last_error_path -Raw | ConvertFrom-Json
+    return ("action={0} status={1} detail={2} file={3}" -f $(if ($payload.action) { [string]$payload.action } else { "unknown" }), $(if ($payload.status) { [string]$payload.status } else { "error" }), $(if ($payload.detail) { [string]$payload.detail } else { "Unknown error" }), $script:DiagnosticsLayout.last_error_path)
+  } catch {
+    return "Could not read last-error log: $($script:DiagnosticsLayout.last_error_path)"
+  }
+}
+
+function Write-LauncherActionRecord {
+  param(
+    [string]$ActionName,
+    [bool]$Ok,
+    [string]$Detail,
+    [AllowNull()]
+    [object]$Extra = $null
+  )
+  $snapshot = $null
+  try { $snapshot = Get-LauncherStatusSnapshot } catch {}
+  $payload = [ordered]@{
+    ok = $Ok
+    status = if ($snapshot) { [string]$snapshot.status } else { $(if ($Ok) { "ok" } else { "error" }) }
+    detail = $Detail
+    repo_root = if ($snapshot) { [string]$snapshot.repo_root } else { $root }
+    repo_rev = if ($snapshot) { [string]$snapshot.repo_rev } else { "" }
+    runtime_dir = $runtimeDir
+    logs_dir = $logsDir
+    controller_port = if ($snapshot) { [int]$snapshot.controller_port } else { 0 }
+    ui_port = $uiPort
+    local_url = if ($snapshot) { [string]$snapshot.local_url } else { "" }
+    network_url = if ($snapshot) { [string]$snapshot.network_url } else { "" }
+    session_file = $script:SessionPath
+    session_state_after = if ($snapshot) { [string]$snapshot.session_state } else { "unknown" }
+    app_runtime_after = if ($snapshot) { [ordered]@{ status = $snapshot.status; version = $snapshot.version; app_built = $snapshot.app_built; app_mode = $snapshot.app_mode } } else { $null }
+  }
+  if ($null -ne $Extra) {
+    foreach ($property in $Extra.PSObject.Properties) {
+      $payload[$property.Name] = $property.Value
+    }
+  }
+  $write = Write-CodrexActionLog -RuntimeDir $runtimeDir -Action $ActionName -Source "launcher" -Payload $payload -IsError:(-not $Ok)
+  $script:lastActionLogPath = $write.action_path
+  if (-not $Ok) { $script:lastRuntimeErrorPath = $write.last_error_path }
+  return $write
 }
 
 function Ensure-LauncherAuth {
@@ -1120,11 +1234,14 @@ function Refresh-State {
     $btnOpenLocal.Enabled = (-not $busy) -and $snapshot.controller_on
     $btnOpenNetwork.Enabled = (-not $busy) -and $snapshot.controller_on -and ($snapshot.lan_ip -ne "127.0.0.1")
     $btnOpenController.Enabled = (-not $busy) -and $snapshot.controller_on
+    $btnOpenLogs.Enabled = (-not $busy)
     $btnGenQr.Enabled = (-not $busy) -and $snapshot.app_built
     $btnAdvanced.Enabled = (-not $busy)
     $hasPair = [bool]$script:pairUrl
     $btnCopyPair.Enabled = (-not $busy) -and $hasPair
     $btnOpenPair.Enabled = (-not $busy) -and $hasPair
+    $btnCopyLogPath.Enabled = (-not $busy)
+    $btnCopyLastError.Enabled = (-not $busy)
   } catch {
     $msg = [string]$_.Exception.Message
     if (-not $msg) { $msg = "Could not refresh launcher state." }
@@ -1136,23 +1253,24 @@ function Refresh-State {
 
 function Start-Stack {
   $existingSnapshot = Get-LauncherStatusSnapshot
-  if ($existingSnapshot.app_built) {
-    Append-Log ("Codrex is already running on port {0}." -f $existingSnapshot.controller_port)
+  if ($existingSnapshot.controller_on -or $existingSnapshot.session_state -eq "present" -or $existingSnapshot.status -eq "running") {
+    Append-Log ("Codrex is already running on port {0}." -f $existingSnapshot.controller_port) -Action "start"
     return
   }
-  Append-Log "Starting mobile stack..."
+  Append-Log "Starting mobile stack..." -Action "start"
   Set-ActionStatus -State "starting" -Detail "Launching Codrex runtime..." -ControllerPort $existingSnapshot.controller_port
-  $procId = Start-DetachedRuntimeAction -ActionName "start"
-  $script:pendingRuntimeAction = "start"
-  $script:pendingRuntimeActionAt = [DateTime]::UtcNow
-  Append-Log ("Start requested via runtime helper PID {0}." -f $procId)
+  $script:pendingRuntimeAction = ""
+  $payload = Invoke-RuntimeAction -ActionName "start"
+  $port = if ($payload.controller_port) { [int]$payload.controller_port } else { [int]$existingSnapshot.controller_port }
+  $version = if ($payload.app_version) { [string]$payload.app_version } else { "n/a" }
+  Append-Log ("Start complete. App ready on port {0} (v{1}). Click Open App to launch the browser UI." -f $port, $version) -Action "start"
 }
 
 function Stop-Stack {
-  Append-Log "Stopping mobile stack..."
+  Append-Log "Stopping mobile stack..." -Action "stop"
   $null = Invoke-RuntimeAction -ActionName "stop"
   Clear-PairingState
-  Append-Log "Stop complete."
+  Append-Log "Stop complete." -Action "stop"
 }
 
 function Toggle-AdvancedActions {
@@ -1206,7 +1324,8 @@ function Generate-PairQr {
 function Safe-Action {
   param(
     [scriptblock]$Action,
-    [System.Windows.Forms.Button]$Button
+    [System.Windows.Forms.Button]$Button,
+    [string]$ActionName = ""
   )
   $savedText = ""
   $activeButton = $null
@@ -1234,9 +1353,13 @@ function Safe-Action {
   } catch {
     $msg = [string]$_.Exception.Message
     if (-not $msg) { $msg = "Unknown error" }
-    Append-Log "Error: $msg"
+    $errorPath = if ($script:lastRuntimeErrorPath) { $script:lastRuntimeErrorPath } else { $script:DiagnosticsLayout.last_error_path }
+    Append-Log "Error: $msg" -Level "error" -Action $(if ($ActionName) { $ActionName } else { "launcher" }) -Context @{ last_error_path = $errorPath }
+    if ($ActionName -and $ActionName -ne "start-stop") {
+      $null = Write-LauncherActionRecord -ActionName $ActionName -Ok:$false -Detail $msg -Extra ([pscustomobject]@{ last_error_path = $errorPath })
+    }
     [System.Windows.Forms.MessageBox]::Show(
-      $msg,
+      ($msg + "`r`n`r`nSee: " + $errorPath),
       "Codrex",
       [System.Windows.Forms.MessageBoxButtons]::OK,
       [System.Windows.Forms.MessageBoxIcon]::Error
@@ -1263,56 +1386,89 @@ $btnStart.Add_Click({
     } else {
       Start-Stack
     }
-  } -Button $btnStart
+  } -Button $btnStart -ActionName "start-stop"
 })
 $btnOpenLocal.Add_Click({
   $port = Resolve-LauncherControllerPort
   $url = ("http://127.0.0.1:{0}/" -f $port)
-  if (Open-Url $url) {
-    Append-Log ("Opened app: {0}" -f $url)
+  $ok = Open-Url $url
+  if ($ok) {
+    Append-Log ("Opened app: {0}" -f $url) -Action "open-app"
   } else {
-    Append-Log ("Could not open app: {0}" -f $url)
+    Append-Log ("Could not open app: {0}" -f $url) -Level "error" -Action "open-app"
   }
+  $null = Write-LauncherActionRecord -ActionName "open-app" -Ok:$ok -Detail $(if ($ok) { "Opened browser app." } else { "Could not open browser app." }) -Extra ([pscustomobject]@{ url = $url })
 })
 $btnAdvanced.Add_Click({ Toggle-AdvancedActions })
 $btnOpenNetwork.Add_Click({
   $port = Resolve-LauncherControllerPort
   $ip = Get-CachedLanIp
   $url = ("http://{0}:{1}/" -f $ip, $port)
-  if (Open-Url $url) {
-    Append-Log ("Opened network app: {0}" -f $url)
+  $ok = Open-Url $url
+  if ($ok) {
+    Append-Log ("Opened network app: {0}" -f $url) -Action "open-network-app"
   } else {
-    Append-Log ("Could not open network app: {0}" -f $url)
+    Append-Log ("Could not open network app: {0}" -f $url) -Level "error" -Action "open-network-app"
   }
+  $null = Write-LauncherActionRecord -ActionName "open-network-app" -Ok:$ok -Detail $(if ($ok) { "Opened network app." } else { "Could not open network app." }) -Extra ([pscustomobject]@{ url = $url })
 })
 $btnOpenController.Add_Click({
   $port = Resolve-LauncherControllerPort
   $url = ("http://127.0.0.1:{0}/legacy" -f $port)
-  if (Open-Url $url) {
-    Append-Log ("Opened fallback page: {0}" -f $url)
+  $ok = Open-Url $url
+  if ($ok) {
+    Append-Log ("Opened fallback page: {0}" -f $url) -Action "open-fallback"
   } else {
-    Append-Log ("Could not open fallback page: {0}" -f $url)
+    Append-Log ("Could not open fallback page: {0}" -f $url) -Level "error" -Action "open-fallback"
   }
+  $null = Write-LauncherActionRecord -ActionName "open-fallback" -Ok:$ok -Detail $(if ($ok) { "Opened fallback page." } else { "Could not open fallback page." }) -Extra ([pscustomobject]@{ url = $url })
 })
-$btnGenQr.Add_Click({ Safe-Action -Action { Generate-PairQr } -Button $btnGenQr })
+$btnOpenLogs.Add_Click({
+  $ok = Open-Url $script:DiagnosticsLayout.logs_dir
+  if ($ok) {
+    Append-Log ("Opened logs folder: {0}" -f $script:DiagnosticsLayout.logs_dir) -Action "open-logs"
+  } else {
+    Append-Log ("Could not open logs folder: {0}" -f $script:DiagnosticsLayout.logs_dir) -Level "error" -Action "open-logs"
+  }
+  $null = Write-LauncherActionRecord -ActionName "open-logs" -Ok:$ok -Detail $(if ($ok) { "Opened logs folder." } else { "Could not open logs folder." }) -Extra ([pscustomobject]@{ logs_path = $script:DiagnosticsLayout.logs_dir })
+})
+$btnGenQr.Add_Click({ Safe-Action -Action { Generate-PairQr; $null = Write-LauncherActionRecord -ActionName "show-pair-qr" -Ok:$true -Detail "Generated pairing QR." -Extra ([pscustomobject]@{ pair_url = $script:pairUrl; qr_info = $lblQrInfo.Text }) } -Button $btnGenQr -ActionName "show-pair-qr" })
 $btnCopyPair.Add_Click({
   if ($script:pairUrl) {
     try { [System.Windows.Forms.Clipboard]::SetText($script:pairUrl) } catch {}
-    Append-Log "Pair link copied to clipboard."
+    Append-Log "Pair link copied to clipboard." -Action "copy-pair-link"
+    $null = Write-LauncherActionRecord -ActionName "copy-pair-link" -Ok:$true -Detail "Pair link copied to clipboard." -Extra ([pscustomobject]@{ pair_url = $script:pairUrl })
   }
 })
 $btnOpenPair.Add_Click({
   if ($script:pairUrl) {
-    if (Open-Url $script:pairUrl) {
-      Append-Log "Opened pair link."
+    $ok = Open-Url $script:pairUrl
+    if ($ok) {
+      Append-Log "Opened pair link." -Action "open-pair-link"
     } else {
-      Append-Log ("Could not open pair link: {0}" -f $script:pairUrl)
+      Append-Log ("Could not open pair link: {0}" -f $script:pairUrl) -Level "error" -Action "open-pair-link"
     }
+    $null = Write-LauncherActionRecord -ActionName "open-pair-link" -Ok:$ok -Detail $(if ($ok) { "Opened pair link." } else { "Could not open pair link." }) -Extra ([pscustomobject]@{ pair_url = $script:pairUrl })
   }
+})
+$btnCopyLogPath.Add_Click({
+  try { [System.Windows.Forms.Clipboard]::SetText($script:DiagnosticsLayout.logs_dir) } catch {}
+  Append-Log ("Log path copied: {0}" -f $script:DiagnosticsLayout.logs_dir) -Action "copy-log-path"
+  $null = Write-LauncherActionRecord -ActionName "copy-log-path" -Ok:$true -Detail "Copied log path." -Extra ([pscustomobject]@{ logs_path = $script:DiagnosticsLayout.logs_dir })
+})
+$btnCopyLastError.Add_Click({
+  $summary = Get-LastErrorSummaryText
+  try { [System.Windows.Forms.Clipboard]::SetText($summary) } catch {}
+  Append-Log "Last error summary copied to clipboard." -Action "copy-last-error"
+  $null = Write-LauncherActionRecord -ActionName "copy-last-error" -Ok:$true -Detail "Copied last error summary." -Extra ([pscustomobject]@{ last_error_summary = $summary; last_error_path = $script:DiagnosticsLayout.last_error_path })
 })
 
 $form.Add_Shown({
   Set-SplitLayout
+  Load-EventLogTail
+  $null = $form.BeginInvoke([System.Windows.Forms.MethodInvoker]{
+    Refresh-State
+  })
 })
 
 $script:refreshTimer = New-Object System.Windows.Forms.Timer
@@ -1331,6 +1487,5 @@ $form.Add_FormClosed({
   try { $form.Dispose() } catch {}
 })
 
-Append-Log "Launcher ready."
-Refresh-State
+Append-Log "Launcher ready." -Action "launcher"
 [System.Windows.Forms.Application]::Run($form)

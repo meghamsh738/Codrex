@@ -21,6 +21,14 @@ def _to_windows_path(path: Path) -> str:
     return raw
 
 
+def _from_windows_path(raw: str) -> Path:
+    if len(raw) >= 3 and raw[1:3] == ":\\":
+        drive = raw[0].lower()
+        rest = raw[3:].replace("\\", "/")
+        return Path(f"/mnt/{drive}/{rest}")
+    return Path(raw)
+
+
 @unittest.skipUnless(shutil.which("powershell.exe"), "powershell.exe not available")
 class WindowsRuntimeScriptTests(unittest.TestCase):
     def _free_port(self) -> int:
@@ -51,16 +59,20 @@ class WindowsRuntimeScriptTests(unittest.TestCase):
         payload = json.loads(output.splitlines()[-1])
         return result, payload
 
+    def _write_local_config(self, runtime_dir: Path, port: int):
+        state_dir = runtime_dir / "state"
+        state_dir.mkdir(parents=True, exist_ok=True)
+        (state_dir / "controller.config.local.json").write_text(
+            json.dumps({"port": port, "token": "test-token"}),
+            encoding="utf-8",
+        )
+        return state_dir
+
     def test_status_reports_stopped_for_empty_runtime(self):
         with tempfile.TemporaryDirectory(dir=str(ROOT)) as td:
             runtime_dir = Path(td)
             test_port = self._free_port()
-            state_dir = runtime_dir / "state"
-            state_dir.mkdir(parents=True, exist_ok=True)
-            (state_dir / "controller.config.local.json").write_text(
-                json.dumps({"port": test_port, "token": "test-token"}),
-                encoding="utf-8",
-            )
+            self._write_local_config(runtime_dir, test_port)
             result, payload = self._run_runtime("status", runtime_dir)
 
         self.assertEqual(result.returncode, 0)
@@ -72,12 +84,7 @@ class WindowsRuntimeScriptTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(dir=str(ROOT)) as td:
             runtime_dir = Path(td)
             test_port = self._free_port()
-            state_dir = runtime_dir / "state"
-            state_dir.mkdir(parents=True, exist_ok=True)
-            (state_dir / "controller.config.local.json").write_text(
-                json.dumps({"port": test_port, "token": "test-token"}),
-                encoding="utf-8",
-            )
+            state_dir = self._write_local_config(runtime_dir, test_port)
             session_path = state_dir / "mobile.session.json"
             session_path.write_text(
                 json.dumps({"controller_port": test_port, "ui_mode": "built"}),
@@ -94,6 +101,39 @@ class WindowsRuntimeScriptTests(unittest.TestCase):
             self.assertTrue(repair_payload["repaired"])
             self.assertEqual(repair_payload["status"], "stopped")
             self.assertFalse(session_path.exists())
+
+    def test_start_then_stop_cycle_reports_running_and_stopped(self):
+        with tempfile.TemporaryDirectory(dir=str(ROOT)) as td:
+            runtime_dir = Path(td)
+            test_port = self._free_port()
+            self._write_local_config(runtime_dir, test_port)
+
+            start_result, start_payload = self._run_runtime("start", runtime_dir)
+            status_result, status_payload = self._run_runtime("status", runtime_dir)
+            stop_result, stop_payload = self._run_runtime("stop", runtime_dir)
+            self.assertTrue(_from_windows_path(start_payload["last_action_path"]).exists())
+            self.assertTrue(_from_windows_path(start_payload["diagnostic_log_path"]).exists())
+            stop_action = json.loads(_from_windows_path(stop_payload["last_action_path"]).read_text(encoding="utf-8-sig"))
+
+        self.assertEqual(start_result.returncode, 0)
+        self.assertTrue(start_payload["ok"])
+        self.assertIn(start_payload["status"], {"running", "checking"})
+        self.assertTrue(start_payload["local_url"].endswith(f":{test_port}/"))
+        self.assertTrue(start_payload["action_id"])
+        self.assertTrue(start_payload["diagnostic_log_path"])
+        self.assertTrue(start_payload["last_action_path"])
+        self.assertEqual(status_result.returncode, 0)
+        self.assertTrue(status_payload["ok"])
+        self.assertEqual(status_payload["status"], "running")
+        self.assertTrue(status_payload["session_present"])
+        self.assertEqual(stop_result.returncode, 0)
+        self.assertTrue(stop_payload["ok"])
+        self.assertEqual(stop_payload["status"], "stopped")
+        self.assertTrue(stop_payload["action_id"])
+        self.assertTrue(stop_payload["last_action_path"])
+        self.assertEqual(stop_action["action"], "stop")
+        self.assertIn("child_invocation", stop_action)
+        self.assertIn("controller_port_snapshot_after", stop_action)
 
 
 if __name__ == "__main__":

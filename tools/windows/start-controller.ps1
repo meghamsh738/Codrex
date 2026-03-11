@@ -10,6 +10,10 @@ param(
 $ErrorActionPreference = "Stop"
 $scriptRoot = Split-Path -Parent $PSCommandPath
 $root = (Resolve-Path (Join-Path $scriptRoot "..\..")).Path
+$diagnosticsScript = Join-Path $scriptRoot "codrex-diagnostics.ps1"
+if (Test-Path $diagnosticsScript) {
+  . $diagnosticsScript
+}
 $script:DefaultControllerPort = 48787
 $script:LegacyControllerPort = 8787
 $script:DefaultDevUiPort = 54312
@@ -244,6 +248,68 @@ foreach ($dir in @($runtimeDir, $stateDir, $logsDir)) {
     New-Item -Path $dir -ItemType Directory -Force | Out-Null
   }
 }
+$script:DiagnosticsLayout = Ensure-CodrexDiagnosticsLayout -RuntimeDir $runtimeDir
+$script:DiagActionId = Get-CodrexCurrentActionId
+if (-not $script:DiagActionId) {
+  $script:DiagActionId = New-CodrexActionId
+}
+$script:DiagActionName = Get-CodrexCurrentActionName
+if (-not $script:DiagActionName) {
+  $script:DiagActionName = "start"
+}
+$script:DiagSource = "start-controller"
+$script:DiagBeforeControllerSnapshot = @()
+
+function Write-StartControllerDiagnostic {
+  param(
+    [bool]$Ok,
+    [string]$Detail,
+    [AllowNull()]
+    [object]$Extra = $null
+  )
+  $lanIp = Get-PrimaryIPv4
+  $payload = [ordered]@{
+    ok = $Ok
+    status = if ($Ok) { "completed" } else { "error" }
+    detail = $Detail
+    repo_root = $root
+    runtime_dir = $runtimeDir
+    logs_dir = $logsDir
+    controller_port = [int]$cfg.port
+    ui_port = [int]$UiPort
+    selected_pair_route = Get-CodrexSelectedRouteFromState -RuntimeDir $runtimeDir
+    local_url = ("http://127.0.0.1:{0}/" -f $cfg.port)
+    network_url = if ($lanIp -and $lanIp -ne "127.0.0.1") { ("http://{0}:{1}/" -f $lanIp, $cfg.port) } else { "" }
+    session_file = Join-Path $stateDir "mobile.session.json"
+    controller_port_snapshot_before = @($script:DiagBeforeControllerSnapshot)
+    controller_port_snapshot_after = Get-CodrexPortDiagnosticsSnapshot -Ports @([int]$cfg.port)
+    linked_process_logs = [ordered]@{
+      controller_stdout = $outLog
+      controller_stderr = $errLog
+      ui_stdout = Join-Path $logsDir "ui.out.log"
+      ui_stderr = Join-Path $logsDir "ui.err.log"
+    }
+  }
+  if ($null -ne $Extra) {
+    foreach ($property in $Extra.PSObject.Properties) {
+      $payload[$property.Name] = $property.Value
+    }
+  }
+  $null = Write-CodrexActionLog -RuntimeDir $runtimeDir -Action $script:DiagActionName -Source $script:DiagSource -Payload $payload -ActionId $script:DiagActionId -IsError:(-not $Ok)
+  $null = Write-CodrexEventLog -RuntimeDir $runtimeDir -Source $script:DiagSource -Action $script:DiagActionName -ActionId $script:DiagActionId -Level $(if ($Ok) { "info" } else { "error" }) -Message $Detail -Context @{
+    controller_port = [int]$cfg.port
+    ui_port = [int]$UiPort
+    open_firewall = [bool]$OpenFirewall
+  }
+}
+
+trap {
+  $message = if ($_.Exception -and $_.Exception.Message) { [string]$_.Exception.Message } else { [string]$_ }
+  Write-StartControllerDiagnostic -Ok:$false -Detail $message -Extra ([pscustomobject]@{
+    failure_stage = "start-controller"
+  })
+  exit 1
+}
 
 # Load persisted controller config. Sensitive values are stored in local override file.
 $cfg = [ordered]@{}
@@ -315,6 +381,15 @@ $resolvedPort = Resolve-CodrexControllerPort -PreferredPort ([int]$cfg.port)
 if ($resolvedPort -ne [int]$cfg.port) {
   Write-Host ("Codrex controller port {0} is busy. Using {1} instead." -f $cfg.port, $resolvedPort)
   $cfg.port = $resolvedPort
+}
+$script:DiagBeforeControllerSnapshot = Get-CodrexPortDiagnosticsSnapshot -Ports @([int]$cfg.port)
+$null = Write-CodrexEventLog -RuntimeDir $runtimeDir -Source $script:DiagSource -Action $script:DiagActionName -ActionId $script:DiagActionId -Message "Starting controller script." -Context @{
+  controller_port = [int]$cfg.port
+  ui_port = [int]$UiPort
+  distro = [string]$cfg.distro
+  workdir = [string]$cfg.workdir
+  file_root = [string]$cfg.fileRoot
+  open_firewall = [bool]$OpenFirewall
 }
 
 $persistLocal = [ordered]@{
@@ -425,4 +500,11 @@ Write-Host ("Token file: {0}" -f $localConfigPath)
 Write-Host ("Runtime dir: {0}" -f $runtimeDir)
 Write-Host "PID: $controllerPid"
 Write-Host "Logs: $outLog"
+Write-StartControllerDiagnostic -Ok:$true -Detail "Controller started." -Extra ([pscustomobject]@{
+  controller_pid = $controllerPid
+  ready_host = $readyHost
+  open_firewall = [bool]$OpenFirewall
+  log_stdout = $outLog
+  log_stderr = $errLog
+})
 exit 0

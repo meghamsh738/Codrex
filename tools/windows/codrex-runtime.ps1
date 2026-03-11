@@ -9,6 +9,10 @@ param(
 $ErrorActionPreference = "Stop"
 $scriptRoot = Split-Path -Parent $PSCommandPath
 $root = (Resolve-Path (Join-Path $scriptRoot "..\..")).Path
+$diagnosticsScript = Join-Path $scriptRoot "codrex-diagnostics.ps1"
+if (Test-Path $diagnosticsScript) {
+  . $diagnosticsScript
+}
 $script:RuntimeDirOverride = [string]$RuntimeDir
 $script:DefaultControllerPort = 48787
 $script:DefaultDevUiPort = 54312
@@ -324,6 +328,82 @@ function Write-MobileSession {
   return Read-JsonFile -Path $Paths.session_path
 }
 
+function Get-StatusSummaryRecord {
+  param(
+    [object]$Snapshot
+  )
+  if (-not $Snapshot) {
+    return $null
+  }
+  return [ordered]@{
+    status = [string]$Snapshot.status
+    detail = [string]$Snapshot.detail
+    controller_port = [int]$Snapshot.controller_port
+    controller_pid = $Snapshot.controller_pid
+    controller_pids = @($Snapshot.controller_pids)
+    session_present = [bool]$Snapshot.session_present
+    session_file = [string]$Snapshot.session_file
+    app_ready = [bool]$Snapshot.app_ready
+    app_version = [string]$Snapshot.app_version
+    ui_mode = [string]$Snapshot.ui_mode
+    local_url = [string]$Snapshot.local_url
+    network_url = [string]$Snapshot.network_url
+  }
+}
+
+function Get-LinkedProcessLogs {
+  param(
+    [object]$Paths
+  )
+  return [ordered]@{
+    controller_stdout = Join-Path $Paths.logs_dir "controller.out.log"
+    controller_stderr = Join-Path $Paths.logs_dir "controller.err.log"
+    ui_stdout = Join-Path $Paths.logs_dir "ui.out.log"
+    ui_stderr = Join-Path $Paths.logs_dir "ui.err.log"
+  }
+}
+
+function Finalize-ActionResult {
+  param(
+    [object]$Paths,
+    [string]$ActionName,
+    [object]$ResultPayload,
+    [AllowNull()]
+    [object]$ActionPayload = $null
+  )
+  $actionId = if ($ResultPayload.action_id) { [string]$ResultPayload.action_id } else { New-CodrexActionId }
+  $payload = if ($ActionPayload) { $ActionPayload } else { $ResultPayload }
+  $actionWrite = Write-CodrexActionLog -RuntimeDir $Paths.runtime_dir -Action $ActionName -Source "runtime" -Payload $payload -ActionId $actionId -IsError:(-not [bool]$ResultPayload.ok)
+  $eventMessage = if ($ResultPayload.ok) {
+    ("{0} completed with status '{1}'." -f $ActionName, $ResultPayload.status)
+  } else {
+    ("{0} failed with status '{1}'." -f $ActionName, $ResultPayload.status)
+  }
+  Write-CodrexEventLog -RuntimeDir $Paths.runtime_dir -Source "runtime" -Action $ActionName -ActionId $actionId -Level $(if ($ResultPayload.ok) { "info" } else { "error" }) -Message $eventMessage -Context @{
+    detail = $ResultPayload.detail
+    controller_port = $ResultPayload.controller_port
+    controller_pid = $ResultPayload.controller_pid
+    session_present = $ResultPayload.session_present
+    app_ready = $ResultPayload.app_ready
+    app_version = $ResultPayload.app_version
+  } | Out-Null
+  foreach ($pair in @(
+    @{ Name = "action_id"; Value = $actionId },
+    @{ Name = "diagnostic_log_path"; Value = $actionWrite.events_log },
+    @{ Name = "last_action_path"; Value = $actionWrite.last_action_path },
+    @{ Name = "last_error_path"; Value = $actionWrite.last_error_path }
+  )) {
+    try {
+      if ($ResultPayload.PSObject.Properties[$pair.Name]) {
+        $ResultPayload.PSObject.Properties[$pair.Name].Value = $pair.Value
+      } else {
+        $ResultPayload | Add-Member -NotePropertyName $pair.Name -NotePropertyValue $pair.Value -Force
+      }
+    } catch {}
+  }
+  return $ResultPayload
+}
+
 function Invoke-ScriptCapture {
   param(
     [string]$ScriptPath,
@@ -434,7 +514,9 @@ function Repair-Runtime {
   param(
     [object]$Paths
   )
+  $actionId = New-CodrexActionId
   $snapshot = Get-StatusSnapshot -Paths $Paths
+  $beforeSummary = Get-StatusSummaryRecord -Snapshot $snapshot
   $repaired = New-Object System.Collections.Generic.List[string]
   if ($snapshot.duplicate_controllers) {
     $result = Stop-CodrexControllerProcesses -Port $snapshot.controller_port -KeepNewest
@@ -456,7 +538,7 @@ function Repair-Runtime {
       $snapshot = Get-StatusSnapshot -Paths $Paths
     }
   }
-  return [pscustomobject]@{
+  $resultPayload = [pscustomobject]@{
     ok = $true
     action = "repair"
     repaired = ($repaired.Count -gt 0)
@@ -470,7 +552,35 @@ function Repair-Runtime {
     app_ready = $snapshot.app_ready
     repo_rev = $snapshot.repo_rev
     logs_dir = $snapshot.logs_dir
+    action_id = $actionId
   }
+  $afterSummary = Get-StatusSummaryRecord -Snapshot $snapshot
+  $actionPayload = [ordered]@{
+    ok = $resultPayload.ok
+    status = $resultPayload.status
+    detail = $resultPayload.detail
+    repaired = $resultPayload.repaired
+    repair_steps = @($resultPayload.repair_steps)
+    repo_root = $root
+    repo_rev = $snapshot.repo_rev
+    runtime_dir = $Paths.runtime_dir
+    logs_dir = $Paths.logs_dir
+    selected_pair_route = Get-CodrexSelectedRouteFromState -RuntimeDir $Paths.runtime_dir
+    controller_port = $snapshot.controller_port
+    local_url = $snapshot.local_url
+    network_url = $snapshot.network_url
+    session_file = $Paths.session_path
+    session_state_before = if ($beforeSummary.session_present) { "present" } else { "missing" }
+    session_state_after = if ($afterSummary.session_present) { "present" } else { "missing" }
+    app_runtime_before = $beforeSummary
+    app_runtime_after = $afterSummary
+    controller_port_snapshot_before = Get-CodrexPortDiagnosticsSnapshot -Ports @($beforeSummary.controller_port)
+    controller_port_snapshot_after = Get-CodrexPortDiagnosticsSnapshot -Ports @($afterSummary.controller_port)
+    ui_port_snapshot_before = @()
+    ui_port_snapshot_after = @()
+    linked_process_logs = Get-LinkedProcessLogs -Paths $Paths
+  }
+  return Finalize-ActionResult -Paths $Paths -ActionName "repair" -ResultPayload $resultPayload -ActionPayload $actionPayload
 }
 
 function Start-Runtime {
@@ -479,9 +589,13 @@ function Start-Runtime {
     [int]$LaunchUiPort,
     [switch]$EnableFirewall
   )
+  $actionId = New-CodrexActionId
   $snapshot = Get-StatusSnapshot -Paths $Paths
+  $beforeSummary = Get-StatusSummaryRecord -Snapshot $snapshot
+  $beforeControllerPort = [int]$snapshot.controller_port
+  $beforeUiPort = if ($LaunchUiPort -gt 0) { [int]$LaunchUiPort } else { 0 }
   if ($snapshot.status -eq "running") {
-    return [pscustomobject]@{
+    $resultPayload = [pscustomobject]@{
       ok = $true
       action = "start"
       status = "running"
@@ -497,13 +611,43 @@ function Start-Runtime {
       logs_dir = $snapshot.logs_dir
       started = $false
       reused = $true
+      action_id = $actionId
     }
+    $actionPayload = [ordered]@{
+      ok = $resultPayload.ok
+      status = $resultPayload.status
+      detail = $resultPayload.detail
+      repo_root = $root
+      repo_rev = $snapshot.repo_rev
+      runtime_dir = $Paths.runtime_dir
+      logs_dir = $Paths.logs_dir
+      selected_pair_route = Get-CodrexSelectedRouteFromState -RuntimeDir $Paths.runtime_dir
+      controller_port = $snapshot.controller_port
+      ui_port = $beforeUiPort
+      local_url = $snapshot.local_url
+      network_url = $snapshot.network_url
+      session_file = $Paths.session_path
+      session_state_before = if ($beforeSummary.session_present) { "present" } else { "missing" }
+      session_state_after = if ($beforeSummary.session_present) { "present" } else { "missing" }
+      app_runtime_before = $beforeSummary
+      app_runtime_after = $beforeSummary
+      controller_port_snapshot_before = Get-CodrexPortDiagnosticsSnapshot -Ports @($beforeControllerPort)
+      controller_port_snapshot_after = Get-CodrexPortDiagnosticsSnapshot -Ports @($beforeControllerPort)
+      ui_port_snapshot_before = Get-CodrexPortDiagnosticsSnapshot -Ports @($beforeUiPort)
+      ui_port_snapshot_after = Get-CodrexPortDiagnosticsSnapshot -Ports @($beforeUiPort)
+      linked_process_logs = Get-LinkedProcessLogs -Paths $Paths
+      child_invocation = $null
+      started = $false
+      reused = $true
+    }
+    return Finalize-ActionResult -Paths $Paths -ActionName "start" -ResultPayload $resultPayload -ActionPayload $actionPayload
   }
   if ($snapshot.controller_pid -and $snapshot.app_ready -and -not $snapshot.duplicate_controllers) {
     $cfg = Get-EffectiveConfig -Paths $Paths
     $session = Write-MobileSession -Paths $Paths -Config $cfg -ControllerPort $snapshot.controller_port -UiMode "built"
     $fresh = Get-StatusSnapshot -Paths $Paths
-    return [pscustomobject]@{
+    $freshSummary = Get-StatusSummaryRecord -Snapshot $fresh
+    $resultPayload = [pscustomobject]@{
       ok = $true
       action = "start"
       status = $fresh.status
@@ -520,7 +664,36 @@ function Start-Runtime {
       started = $false
       reused = $true
       session = $session
+      action_id = $actionId
     }
+    $actionPayload = [ordered]@{
+      ok = $resultPayload.ok
+      status = $resultPayload.status
+      detail = $resultPayload.detail
+      repo_root = $root
+      repo_rev = $fresh.repo_rev
+      runtime_dir = $Paths.runtime_dir
+      logs_dir = $Paths.logs_dir
+      selected_pair_route = Get-CodrexSelectedRouteFromState -RuntimeDir $Paths.runtime_dir
+      controller_port = $fresh.controller_port
+      ui_port = $beforeUiPort
+      local_url = $fresh.local_url
+      network_url = $fresh.network_url
+      session_file = $Paths.session_path
+      session_state_before = if ($beforeSummary.session_present) { "present" } else { "missing" }
+      session_state_after = if ($freshSummary.session_present) { "present" } else { "missing" }
+      app_runtime_before = $beforeSummary
+      app_runtime_after = $freshSummary
+      controller_port_snapshot_before = Get-CodrexPortDiagnosticsSnapshot -Ports @($beforeControllerPort)
+      controller_port_snapshot_after = Get-CodrexPortDiagnosticsSnapshot -Ports @($fresh.controller_port)
+      ui_port_snapshot_before = Get-CodrexPortDiagnosticsSnapshot -Ports @($beforeUiPort)
+      ui_port_snapshot_after = Get-CodrexPortDiagnosticsSnapshot -Ports @($beforeUiPort)
+      linked_process_logs = Get-LinkedProcessLogs -Paths $Paths
+      child_invocation = $null
+      started = $false
+      reused = $true
+    }
+    return Finalize-ActionResult -Paths $Paths -ActionName "start" -ResultPayload $resultPayload -ActionPayload $actionPayload
   }
   if ($snapshot.status -ne "stopped") {
     $null = Repair-Runtime -Paths $Paths
@@ -529,14 +702,53 @@ function Start-Runtime {
   if ($EnableFirewall) {
     $args += "-OpenFirewall"
   }
-  $result = Invoke-ScriptCapture -ScriptPath $Paths.start_mobile_script -Arguments $args
+  $previousRuntimeDir = [string]$env:CODEX_RUNTIME_DIR
+  $previousActionId = [string]$env:CODEX_ACTION_ID
+  $previousActionName = [string]$env:CODEX_ACTION_NAME
+  $previousActionSource = [string]$env:CODEX_ACTION_SOURCE
+  $env:CODEX_RUNTIME_DIR = [string]$Paths.runtime_dir
+  $env:CODEX_ACTION_ID = $actionId
+  $env:CODEX_ACTION_NAME = "start"
+  $env:CODEX_ACTION_SOURCE = "runtime"
+  Write-CodrexEventLog -RuntimeDir $Paths.runtime_dir -Source "runtime" -Action "start" -ActionId $actionId -Message "Starting Codrex runtime action." -Context @{
+    controller_port = $beforeControllerPort
+    ui_port = $beforeUiPort
+    selected_pair_route = Get-CodrexSelectedRouteFromState -RuntimeDir $Paths.runtime_dir
+    arguments = @($args)
+  } | Out-Null
+  try {
+    $result = Invoke-ScriptCapture -ScriptPath $Paths.start_mobile_script -Arguments $args
+  } finally {
+    if ($previousRuntimeDir) {
+      $env:CODEX_RUNTIME_DIR = $previousRuntimeDir
+    } else {
+      Remove-Item Env:CODEX_RUNTIME_DIR -ErrorAction SilentlyContinue
+    }
+    if ($previousActionId) {
+      $env:CODEX_ACTION_ID = $previousActionId
+    } else {
+      Remove-Item Env:CODEX_ACTION_ID -ErrorAction SilentlyContinue
+    }
+    if ($previousActionName) {
+      $env:CODEX_ACTION_NAME = $previousActionName
+    } else {
+      Remove-Item Env:CODEX_ACTION_NAME -ErrorAction SilentlyContinue
+    }
+    if ($previousActionSource) {
+      $env:CODEX_ACTION_SOURCE = $previousActionSource
+    } else {
+      Remove-Item Env:CODEX_ACTION_SOURCE -ErrorAction SilentlyContinue
+    }
+  }
   $fresh = Get-StatusSnapshot -Paths $Paths
+  $afterSummary = Get-StatusSummaryRecord -Snapshot $fresh
   $detail = $fresh.detail
   if ($result.text) {
     $detail = if ($detail) { "$detail Output: $($result.text)" } else { $result.text }
   }
+  $resultPayload = $null
   if ($result.exit_code -ne 0 -or $fresh.status -ne "running") {
-    return [pscustomobject]@{
+    $resultPayload = [pscustomobject]@{
       ok = $false
       action = "start"
       status = if ($fresh.status) { $fresh.status } else { "error" }
@@ -553,26 +765,62 @@ function Start-Runtime {
       started = $false
       reused = $false
       exit_code = $result.exit_code
+      action_id = $actionId
+    }
+  } else {
+    $resultPayload = [pscustomobject]@{
+      ok = $true
+      action = "start"
+      status = $fresh.status
+      detail = "Codrex app stack started."
+      controller_port = $fresh.controller_port
+      controller_pid = $fresh.controller_pid
+      local_url = $fresh.local_url
+      network_url = $fresh.network_url
+      session_present = $fresh.session_present
+      app_ready = $fresh.app_ready
+      app_version = $fresh.app_version
+      repo_rev = $fresh.repo_rev
+      logs_dir = $fresh.logs_dir
+      started = $true
+      reused = $false
+      exit_code = $result.exit_code
+      action_id = $actionId
     }
   }
-  return [pscustomobject]@{
-    ok = $true
-    action = "start"
-    status = $fresh.status
-    detail = "Codrex app stack started."
+  $actionPayload = [ordered]@{
+    ok = $resultPayload.ok
+    status = $resultPayload.status
+    detail = $resultPayload.detail
+    repo_root = $root
+    repo_rev = $fresh.repo_rev
+    runtime_dir = $Paths.runtime_dir
+    logs_dir = $Paths.logs_dir
+    selected_pair_route = Get-CodrexSelectedRouteFromState -RuntimeDir $Paths.runtime_dir
     controller_port = $fresh.controller_port
-    controller_pid = $fresh.controller_pid
+    ui_port = $beforeUiPort
     local_url = $fresh.local_url
     network_url = $fresh.network_url
-    session_present = $fresh.session_present
-    app_ready = $fresh.app_ready
-    app_version = $fresh.app_version
-    repo_rev = $fresh.repo_rev
-    logs_dir = $fresh.logs_dir
-    started = $true
-    reused = $false
-    exit_code = $result.exit_code
+    session_file = $Paths.session_path
+    session_state_before = if ($beforeSummary.session_present) { "present" } else { "missing" }
+    session_state_after = if ($afterSummary.session_present) { "present" } else { "missing" }
+    app_runtime_before = $beforeSummary
+    app_runtime_after = $afterSummary
+    controller_port_snapshot_before = Get-CodrexPortDiagnosticsSnapshot -Ports @($beforeControllerPort)
+    controller_port_snapshot_after = Get-CodrexPortDiagnosticsSnapshot -Ports @($fresh.controller_port)
+    ui_port_snapshot_before = Get-CodrexPortDiagnosticsSnapshot -Ports @($beforeUiPort)
+    ui_port_snapshot_after = Get-CodrexPortDiagnosticsSnapshot -Ports @($beforeUiPort)
+    child_invocation = [ordered]@{
+      script_path = $Paths.start_mobile_script
+      arguments = @($args)
+      exit_code = $result.exit_code
+      output_tail = Get-CodrexTextTail -Text $result.lines
+    }
+    linked_process_logs = Get-LinkedProcessLogs -Paths $Paths
+    started = $resultPayload.started
+    reused = $resultPayload.reused
   }
+  return Finalize-ActionResult -Paths $Paths -ActionName "start" -ResultPayload $resultPayload -ActionPayload $actionPayload
 }
 
 function Stop-Runtime {
@@ -580,9 +828,48 @@ function Stop-Runtime {
     [object]$Paths,
     [int]$LaunchUiPort
   )
+  $actionId = New-CodrexActionId
   $snapshot = Get-StatusSnapshot -Paths $Paths
   $controllerPort = $snapshot.controller_port
-  $result = Invoke-ScriptCapture -ScriptPath $Paths.stop_mobile_script -Arguments @("-UiPort", [string]$LaunchUiPort)
+  $beforeSummary = Get-StatusSummaryRecord -Snapshot $snapshot
+  $beforeUiPort = if ($LaunchUiPort -gt 0) { [int]$LaunchUiPort } else { 0 }
+  $previousRuntimeDir = [string]$env:CODEX_RUNTIME_DIR
+  $previousActionId = [string]$env:CODEX_ACTION_ID
+  $previousActionName = [string]$env:CODEX_ACTION_NAME
+  $previousActionSource = [string]$env:CODEX_ACTION_SOURCE
+  $env:CODEX_RUNTIME_DIR = [string]$Paths.runtime_dir
+  $env:CODEX_ACTION_ID = $actionId
+  $env:CODEX_ACTION_NAME = "stop"
+  $env:CODEX_ACTION_SOURCE = "runtime"
+  Write-CodrexEventLog -RuntimeDir $Paths.runtime_dir -Source "runtime" -Action "stop" -ActionId $actionId -Message "Stopping Codrex runtime action." -Context @{
+    controller_port = $controllerPort
+    ui_port = $beforeUiPort
+    selected_pair_route = Get-CodrexSelectedRouteFromState -RuntimeDir $Paths.runtime_dir
+  } | Out-Null
+  try {
+    $result = Invoke-ScriptCapture -ScriptPath $Paths.stop_mobile_script -Arguments @("-UiPort", [string]$LaunchUiPort)
+  } finally {
+    if ($previousRuntimeDir) {
+      $env:CODEX_RUNTIME_DIR = $previousRuntimeDir
+    } else {
+      Remove-Item Env:CODEX_RUNTIME_DIR -ErrorAction SilentlyContinue
+    }
+    if ($previousActionId) {
+      $env:CODEX_ACTION_ID = $previousActionId
+    } else {
+      Remove-Item Env:CODEX_ACTION_ID -ErrorAction SilentlyContinue
+    }
+    if ($previousActionName) {
+      $env:CODEX_ACTION_NAME = $previousActionName
+    } else {
+      Remove-Item Env:CODEX_ACTION_NAME -ErrorAction SilentlyContinue
+    }
+    if ($previousActionSource) {
+      $env:CODEX_ACTION_SOURCE = $previousActionSource
+    } else {
+      Remove-Item Env:CODEX_ACTION_SOURCE -ErrorAction SilentlyContinue
+    }
+  }
   $jsonLine = Find-JsonLine -Lines $result.lines
   $stopPayload = $null
   if ($jsonLine) {
@@ -591,8 +878,9 @@ function Stop-Runtime {
     } catch {}
   }
   $fresh = Get-StatusSnapshot -Paths $Paths
+  $afterSummary = Get-StatusSummaryRecord -Snapshot $fresh
   $ok = ($result.exit_code -eq 0) -and ($fresh.status -eq "stopped")
-  return [pscustomobject]@{
+  $resultPayload = [pscustomobject]@{
     ok = $ok
     action = "stop"
     status = $fresh.status
@@ -609,7 +897,42 @@ function Stop-Runtime {
     ui_stopped = if ($stopPayload) { [bool]$stopPayload.ui_stopped } else { $true }
     stale_session_removed = if ($stopPayload) { [bool]$stopPayload.stale_session_file_removed } else { (-not (Test-Path $Paths.session_path)) }
     exit_code = $result.exit_code
+    action_id = $actionId
   }
+  $actionPayload = [ordered]@{
+    ok = $resultPayload.ok
+    status = $resultPayload.status
+    detail = $resultPayload.detail
+    repo_root = $root
+    repo_rev = $fresh.repo_rev
+    runtime_dir = $Paths.runtime_dir
+    logs_dir = $Paths.logs_dir
+    selected_pair_route = Get-CodrexSelectedRouteFromState -RuntimeDir $Paths.runtime_dir
+    controller_port = $controllerPort
+    ui_port = $beforeUiPort
+    local_url = $fresh.local_url
+    network_url = $fresh.network_url
+    session_file = $Paths.session_path
+    session_state_before = if ($beforeSummary.session_present) { "present" } else { "missing" }
+    session_state_after = if ($afterSummary.session_present) { "present" } else { "missing" }
+    app_runtime_before = $beforeSummary
+    app_runtime_after = $afterSummary
+    controller_port_snapshot_before = Get-CodrexPortDiagnosticsSnapshot -Ports @($controllerPort)
+    controller_port_snapshot_after = Get-CodrexPortDiagnosticsSnapshot -Ports @($controllerPort)
+    ui_port_snapshot_before = Get-CodrexPortDiagnosticsSnapshot -Ports @($beforeUiPort)
+    ui_port_snapshot_after = Get-CodrexPortDiagnosticsSnapshot -Ports @($beforeUiPort)
+    child_invocation = [ordered]@{
+      script_path = $Paths.stop_mobile_script
+      arguments = @("-UiPort", [string]$LaunchUiPort)
+      exit_code = $result.exit_code
+      output_tail = Get-CodrexTextTail -Text $result.lines
+    }
+    linked_process_logs = Get-LinkedProcessLogs -Paths $Paths
+    controller_stopped = $resultPayload.controller_stopped
+    ui_stopped = $resultPayload.ui_stopped
+    stale_session_removed = $resultPayload.stale_session_removed
+  }
+  return Finalize-ActionResult -Paths $Paths -ActionName "stop" -ResultPayload $resultPayload -ActionPayload $actionPayload
 }
 
 $paths = Get-Paths

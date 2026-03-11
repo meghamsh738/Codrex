@@ -8,6 +8,10 @@ param(
 $ErrorActionPreference = "Stop"
 $scriptRoot = Split-Path -Parent $PSCommandPath
 $root = (Resolve-Path (Join-Path $scriptRoot "..\..")).Path
+$diagnosticsScript = Join-Path $scriptRoot "codrex-diagnostics.ps1"
+if (Test-Path $diagnosticsScript) {
+  . $diagnosticsScript
+}
 $script:DefaultControllerPort = 48787
 $script:LegacyControllerPort = 8787
 $script:DefaultDevUiPort = 54312
@@ -263,10 +267,92 @@ foreach ($dir in @($runtimeDir, $stateDir, $logsDir)) {
     New-Item -Path $dir -ItemType Directory -Force | Out-Null
   }
 }
+$script:DiagnosticsLayout = Ensure-CodrexDiagnosticsLayout -RuntimeDir $runtimeDir
+$script:DiagActionId = Get-CodrexCurrentActionId
+if (-not $script:DiagActionId) {
+  $script:DiagActionId = New-CodrexActionId
+}
+$script:DiagActionName = Get-CodrexCurrentActionName
+if (-not $script:DiagActionName) {
+  $script:DiagActionName = "start"
+}
+$script:DiagSource = "start-mobile"
+$script:DiagBeforeSessionState = if ((Read-SessionData -Path $sessionPath) -or (Read-SessionData -Path (Join-Path (Join-Path $root "logs") "mobile.session.json"))) { "present" } else { "missing" }
+$script:DiagBeforeControllerSnapshot = @()
+$script:DiagBeforeUiSnapshot = @()
+$script:DiagLinkedLogs = [ordered]@{
+  controller_stdout = Join-Path $logsDir "controller.out.log"
+  controller_stderr = Join-Path $logsDir "controller.err.log"
+  ui_stdout = $uiOutLog
+  ui_stderr = $uiErrLog
+}
+
+function Write-StartMobileDiagnostic {
+  param(
+    [bool]$Ok,
+    [string]$Detail,
+    [AllowNull()]
+    [object]$Extra = $null
+  )
+  $currentSession = Read-SessionData -Path $sessionPath
+  $lanIp = Get-PrimaryIPv4
+  $payload = [ordered]@{
+    ok = $Ok
+    status = if ($Ok) { "completed" } else { "error" }
+    detail = $Detail
+    repo_root = $root
+    runtime_dir = $runtimeDir
+    logs_dir = $logsDir
+    controller_port = $controllerPort
+    ui_port = $UiPort
+    ui_mode = if ($DevUi) { "dev" } else { "built" }
+    selected_pair_route = Get-CodrexSelectedRouteFromState -RuntimeDir $runtimeDir
+    local_url = if ($controllerPort -gt 0) { ("http://127.0.0.1:{0}/" -f $controllerPort) } else { "" }
+    network_url = if ($lanIp -and $lanIp -ne "127.0.0.1" -and $controllerPort -gt 0) { ("http://{0}:{1}/" -f $lanIp, $controllerPort) } else { "" }
+    session_file = $sessionPath
+    session_state_before = $script:DiagBeforeSessionState
+    session_state_after = if ($currentSession) { "present" } else { "missing" }
+    controller_port_snapshot_before = @($script:DiagBeforeControllerSnapshot)
+    controller_port_snapshot_after = Get-CodrexPortDiagnosticsSnapshot -Ports @($controllerPort)
+    ui_port_snapshot_before = @($script:DiagBeforeUiSnapshot)
+    ui_port_snapshot_after = Get-CodrexPortDiagnosticsSnapshot -Ports @($UiPort)
+    linked_process_logs = $script:DiagLinkedLogs
+  }
+  if ($null -ne $Extra) {
+    foreach ($property in $Extra.PSObject.Properties) {
+      $payload[$property.Name] = $property.Value
+    }
+  }
+  $null = Write-CodrexActionLog -RuntimeDir $runtimeDir -Action $script:DiagActionName -Source $script:DiagSource -Payload $payload -ActionId $script:DiagActionId -IsError:(-not $Ok)
+  $null = Write-CodrexEventLog -RuntimeDir $runtimeDir -Source $script:DiagSource -Action $script:DiagActionName -ActionId $script:DiagActionId -Level $(if ($Ok) { "info" } else { "error" }) -Message $Detail -Context @{
+    controller_port = $controllerPort
+    ui_port = $UiPort
+    ui_mode = if ($DevUi) { "dev" } else { "built" }
+    session_state_after = if ($currentSession) { "present" } else { "missing" }
+  }
+}
+
+trap {
+  $message = if ($_.Exception -and $_.Exception.Message) { [string]$_.Exception.Message } else { [string]$_ }
+  Write-StartMobileDiagnostic -Ok:$false -Detail $message -Extra ([pscustomobject]@{
+    failure_stage = "start-mobile"
+  })
+  exit 1
+}
 
 $controllerPort = Read-ControllerPort -ConfigPath $configPath -LocalConfigPath $localConfigPath -LegacyLocalConfigPath $legacyLocalConfigPath
 if ($controllerPort -eq $script:LegacyControllerPort) {
   $controllerPort = $script:DefaultControllerPort
+}
+$script:DiagBeforeControllerSnapshot = Get-CodrexPortDiagnosticsSnapshot -Ports @($controllerPort)
+$script:DiagBeforeUiSnapshot = Get-CodrexPortDiagnosticsSnapshot -Ports @($UiPort)
+$null = Write-CodrexEventLog -RuntimeDir $runtimeDir -Source $script:DiagSource -Action $script:DiagActionName -ActionId $script:DiagActionId -Message "Starting mobile stack script." -Context @{
+  controller_port = $controllerPort
+  ui_port = $UiPort
+  dev_ui = [bool]$DevUi
+  open_firewall = [bool]$OpenFirewall
+  skip_ui_install = [bool]$SkipUiInstall
+  session_state_before = $script:DiagBeforeSessionState
 }
 
 if ($DevUi) {
@@ -420,4 +506,11 @@ Write-Host ("Runtime dir:    {0}" -f $runtimeDir)
 if ((-not $OpenFirewall) -and ($lanIp -and $lanIp -ne "127.0.0.1")) {
   Write-Host "Tip: if phone/tablet cannot open network URL, rerun with -OpenFirewall."
 }
+Write-StartMobileDiagnostic -Ok:$true -Detail "Mobile stack ready." -Extra ([pscustomobject]@{
+  controller_pid = $controllerPid
+  ui_pid = $uiPid
+  dev_ui = [bool]$DevUi
+  open_firewall = [bool]$OpenFirewall
+  session_written = [bool]$persistedSession
+})
 exit 0
