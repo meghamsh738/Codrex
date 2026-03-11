@@ -37,6 +37,25 @@ test.describe("mobile Sessions flow", () => {
           screenText: "Idle.",
         },
       ],
+      sessionFiles: {
+        codex_demo: [
+          {
+            id: "sf_plot",
+            title: "Release Plot",
+            file_name: "release-plot.png",
+            mime_type: "image/png",
+            size_bytes: 2048,
+            created_at: Date.now(),
+            expires_at: Date.now() + 24 * 3600 * 1000,
+            created_by: "session:codex_demo",
+            is_image: true,
+            item_kind: "file",
+            source_kind: "upload",
+            wsl_path: "/home/megha/codrex-work/output/release-plot.png",
+            download_url: "/codex/session/codex_demo/files/sf_plot/download",
+          },
+        ],
+      },
     });
 
     await page.goto("/", { waitUntil: "domcontentloaded" });
@@ -61,7 +80,7 @@ test.describe("mobile Sessions flow", () => {
 
     await page.getByTestId("composer-send-telegram").click();
     await expect.poll(() => mock.promptRequests.length).toBe(2);
-    await expect.poll(() => mock.promptRequests[1]?.prompt ?? "").toContain("tgsend");
+    await expect.poll(() => mock.promptRequests[1]?.prompt ?? "").toContain('/tgsend "/home/megha/codrex-work/output/release-plot.png"');
 
     const notesInput = page.getByTestId("session-notes-input");
     await notesInput.fill("Release checklist");

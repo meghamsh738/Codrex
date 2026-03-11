@@ -469,7 +469,7 @@ describe("app shell tabs", () => {
     });
     fireEvent.click(streamImage, { clientX: 120, clientY: 80 });
 
-    fireEvent.change(screen.getByPlaceholderText("Type text on desktop"), {
+    fireEvent.change(screen.getByPlaceholderText("Type text for the focused desktop app"), {
       target: { value: "Remote quick note" },
     });
     fireEvent.click(screen.getByRole("button", { name: "Send Text" }));
@@ -482,7 +482,7 @@ describe("app shell tabs", () => {
     expect(screen.queryByRole("button", { name: "Send Telegram" })).not.toBeInTheDocument();
   });
 
-  it("pastes clipboard text without re-clicking the desktop target", async () => {
+  it("types clipboard text without re-clicking the desktop target", async () => {
     getDesktopInfoMock.mockResolvedValue({
       ok: true,
       enabled: true,
@@ -520,7 +520,7 @@ describe("app shell tabs", () => {
     fireEvent.click(streamImage, { clientX: 140, clientY: 100 });
     desktopClickMock.mockClear();
 
-    fireEvent.click(screen.getByRole("button", { name: "Paste Clipboard" }));
+    fireEvent.click(screen.getByRole("button", { name: "Type Clipboard" }));
 
     await waitFor(() => {
       expect(desktopSendTextMock).toHaveBeenCalledWith("Clipboard payload");
@@ -1054,7 +1054,7 @@ describe("app shell tabs", () => {
     });
   });
 
-  it("appends a Telegram helper instruction to the current draft and sends it immediately", async () => {
+  it("submits an exact /tgsend command for the selected session file", async () => {
     getAuthStatusMock.mockResolvedValue({
       ok: true,
       auth_required: true,
@@ -1106,23 +1106,21 @@ describe("app shell tabs", () => {
     expect(itemCard).not.toBeNull();
     fireEvent.click(itemCard as HTMLElement);
 
-    const composer = screen.getByPlaceholderText("Type your prompt. Codrex will send Enter + Enter to submit.");
-    fireEvent.change(composer, { target: { value: "Once the plot is ready, review it." } });
     const telegramButton = await screen.findByTestId("composer-send-telegram");
     fireEvent.click(telegramButton);
 
     await waitFor(() => {
       expect(sendToSessionMock).toHaveBeenCalledWith(
         "codex_demo",
-        expect.stringContaining("Once the plot is ready, review it."),
+        expect.stringMatching(/^\/tgsend /),
       );
       expect(sendToSessionMock).toHaveBeenCalledWith(
         "codex_demo",
-        expect.stringContaining("/home/megha/codrex-work/output/result.png"),
+        expect.stringContaining('"/home/megha/codrex-work/output/result.png"'),
       );
       expect(sendToSessionMock).toHaveBeenCalledWith(
         "codex_demo",
-        expect.stringContaining("tgsend"),
+        expect.stringContaining('--caption "Result Plot"'),
       );
     });
   });

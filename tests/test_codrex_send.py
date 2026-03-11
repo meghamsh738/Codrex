@@ -111,6 +111,30 @@ class CodrexSendConfigTests(unittest.TestCase):
             self.assertTrue(codrex_send._path_within_root(staged, share_root))
             self.assertEqual(staged.read_bytes(), outside_file.read_bytes())
 
+    def test_request_json_with_fallback_uses_next_candidate_after_connection_refused(self):
+        responses = {
+            "http://127.0.0.1:48787": {"ok": False, "error": "request_failed", "detail": "URLError: [Errno 111] Connection refused"},
+            "http://100.64.0.9:48787": {"ok": True, "item": {"id": "share_123"}},
+        }
+
+        def fake_request(base_url, method, path, payload, token):
+            self.assertEqual(method, "POST")
+            self.assertEqual(path, "/shares")
+            self.assertEqual(token, "runtime-token")
+            return responses[base_url]
+
+        with mock.patch.object(codrex_send, "_request_json", side_effect=fake_request):
+            response, used_base = codrex_send._request_json_with_fallback(
+                ["http://127.0.0.1:48787", "http://100.64.0.9:48787"],
+                "POST",
+                "/shares",
+                {"path": "/home/megha/codrex-work/output/result.png"},
+                "runtime-token",
+            )
+
+        self.assertTrue(response.get("ok"))
+        self.assertEqual(used_base, "http://100.64.0.9:48787")
+
 
 if __name__ == "__main__":
     unittest.main()

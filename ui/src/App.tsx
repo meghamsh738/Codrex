@@ -116,22 +116,17 @@ interface SessionGroup {
   items: SessionInfo[];
 }
 
-function buildTelegramSendInstruction(targetPath = ""): string {
-  const helperHint = "Use the existing `tgsend` / `codrex-send` helper already available in this session. Do not search for Telegram bot keys or secret files.";
+function buildTelegramSendCommand(targetPath: string, caption = ""): string {
   const trimmedPath = targetPath.trim();
-  if (trimmedPath) {
-    return [
-      "Send the relevant output to me via Telegram.",
-      `Use this exact file path if it is the correct artifact: \`${trimmedPath}\`.`,
-      helperHint,
-      "After sending, tell me exactly which path you sent.",
-    ].join(" ");
+  if (!trimmedPath) {
+    return "";
   }
-  return [
-    "Send the most relevant generated output file from this session to me via Telegram.",
-    helperHint,
-    "If no sendable output file exists yet, tell me that clearly and mention the path you checked.",
-  ].join(" ");
+  const parts = ["/tgsend", JSON.stringify(trimmedPath)];
+  const trimmedCaption = caption.trim();
+  if (trimmedCaption) {
+    parts.push("--caption", JSON.stringify(trimmedCaption));
+  }
+  return parts.join(" ");
 }
 
 async function copyTextWithFallback(text: string): Promise<void> {
@@ -2341,13 +2336,23 @@ export default function App() {
       ? "Install flow update"
       : statusMessage === "Ready."
         ? "Ready"
-        : statusMessage;
+      : statusMessage;
   const canSendPrompt = promptText.trim().length > 0;
+  const composerTelegramTarget = selectedSessionFile && selectedSessionFile.item_kind !== "directory"
+    ? selectedSessionFile
+    : newestSessionFile && newestSessionFile.item_kind !== "directory"
+      ? newestSessionFile
+      : null;
   const composerTelegramDisabledReason = !telegramConfigured
     ? "Telegram is not configured."
     : !selectedSession
       ? "Select a session first."
-      : "";
+      : !composerTelegramTarget
+        ? "No session file is available to send yet."
+        : "";
+  const desktopFocusSummary = desktopFocusPoint
+    ? `Focused target: ${desktopFocusPoint.x}, ${desktopFocusPoint.y}`
+    : "No desktop target focused yet. Tap the remote desktop once first.";
   const stopSessionFileSelection = (event: { stopPropagation: () => void }) => {
     event.stopPropagation();
   };
@@ -3051,25 +3056,26 @@ export default function App() {
       setError("Telegram is not configured yet.");
       return;
     }
-    const targetFile = selectedSessionFile && selectedSessionFile.item_kind !== "directory"
-      ? selectedSessionFile
-      : newestSessionFile && newestSessionFile.item_kind !== "directory"
-        ? newestSessionFile
-        : null;
-    const telegramInstruction = buildTelegramSendInstruction(targetFile?.wsl_path || "");
-    const existingDraft = promptText.trim();
-    const combinedPrompt = existingDraft ? `${existingDraft}\n\n${telegramInstruction}` : telegramInstruction;
+    if (!composerTelegramTarget) {
+      setError("No session file is available to send yet.");
+      return;
+    }
+    const telegramCommand = buildTelegramSendCommand(
+      composerTelegramTarget.wsl_path || "",
+      composerTelegramTarget.title || composerTelegramTarget.file_name || "",
+    );
+    if (!telegramCommand) {
+      setError("Telegram command could not be prepared for the selected file.");
+      return;
+    }
     setComposerTelegramBusy(true);
     try {
-      setPromptText(combinedPrompt);
       const sent = await submitPromptText(
-        combinedPrompt,
-        targetFile
-          ? `Sent Telegram instruction for ${targetFile.file_name}.`
-          : `Sent Telegram instruction to ${selectedSession}.`,
+        telegramCommand,
+        `Sent ${composerTelegramTarget.file_name || "file"} to Telegram.`,
       );
       if (!sent) {
-        setPromptText(combinedPrompt);
+        setPromptText(telegramCommand);
       }
     } catch (error) {
       setError(`Telegram send failed: ${(error as Error).message}`);
@@ -3077,10 +3083,8 @@ export default function App() {
       setComposerTelegramBusy(false);
     }
   }, [
-    newestSessionFile,
-    promptText,
+    composerTelegramTarget,
     selectedSession,
-    selectedSessionFile,
     setError,
     submitPromptText,
     telegramConfigured,
@@ -4441,7 +4445,10 @@ export default function App() {
                                     className="composer-telegram-btn"
                                     data-testid="composer-send-telegram"
                                     aria-label="Send via Telegram"
-                                    title={composerTelegramDisabledReason || "Ask Codex to send the relevant output file via Telegram."}
+                                    title={
+                                      composerTelegramDisabledReason
+                                      || `Send ${composerTelegramTarget?.file_name || "the selected file"} to Telegram via /tgsend.`
+                                    }
                                     onClick={() => {
                                       if (composerTelegramDisabledReason) {
                                         setError(composerTelegramDisabledReason);
@@ -5484,16 +5491,30 @@ export default function App() {
                             type="text"
                             value={desktopTextInput}
                             onChange={(event) => setDesktopTextInput(event.target.value)}
-                            placeholder="Type text on desktop"
+                            placeholder={desktopFocusPoint ? "Type text for the focused desktop app" : "Tap the remote desktop to focus a target first"}
                             disabled={desktopInteractionDisabled}
                           />
-                          <button type="button" className="button soft compact action-chip" data-short="SEND" onClick={() => void onDesktopSendText()} disabled={desktopInteractionDisabled || !desktopTextInput}>
+                          <button
+                            type="button"
+                            className="button soft compact action-chip"
+                            data-short="SEND"
+                            onClick={() => void onDesktopSendText()}
+                            disabled={desktopInteractionDisabled || !desktopTextInput || !desktopFocusPoint}
+                          >
                             <span className="btn-text">Send Text</span>
                           </button>
-                          <button type="button" className="button soft compact action-chip" data-short="PASTE" onClick={() => void onDesktopPasteClipboard()} disabled={desktopInteractionDisabled}>
-                            <span className="btn-text">Paste Clipboard</span>
+                          <button
+                            type="button"
+                            className="button soft compact action-chip"
+                            data-short="TYPE"
+                            onClick={() => void onDesktopPasteClipboard()}
+                            disabled={desktopInteractionDisabled || !desktopFocusPoint}
+                            title={desktopFocusPoint ? "Type clipboard text into the focused desktop app." : "Tap the remote desktop once to focus a target first."}
+                          >
+                            <span className="btn-text">Type Clipboard</span>
                           </button>
                         </div>
+                        <p className="small">{desktopFocusSummary}</p>
                         <div className="row remote-key-controls">
                           <select value={desktopKeyInput} onChange={(event) => setDesktopKeyInput(event.target.value)} disabled={desktopInteractionDisabled}>
                             <option value="enter">Enter</option>

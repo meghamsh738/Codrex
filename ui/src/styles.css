@@ -929,7 +929,7 @@ button:active,
 }
 
 .session-list {
-  max-height: min(40vh, 500px);
+  max-height: min(46vh, 580px);
   overflow: auto;
   padding: 8px;
   padding-right: 6px;
@@ -949,8 +949,8 @@ button:active,
 
 .session-card-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
-  gap: 12px;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 14px;
 }
 
 .list-tools {
@@ -980,7 +980,7 @@ button:active,
   border: 1px solid var(--border);
   border-radius: var(--radius-m);
   background: linear-gradient(175deg, color-mix(in srgb, var(--surface) 98%, transparent), color-mix(in srgb, var(--surface-soft) 94%, transparent));
-  padding: 14px;
+  padding: 16px;
   cursor: pointer;
   transition: border-color 120ms ease, transform 120ms ease, box-shadow 120ms ease;
 }
@@ -1004,7 +1004,7 @@ button:active,
 }
 
 .session-snippet {
-  font-size: 0.88rem;
+  font-size: 0.92rem;
   line-height: 1.35;
 }
 
@@ -1787,6 +1787,11 @@ button:active,
 .remote-text-controls .button {
   flex: 1 1 160px;
   min-width: 160px;
+}
+
+.remote-text-controls + .small {
+  margin-top: -2px;
+  color: var(--muted);
 }
 
 .remote-key-controls select {
@@ -2634,7 +2639,7 @@ button.event-item:hover {
   }
 
   .session-list {
-    max-height: min(44vh, 560px);
+    max-height: min(50vh, 640px);
   }
 
   .run-list,

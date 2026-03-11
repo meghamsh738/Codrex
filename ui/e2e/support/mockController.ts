@@ -12,11 +12,28 @@ export interface MockSession {
   screenText?: string;
 }
 
+export interface MockSessionFile {
+  id: string;
+  title: string;
+  file_name: string;
+  mime_type: string;
+  size_bytes: number;
+  created_at: number;
+  expires_at: number;
+  created_by?: string;
+  is_image?: boolean;
+  item_kind?: "file" | "directory";
+  source_kind?: string;
+  wsl_path: string;
+  download_url: string;
+}
+
 export interface MockControllerOptions {
   authRequired?: boolean;
   authenticated?: boolean;
   sessions?: MockSession[];
   telegramConfigured?: boolean;
+  sessionFiles?: Record<string, MockSessionFile[]>;
 }
 
 export interface PromptRequest {
@@ -63,6 +80,9 @@ export async function installMockController(
   const sessions = options.sessions ?? [];
   const promptRequests: PromptRequest[] = [];
   const notesBySession = new Map<string, string>();
+  const sessionFilesBySession = new Map(
+    Object.entries(options.sessionFiles ?? {}),
+  );
   const screenTextBySession = new Map(
     sessions.map((session) => [session.session, session.screenText ?? session.snippet ?? ""]),
   );
@@ -240,7 +260,7 @@ export async function installMockController(
     json(route, {
       ok: true,
       session: decodeSessionName(route.request().url()),
-      items: [],
+      items: sessionFilesBySession.get(decodeSessionName(route.request().url())) ?? [],
     }),
   );
 
@@ -306,10 +326,21 @@ export async function installMockController(
 
   await page.route(/\/codex\/session\/[^/]+\/send(?:\?.*)?$/, async (route) => {
     const sessionName = decodeSessionName(route.request().url());
+    const prompt = route.request().postData() ?? "";
     promptRequests.push({
       session: sessionName,
-      prompt: route.request().postData() ?? "",
+      prompt,
     });
+    if (prompt.startsWith("/tgsend ")) {
+      const firstFile = (sessionFilesBySession.get(sessionName) ?? []).find((item) => item.item_kind !== "directory");
+      await json(route, {
+        ok: true,
+        session: sessionName,
+        session_file: firstFile ?? null,
+        detail: "Shared file added to mobile inbox and sent to Telegram.",
+      });
+      return;
+    }
     await json(route, {
       ok: true,
       session: sessionName,

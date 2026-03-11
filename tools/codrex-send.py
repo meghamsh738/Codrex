@@ -250,7 +250,7 @@ def _build_controller_candidates(env_base: str, cfg: Dict[str, Any], port: int) 
     return candidates
 
 
-def _get_controller_defaults() -> Tuple[str, str, Dict[str, Any]]:
+def _get_controller_details() -> Tuple[str, str, Dict[str, Any], List[str]]:
     # Priority:
     # 1) explicit env
     # 2) controller.config.json (port + token)
@@ -284,6 +284,11 @@ def _get_controller_defaults() -> Tuple[str, str, Dict[str, Any]]:
         if _controller_reachable(candidate, token):
             base = candidate
             break
+    return base, token, cfg, candidates
+
+
+def _get_controller_defaults() -> Tuple[str, str, Dict[str, Any]]:
+    base, token, cfg, _candidates = _get_controller_details()
     return base, token, cfg
 
 
@@ -347,6 +352,31 @@ def _request_json(base_url: str, method: str, path: str, payload: Optional[Dict[
         return {"ok": False, "error": "request_failed", "detail": f"{type(e).__name__}: {e}"}
 
 
+def _request_json_with_fallback(
+    base_urls: List[str],
+    method: str,
+    path: str,
+    payload: Optional[Dict[str, Any]],
+    token: str,
+) -> Tuple[Dict[str, Any], str]:
+    seen: List[str] = []
+    last_response: Dict[str, Any] = {"ok": False, "error": "request_failed", "detail": "No controller candidates available."}
+    for raw_base in base_urls:
+        base = _normalize_base_url(raw_base)
+        if not base or base in seen:
+            continue
+        seen.append(base)
+        response = _request_json(base, method, path, payload, token)
+        if response.get("ok"):
+            return response, base
+        if response.get("error") != "request_failed":
+            return response, base
+        last_response = response
+    if seen:
+        return last_response, seen[0]
+    return last_response, ""
+
+
 def _parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Share file to Codrex inbox and optional Telegram relay")
     parser.add_argument("path", help="Absolute or relative WSL file path")
@@ -370,7 +400,8 @@ def main(argv: list[str]) -> int:
     if not wsl_path.is_file():
         _die(f"Source path is not a regular file: {wsl_path}", code=2)
 
-    base_url, token, cfg = _get_controller_defaults()
+    base_url, token, cfg, controller_candidates = _get_controller_details()
+    request_bases = [base_url, *controller_candidates]
 
     share_path = wsl_path
     share_root = _resolve_share_root(cfg)
@@ -386,7 +417,7 @@ def main(argv: list[str]) -> int:
     if args.title.strip():
         share_payload["title"] = args.title.strip()
 
-    share = _request_json(base_url, "POST", "/shares", share_payload, token)
+    share, base_used = _request_json_with_fallback(request_bases, "POST", "/shares", share_payload, token)
     if not share.get("ok"):
         _die(f"Share failed: {share.get('detail') or share.get('error') or 'unknown error'}", code=2)
 
@@ -399,14 +430,14 @@ def main(argv: list[str]) -> int:
     print(f"Inbox id: {share_id}")
     dl = str(item.get("download_url") or "").strip()
     if dl:
-        print(f"Download: {base_url.rstrip('/')}{dl if dl.startswith('/') else '/' + dl}")
+        print(f"Download: {base_used.rstrip('/')}{dl if dl.startswith('/') else '/' + dl}")
 
     if args.telegram:
         tg_payload: Dict[str, Any] = {}
         caption = args.caption.strip() or args.title.strip()
         if caption:
             tg_payload["caption"] = caption
-        tg = _request_json(base_url, "POST", f"/shares/{share_id}/telegram", tg_payload, token)
+        tg, _tg_base = _request_json_with_fallback(request_bases, "POST", f"/shares/{share_id}/telegram", tg_payload, token)
         if not tg.get("ok"):
             _die(f"Telegram failed: {tg.get('detail') or tg.get('error') or 'unknown error'}", code=3)
         print("Telegram: sent")
