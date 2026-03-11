@@ -122,8 +122,9 @@ function buildTelegramInferencePrompt(options: {
   candidateFiles: SharedFileInfo[];
 }): string {
   const lines = [
-    "Use the existing tgsend / codrex-send helper already available in this session to send the relevant output to me via Telegram.",
-    "Do not search for Telegram bot keys or secret files.",
+    "Send the relevant output from this session to me via Telegram.",
+    "Use `tgsend` if it is available. If it is not on PATH, use `/home/megha/.local/bin/codrex-send --telegram` directly.",
+    "Do not search for Telegram bot keys, secret files, or controller config files.",
   ];
 
   if (options.selectedFile?.wsl_path) {
@@ -148,7 +149,7 @@ function buildTelegramInferencePrompt(options: {
     lines.push("No explicit session file hint is available, so locate the most relevant generated output from this session.");
   }
 
-  lines.push("If one of the hinted files is the correct artifact, send it. Otherwise locate the correct generated output from this session, send it with the helper, and then tell me exactly which path you sent.");
+  lines.push("If one of the hinted files is the correct artifact, send that exact file. Otherwise locate the correct generated output from this session, send it with the helper, and then tell me exactly which path you sent.");
   return lines.join("\n\n");
 }
 

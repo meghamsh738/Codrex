@@ -1054,7 +1054,7 @@ describe("app shell tabs", () => {
     });
   });
 
-  it("submits an infer-style Telegram helper prompt with session file hints", async () => {
+  it("submits an infer-style Telegram helper prompt with explicit helper fallback and session file hints", async () => {
     getAuthStatusMock.mockResolvedValue({
       ok: true,
       auth_required: true,
@@ -1112,7 +1112,7 @@ describe("app shell tabs", () => {
     await waitFor(() => {
       expect(sendToSessionMock).toHaveBeenCalledWith(
         "codex_demo",
-        expect.stringContaining("Use the existing tgsend / codrex-send helper already available in this session"),
+        expect.stringContaining("Use `tgsend` if it is available. If it is not on PATH, use `/home/megha/.local/bin/codrex-send --telegram` directly."),
       );
       expect(sendToSessionMock).toHaveBeenCalledWith(
         "codex_demo",
@@ -1120,7 +1120,7 @@ describe("app shell tabs", () => {
       );
       expect(sendToSessionMock).toHaveBeenCalledWith(
         "codex_demo",
-        expect.stringContaining("Do not search for Telegram bot keys or secret files."),
+        expect.stringContaining("Do not search for Telegram bot keys, secret files, or controller config files."),
       );
     });
   });
