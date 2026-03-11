@@ -454,6 +454,26 @@ describe("app shell tabs", () => {
     expect(screen.queryByRole("button", { name: "Send Telegram" })).not.toBeInTheDocument();
   });
 
+  it("sends remote arrow quick keys from the tablet control cluster", async () => {
+    getDesktopInfoMock.mockResolvedValue({
+      ok: true,
+      enabled: true,
+      width: 1920,
+      height: 1080,
+    });
+    render(<App />);
+
+    fireEvent.click(await screen.findByTestId("tab-remote"));
+    const remotePanel = await screen.findByTestId("tab-panel-remote");
+    await within(remotePanel).findByRole("button", { name: "Disable Control" });
+
+    fireEvent.click(within(remotePanel).getByRole("button", { name: "Up" }));
+
+    await waitFor(() => {
+      expect(desktopSendKeyMock).toHaveBeenCalledWith("up");
+    });
+  });
+
   it("arms and confirms destructive power actions from remote tab", async () => {
     sendPowerActionMock
       .mockResolvedValueOnce({

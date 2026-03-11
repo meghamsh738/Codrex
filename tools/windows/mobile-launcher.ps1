@@ -409,6 +409,7 @@ function Get-LauncherStatusSnapshot {
     network_url = if ($payload.network_url) { [string]$payload.network_url } else { "n/a" }
     status = if ($payload.status) { [string]$payload.status } else { "stopped" }
     lan_ip = Get-CachedLanIp
+    tailscale_ip = Get-TailscaleIPv4
     detail = if ($payload.detail) { [string]$payload.detail } else { "" }
   }
 }
@@ -421,7 +422,9 @@ function Apply-LauncherStatus {
     return
   }
   $revSuffix = if ($Snapshot.repo_rev) { " | Rev: $($Snapshot.repo_rev)" } else { "" }
-  $lblStatus.Text = "Launcher shell | State: $($Snapshot.status) | Mode: $($Snapshot.app_mode)`r`nBuild: v$($Snapshot.version)$revSuffix | Port: $($Snapshot.controller_port) | Session: $($Snapshot.session_state)`r`nApp: $($Snapshot.local_url)`r`nLAN: $($Snapshot.network_url) | Repo: $($Snapshot.repo_label)`r`nDetail: $($Snapshot.detail)"
+  $routeLabel = Resolve-SelectedRouteLabel
+  $networkHost = Resolve-SelectedRouteHost
+  $lblStatus.Text = "Launcher shell | State: $($Snapshot.status) | Mode: $($Snapshot.app_mode)`r`nBuild: v$($Snapshot.version)$revSuffix | Port: $($Snapshot.controller_port) | Session: $($Snapshot.session_state)`r`nApp: $($Snapshot.local_url)`r`nPair route: $routeLabel ($networkHost) | Repo: $($Snapshot.repo_label)`r`nDetail: $($Snapshot.detail)"
   switch ([string]$Snapshot.status) {
     "running" {
       $statusCard.BackColor = [System.Drawing.ColorTranslator]::FromHtml("#0d2f53")
@@ -559,6 +562,7 @@ $root = (Resolve-Path (Join-Path $scriptRoot "..\..")).Path
 $runtimeDir = Get-CodrexRuntimeDir -RepoRoot $root
 $stateDir = Join-Path $runtimeDir "state"
 $logsDir = Join-Path $runtimeDir "logs"
+$launcherStatePath = Join-Path $stateDir "launcher.state.json"
 $script:DiagnosticsLayout = Ensure-CodrexDiagnosticsLayout -RuntimeDir $runtimeDir
 $configPath = Join-Path $root "controller.config.json"
 $script:LocalConfigPath = Join-Path $stateDir "controller.config.local.json"
@@ -599,6 +603,9 @@ $script:pendingRuntimeAction = ""
 $script:pendingRuntimeActionAt = [DateTime]::MinValue
 $script:pendingRuntimeTimeoutSec = 45
 $script:advancedVisible = $false
+$script:selectedPairRoute = "lan"
+$script:lastKnownLanIp = ""
+$script:lastKnownTailnetIp = ""
 $script:pendingStart = $false
 $script:pendingStartAt = [DateTime]::MinValue
 $script:pendingStartTimeoutSec = 45
@@ -606,6 +613,53 @@ $script:pendingStartPort = 0
 $script:pendingStartWorker = $null
 $script:pendingStartAsync = $null
 $script:pendingStartResultRead = $false
+
+function Read-LauncherState {
+  if (-not (Test-Path $launcherStatePath)) {
+    return $null
+  }
+  try {
+    return Get-Content -Path $launcherStatePath -Raw | ConvertFrom-Json
+  } catch {}
+  return $null
+}
+
+function Save-LauncherState {
+  $payload = [ordered]@{
+    preferred_pair_route = $script:selectedPairRoute
+    advanced_visible = [bool]$script:advancedVisible
+  }
+  $parent = Split-Path -Parent $launcherStatePath
+  if ($parent -and -not (Test-Path $parent)) {
+    New-Item -Path $parent -ItemType Directory -Force | Out-Null
+  }
+  $payload | ConvertTo-Json | Set-Content -Path $launcherStatePath -Encoding UTF8
+}
+
+function Resolve-SelectedRouteIp {
+  switch ($script:selectedPairRoute) {
+    "tailscale" { return $script:lastKnownTailnetIp }
+    default { return $script:lastKnownLanIp }
+  }
+}
+
+function Resolve-SelectedRouteLabel {
+  switch ($script:selectedPairRoute) {
+    "tailscale" { return "Tailscale" }
+    default { return "LAN" }
+  }
+}
+
+function Resolve-SelectedRouteHost {
+  $candidate = Resolve-SelectedRouteIp
+  if ($candidate -and $candidate -ne "127.0.0.1") {
+    return $candidate
+  }
+  if ($script:lastKnownLanIp -and $script:lastKnownLanIp -ne "127.0.0.1") {
+    return $script:lastKnownLanIp
+  }
+  return "127.0.0.1"
+}
 
 function Set-LauncherButtonStyle {
   param(
@@ -619,10 +673,10 @@ function Set-LauncherButtonStyle {
   $Button.FlatAppearance.MouseOverBackColor = [System.Drawing.ColorTranslator]::FromHtml("#15466f")
   $Button.FlatAppearance.MouseDownBackColor = [System.Drawing.ColorTranslator]::FromHtml("#0b3556")
   $Button.Font = New-Object System.Drawing.Font("Segoe UI Semibold", 9.5)
-  $Button.MinimumSize = New-Object System.Drawing.Size(150, 38)
+  $Button.MinimumSize = New-Object System.Drawing.Size(136, 38)
   $Button.Margin = New-Object System.Windows.Forms.Padding(0, 0, 10, 10)
   $Button.AutoSize = $false
-  $Button.Size = New-Object System.Drawing.Size(168, 38)
+  $Button.Size = New-Object System.Drawing.Size(152, 38)
   $kind = "default"
   $normalBack = $colorAccentSoft
   $normalFore = $colorText
@@ -701,11 +755,34 @@ function Register-LauncherButtonFeedback {
 $form = New-Object System.Windows.Forms.Form
 $form.Text = "Codrex"
 $form.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
-$form.Size = New-Object System.Drawing.Size(1120, 760)
-$form.MinimumSize = New-Object System.Drawing.Size(1000, 700)
+$form.Size = New-Object System.Drawing.Size(1200, 760)
+$form.MinimumSize = New-Object System.Drawing.Size(1040, 700)
 $form.Icon = [System.Drawing.SystemIcons]::Shield
 $form.BackColor = $colorBg
 $form.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+$form.ShowInTaskbar = $true
+$form.MinimizeBox = $true
+$form.MaximizeBox = $false
+$form.Add_Resize({
+  if ($form.WindowState -eq [System.Windows.Forms.FormWindowState]::Minimized) {
+    $form.ShowInTaskbar = $true
+  } else {
+    $form.ShowInTaskbar = $true
+  }
+})
+$form.Add_SizeChanged({
+  if ($form.WindowState -ne [System.Windows.Forms.FormWindowState]::Minimized) {
+    $form.ShowInTaskbar = $true
+  }
+})
+$form.Add_VisibleChanged({
+  if (-not $form.Visible) {
+    $form.ShowInTaskbar = $true
+  }
+})
+$form.Add_Shown({
+  $form.ShowInTaskbar = $true
+})
 
 $split = New-Object System.Windows.Forms.SplitContainer
 $split.Dock = "Fill"
@@ -804,8 +881,9 @@ $left.Controls.Add($actionsCard, 0, 2)
 $actionsGrid = New-Object System.Windows.Forms.TableLayoutPanel
 $actionsGrid.Dock = "Fill"
 $actionsGrid.ColumnCount = 1
-$actionsGrid.RowCount = 3
+$actionsGrid.RowCount = 4
 $actionsGrid.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 54)))
+$actionsGrid.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 48)))
 $actionsGrid.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 0)))
 $actionsGrid.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 0)))
 $actionsCard.Controls.Add($actionsGrid)
@@ -824,6 +902,14 @@ $btnOpenLocal = New-Object System.Windows.Forms.Button
 $btnOpenLocal.Text = "Open App"
 $rowStartStop.Controls.Add($btnOpenLocal) | Out-Null
 
+$btnRouteLan = New-Object System.Windows.Forms.Button
+$btnRouteLan.Text = "Use LAN"
+$rowStartStop.Controls.Add($btnRouteLan) | Out-Null
+
+$btnRouteTailscale = New-Object System.Windows.Forms.Button
+$btnRouteTailscale.Text = "Use Tailscale"
+$rowStartStop.Controls.Add($btnRouteTailscale) | Out-Null
+
 $btnGenQr = New-Object System.Windows.Forms.Button
 $btnGenQr.Text = "Show Pair QR"
 $rowStartStop.Controls.Add($btnGenQr) | Out-Null
@@ -832,11 +918,33 @@ $btnAdvanced = New-Object System.Windows.Forms.Button
 $btnAdvanced.Text = "Advanced"
 $rowStartStop.Controls.Add($btnAdvanced) | Out-Null
 
+$rowRoute = New-Object System.Windows.Forms.FlowLayoutPanel
+$rowRoute.Dock = "Fill"
+$rowRoute.FlowDirection = [System.Windows.Forms.FlowDirection]::LeftToRight
+$rowRoute.WrapContents = $true
+$actionsGrid.Controls.Add($rowRoute, 0, 1)
+
+$lblRoute = New-Object System.Windows.Forms.Label
+$lblRoute.Text = "Pair route:"
+$lblRoute.AutoSize = $true
+$lblRoute.Margin = New-Object System.Windows.Forms.Padding(0, 9, 10, 10)
+$lblRoute.ForeColor = $colorMuted
+$lblRoute.Font = New-Object System.Drawing.Font("Segoe UI Semibold", 9)
+$rowRoute.Controls.Add($lblRoute) | Out-Null
+
+$lblRouteValue = New-Object System.Windows.Forms.Label
+$lblRouteValue.Text = "LAN"
+$lblRouteValue.AutoSize = $true
+$lblRouteValue.Margin = New-Object System.Windows.Forms.Padding(0, 9, 0, 10)
+$lblRouteValue.ForeColor = $colorAccent
+$lblRouteValue.Font = New-Object System.Drawing.Font("Segoe UI Semibold", 9)
+$rowRoute.Controls.Add($lblRouteValue) | Out-Null
+
 $rowOpen = New-Object System.Windows.Forms.FlowLayoutPanel
 $rowOpen.Dock = "Fill"
 $rowOpen.FlowDirection = [System.Windows.Forms.FlowDirection]::LeftToRight
 $rowOpen.WrapContents = $true
-$actionsGrid.Controls.Add($rowOpen, 0, 1)
+$actionsGrid.Controls.Add($rowOpen, 0, 2)
 
 $btnOpenNetwork = New-Object System.Windows.Forms.Button
 $btnOpenNetwork.Text = "Open Network App"
@@ -854,7 +962,7 @@ $rowPair = New-Object System.Windows.Forms.FlowLayoutPanel
 $rowPair.Dock = "Fill"
 $rowPair.FlowDirection = [System.Windows.Forms.FlowDirection]::LeftToRight
 $rowPair.WrapContents = $true
-$actionsGrid.Controls.Add($rowPair, 0, 2)
+$actionsGrid.Controls.Add($rowPair, 0, 3)
 
 $btnCopyPair = New-Object System.Windows.Forms.Button
 $btnCopyPair.Text = "Copy Pair Link"
@@ -980,17 +1088,21 @@ Set-LauncherButtonStyle -Button $btnCopyLastError
   $btnOpenLocal,
   $btnAdvanced,
   $btnOpenNetwork,
-  $btnOpenController,
-  $btnOpenLogs,
-  $btnGenQr,
-  $btnCopyPair,
-  $btnOpenPair,
+$btnOpenController,
+$btnOpenLogs,
+$btnRouteLan,
+$btnRouteTailscale,
+$btnGenQr,
+$btnCopyPair,
+$btnOpenPair,
   $btnCopyLogPath,
   $btnCopyLastError
 ) | ForEach-Object { Register-LauncherButtonFeedback -Button $_ }
 $script:launcherButtons = @(
   $btnStart,
   $btnOpenLocal,
+  $btnRouteLan,
+  $btnRouteTailscale,
   $btnAdvanced,
   $btnOpenNetwork,
   $btnOpenController,
@@ -1032,6 +1144,46 @@ function Set-PrimaryActionStyle {
   Reset-LauncherButtonVisual -Button $btnStart
 }
 
+function Set-RouteButtonState {
+  param(
+    [System.Windows.Forms.Button]$Button,
+    [bool]$IsActive,
+    [bool]$IsAvailable
+  )
+  if (-not $Button) { return }
+  if ($IsActive) {
+    Set-LauncherButtonStyle -Button $Button -Primary $true
+  } else {
+    Set-LauncherButtonStyle -Button $Button
+  }
+  Reset-LauncherButtonVisual -Button $Button
+  if (-not $IsAvailable) {
+    $Button.Enabled = $false
+    $Button.ForeColor = $colorMuted
+    $Button.FlatAppearance.BorderColor = [System.Drawing.ColorTranslator]::FromHtml("#355170")
+    $Button.BackColor = [System.Drawing.ColorTranslator]::FromHtml("#08111f")
+  }
+}
+
+function Apply-RouteSelection {
+  param(
+    [string]$Route,
+    [bool]$Busy = $false,
+    [switch]$Persist
+  )
+  $normalized = if ($Route -eq "tailscale") { "tailscale" } else { "lan" }
+  $script:selectedPairRoute = $normalized
+  $activeLabel = if ($normalized -eq "tailscale") { "Tailscale" } else { "LAN" }
+  $lblRouteValue.Text = $activeLabel
+  $lanAvailable = [bool]($script:lastKnownLanIp -and $script:lastKnownLanIp -ne "127.0.0.1")
+  $tailAvailable = [bool]($script:lastKnownTailnetIp)
+  Set-RouteButtonState -Button $btnRouteLan -IsActive:($normalized -eq "lan") -IsAvailable:(($lanAvailable -or -not $tailAvailable) -and (-not $Busy))
+  Set-RouteButtonState -Button $btnRouteTailscale -IsActive:($normalized -eq "tailscale") -IsAvailable:($tailAvailable -and (-not $Busy))
+  if ($Persist) {
+    Save-LauncherState
+  }
+}
+
 function Set-AdvancedVisibility {
   param(
     [bool]$Visible
@@ -1041,12 +1193,13 @@ function Set-AdvancedVisibility {
   $rowPair.Visible = $Visible
   $lblPairLink.Visible = $Visible
   $txtPair.Visible = $Visible
-  $actionsGrid.RowStyles[1].Height = if ($Visible) { 54 } else { 0 }
   $actionsGrid.RowStyles[2].Height = if ($Visible) { 54 } else { 0 }
-  $left.RowStyles[2].Height = if ($Visible) { 180 } else { 76 }
+  $actionsGrid.RowStyles[3].Height = if ($Visible) { 54 } else { 0 }
+  $left.RowStyles[2].Height = if ($Visible) { 234 } else { 124 }
   $left.RowStyles[3].Height = if ($Visible) { 24 } else { 0 }
   $left.RowStyles[4].Height = if ($Visible) { 40 } else { 0 }
   $btnAdvanced.Text = if ($Visible) { "Hide Advanced" } else { "Advanced" }
+  Save-LauncherState
 }
 
 function Clear-PairingState {
@@ -1117,6 +1270,7 @@ function Write-LauncherActionRecord {
     logs_dir = $logsDir
     controller_port = if ($snapshot) { [int]$snapshot.controller_port } else { 0 }
     ui_port = $uiPort
+    selected_pair_route = $script:selectedPairRoute
     local_url = if ($snapshot) { [string]$snapshot.local_url } else { "" }
     network_url = if ($snapshot) { [string]$snapshot.network_url } else { "" }
     session_file = $script:SessionPath
@@ -1200,6 +1354,8 @@ function Refresh-State {
   $script:refreshInProgress = $true
   try {
     $snapshot = Get-LauncherStatusSnapshot
+    $script:lastKnownLanIp = if ($snapshot.lan_ip) { [string]$snapshot.lan_ip } else { "" }
+    $script:lastKnownTailnetIp = if ($snapshot.tailscale_ip) { [string]$snapshot.tailscale_ip } else { "" }
     $stackActive = ($snapshot.controller_on -or $snapshot.session_state -eq "present")
     $pendingAction = [string]$script:pendingRuntimeAction
     if ($pendingAction) {
@@ -1234,11 +1390,12 @@ function Refresh-State {
     }
     Apply-LauncherStatus -Snapshot $snapshot
     $busy = ($script:actionInProgress -or [bool]$script:pendingRuntimeAction)
+    Apply-RouteSelection -Route $script:selectedPairRoute -Busy:$busy
     $btnStart.Enabled = (-not $busy)
     $btnStart.Text = if ($stackActive) { "Stop" } else { "Start" }
     Set-PrimaryActionStyle -IsRunning:$stackActive
     $btnOpenLocal.Enabled = (-not $busy) -and $snapshot.controller_on
-    $btnOpenNetwork.Enabled = (-not $busy) -and $snapshot.controller_on -and ($snapshot.lan_ip -ne "127.0.0.1")
+    $btnOpenNetwork.Enabled = (-not $busy) -and $snapshot.controller_on -and ([bool](Resolve-SelectedRouteHost))
     $btnOpenController.Enabled = (-not $busy) -and $snapshot.controller_on
     $btnOpenLogs.Enabled = (-not $busy)
     $btnGenQr.Enabled = (-not $busy) -and $snapshot.app_built
@@ -1296,11 +1453,16 @@ function Generate-PairQr {
     throw "Could not authenticate launcher session. Open the app locally once, or start the controller so it writes the runtime token file."
   }
 
-  $tailscale = Get-TailscaleIPv4
-  $lan = Get-CachedLanIp
-  $pairHost = if ($tailscale) { $tailscale } elseif ($lan) { $lan } else { "127.0.0.1" }
-  $route = if ($tailscale) { "Tailscale" } elseif ($lan -and $lan -ne "127.0.0.1") { "LAN" } else { "Localhost" }
-  $confidence = if ($tailscale) { "high confidence" } elseif ($lan -and $lan -ne "127.0.0.1") { "medium confidence" } else { "low confidence" }
+  $script:lastKnownTailnetIp = Get-TailscaleIPv4
+  $script:lastKnownLanIp = Get-CachedLanIp
+  $pairHost = Resolve-SelectedRouteHost
+  $route = Resolve-SelectedRouteLabel
+  if ($script:selectedPairRoute -eq "tailscale" -and -not $script:lastKnownTailnetIp) {
+    throw "Tailscale route is unavailable on this laptop right now."
+  }
+  if ($script:selectedPairRoute -eq "lan" -and (-not $script:lastKnownLanIp -or $script:lastKnownLanIp -eq "127.0.0.1")) {
+    throw "LAN route is unavailable on this laptop right now."
+  }
 
   Append-Log "Creating pairing code ($route)..."
   $create = Invoke-Json -Url ("http://127.0.0.1:{0}/auth/pair/create" -f $controllerPort) -Method "POST" -BodyObj @{} -Token "" -Session $authSession
@@ -1322,8 +1484,8 @@ function Generate-PairQr {
   }
   $picQr.Image = $img
   $expires = if ($create.expires_in) { [int]$create.expires_in } else { 0 }
-  $lblQrInfo.Text = "Route: $route ($confidence) | Expires in: ${expires}s"
-  $lblHint.Text = "Scan now. If the phone cannot open it, retry with Tailscale route."
+  $lblQrInfo.Text = "Route: $route | Host: $pairHost | Expires in: ${expires}s"
+  $lblHint.Text = "Scan now. Route stays pinned until you switch it."
   Append-Log "QR ready. Scan from phone/tablet."
 }
 
@@ -1408,7 +1570,7 @@ $btnOpenLocal.Add_Click({
 $btnAdvanced.Add_Click({ Toggle-AdvancedActions })
 $btnOpenNetwork.Add_Click({
   $port = Resolve-LauncherControllerPort
-  $ip = Get-CachedLanIp
+  $ip = Resolve-SelectedRouteHost
   $url = ("http://{0}:{1}/" -f $ip, $port)
   $ok = Open-Url $url
   if ($ok) {
@@ -1417,6 +1579,18 @@ $btnOpenNetwork.Add_Click({
     Append-Log ("Could not open network app: {0}" -f $url) -Level "error" -Action "open-network-app"
   }
   $null = Write-LauncherActionRecord -ActionName "open-network-app" -Ok:$ok -Detail $(if ($ok) { "Opened network app." } else { "Could not open network app." }) -Extra ([pscustomobject]@{ url = $url })
+})
+$btnRouteLan.Add_Click({
+  Apply-RouteSelection -Route "lan" -Persist
+  Append-Log "Preferred pair route set to LAN." -Action "route-lan"
+  $null = Write-LauncherActionRecord -ActionName "route-lan" -Ok:$true -Detail "Preferred pair route set to LAN."
+  Refresh-State -Force
+})
+$btnRouteTailscale.Add_Click({
+  Apply-RouteSelection -Route "tailscale" -Persist
+  Append-Log "Preferred pair route set to Tailscale." -Action "route-tailscale"
+  $null = Write-LauncherActionRecord -ActionName "route-tailscale" -Ok:$true -Detail "Preferred pair route set to Tailscale."
+  Refresh-State -Force
 })
 $btnOpenController.Add_Click({
   $port = Resolve-LauncherControllerPort
@@ -1478,11 +1652,24 @@ $form.Add_Shown({
 })
 
 $script:refreshTimer = New-Object System.Windows.Forms.Timer
-$script:refreshTimer.Interval = 2000
+$script:refreshTimer.Interval = 1200
 $script:refreshTimer.Add_Tick({ Refresh-State })
 $script:refreshTimer.Start()
 
-Set-AdvancedVisibility -Visible:$false
+$launcherState = Read-LauncherState
+if ($launcherState -and $launcherState.preferred_pair_route) {
+  $preferredRoute = ([string]$launcherState.preferred_pair_route).Trim().ToLowerInvariant()
+  if ($preferredRoute -in @("lan", "tailscale")) {
+    $script:selectedPairRoute = $preferredRoute
+  }
+}
+$initialAdvancedVisible = $false
+if ($launcherState -and $null -ne $launcherState.advanced_visible) {
+  try {
+    $initialAdvancedVisible = [bool]$launcherState.advanced_visible
+  } catch {}
+}
+Set-AdvancedVisibility -Visible:$initialAdvancedVisible
 Clear-PairingState
 
 $form.Add_FormClosed({

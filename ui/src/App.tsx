@@ -4235,7 +4235,7 @@ export default function App() {
                       </div>
                     </div>
 
-                    <div className="row output-controls">
+                    <div className="row output-controls session-composer-card">
                       <span className={`badge ${outputFeedState === "live" ? "" : "muted"}`}>
                         Output: {outputFeedState}
                       </span>
@@ -4293,7 +4293,7 @@ export default function App() {
                           </label>
                         </div>
 
-                        <div className="quick-open-card">
+                        <div className="quick-open-card session-image-card">
                           <h3>Image Upload</h3>
                           <p className="small">Upload an image, then choose how to deliver it into your active Codex workflow.</p>
                           <div className="row">
@@ -4445,41 +4445,51 @@ export default function App() {
                         </div>
 
                         <div className="session-action-dock" data-testid="session-action-dock">
-                          <button
-                            type="button"
-                            className="button soft compact"
-                            data-short="REF"
-                            onClick={() => void refreshScreen(selectedSessionInfo.session)}
-                          >
-                            <span className="btn-text">Refresh</span>
-                          </button>
-                          <button type="button" className="button soft compact" data-short="ENT" onClick={() => void onSendEnter()} disabled={sessionBusy}>
-                            <span className="btn-text">Enter</span>
-                          </button>
-                          <button type="button" className="button soft compact" data-short="UP" onClick={() => void onSendArrowKey("up")} disabled={sessionBusy}>
-                            <span className="btn-text">Up</span>
-                          </button>
-                          <button type="button" className="button soft compact" data-short="DN" onClick={() => void onSendArrowKey("down")} disabled={sessionBusy}>
-                            <span className="btn-text">Down</span>
-                          </button>
-                          <button type="button" className="button soft compact" data-short="LT" onClick={() => void onSendArrowKey("left")} disabled={sessionBusy}>
-                            <span className="btn-text">Left</span>
-                          </button>
-                          <button type="button" className="button soft compact" data-short="RT" onClick={() => void onSendArrowKey("right")} disabled={sessionBusy}>
-                            <span className="btn-text">Right</span>
-                          </button>
-                          <button type="button" className="button warn compact" data-short="INT" onClick={() => void onInterrupt()} disabled={sessionBusy}>
-                            <span className="btn-text">Interrupt</span>
-                          </button>
-                          <button type="button" className="button danger compact" data-short="C^C" onClick={() => void onCtrlC()} disabled={sessionBusy}>
-                            <span className="btn-text">Ctrl+C</span>
-                          </button>
-                          <button type="button" className="button danger compact" data-short="CLS" onClick={() => void onCloseSession()} disabled={sessionBusy}>
-                            <span className="btn-text">Close</span>
-                          </button>
+                          <div className="session-action-group session-action-group-wide" role="group" aria-label="Session utility controls">
+                            <button
+                              type="button"
+                              className="button soft compact action-chip"
+                              data-short="REF"
+                              onClick={() => void refreshScreen(selectedSessionInfo.session)}
+                            >
+                              <span className="btn-glyph" aria-hidden="true">↻</span>
+                              <span className="btn-text">Refresh</span>
+                            </button>
+                            <button type="button" className="button soft compact action-chip" data-short="ENT" onClick={() => void onSendEnter()} disabled={sessionBusy}>
+                              <span className="btn-glyph" aria-hidden="true">↵</span>
+                              <span className="btn-text">Enter</span>
+                            </button>
+                          </div>
+                          <div className="arrow-cluster" role="group" aria-label="Session arrow keys">
+                            <span className="arrow-cluster-gap" aria-hidden="true" />
+                            <button type="button" className="button soft compact arrow-key" data-short="UP" aria-label="Up" onClick={() => void onSendArrowKey("up")} disabled={sessionBusy}>
+                              <span className="btn-text" aria-hidden="true">↑</span>
+                            </button>
+                            <span className="arrow-cluster-gap" aria-hidden="true" />
+                            <button type="button" className="button soft compact arrow-key" data-short="LT" aria-label="Left" onClick={() => void onSendArrowKey("left")} disabled={sessionBusy}>
+                              <span className="btn-text" aria-hidden="true">←</span>
+                            </button>
+                            <button type="button" className="button soft compact arrow-key" data-short="DN" aria-label="Down" onClick={() => void onSendArrowKey("down")} disabled={sessionBusy}>
+                              <span className="btn-text" aria-hidden="true">↓</span>
+                            </button>
+                            <button type="button" className="button soft compact arrow-key" data-short="RT" aria-label="Right" onClick={() => void onSendArrowKey("right")} disabled={sessionBusy}>
+                              <span className="btn-text" aria-hidden="true">→</span>
+                            </button>
+                          </div>
+                          <div className="session-action-group" role="group" aria-label="Session safety controls">
+                            <button type="button" className="button warn compact action-chip" data-short="INT" onClick={() => void onInterrupt()} disabled={sessionBusy}>
+                              <span className="btn-text">Interrupt</span>
+                            </button>
+                            <button type="button" className="button danger compact action-chip" data-short="C^C" onClick={() => void onCtrlC()} disabled={sessionBusy}>
+                              <span className="btn-text">Ctrl+C</span>
+                            </button>
+                            <button type="button" className="button danger compact action-chip" data-short="CLS" onClick={() => void onCloseSession()} disabled={sessionBusy}>
+                              <span className="btn-text">Close</span>
+                            </button>
+                          </div>
                         </div>
 
-                        <div className="quick-open-card">
+                        <div className="quick-open-card session-model-card">
                           <h3>Model Selection</h3>
                           <p className="small">Defaults for new sessions. Apply to current session only when you choose.</p>
                           <div className="row">
@@ -5157,101 +5167,137 @@ export default function App() {
                     </strong>
                   </p>
                   <p className="small">{desktopStatus || "Desktop controls are available only on Windows host."}</p>
-                  <div
-                    ref={remoteStageRef}
-                    className={`stream-wrap remote-stage${desktopFullscreen ? " fullscreen-active" : ""}`}
-                    data-remote-gesture="true"
-                    data-testid="remote-stage"
-                  >
-                    <div className="remote-stage-toolbar">
-                      <span className="badge muted">{desktopTrackpadMode ? "Trackpad mode" : "Direct tap mode"}</span>
-                      <span className="badge muted">{desktopFullscreen ? "Fullscreen" : "Windowed"}</span>
+                  <div className="remote-workspace">
+                    <div className="remote-view-stack">
+                      <div
+                        ref={remoteStageRef}
+                        className={`stream-wrap remote-stage${desktopFullscreen ? " fullscreen-active" : ""}`}
+                        data-remote-gesture="true"
+                        data-testid="remote-stage"
+                      >
+                        <div className="remote-stage-toolbar">
+                          <span className="badge muted">{desktopTrackpadMode ? "Trackpad mode" : "Direct tap mode"}</span>
+                          <span className="badge muted">{desktopFullscreen ? "Fullscreen" : "Windowed"}</span>
+                        </div>
+                        <img
+                          ref={desktopFrameRef}
+                          className="desktop-frame"
+                          src={desktopStreamUrl}
+                          alt="Desktop stream"
+                          onClick={(event) => void onDesktopFrameTap(event)}
+                          onContextMenu={(event) => void onDesktopContextMenu(event)}
+                          onWheel={(event) => void onDesktopWheel(event)}
+                          onPointerDown={(event) => void onDesktopPointerDown(event)}
+                          onPointerMove={(event) => void onDesktopPointerMove(event)}
+                          onPointerUp={(event) => void onDesktopPointerUp(event)}
+                        />
+                      </div>
+                      <p className="small">
+                        Live stream stays on in both modes. Fullscreen turns the browser into a tablet-friendly remote stage. Trackpad mode moves first and taps on release; Direct mode clicks exactly where you tap.
+                      </p>
                     </div>
-                    <img
-                      ref={desktopFrameRef}
-                      className="desktop-frame"
-                      src={desktopStreamUrl}
-                      alt="Desktop stream"
-                      onClick={(event) => void onDesktopFrameTap(event)}
-                      onContextMenu={(event) => void onDesktopContextMenu(event)}
-                      onWheel={(event) => void onDesktopWheel(event)}
-                      onPointerDown={(event) => void onDesktopPointerDown(event)}
-                      onPointerMove={(event) => void onDesktopPointerMove(event)}
-                      onPointerUp={(event) => void onDesktopPointerUp(event)}
-                    />
-                  </div>
-                  <p className="small">
-                    Live stream stays on in both modes. Fullscreen turns the browser into a tablet-friendly remote stage. Trackpad mode moves first and taps on release; Direct mode clicks exactly where you tap.
-                  </p>
-                  <div className="remote-control-group">
-                    <h4>Pointer Controls</h4>
-                    <div className="row remote-mouse-controls">
-                      <button type="button" className="button soft compact" data-short="L" onClick={() => void onDesktopClick("left")} disabled={desktopInteractionDisabled}>
-                        <span className="btn-text">Left Click</span>
-                      </button>
-                      <button type="button" className="button soft compact" data-short="R" onClick={() => void onDesktopClick("right")} disabled={desktopInteractionDisabled}>
-                        <span className="btn-text">Right Click</span>
-                      </button>
-                      <button type="button" className="button soft compact" data-short="2X" onClick={() => void onDesktopClick("left", true)} disabled={desktopInteractionDisabled}>
-                        <span className="btn-text">Double</span>
-                      </button>
-                      <button type="button" className="button soft compact" data-short="UP" onClick={() => void onDesktopScroll(-240)} disabled={desktopInteractionDisabled}>
-                        <span className="btn-text">Scroll Up</span>
-                      </button>
-                      <button type="button" className="button soft compact" data-short="DN" onClick={() => void onDesktopScroll(240)} disabled={desktopInteractionDisabled}>
-                        <span className="btn-text">Scroll Down</span>
-                      </button>
-                    </div>
-                  </div>
-                  <div className="remote-control-group">
-                    <h4>Text and Keyboard</h4>
-                    <div className="row remote-text-controls">
-                      <input
-                        type="text"
-                        value={desktopTextInput}
-                        onChange={(event) => setDesktopTextInput(event.target.value)}
-                        placeholder="Type text on desktop"
-                        disabled={desktopInteractionDisabled}
-                      />
-                      <button type="button" className="button soft compact" data-short="SEND" onClick={() => void onDesktopSendText()} disabled={desktopInteractionDisabled || !desktopTextInput}>
-                        <span className="btn-text">Send Text</span>
-                      </button>
-                      <button type="button" className="button soft compact" data-short="PASTE" onClick={() => void onDesktopPasteClipboard()} disabled={desktopInteractionDisabled}>
-                        <span className="btn-text">Paste Clipboard</span>
-                      </button>
-                    </div>
-                    <div className="row remote-key-controls">
-                      <select value={desktopKeyInput} onChange={(event) => setDesktopKeyInput(event.target.value)} disabled={desktopInteractionDisabled}>
-                        <option value="enter">Enter</option>
-                        <option value="backspace">Backspace</option>
-                        <option value="delete">Delete</option>
-                        <option value="esc">Esc</option>
-                        <option value="tab">Tab</option>
-                        <option value="up">Up</option>
-                        <option value="down">Down</option>
-                        <option value="left">Left</option>
-                        <option value="right">Right</option>
-                        <option value="alt+tab">Alt+Tab</option>
-                        <option value="ctrl+a">Ctrl+A</option>
-                        <option value="ctrl+c">Ctrl+C</option>
-                        <option value="ctrl+v">Ctrl+V</option>
-                      </select>
-                      <button type="button" className="button soft compact" data-short="KEY" onClick={() => void onDesktopSendKey()} disabled={desktopInteractionDisabled}>
-                        <span className="btn-text">Send Key</span>
-                      </button>
-                    </div>
-                    <div className="row remote-key-controls">
-                      {["tab", "esc", "enter", "alt+tab", "ctrl+c", "ctrl+v"].map((key) => (
-                        <button
-                          key={key}
-                          type="button"
-                          className="button soft compact"
-                          onClick={() => void onDesktopSendQuickKey(key)}
-                          disabled={desktopInteractionDisabled}
-                        >
-                          {key}
-                        </button>
-                      ))}
+
+                    <div className="remote-control-stack">
+                      <div className="remote-control-group">
+                        <h4>Pointer Controls</h4>
+                        <div className="row remote-mouse-controls">
+                          <button type="button" className="button soft compact action-chip" data-short="L" onClick={() => void onDesktopClick("left")} disabled={desktopInteractionDisabled}>
+                            <span className="btn-text">Left Click</span>
+                          </button>
+                          <button type="button" className="button soft compact action-chip" data-short="R" onClick={() => void onDesktopClick("right")} disabled={desktopInteractionDisabled}>
+                            <span className="btn-text">Right Click</span>
+                          </button>
+                          <button type="button" className="button soft compact action-chip" data-short="2X" onClick={() => void onDesktopClick("left", true)} disabled={desktopInteractionDisabled}>
+                            <span className="btn-text">Double</span>
+                          </button>
+                          <button type="button" className="button soft compact action-chip" data-short="UP" onClick={() => void onDesktopScroll(-240)} disabled={desktopInteractionDisabled}>
+                            <span className="btn-text">Scroll Up</span>
+                          </button>
+                          <button type="button" className="button soft compact action-chip" data-short="DN" onClick={() => void onDesktopScroll(240)} disabled={desktopInteractionDisabled}>
+                            <span className="btn-text">Scroll Down</span>
+                          </button>
+                        </div>
+                      </div>
+                      <div className="remote-control-group">
+                        <h4>Text and Keyboard</h4>
+                        <div className="row remote-text-controls">
+                          <input
+                            type="text"
+                            value={desktopTextInput}
+                            onChange={(event) => setDesktopTextInput(event.target.value)}
+                            placeholder="Type text on desktop"
+                            disabled={desktopInteractionDisabled}
+                          />
+                          <button type="button" className="button soft compact action-chip" data-short="SEND" onClick={() => void onDesktopSendText()} disabled={desktopInteractionDisabled || !desktopTextInput}>
+                            <span className="btn-text">Send Text</span>
+                          </button>
+                          <button type="button" className="button soft compact action-chip" data-short="PASTE" onClick={() => void onDesktopPasteClipboard()} disabled={desktopInteractionDisabled}>
+                            <span className="btn-text">Paste Clipboard</span>
+                          </button>
+                        </div>
+                        <div className="row remote-key-controls">
+                          <select value={desktopKeyInput} onChange={(event) => setDesktopKeyInput(event.target.value)} disabled={desktopInteractionDisabled}>
+                            <option value="enter">Enter</option>
+                            <option value="backspace">Backspace</option>
+                            <option value="delete">Delete</option>
+                            <option value="esc">Esc</option>
+                            <option value="tab">Tab</option>
+                            <option value="up">Up</option>
+                            <option value="down">Down</option>
+                            <option value="left">Left</option>
+                            <option value="right">Right</option>
+                            <option value="alt+tab">Alt+Tab</option>
+                            <option value="ctrl+a">Ctrl+A</option>
+                            <option value="ctrl+c">Ctrl+C</option>
+                            <option value="ctrl+v">Ctrl+V</option>
+                          </select>
+                          <button type="button" className="button soft compact action-chip" data-short="KEY" onClick={() => void onDesktopSendKey()} disabled={desktopInteractionDisabled}>
+                            <span className="btn-glyph" aria-hidden="true">⌨</span>
+                            <span className="btn-text">Send Key</span>
+                          </button>
+                        </div>
+                        <div className="remote-shortcut-grid">
+                          <div className="arrow-cluster" role="group" aria-label="Remote arrow keys">
+                            <span className="arrow-cluster-gap" aria-hidden="true" />
+                            <button type="button" className="button soft compact arrow-key" aria-label="Up" onClick={() => void onDesktopSendQuickKey("up")} disabled={desktopInteractionDisabled}>
+                              <span className="btn-text" aria-hidden="true">↑</span>
+                            </button>
+                            <span className="arrow-cluster-gap" aria-hidden="true" />
+                            <button type="button" className="button soft compact arrow-key" aria-label="Left" onClick={() => void onDesktopSendQuickKey("left")} disabled={desktopInteractionDisabled}>
+                              <span className="btn-text" aria-hidden="true">←</span>
+                            </button>
+                            <button type="button" className="button soft compact arrow-key" aria-label="Down" onClick={() => void onDesktopSendQuickKey("down")} disabled={desktopInteractionDisabled}>
+                              <span className="btn-text" aria-hidden="true">↓</span>
+                            </button>
+                            <button type="button" className="button soft compact arrow-key" aria-label="Right" onClick={() => void onDesktopSendQuickKey("right")} disabled={desktopInteractionDisabled}>
+                              <span className="btn-text" aria-hidden="true">→</span>
+                            </button>
+                          </div>
+                          <div className="remote-quickkeys" role="group" aria-label="Remote quick keys">
+                            <button type="button" className="button soft compact action-chip" onClick={() => void onDesktopSendQuickKey("tab")} disabled={desktopInteractionDisabled}>
+                              <span className="btn-glyph" aria-hidden="true">⇥</span>
+                              <span className="btn-text">Tab</span>
+                            </button>
+                            <button type="button" className="button soft compact action-chip" onClick={() => void onDesktopSendQuickKey("esc")} disabled={desktopInteractionDisabled}>
+                              <span className="btn-glyph" aria-hidden="true">⎋</span>
+                              <span className="btn-text">Esc</span>
+                            </button>
+                            <button type="button" className="button soft compact action-chip" onClick={() => void onDesktopSendQuickKey("enter")} disabled={desktopInteractionDisabled}>
+                              <span className="btn-glyph" aria-hidden="true">↵</span>
+                              <span className="btn-text">Enter</span>
+                            </button>
+                            <button type="button" className="button soft compact action-chip" onClick={() => void onDesktopSendQuickKey("alt+tab")} disabled={desktopInteractionDisabled}>
+                              <span className="btn-text">Alt+Tab</span>
+                            </button>
+                            <button type="button" className="button soft compact action-chip" onClick={() => void onDesktopSendQuickKey("ctrl+c")} disabled={desktopInteractionDisabled}>
+                              <span className="btn-text">Ctrl+C</span>
+                            </button>
+                            <button type="button" className="button soft compact action-chip" onClick={() => void onDesktopSendQuickKey("ctrl+v")} disabled={desktopInteractionDisabled}>
+                              <span className="btn-text">Ctrl+V</span>
+                            </button>
+                          </div>
+                        </div>
+                      </div>
                     </div>
                   </div>
                 </div>

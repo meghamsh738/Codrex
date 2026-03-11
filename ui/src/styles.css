@@ -1095,10 +1095,11 @@ button:active,
 
 .session-main-pane,
 .session-files-pane {
-  display: flex;
-  flex-direction: column;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: 12px;
   min-width: 0;
+  align-items: start;
 }
 
 .session-files-pane {
@@ -1210,6 +1211,7 @@ button:active,
   border-radius: var(--radius-m);
   background: var(--surface-panel);
   padding: 9px;
+  min-width: 0;
 }
 
 .prompt-composer {
@@ -1290,6 +1292,7 @@ button:active,
   flex-direction: column;
   gap: 10px;
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.8);
+  min-width: 0;
 }
 
 .quick-open-card h3 {
@@ -1304,6 +1307,34 @@ button:active,
 
 .session-notes-card textarea {
   min-height: 220px;
+}
+
+.session-composer-card,
+.session-console-card,
+.session-notes-card,
+.session-image-card,
+.session-model-card {
+  min-width: 0;
+}
+
+.session-composer-card {
+  padding: 12px;
+}
+
+.session-image-card,
+.session-model-card {
+  background:
+    linear-gradient(170deg, color-mix(in srgb, var(--surface-soft) 96%, transparent), color-mix(in srgb, var(--surface) 98%, transparent));
+}
+
+.btn-glyph {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 1.05rem;
+  font-size: 1rem;
+  line-height: 1;
+  font-weight: 800;
 }
 
 .section-row {
@@ -1372,18 +1403,73 @@ button:active,
   bottom: auto;
   z-index: auto;
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
-  gap: 9px;
+  grid-template-columns: minmax(0, 1.08fr) auto minmax(0, 1fr);
+  gap: 12px;
+  align-items: center;
   border: 1px solid var(--border);
   border-radius: var(--radius-m);
-  background: color-mix(in srgb, var(--surface) 95%, transparent);
-  backdrop-filter: blur(10px);
-  padding: 9px;
+  background:
+    linear-gradient(165deg, color-mix(in srgb, var(--surface-soft) 96%, transparent), color-mix(in srgb, var(--surface) 98%, transparent));
+  padding: 12px;
   box-shadow: var(--shadow-3);
 }
 
-.session-action-dock .button {
+.session-action-group,
+.remote-quickkeys {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  min-width: 0;
+}
+
+.session-action-group-wide {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.action-chip {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
   width: 100%;
+  min-width: 0;
+  min-height: 44px;
+}
+
+.action-chip .btn-text,
+.arrow-key .btn-text {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.arrow-cluster {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(50px, 56px));
+  grid-template-rows: repeat(2, minmax(46px, 1fr));
+  gap: 8px;
+  align-items: stretch;
+  justify-content: center;
+}
+
+.arrow-cluster-gap {
+  pointer-events: none;
+}
+
+.arrow-key {
+  width: 100%;
+  min-width: 0;
+  padding: 0;
+  font-size: 1.2rem;
+  border-radius: 16px;
+}
+
+.arrow-key .btn-text {
+  font-size: 1.18rem;
+  font-weight: 800;
+  line-height: 1;
 }
 
 .mode-banner {
@@ -1419,6 +1505,7 @@ button:active,
   display: flex;
   flex-direction: column;
   gap: 8px;
+  min-width: 0;
 }
 
 .remote-control-group h4 {
@@ -1433,6 +1520,10 @@ button:active,
 .remote-key-controls .button,
 .remote-text-controls .button {
   min-height: 44px;
+}
+
+.remote-mouse-controls .action-chip {
+  flex: 1 1 132px;
 }
 
 .remote-text-controls {
@@ -1452,6 +1543,40 @@ button:active,
 .remote-key-controls select {
   flex: 2 1 280px;
   min-width: 220px;
+}
+
+.remote-key-controls .action-chip {
+  flex: 1 1 160px;
+}
+
+.remote-workspace {
+  display: grid;
+  grid-template-columns: minmax(0, 1.5fr) minmax(320px, 1fr);
+  gap: 14px;
+  align-items: start;
+}
+
+.remote-view-stack,
+.remote-control-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-width: 0;
+}
+
+.remote-view-stack .remote-stage {
+  padding: 14px;
+}
+
+.remote-shortcut-grid {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 12px;
+  align-items: start;
+}
+
+.remote-quickkeys {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
 }
 
 .remote-power-grid {
@@ -1596,13 +1721,34 @@ button:active,
     grid-template-columns: 1fr;
   }
 
+  .session-main-pane,
+  .remote-workspace {
+    grid-template-columns: 1fr;
+  }
+
   .session-action-dock {
-    grid-template-columns: repeat(6, minmax(44px, 1fr));
+    grid-template-columns: 1fr;
     margin-top: 4px;
     padding: 8px;
     border-radius: 14px;
     box-shadow: none;
     backdrop-filter: none;
+  }
+
+  .session-action-group,
+  .session-action-group-wide,
+  .remote-quickkeys {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .remote-shortcut-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .arrow-cluster {
+    grid-template-columns: repeat(3, minmax(44px, 52px));
+    grid-template-rows: repeat(2, 42px);
+    justify-content: stretch;
   }
 
   .button.compact {
@@ -1629,7 +1775,7 @@ button:active,
   }
 
   .desktop-frame {
-    min-height: 34vh;
+    min-height: 32vh;
     max-height: 66vh;
   }
 
@@ -1651,6 +1797,10 @@ button:active,
   .remote-text-controls .button {
     flex: 1 1 calc(50% - 5px);
     min-width: 0;
+  }
+
+  .session-notes-card textarea {
+    min-height: 180px;
   }
 }
 
@@ -2196,7 +2346,7 @@ button.event-item:hover {
   }
 
   .session-workspace {
-    grid-template-columns: minmax(0, 1.55fr) minmax(320px, 0.95fr);
+    grid-template-columns: minmax(0, 1.72fr) minmax(340px, 1fr);
     align-items: start;
   }
 
@@ -2240,7 +2390,7 @@ button.event-item:hover {
   .session-action-dock {
     position: static;
     bottom: auto;
-    grid-template-columns: repeat(auto-fit, minmax(118px, 1fr));
+    grid-template-columns: minmax(0, 1.08fr) auto minmax(0, 1fr);
     border: 1px solid var(--border);
     background: linear-gradient(170deg, color-mix(in srgb, var(--surface-soft) 95%, transparent), color-mix(in srgb, var(--surface) 96%, transparent));
     backdrop-filter: none;
@@ -2251,5 +2401,54 @@ button.event-item:hover {
     max-width: none;
     align-self: stretch;
     width: 100%;
+  }
+}
+
+@media (min-width: 980px) {
+  .session-main-pane {
+    grid-template-columns: minmax(0, 1.18fr) minmax(300px, 0.9fr);
+  }
+
+  .session-composer-card {
+    grid-column: 1 / -1;
+  }
+
+  .session-console-card {
+    grid-column: 1 / 2;
+    grid-row: 2 / span 3;
+  }
+
+  .session-notes-card {
+    grid-column: 2 / 3;
+    grid-row: 2;
+  }
+
+  .session-image-card {
+    grid-column: 2 / 3;
+    grid-row: 3;
+  }
+
+  .session-model-card {
+    grid-column: 2 / 3;
+    grid-row: 4;
+  }
+
+  .session-action-dock {
+    grid-column: 1 / -1;
+    grid-row: 5;
+  }
+
+  .session-notes-card textarea {
+    min-height: 260px;
+  }
+}
+
+@media (max-width: 1180px) {
+  .remote-workspace {
+    grid-template-columns: 1fr;
+  }
+
+  .remote-shortcut-grid {
+    grid-template-columns: 1fr;
   }
 }
