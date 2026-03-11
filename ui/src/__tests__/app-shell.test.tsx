@@ -451,6 +451,23 @@ describe("app shell tabs", () => {
 
     fireEvent.click(await screen.findByTestId("tab-remote"));
     await screen.findByRole("button", { name: "Disable Control" });
+    fireEvent.click(screen.getByRole("button", { name: "Trackpad: On" }));
+    const streamImage = screen.getByAltText("Desktop stream");
+    Object.defineProperty(streamImage, "getBoundingClientRect", {
+      configurable: true,
+      value: () => ({
+        left: 0,
+        top: 0,
+        width: 960,
+        height: 540,
+        right: 960,
+        bottom: 540,
+        x: 0,
+        y: 0,
+        toJSON: () => ({}),
+      }),
+    });
+    fireEvent.click(streamImage, { clientX: 120, clientY: 80 });
 
     fireEvent.change(screen.getByPlaceholderText("Type text on desktop"), {
       target: { value: "Remote quick note" },
@@ -460,8 +477,55 @@ describe("app shell tabs", () => {
     await waitFor(() => {
       expect(desktopSendTextMock).toHaveBeenCalledWith("Remote quick note");
     });
+    expect(desktopClickMock).toHaveBeenCalledTimes(1);
     expect(desktopSendKeyMock).not.toHaveBeenCalled();
     expect(screen.queryByRole("button", { name: "Send Telegram" })).not.toBeInTheDocument();
+  });
+
+  it("pastes clipboard text without re-clicking the desktop target", async () => {
+    getDesktopInfoMock.mockResolvedValue({
+      ok: true,
+      enabled: true,
+      width: 1920,
+      height: 1080,
+    });
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: {
+        writeText: clipboardWriteTextMock,
+        readText: vi.fn().mockResolvedValue("Clipboard payload"),
+      },
+    });
+
+    render(<App />);
+
+    fireEvent.click(await screen.findByTestId("tab-remote"));
+    await screen.findByRole("button", { name: "Disable Control" });
+    fireEvent.click(screen.getByRole("button", { name: "Trackpad: On" }));
+    const streamImage = screen.getByAltText("Desktop stream");
+    Object.defineProperty(streamImage, "getBoundingClientRect", {
+      configurable: true,
+      value: () => ({
+        left: 0,
+        top: 0,
+        width: 960,
+        height: 540,
+        right: 960,
+        bottom: 540,
+        x: 0,
+        y: 0,
+        toJSON: () => ({}),
+      }),
+    });
+    fireEvent.click(streamImage, { clientX: 140, clientY: 100 });
+    desktopClickMock.mockClear();
+
+    fireEvent.click(screen.getByRole("button", { name: "Paste Clipboard" }));
+
+    await waitFor(() => {
+      expect(desktopSendTextMock).toHaveBeenCalledWith("Clipboard payload");
+    });
+    expect(desktopClickMock).not.toHaveBeenCalled();
   });
 
   it("sends remote arrow quick keys from the tablet control cluster", async () => {

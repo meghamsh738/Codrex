@@ -1573,10 +1573,18 @@ function Start-Stack {
 }
 
 function Stop-Stack {
+  $existingSnapshot = Get-LauncherStatusSnapshot
+  if (-not $existingSnapshot.controller_on -and $existingSnapshot.session_state -ne "present" -and $existingSnapshot.status -eq "stopped") {
+    Append-Log "Codrex is already stopped." -Action "stop"
+    Clear-PairingState
+    return
+  }
   Append-Log "Stopping mobile stack..." -Action "stop"
-  $null = Invoke-RuntimeAction -ActionName "stop"
-  Clear-PairingState
-  Append-Log "Stop complete." -Action "stop"
+  Set-ActionStatus -State "stopping" -Detail "Stopping Codrex runtime..." -ControllerPort $existingSnapshot.controller_port
+  $script:pendingRuntimeAction = "stop"
+  $script:pendingRuntimeActionAt = [DateTime]::UtcNow
+  $helperPid = Start-DetachedRuntimeAction -ActionName "stop"
+  Append-Log ("Stop requested via runtime helper PID {0}." -f $helperPid) -Action "stop"
 }
 
 function Toggle-AdvancedActions {

@@ -14,6 +14,7 @@ import os
 import pathlib
 import re
 import shutil
+import subprocess
 import sys
 import time
 import urllib.error
@@ -101,6 +102,83 @@ def _wsl_nameserver_host() -> str:
     return ""
 
 
+def _read_json_file(path: pathlib.Path) -> Dict[str, Any]:
+    try:
+        raw = path.read_text(encoding="utf-8-sig")
+    except Exception:
+        return {}
+    if not raw.strip():
+        return {}
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _windows_local_appdata_wsl() -> pathlib.Path | None:
+    env_value = (os.environ.get("LOCALAPPDATA") or "").strip()
+    if env_value:
+        converted = _win_to_wsl_path(env_value)
+        candidate = pathlib.Path(converted).expanduser()
+        if candidate.exists():
+            return candidate
+    try:
+        out = subprocess.run(
+            ["cmd.exe", "/c", "echo", "%LocalAppData%"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+        raw = (out.stdout or "").strip()
+        if raw and "%" not in raw:
+            converted = _win_to_wsl_path(raw)
+            candidate = pathlib.Path(converted).expanduser()
+            if candidate.exists():
+                return candidate
+    except Exception:
+        return None
+    return None
+
+
+def _runtime_dir_candidates(config_path: pathlib.Path) -> List[pathlib.Path]:
+    candidates: List[pathlib.Path] = []
+
+    def add(value: pathlib.Path | str) -> None:
+        if not value:
+            return
+        path_value = pathlib.Path(str(value)).expanduser()
+        if path_value not in candidates:
+            candidates.append(path_value)
+
+    runtime_env = (os.environ.get("CODEX_RUNTIME_DIR") or "").strip()
+    if runtime_env:
+        add(_win_to_wsl_path(runtime_env))
+
+    local_appdata = _windows_local_appdata_wsl()
+    if local_appdata:
+        add(local_appdata / "Codrex" / "remote-ui")
+
+    repo_root = config_path.parent
+    add(repo_root / ".runtime")
+
+    return candidates
+
+
+def _load_runtime_controller_state(config_path: pathlib.Path) -> Dict[str, Any]:
+    merged: Dict[str, Any] = {}
+    for runtime_dir in _runtime_dir_candidates(config_path):
+        state_dir = runtime_dir / "state"
+        local_cfg = _read_json_file(state_dir / "controller.config.local.json")
+        session = _read_json_file(state_dir / "mobile.session.json")
+        if local_cfg:
+            merged = _merge_controller_configs(merged, local_cfg)
+        if session:
+            merged = _merge_controller_configs(merged, session)
+    return merged
+
+
 def _controller_reachable(base_url: str, token: str) -> bool:
     base = _normalize_base_url(base_url)
     if not base:
@@ -134,7 +212,17 @@ def _build_controller_candidates(env_base: str, cfg: Dict[str, Any], port: int) 
     if env_base:
         add(env_base)
 
-    for key in ("controller_url", "controllerUrl", "base_url", "baseUrl", "url"):
+    for key in (
+        "controller_url",
+        "controllerUrl",
+        "base_url",
+        "baseUrl",
+        "url",
+        "app_url",
+        "network_app_url",
+        "local_url",
+        "network_url",
+    ):
         v = str(cfg.get(key) or "").strip()
         if v:
             add(v)
@@ -178,7 +266,8 @@ def _get_controller_defaults() -> Tuple[str, str, Dict[str, Any]]:
 
     cfg_main = _read_controller_config(config_path)
     cfg_local = _read_controller_config(local_config_path)
-    cfg = _merge_controller_configs(cfg_main, cfg_local)
+    cfg_runtime = _load_runtime_controller_state(config_path)
+    cfg = _merge_controller_configs(_merge_controller_configs(cfg_main, cfg_local), cfg_runtime)
 
     port = 8787
     try:

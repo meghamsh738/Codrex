@@ -929,7 +929,7 @@ button:active,
 }
 
 .session-list {
-  max-height: min(36vh, 420px);
+  max-height: min(40vh, 500px);
   overflow: auto;
   padding: 8px;
   padding-right: 6px;
@@ -949,8 +949,8 @@ button:active,
 
 .session-card-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-  gap: 10px;
+  grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+  gap: 12px;
 }
 
 .list-tools {
@@ -980,7 +980,7 @@ button:active,
   border: 1px solid var(--border);
   border-radius: var(--radius-m);
   background: linear-gradient(175deg, color-mix(in srgb, var(--surface) 98%, transparent), color-mix(in srgb, var(--surface-soft) 94%, transparent));
-  padding: 11px;
+  padding: 14px;
   cursor: pointer;
   transition: border-color 120ms ease, transform 120ms ease, box-shadow 120ms ease;
 }
@@ -1004,7 +1004,7 @@ button:active,
 }
 
 .session-snippet {
-  font-size: 0.82rem;
+  font-size: 0.88rem;
   line-height: 1.35;
 }
 
@@ -1191,7 +1191,7 @@ button:active,
 }
 
 .session-console-primary {
-  min-height: min(64vh, 780px);
+  min-height: min(68vh, 860px);
 }
 
 .session-console-meta {
@@ -1203,8 +1203,8 @@ button:active,
 }
 
 .session-console {
-  min-height: clamp(360px, 52vh, 720px);
-  max-height: min(68vh, 820px);
+  min-height: clamp(420px, 58vh, 780px);
+  max-height: min(72vh, 880px);
 }
 
 .session-file-list {
@@ -2634,7 +2634,7 @@ button.event-item:hover {
   }
 
   .session-list {
-    max-height: min(34vh, 420px);
+    max-height: min(44vh, 560px);
   }
 
   .run-list,
@@ -2674,7 +2674,11 @@ button.event-item:hover {
   }
 
   .session-console-primary {
-    min-height: min(68vh, 860px);
+    min-height: min(72vh, 920px);
+  }
+
+  .session-console {
+    min-height: clamp(500px, 62vh, 840px);
   }
 
   .session-pane-card {

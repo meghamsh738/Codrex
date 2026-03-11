@@ -3556,21 +3556,22 @@ export default function App() {
       setError("Desktop control is disabled. Enable Desktop first.");
       return;
     }
+    if (!desktopFocusPoint) {
+      setError("Tap the remote desktop once to focus the target app/window first.");
+      return;
+    }
     const text = desktopTextInput;
     if (!text) {
       setError("Desktop text is empty.");
       return;
     }
     try {
-      if (desktopFocusPoint) {
-        await desktopClick({ x: desktopFocusPoint.x, y: desktopFocusPoint.y, button: "left" });
-      }
       const response = await desktopSendText(text);
       if (!response.ok) {
         throw new Error(response.detail || response.error || "Desktop text failed.");
       }
       setDesktopTextInput("");
-      setDesktopStatus("Desktop text sent.");
+      setDesktopStatus(`Typed text into focused app at ${desktopFocusPoint.x}, ${desktopFocusPoint.y}.`);
     } catch (error) {
       setError(`Desktop text failed: ${(error as Error).message}`);
     }
@@ -3579,6 +3580,10 @@ export default function App() {
   const onDesktopPasteClipboard = useCallback(async () => {
     if (!desktopEnabled) {
       setError("Desktop control is disabled. Enable Desktop first.");
+      return;
+    }
+    if (!desktopFocusPoint) {
+      setError("Tap the remote desktop once to focus the target app/window first.");
       return;
     }
     let text = "";
@@ -3598,15 +3603,12 @@ export default function App() {
       return;
     }
     try {
-      if (desktopFocusPoint) {
-        await desktopClick({ x: desktopFocusPoint.x, y: desktopFocusPoint.y, button: "left" });
-      }
       const response = await desktopSendText(text);
       if (!response.ok) {
         throw new Error(response.detail || response.error || "Desktop paste failed.");
       }
       setDesktopTextInput("");
-      setDesktopStatus("Clipboard text sent to desktop.");
+      setDesktopStatus(`Typed clipboard text into focused app at ${desktopFocusPoint.x}, ${desktopFocusPoint.y}.`);
     } catch (error) {
       setError(`Desktop paste failed: ${(error as Error).message}`);
     }

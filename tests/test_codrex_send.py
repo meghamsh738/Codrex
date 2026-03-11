@@ -36,6 +36,7 @@ class CodrexSendConfigTests(unittest.TestCase):
             local_cfg.write_text('{"token": "local-token"}', encoding="utf-8")
 
             with mock.patch.dict(os.environ, {"CODREX_CONTROLLER_CONFIG": str(main_cfg)}, clear=False), \
+                 mock.patch.object(codrex_send, "_windows_local_appdata_wsl", return_value=None), \
                  mock.patch.object(codrex_send, "_build_controller_candidates", return_value=["http://127.0.0.1:8787"]), \
                  mock.patch.object(codrex_send, "_controller_reachable", return_value=True):
                 base, token, cfg = codrex_send._get_controller_defaults()
@@ -59,11 +60,43 @@ class CodrexSendConfigTests(unittest.TestCase):
                     "CODREX_AUTH_TOKEN": "env-token",
                 },
                 clear=False,
-            ), mock.patch.object(codrex_send, "_build_controller_candidates", return_value=["http://127.0.0.1:8787"]), \
+            ), mock.patch.object(codrex_send, "_windows_local_appdata_wsl", return_value=None), \
+                mock.patch.object(codrex_send, "_build_controller_candidates", return_value=["http://127.0.0.1:8787"]), \
                 mock.patch.object(codrex_send, "_controller_reachable", return_value=True):
                 _base, token, _cfg = codrex_send._get_controller_defaults()
 
             self.assertEqual(token, "env-token")
+
+    def test_get_controller_defaults_prefers_runtime_state_urls_and_token(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            main_cfg = root / "controller.config.json"
+            main_cfg.write_text('{"port": 48787, "token": ""}', encoding="utf-8")
+
+            runtime_base = root / "AppData" / "Local"
+            runtime_state = runtime_base / "Codrex" / "remote-ui" / "state"
+            runtime_state.mkdir(parents=True, exist_ok=True)
+            (runtime_state / "controller.config.local.json").write_text(
+                '{"token": "runtime-token"}',
+                encoding="utf-8",
+            )
+            (runtime_state / "mobile.session.json").write_text(
+                '{"controller_port": 48787, "network_app_url": "http://100.64.0.9:48787/"}',
+                encoding="utf-8",
+            )
+
+            with mock.patch.dict(os.environ, {"CODREX_CONTROLLER_CONFIG": str(main_cfg)}, clear=False), \
+                 mock.patch.object(codrex_send, "_windows_local_appdata_wsl", return_value=runtime_base), \
+                 mock.patch.object(
+                     codrex_send,
+                     "_controller_reachable",
+                     side_effect=lambda base, token: base.rstrip("/") == "http://100.64.0.9:48787" and token == "runtime-token",
+                 ):
+                base, token, cfg = codrex_send._get_controller_defaults()
+
+            self.assertEqual(base, "http://100.64.0.9:48787")
+            self.assertEqual(token, "runtime-token")
+            self.assertEqual(cfg.get("network_app_url"), "http://100.64.0.9:48787/")
 
     def test_stage_file_for_outside_root(self):
         with tempfile.TemporaryDirectory() as tmp:
