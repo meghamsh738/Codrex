@@ -64,6 +64,16 @@ function Get-TailscaleIPv4 {
   return ""
 }
 
+function Get-RepoRevision {
+  try {
+    $rev = git -C $root rev-parse --short HEAD 2>$null | Select-Object -First 1
+    if ($rev) {
+      return ([string]$rev).Trim()
+    }
+  } catch {}
+  return ""
+}
+
 function Get-CodrexRuntimeDir {
   param(
     [string]$RepoRoot
@@ -123,6 +133,28 @@ function Get-ProcessByPort([int]$Port) {
     if ($proc) { return $proc }
   }
   return $null
+}
+
+function Get-ControllerProcessesByPort {
+  param(
+    [int]$Port
+  )
+  try {
+    $listeners = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue
+  } catch {
+    return @()
+  }
+  if (-not $listeners) {
+    return @()
+  }
+  $owners = New-Object System.Collections.Generic.List[object]
+  foreach ($entry in ($listeners | Select-Object -Unique OwningProcess)) {
+    $proc = Get-CimInstance Win32_Process -Filter ("ProcessId = {0}" -f $entry.OwningProcess) -ErrorAction SilentlyContinue
+    if ($proc -and $proc.CommandLine -and $proc.CommandLine -match "app\.server:app") {
+      $owners.Add($proc) | Out-Null
+    }
+  }
+  return @($owners | Sort-Object ProcessId -Descending)
 }
 
 function Get-ListeningStateMap {
@@ -389,28 +421,73 @@ function Wait-ForSessionCleared {
 }
 
 function Get-LauncherStatusSnapshot {
-  $payload = Invoke-RuntimeAction -ActionName "status"
-  $repoRoot = if ($payload.repo_root) { [string]$payload.repo_root } else { "" }
-  $repoLabel = if ($repoRoot) { Split-Path -Leaf $repoRoot } else { "n/a" }
+  $cfg = Get-CachedControllerConfig
+  $session = Read-MobileSession
+  $controllerPort = $script:DefaultControllerPort
+  if ($cfg -and $cfg.port) {
+    $controllerPort = [int]$cfg.port
+  }
+  if ($session -and $session.controller_port) {
+    try {
+      $controllerPort = [int]$session.controller_port
+    } catch {}
+  }
+  $owners = @(Get-ControllerProcessesByPort -Port $controllerPort)
+  $controllerOn = ($owners.Count -gt 0)
+  $duplicateControllers = ($owners.Count -gt 1)
+  $appRuntime = if ($controllerOn) { Get-AppRuntime -ControllerPort $controllerPort } else { $null }
+  $appHealth = if ($appRuntime) { $appRuntime } elseif ($controllerOn) { Get-AppHealth -ControllerPort $controllerPort } else { $null }
+  $appBuilt = [bool]($appHealth -and $appHealth.ok -and $appHealth.ui_mode -eq "built")
+  $sessionPresent = [bool]$session
+  $sessionValid = $false
+  if ($sessionPresent -and $session.controller_port) {
+    try {
+      $sessionValid = ([int]$session.controller_port -eq $controllerPort)
+    } catch {}
+  }
+  $status = "stopped"
+  $detail = "No active controller."
+  if ($controllerOn -and $appBuilt -and $sessionValid -and -not $duplicateControllers) {
+    $status = "running"
+    $detail = "Codrex app is ready."
+  } elseif ($controllerOn -and $duplicateControllers) {
+    $status = "recovering"
+    $detail = "Duplicate Codrex controller processes detected."
+  } elseif ($controllerOn -and $appBuilt -and -not $sessionValid) {
+    $status = "recovering"
+    $detail = "Controller is healthy but runtime session state is missing or stale."
+  } elseif ($controllerOn) {
+    $status = "checking"
+    $detail = "Controller is running but app readiness is not confirmed yet."
+  } elseif ($sessionPresent) {
+    $status = "recovering"
+    $detail = "Runtime session file exists without a live controller."
+  }
+  $repoRoot = $root
+  $repoLabel = Split-Path -Leaf $repoRoot
+  $lanIp = Get-CachedLanIp
+  $tailscaleIp = Get-CachedTailscaleIp
+  $localUrl = if ($controllerOn -or $sessionPresent) { "http://127.0.0.1:$controllerPort/" } else { "offline" }
+  $networkUrl = if ($lanIp -and $lanIp -ne "127.0.0.1" -and ($controllerOn -or $sessionPresent)) { "http://$lanIp`:$controllerPort/" } else { "n/a" }
   return [pscustomobject]@{
-    session = $payload.session
-    controller_port = [int]$payload.controller_port
-    controller_on = [bool]$payload.controller_pid
-    app_runtime = $null
-    app_health = $null
-    app_built = [bool]$payload.app_ready
-    app_mode = if ($payload.ui_mode) { [string]$payload.ui_mode } else { "offline" }
-    version = if ($payload.app_version) { [string]$payload.app_version } else { "n/a" }
+    session = $session
+    controller_port = [int]$controllerPort
+    controller_on = [bool]$controllerOn
+    app_runtime = $appRuntime
+    app_health = $appHealth
+    app_built = [bool]$appBuilt
+    app_mode = if ($appHealth -and $appHealth.ui_mode) { [string]$appHealth.ui_mode } else { "offline" }
+    version = if ($appRuntime -and $appRuntime.version) { [string]$appRuntime.version } else { "n/a" }
     repo_root = $repoRoot
     repo_label = $repoLabel
-    repo_rev = if ($payload.repo_rev) { [string]$payload.repo_rev } else { "" }
-    session_state = if ($payload.session_present) { "present" } else { "missing" }
-    local_url = if ($payload.local_url) { [string]$payload.local_url } else { "offline" }
-    network_url = if ($payload.network_url) { [string]$payload.network_url } else { "n/a" }
-    status = if ($payload.status) { [string]$payload.status } else { "stopped" }
-    lan_ip = Get-CachedLanIp
-    tailscale_ip = Get-TailscaleIPv4
-    detail = if ($payload.detail) { [string]$payload.detail } else { "" }
+    repo_rev = Get-CachedRepoRevision
+    session_state = if ($sessionPresent) { "present" } else { "missing" }
+    local_url = $localUrl
+    network_url = $networkUrl
+    status = $status
+    lan_ip = $lanIp
+    tailscale_ip = $tailscaleIp
+    detail = $detail
   }
 }
 
@@ -591,6 +668,9 @@ $script:cachedControllerConfig = $null
 $script:cachedControllerConfigAt = [DateTime]::MinValue
 $script:cachedLanIp = "127.0.0.1"
 $script:cachedLanIpAt = [DateTime]::MinValue
+$script:cachedTailnetIp = ""
+$script:cachedTailnetIpAt = [DateTime]::MinValue
+$script:cachedRepoRevision = ""
 $script:refreshInProgress = $false
 $script:actionInProgress = $false
 $script:refreshTimer = $null
@@ -1339,6 +1419,22 @@ function Get-CachedLanIp {
     $script:cachedLanIpAt = $now.AddSeconds(15)
   }
   return $script:cachedLanIp
+}
+
+function Get-CachedTailscaleIp {
+  $now = Get-Date
+  if (($null -eq $script:cachedTailnetIp) -or ($now -ge $script:cachedTailnetIpAt)) {
+    $script:cachedTailnetIp = Get-TailscaleIPv4
+    $script:cachedTailnetIpAt = $now.AddSeconds(15)
+  }
+  return $script:cachedTailnetIp
+}
+
+function Get-CachedRepoRevision {
+  if (-not $script:cachedRepoRevision) {
+    $script:cachedRepoRevision = Get-RepoRevision
+  }
+  return $script:cachedRepoRevision
 }
 
 function Resolve-LauncherControllerPort {
