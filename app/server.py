@@ -2181,6 +2181,7 @@ VK_SPACE = 0x20
 
 VK_CONTROL = 0x11
 VK_MENU = 0x12  # Alt
+VK_LWIN = 0x5B
 VK_HOME = 0x24
 VK_END = 0x23
 VK_PRIOR = 0x21  # Page Up
@@ -3218,10 +3219,11 @@ def _desktop_send_key(key: str) -> Dict[str, Any]:
         "ctrl+x": ([VK_CONTROL], 0x58),
         "ctrl+z": ([VK_CONTROL], 0x5A),
         "alt+tab": ([VK_MENU], VK_TAB),
+        "win+tab": ([VK_LWIN], VK_TAB),
     }
     if k in native_combos:
         mods, vk = native_combos[k]
-        _send_vk_combo(mods, vk, extended=(k == "alt+tab"))
+        _send_vk_combo(mods, vk, extended=(k in {"alt+tab", "win+tab"}))
         return {"exit_code": 0, "stdout": "", "stderr": "", "mode": "native_combo", "key": k}
 
     # Fallback to SendKeys for uncommon special-key specs.
@@ -3230,7 +3232,7 @@ def _desktop_send_key(key: str) -> Dict[str, Any]:
     }
     spec = ps_key_map.get(k)
     if not spec:
-        raise HTTPException(status_code=400, detail="Unsupported key. Try: enter, esc, tab, arrows, ctrl+c.")
+        raise HTTPException(status_code=400, detail="Unsupported key. Try: enter, esc, tab, arrows, win+tab, ctrl+c.")
     script = "Add-Type -AssemblyName System.Windows.Forms; " + f"[System.Windows.Forms.SendKeys]::SendWait('{spec}')"
     r = _run_powershell(script, timeout_s=8)
     r["mode"] = "powershell_sendkeys"
@@ -4381,6 +4383,7 @@ def legacy_index(request: Request):
     	              <option value="down">Down</option>
     	              <option value="left">Left</option>
     	              <option value="right">Right</option>
+    	              <option value="win+tab">Win+Tab</option>
     	              <option value="alt+tab">Alt+Tab</option>
     	              <option value="ctrl+a">Ctrl+A</option>
     	              <option value="ctrl+c">Ctrl+C</option>
@@ -4445,6 +4448,7 @@ def legacy_index(request: Request):
                 <option value="down">Down</option>
                 <option value="left">Left</option>
                 <option value="right">Right</option>
+                <option value="win+tab">Win+Tab</option>
                 <option value="alt+tab">Alt+Tab</option>
                 <option value="ctrl+a">Ctrl+A</option>
                 <option value="ctrl+c">Ctrl+C</option>

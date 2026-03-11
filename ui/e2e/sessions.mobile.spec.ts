@@ -60,7 +60,8 @@ test.describe("mobile Sessions flow", () => {
     await expect.poll(() => mock.promptRequests[0]?.prompt ?? "").toBe("Summarize the latest build status.");
 
     await page.getByTestId("composer-send-telegram").click();
-    await page.getByRole("menuitem", { name: "Latest Response" }).click();
+    await expect.poll(() => mock.promptRequests.length).toBe(2);
+    await expect.poll(() => mock.promptRequests[1]?.prompt ?? "").toContain("tgsend");
 
     const notesInput = page.getByTestId("session-notes-input");
     await notesInput.fill("Release checklist");

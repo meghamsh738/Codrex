@@ -57,7 +57,6 @@ vi.mock("../api", async (importOriginal) => {
     saveSessionNotes: vi.fn(),
     sendSessionFileToTelegram: vi.fn(),
     sendSessionImage: vi.fn(),
-    sendTelegramText: vi.fn(),
     sendPowerAction: vi.fn(),
     addThreadRecordMessage: vi.fn(),
     createThreadRecord: vi.fn(),
@@ -91,7 +90,6 @@ const createSessionMock = vi.mocked(api.createSessionWithOptions);
 const registerSessionFileMock = vi.mocked(api.registerSessionFile);
 const deleteSessionFileMock = vi.mocked(api.deleteSessionFile);
 const sendSessionFileToTelegramMock = vi.mocked(api.sendSessionFileToTelegram);
-const sendTelegramTextMock = vi.mocked(api.sendTelegramText);
 const createThreadRecordMock = vi.mocked(api.createThreadRecord);
 const updateThreadRecordMock = vi.mocked(api.updateThreadRecord);
 const deleteThreadRecordMock = vi.mocked(api.deleteThreadRecord);
@@ -131,6 +129,7 @@ const uploadSessionFileMock = vi.mocked(api.uploadSessionFile);
 const startCodexExecMock = vi.mocked(api.startCodexExec);
 const setIpcObserverMock = vi.mocked(api.setIpcObserver);
 const uploadWslFileMock = vi.mocked(api.uploadWslFile);
+const clipboardWriteTextMock = vi.fn();
 
 function setupDefaultMocks(): void {
   window.localStorage.removeItem("codrex.ui.controller_base.v1");
@@ -229,10 +228,6 @@ function setupDefaultMocks(): void {
     },
   });
   sendSessionFileToTelegramMock.mockResolvedValue({
-    ok: true,
-    detail: "Sent to Telegram.",
-  });
-  sendTelegramTextMock.mockResolvedValue({
     ok: true,
     detail: "Sent to Telegram.",
   });
@@ -364,6 +359,15 @@ function setupDefaultMocks(): void {
 describe("app shell tabs", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    clipboardWriteTextMock.mockReset();
+    clipboardWriteTextMock.mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: {
+        writeText: clipboardWriteTextMock,
+        readText: vi.fn().mockResolvedValue(""),
+      },
+    });
     setupDefaultMocks();
   });
 
@@ -477,6 +481,28 @@ describe("app shell tabs", () => {
 
     await waitFor(() => {
       expect(desktopSendKeyMock).toHaveBeenCalledWith("up");
+    });
+  });
+
+  it("sends all-tabs and switch-tab quick keys from remote tab", async () => {
+    getDesktopInfoMock.mockResolvedValue({
+      ok: true,
+      enabled: true,
+      width: 1920,
+      height: 1080,
+    });
+    render(<App />);
+
+    fireEvent.click(await screen.findByTestId("tab-remote"));
+    const remotePanel = await screen.findByTestId("tab-panel-remote");
+    await within(remotePanel).findByRole("button", { name: "Disable Control" });
+
+    fireEvent.click(within(remotePanel).getByRole("button", { name: "All Tabs" }));
+    fireEvent.click(within(remotePanel).getByRole("button", { name: "Switch Tab" }));
+
+    await waitFor(() => {
+      expect(desktopSendKeyMock).toHaveBeenCalledWith("win+tab");
+      expect(desktopSendKeyMock).toHaveBeenCalledWith("alt+tab");
     });
   });
 
@@ -964,7 +990,7 @@ describe("app shell tabs", () => {
     });
   });
 
-  it("sends the latest response to telegram from the composer shortcut", async () => {
+  it("appends a Telegram helper instruction to the current draft and sends it immediately", async () => {
     getAuthStatusMock.mockResolvedValue({
       ok: true,
       auth_required: true,
@@ -988,20 +1014,87 @@ describe("app shell tabs", () => {
       ok: true,
       configured: true,
     });
+    listSessionFilesMock.mockResolvedValue({
+      ok: true,
+      items: [
+        {
+          id: "sf_abc",
+          title: "Result Plot",
+          file_name: "result.png",
+          mime_type: "image/png",
+          size_bytes: 2048,
+          created_at: Date.now(),
+          expires_at: Date.now() + 24 * 3600 * 1000,
+          created_by: "session:codex_demo",
+          is_image: true,
+          item_kind: "file",
+          wsl_path: "/home/megha/codrex-work/output/result.png",
+          download_url: "/codex/session/codex_demo/files/sf_abc/download",
+        },
+      ],
+    });
+
+    render(<App />);
+
+    fireEvent.click(await screen.findByTestId("session-pane-tab-files"));
+    const panel = await screen.findByTestId("session-files-panel");
+    const itemCard = (await within(panel).findByText("/home/megha/codrex-work/output/result.png")).closest(".session-file-item");
+    expect(itemCard).not.toBeNull();
+    fireEvent.click(itemCard as HTMLElement);
+
+    const composer = screen.getByPlaceholderText("Type your prompt. Codrex will send Enter + Enter to submit.");
+    fireEvent.change(composer, { target: { value: "Once the plot is ready, review it." } });
+    const telegramButton = await screen.findByTestId("composer-send-telegram");
+    fireEvent.click(telegramButton);
+
+    await waitFor(() => {
+      expect(sendToSessionMock).toHaveBeenCalledWith(
+        "codex_demo",
+        expect.stringContaining("Once the plot is ready, review it."),
+      );
+      expect(sendToSessionMock).toHaveBeenCalledWith(
+        "codex_demo",
+        expect.stringContaining("/home/megha/codrex-work/output/result.png"),
+      );
+      expect(sendToSessionMock).toHaveBeenCalledWith(
+        "codex_demo",
+        expect.stringContaining("tgsend"),
+      );
+    });
+  });
+
+  it("copies notes and latest response with the shared clipboard helper", async () => {
+    getSessionsMock.mockResolvedValue({
+      ok: true,
+      sessions: [
+        {
+          session: "codex_demo",
+          pane_id: "%1",
+          current_command: "codex",
+          cwd: "/home/megha/work",
+          state: "idle",
+          updated_at: Date.now(),
+          snippet: "Assistant ready",
+        },
+      ],
+    });
     getSessionScreenMock.mockResolvedValue({
       ok: true,
       text: "Summary heading\n\nFirst action\nSecond action",
     });
 
     render(<App />);
+    const notesInput = await screen.findByTestId("session-notes-input");
+    fireEvent.change(notesInput, { target: { value: "Release checklist" } });
 
-    await screen.findByText(/Summary heading/);
-    const telegramButton = await screen.findByTestId("composer-send-telegram");
-    fireEvent.click(telegramButton);
-    fireEvent.click(await screen.findByRole("menuitem", { name: "Latest Response" }));
-
+    fireEvent.click(screen.getByRole("button", { name: "Copy Notes" }));
     await waitFor(() => {
-      expect(sendTelegramTextMock).toHaveBeenCalledWith("Summary heading\nFirst action\nSecond action");
+      expect(clipboardWriteTextMock).toHaveBeenCalledWith("Release checklist");
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Copy Latest Response" }));
+    await waitFor(() => {
+      expect(clipboardWriteTextMock).toHaveBeenCalledWith("Summary heading\nFirst action\nSecond action");
     });
   });
 

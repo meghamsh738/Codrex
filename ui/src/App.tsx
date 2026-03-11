@@ -57,7 +57,6 @@ import {
   sendPowerAction,
   sendSessionFileToTelegram,
   sendSessionImage,
-  sendTelegramText,
   sendToPaneKey,
   sendToPane,
   sendToSession,
@@ -94,7 +93,6 @@ type ThemeMode = "system" | "light" | "dark";
 type ReasoningEffort = "minimal" | "low" | "medium" | "high" | "xhigh";
 type SessionViewMode = "grouped" | "flat";
 type SessionWorkspacePane = "notes" | "files" | "setup";
-type ComposerTelegramTarget = "latest-response" | "selected-file" | "newest-file";
 type StreamProfile = "fast" | "balanced" | "battery";
 type TmuxShellProfile = "ubuntu" | "powershell" | "cmd";
 type OutputFeedState = "off" | "polling" | "connecting" | "live" | "error";
@@ -116,6 +114,53 @@ interface AppEventItem {
 interface SessionGroup {
   project: string;
   items: SessionInfo[];
+}
+
+function buildTelegramSendInstruction(targetPath = ""): string {
+  const helperHint = "Use the existing `tgsend` / `codrex-send` helper already available in this session. Do not search for Telegram bot keys or secret files.";
+  const trimmedPath = targetPath.trim();
+  if (trimmedPath) {
+    return [
+      "Send the relevant output to me via Telegram.",
+      `Use this exact file path if it is the correct artifact: \`${trimmedPath}\`.`,
+      helperHint,
+      "After sending, tell me exactly which path you sent.",
+    ].join(" ");
+  }
+  return [
+    "Send the most relevant generated output file from this session to me via Telegram.",
+    helperHint,
+    "If no sendable output file exists yet, tell me that clearly and mention the path you checked.",
+  ].join(" ");
+}
+
+async function copyTextWithFallback(text: string): Promise<void> {
+  if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return;
+    } catch {
+      // Fall back to textarea-based copy when async clipboard is blocked.
+    }
+  }
+  if (typeof document === "undefined") {
+    throw new Error("Clipboard is not available in this context.");
+  }
+  const textarea = document.createElement("textarea");
+  textarea.value = text;
+  textarea.setAttribute("readonly", "true");
+  textarea.style.position = "fixed";
+  textarea.style.left = "-9999px";
+  textarea.style.top = "0";
+  document.body.appendChild(textarea);
+  textarea.focus();
+  textarea.select();
+  textarea.setSelectionRange(0, textarea.value.length);
+  const copied = typeof document.execCommand === "function" ? document.execCommand("copy") : false;
+  document.body.removeChild(textarea);
+  if (!copied) {
+    throw new Error("Clipboard permission is unavailable.");
+  }
 }
 
 interface ChatThread {
@@ -745,7 +790,6 @@ export default function App() {
   const [sessionNotesLoading, setSessionNotesLoading] = useState(false);
   const [sessionNotesBusy, setSessionNotesBusy] = useState(false);
   const [telegramConfigured, setTelegramConfigured] = useState(false);
-  const [composerTelegramOpen, setComposerTelegramOpen] = useState(false);
   const [composerTelegramBusy, setComposerTelegramBusy] = useState(false);
 
   const [threads, setThreads] = useState<ChatThread[]>(() => {
@@ -2141,10 +2185,6 @@ export default function App() {
   }, [sessionFiles]);
 
   useEffect(() => {
-    setComposerTelegramOpen(false);
-  }, [selectedSession, sessionWorkspacePane]);
-
-  useEffect(() => {
     safeStorageSet(STREAM_PROFILE_STORAGE, streamProfile);
   }, [streamProfile]);
 
@@ -2303,14 +2343,11 @@ export default function App() {
         ? "Ready"
         : statusMessage;
   const canSendPrompt = promptText.trim().length > 0;
-  const latestTelegramResponse = latestSessionResponseSnapshot.trim() || (sessionNotesInfo?.last_response_snapshot || "").trim();
   const composerTelegramDisabledReason = !telegramConfigured
     ? "Telegram is not configured."
     : !selectedSession
       ? "Select a session first."
-      : !latestTelegramResponse && !newestSessionFile
-        ? "No latest response or session file is available yet."
-        : "";
+      : "";
   const stopSessionFileSelection = (event: { stopPropagation: () => void }) => {
     event.stopPropagation();
   };
@@ -2601,57 +2638,6 @@ export default function App() {
     setStatus,
   ]);
 
-  const onSendPrompt = useCallback(async () => {
-    if (!selectedSession) {
-      setError("Select a session first.");
-      return;
-    }
-    const userPrompt = promptText.trim();
-    if (!userPrompt) {
-      setError("Prompt cannot be empty.");
-      return;
-    }
-
-    setSessionBusy(true);
-    try {
-      const response = await sendToSession(selectedSession, userPrompt);
-      if (!response.ok) {
-        throw new Error(response.detail || response.error || "Prompt send failed.");
-      }
-      if (response.shared_file || response.session_file) {
-        setPromptText("");
-        setStatus(response.detail || `Attached ${(response.session_file || response.shared_file)?.file_name || "item"} to session files.`);
-        await refreshSessionFiles(selectedSession);
-        await refreshSessions();
-        return;
-      }
-      setPromptText("");
-      const threadId = await ensureThreadForSession(selectedSession, userPrompt);
-      if (threadId) {
-        const message = addThreadMessage(threadId, "user", userPrompt);
-        if (message) {
-          void syncThreadMessage(message);
-        }
-      }
-      setStatus(`Sent prompt to ${selectedSession}.`);
-      await refreshScreen(selectedSession);
-      await refreshSessionFiles(selectedSession);
-      await refreshSessions();
-      window.setTimeout(async () => {
-        try {
-          const snapshot = await getSessionScreen(selectedSession);
-          if (snapshot.ok && snapshot.text && threadId) {
-            captureAssistantSnapshot(selectedSession, snapshot.text, threadId);
-          }
-        } catch {}
-      }, 1200);
-    } catch (error) {
-      setError(`Send failed: ${(error as Error).message}`);
-    } finally {
-      setSessionBusy(false);
-    }
-  }, [addThreadMessage, captureAssistantSnapshot, ensureThreadForSession, promptText, refreshScreen, refreshSessionFiles, refreshSessions, selectedSession, setError, setStatus, syncThreadMessage]);
-
   const onSendEnter = useCallback(async () => {
     if (!selectedSession) {
       setError("Select a session first.");
@@ -2912,7 +2898,7 @@ export default function App() {
       return;
     }
     try {
-      await navigator.clipboard.writeText(path);
+      await copyTextWithFallback(path);
       setLastCopiedSessionPath(path);
       setStatus(`Copied path: ${path}`);
     } catch (error) {
@@ -2974,6 +2960,74 @@ export default function App() {
     }
   }, [selectedSession, setError, setStatus]);
 
+  const submitPromptText = useCallback(async (userPrompt: string, successMessage?: string) => {
+    if (!selectedSession) {
+      setError("Select a session first.");
+      return false;
+    }
+    const normalizedPrompt = userPrompt.trim();
+    if (!normalizedPrompt) {
+      setError("Prompt cannot be empty.");
+      return false;
+    }
+
+    setSessionBusy(true);
+    try {
+      const response = await sendToSession(selectedSession, normalizedPrompt);
+      if (!response.ok) {
+        throw new Error(response.detail || response.error || "Prompt send failed.");
+      }
+      if (response.shared_file || response.session_file) {
+        setPromptText("");
+        setStatus(response.detail || `Attached ${(response.session_file || response.shared_file)?.file_name || "item"} to session files.`);
+        await refreshSessionFiles(selectedSession);
+        await refreshSessions();
+        return true;
+      }
+      setPromptText("");
+      const threadId = await ensureThreadForSession(selectedSession, normalizedPrompt);
+      if (threadId) {
+        const message = addThreadMessage(threadId, "user", normalizedPrompt);
+        if (message) {
+          void syncThreadMessage(message);
+        }
+      }
+      setStatus(successMessage || `Sent prompt to ${selectedSession}.`);
+      await refreshScreen(selectedSession);
+      await refreshSessionFiles(selectedSession);
+      await refreshSessions();
+      window.setTimeout(async () => {
+        try {
+          const snapshot = await getSessionScreen(selectedSession);
+          if (snapshot.ok && snapshot.text && threadId) {
+            captureAssistantSnapshot(selectedSession, snapshot.text, threadId);
+          }
+        } catch {}
+      }, 1200);
+      return true;
+    } catch (error) {
+      setError(`Send failed: ${(error as Error).message}`);
+      return false;
+    } finally {
+      setSessionBusy(false);
+    }
+  }, [
+    addThreadMessage,
+    captureAssistantSnapshot,
+    ensureThreadForSession,
+    refreshScreen,
+    refreshSessionFiles,
+    refreshSessions,
+    selectedSession,
+    setError,
+    setStatus,
+    syncThreadMessage,
+  ]);
+
+  const onSendPrompt = useCallback(async () => {
+    await submitPromptText(promptText);
+  }, [promptText, submitPromptText]);
+
   const onCopyLatestSessionResponse = useCallback(async () => {
     const text = latestSessionResponseSnapshot.trim() || (sessionNotesInfo?.last_response_snapshot || "").trim();
     if (!text) {
@@ -2981,14 +3035,14 @@ export default function App() {
       return;
     }
     try {
-      await navigator.clipboard.writeText(text);
+      await copyTextWithFallback(text);
       setStatus(`Latest response copied: ${text}`);
     } catch (error) {
       setError(`Copy latest response failed: ${(error as Error).message}`);
     }
   }, [latestSessionResponseSnapshot, sessionNotesInfo?.last_response_snapshot, setError, setStatus]);
 
-  const onSendComposerToTelegram = useCallback(async (target: ComposerTelegramTarget) => {
+  const onSendComposerToTelegram = useCallback(async () => {
     if (!selectedSession) {
       setError("Select a session first.");
       return;
@@ -2997,50 +3051,38 @@ export default function App() {
       setError("Telegram is not configured yet.");
       return;
     }
+    const targetFile = selectedSessionFile && selectedSessionFile.item_kind !== "directory"
+      ? selectedSessionFile
+      : newestSessionFile && newestSessionFile.item_kind !== "directory"
+        ? newestSessionFile
+        : null;
+    const telegramInstruction = buildTelegramSendInstruction(targetFile?.wsl_path || "");
+    const existingDraft = promptText.trim();
+    const combinedPrompt = existingDraft ? `${existingDraft}\n\n${telegramInstruction}` : telegramInstruction;
     setComposerTelegramBusy(true);
     try {
-      if (target === "latest-response") {
-        const text = latestSessionResponseSnapshot.trim() || (sessionNotesInfo?.last_response_snapshot || "").trim();
-        if (!text) {
-          throw new Error("No recent Codex response is available to send.");
-        }
-        const response = await sendTelegramText(text);
-        if (!response.ok) {
-          throw new Error(response.detail || response.error || "Telegram send failed.");
-        }
-        setStatus(response.detail || `Sent the latest Codex response from ${selectedSession} to Telegram.`);
-      } else {
-        const targetFile = target === "selected-file" ? selectedSessionFile : newestSessionFile;
-        if (!targetFile) {
-          throw new Error(target === "selected-file" ? "Select a session file first." : "No session files are attached yet.");
-        }
-        if (targetFile.item_kind === "directory") {
-          throw new Error("Folders cannot be sent to Telegram. Pick a file instead.");
-        }
-        const response = await sendSessionFileToTelegram(
-          selectedSession,
-          targetFile.id,
-          targetFile.title || targetFile.file_name,
-        );
-        if (!response.ok) {
-          throw new Error(response.detail || response.error || "Telegram send failed.");
-        }
-        setStatus(response.detail || `Sent ${targetFile.file_name} to Telegram.`);
+      setPromptText(combinedPrompt);
+      const sent = await submitPromptText(
+        combinedPrompt,
+        targetFile
+          ? `Sent Telegram instruction for ${targetFile.file_name}.`
+          : `Sent Telegram instruction to ${selectedSession}.`,
+      );
+      if (!sent) {
+        setPromptText(combinedPrompt);
       }
-      setComposerTelegramOpen(false);
     } catch (error) {
       setError(`Telegram send failed: ${(error as Error).message}`);
     } finally {
       setComposerTelegramBusy(false);
     }
   }, [
-    latestSessionResponseSnapshot,
     newestSessionFile,
+    promptText,
     selectedSession,
     selectedSessionFile,
-    sessionNotesInfo?.last_response_snapshot,
     setError,
-    setStatus,
+    submitPromptText,
     telegramConfigured,
   ]);
 
@@ -3051,7 +3093,7 @@ export default function App() {
       return;
     }
     try {
-      await navigator.clipboard.writeText(text);
+      await copyTextWithFallback(text);
       setStatus("Session notes copied.");
     } catch (error) {
       setError(`Copy notes failed: ${(error as Error).message}`);
@@ -4394,63 +4436,22 @@ export default function App() {
                                 <div className="composer-action-stack">
                                   <button
                                     type="button"
-                                    className={`composer-telegram-btn ${composerTelegramOpen ? "active" : ""}`}
+                                    className="composer-telegram-btn"
                                     data-testid="composer-send-telegram"
                                     aria-label="Send via Telegram"
-                                    aria-haspopup="menu"
-                                    aria-expanded={composerTelegramOpen}
-                                    title={composerTelegramDisabledReason || "Send latest response or a session file to Telegram."}
+                                    title={composerTelegramDisabledReason || "Ask Codex to send the relevant output file via Telegram."}
                                     onClick={() => {
                                       if (composerTelegramDisabledReason) {
                                         setError(composerTelegramDisabledReason);
                                         return;
                                       }
-                                      setComposerTelegramOpen((current) => !current);
+                                      void onSendComposerToTelegram();
                                     }}
                                     disabled={composerTelegramBusy || !!composerTelegramDisabledReason}
                                   >
                                     <span className="composer-telegram-glyph" aria-hidden="true">✈</span>
-                                    <span className="composer-telegram-label">Telegram</span>
+                                    <span className="composer-telegram-label">{composerTelegramBusy ? "Sending..." : "Telegram"}</span>
                                   </button>
-                                  {composerTelegramOpen ? (
-                                    <div className="composer-telegram-menu" role="menu" data-testid="composer-telegram-menu">
-                                      <button
-                                        type="button"
-                                        className="button soft compact button-light is-active"
-                                        role="menuitem"
-                                        onClick={() => void onSendComposerToTelegram("latest-response")}
-                                        disabled={composerTelegramBusy || !latestTelegramResponse}
-                                      >
-                                        Latest Response
-                                      </button>
-                                      <button
-                                        type="button"
-                                        className="button soft compact button-light"
-                                        role="menuitem"
-                                        onClick={() => void onSendComposerToTelegram("selected-file")}
-                                        disabled={
-                                          composerTelegramBusy
-                                          || !selectedSessionFile
-                                          || selectedSessionFile.item_kind === "directory"
-                                        }
-                                      >
-                                        Selected File
-                                      </button>
-                                      <button
-                                        type="button"
-                                        className="button soft compact button-light"
-                                        role="menuitem"
-                                        onClick={() => void onSendComposerToTelegram("newest-file")}
-                                        disabled={
-                                          composerTelegramBusy
-                                          || !newestSessionFile
-                                          || newestSessionFile.item_kind === "directory"
-                                        }
-                                      >
-                                        Newest File
-                                      </button>
-                                    </div>
-                                  ) : null}
                                 </div>
                                 <button
                                   type="button"
@@ -5502,6 +5503,7 @@ export default function App() {
                             <option value="down">Down</option>
                             <option value="left">Left</option>
                             <option value="right">Right</option>
+                            <option value="win+tab">Win+Tab</option>
                             <option value="alt+tab">Alt+Tab</option>
                             <option value="ctrl+a">Ctrl+A</option>
                             <option value="ctrl+c">Ctrl+C</option>
@@ -5542,8 +5544,11 @@ export default function App() {
                               <span className="btn-glyph" aria-hidden="true">↵</span>
                               <span className="btn-text">Enter</span>
                             </button>
+                            <button type="button" className="button soft compact action-chip" onClick={() => void onDesktopSendQuickKey("win+tab")} disabled={desktopInteractionDisabled}>
+                              <span className="btn-text">All Tabs</span>
+                            </button>
                             <button type="button" className="button soft compact action-chip" onClick={() => void onDesktopSendQuickKey("alt+tab")} disabled={desktopInteractionDisabled}>
-                              <span className="btn-text">Alt+Tab</span>
+                              <span className="btn-text">Switch Tab</span>
                             </button>
                             <button type="button" className="button soft compact action-chip" onClick={() => void onDesktopSendQuickKey("ctrl+c")} disabled={desktopInteractionDisabled}>
                               <span className="btn-text">Ctrl+C</span>
