@@ -11,25 +11,34 @@ $root = Split-Path -Parent $PSCommandPath
 Set-Location $root
 
 $runtimeScript = Join-Path $root "tools\windows\codrex-runtime.ps1"
+$buildLauncherScript = Join-Path $root "tools\windows\build-launcher.ps1"
 $launcherCmd = Join-Path $root "Codrex.cmd"
 $logsPath = Join-Path $env:LocalAppData "Codrex\\remote-ui\\logs"
 $summaryLines = New-Object System.Collections.Generic.List[string]
 $setupFailed = $false
 
-function Open-Url {
-  param(
-    [string]$Url
-  )
-  if (-not $Url) { return $false }
-  try {
-    Start-Process -FilePath "explorer.exe" -ArgumentList @($Url) | Out-Null
-    return $true
-  } catch {}
-  try {
-    Start-Process $Url | Out-Null
-    return $true
-  } catch {}
-  return $false
+function Build-DesktopLauncher {
+  if (-not (Test-Path $buildLauncherScript)) {
+    return [pscustomobject]@{
+      built = $false
+      detail = "Launcher build script not found yet."
+    }
+  }
+  Write-Host "Building desktop launcher..."
+  $launcherBuildOutput = @(& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $buildLauncherScript 2>&1 | ForEach-Object { [string]$_ })
+  $launcherBuildExit = if ($LASTEXITCODE -is [int]) { [int]$LASTEXITCODE } else { 0 }
+  if ($launcherBuildExit -ne 0) {
+    return [pscustomobject]@{
+      built = $false
+      detail = (($launcherBuildOutput -join "`n").Trim())
+    }
+  }
+  $launcherExe = (($launcherBuildOutput | Select-Object -Last 1) -as [string]).Trim()
+
+  return [pscustomobject]@{
+    built = $true
+    detail = if ($launcherExe) { "Desktop launcher built: $launcherExe" } else { "Desktop launcher built successfully." }
+  }
 }
 
 try {
@@ -65,6 +74,9 @@ try {
   & $npmCmd install --prefix $uiRoot
   Write-Host "Building UI..."
   & $npmCmd run build --prefix $uiRoot
+
+  $launcherBuild = Build-DesktopLauncher
+  $summaryLines.Add($launcherBuild.detail)
 
   if (-not (Test-Path $runtimeScript)) {
     throw "Missing runtime script at $runtimeScript"
@@ -107,11 +119,7 @@ try {
     Start-Process -FilePath $launcherCmd | Out-Null
     $summaryLines.Add("Launcher opened: $launcherCmd")
   }
-  if (Open-Url -Url $appUrl) {
-    $summaryLines.Add("Browser opened: $appUrl")
-  } else {
-    $summaryLines.Add("Open browser manually: $appUrl")
-  }
+  $summaryLines.Add("Browser not opened automatically. Use Open App from the launcher when you want the laptop UI.")
 } catch {
   $setupFailed = $true
   $summaryLines.Add("Setup failed.")

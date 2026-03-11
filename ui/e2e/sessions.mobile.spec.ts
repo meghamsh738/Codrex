@@ -80,7 +80,8 @@ test.describe("mobile Sessions flow", () => {
 
     await page.getByTestId("composer-send-telegram").click();
     await expect.poll(() => mock.promptRequests.length).toBe(2);
-    await expect.poll(() => mock.promptRequests[1]?.prompt ?? "").toContain('/tgsend "/home/megha/codrex-work/output/release-plot.png"');
+    await expect.poll(() => mock.promptRequests[1]?.prompt ?? "").toContain("Use the existing tgsend / codrex-send helper already available in this session");
+    await expect.poll(() => mock.promptRequests[1]?.prompt ?? "").toContain("/home/megha/codrex-work/output/release-plot.png");
 
     const notesInput = page.getByTestId("session-notes-input");
     await notesInput.fill("Release checklist");

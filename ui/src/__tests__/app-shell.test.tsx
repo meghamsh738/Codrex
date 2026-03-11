@@ -1054,7 +1054,7 @@ describe("app shell tabs", () => {
     });
   });
 
-  it("submits an exact /tgsend command for the selected session file", async () => {
+  it("submits an infer-style Telegram helper prompt with session file hints", async () => {
     getAuthStatusMock.mockResolvedValue({
       ok: true,
       auth_required: true,
@@ -1112,15 +1112,15 @@ describe("app shell tabs", () => {
     await waitFor(() => {
       expect(sendToSessionMock).toHaveBeenCalledWith(
         "codex_demo",
-        expect.stringMatching(/^\/tgsend /),
+        expect.stringContaining("Use the existing tgsend / codrex-send helper already available in this session"),
       );
       expect(sendToSessionMock).toHaveBeenCalledWith(
         "codex_demo",
-        expect.stringContaining('"/home/megha/codrex-work/output/result.png"'),
+        expect.stringContaining("/home/megha/codrex-work/output/result.png"),
       );
       expect(sendToSessionMock).toHaveBeenCalledWith(
         "codex_demo",
-        expect.stringContaining('--caption "Result Plot"'),
+        expect.stringContaining("Do not search for Telegram bot keys or secret files."),
       );
     });
   });

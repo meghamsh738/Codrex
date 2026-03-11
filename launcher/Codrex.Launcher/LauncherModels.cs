@@ -1,0 +1,117 @@
+using System.Text.Json.Serialization;
+
+namespace Codrex.Launcher;
+
+public sealed class LauncherPreferences
+{
+    [JsonPropertyName("preferred_pair_route")]
+    public string PreferredPairRoute { get; set; } = "lan";
+
+    [JsonPropertyName("advanced_visible")]
+    public bool AdvancedVisible { get; set; }
+}
+
+public sealed class RuntimeActionResult
+{
+    [JsonPropertyName("ok")]
+    public bool Ok { get; set; }
+
+    [JsonPropertyName("action")]
+    public string Action { get; set; } = "";
+
+    [JsonPropertyName("status")]
+    public string Status { get; set; } = "";
+
+    [JsonPropertyName("detail")]
+    public string Detail { get; set; } = "";
+
+    [JsonPropertyName("repo_root")]
+    public string RepoRoot { get; set; } = "";
+
+    [JsonPropertyName("repo_rev")]
+    public string RepoRev { get; set; } = "";
+
+    [JsonPropertyName("runtime_dir")]
+    public string RuntimeDir { get; set; } = "";
+
+    [JsonPropertyName("logs_dir")]
+    public string LogsDir { get; set; } = "";
+
+    [JsonPropertyName("controller_port")]
+    public int ControllerPort { get; set; }
+
+    [JsonPropertyName("session_present")]
+    public bool SessionPresent { get; set; }
+
+    [JsonPropertyName("app_ready")]
+    public bool AppReady { get; set; }
+
+    [JsonPropertyName("app_version")]
+    public string AppVersion { get; set; } = "";
+
+    [JsonPropertyName("ui_mode")]
+    public string UiMode { get; set; } = "";
+
+    [JsonPropertyName("local_url")]
+    public string LocalUrl { get; set; } = "";
+
+    [JsonPropertyName("network_url")]
+    public string NetworkUrl { get; set; } = "";
+
+    [JsonPropertyName("action_id")]
+    public string ActionId { get; set; } = "";
+
+    [JsonPropertyName("diagnostic_log_path")]
+    public string DiagnosticLogPath { get; set; } = "";
+
+    [JsonPropertyName("last_action_path")]
+    public string LastActionPath { get; set; } = "";
+
+    [JsonPropertyName("last_error_path")]
+    public string LastErrorPath { get; set; } = "";
+}
+
+public sealed class NetInfoPayload
+{
+    [JsonPropertyName("ok")]
+    public bool Ok { get; set; }
+
+    [JsonPropertyName("lan_ip")]
+    public string LanIp { get; set; } = "";
+
+    [JsonPropertyName("tailscale_ip")]
+    public string TailscaleIp { get; set; } = "";
+}
+
+public sealed class PairCreatePayload
+{
+    [JsonPropertyName("ok")]
+    public bool Ok { get; set; }
+
+    [JsonPropertyName("code")]
+    public string Code { get; set; } = "";
+
+    [JsonPropertyName("expires_in")]
+    public int ExpiresIn { get; set; }
+
+    [JsonPropertyName("detail")]
+    public string Detail { get; set; } = "";
+
+    [JsonPropertyName("error")]
+    public string Error { get; set; } = "";
+}
+
+public sealed class PairingResult
+{
+    public bool Ok { get; set; }
+    public string Detail { get; set; } = "";
+    public string PairLink { get; set; } = "";
+    public string QrImageUrl { get; set; } = "";
+    public int ExpiresIn { get; set; }
+}
+
+public sealed class ControllerConfigData
+{
+    public int Port { get; set; } = 48787;
+    public string Token { get; set; } = "";
+}

@@ -116,17 +116,40 @@ interface SessionGroup {
   items: SessionInfo[];
 }
 
-function buildTelegramSendCommand(targetPath: string, caption = ""): string {
-  const trimmedPath = targetPath.trim();
-  if (!trimmedPath) {
-    return "";
+function buildTelegramInferencePrompt(options: {
+  selectedFile: SharedFileInfo | null;
+  newestFile: SharedFileInfo | null;
+  candidateFiles: SharedFileInfo[];
+}): string {
+  const lines = [
+    "Use the existing tgsend / codrex-send helper already available in this session to send the relevant output to me via Telegram.",
+    "Do not search for Telegram bot keys or secret files.",
+  ];
+
+  if (options.selectedFile?.wsl_path) {
+    lines.push(`Selected session file hint: ${options.selectedFile.wsl_path}`);
   }
-  const parts = ["/tgsend", JSON.stringify(trimmedPath)];
-  const trimmedCaption = caption.trim();
-  if (trimmedCaption) {
-    parts.push("--caption", JSON.stringify(trimmedCaption));
+
+  if (
+    options.newestFile?.wsl_path
+    && options.newestFile.id !== options.selectedFile?.id
+  ) {
+    lines.push(`Newest session file hint: ${options.newestFile.wsl_path}`);
   }
-  return parts.join(" ");
+
+  const fallbackHints = options.candidateFiles
+    .filter((item) => item.wsl_path && item.id !== options.selectedFile?.id && item.id !== options.newestFile?.id)
+    .slice(0, 3)
+    .map((item) => `${item.title || item.file_name}: ${item.wsl_path}`);
+
+  if (fallbackHints.length > 0) {
+    lines.push(`Other recent session file hints:\n- ${fallbackHints.join("\n- ")}`);
+  } else if (!options.selectedFile?.wsl_path && !options.newestFile?.wsl_path) {
+    lines.push("No explicit session file hint is available, so locate the most relevant generated output from this session.");
+  }
+
+  lines.push("If one of the hinted files is the correct artifact, send it. Otherwise locate the correct generated output from this session, send it with the helper, and then tell me exactly which path you sent.");
+  return lines.join("\n\n");
 }
 
 async function copyTextWithFallback(text: string): Promise<void> {
@@ -2343,13 +2366,18 @@ export default function App() {
     : newestSessionFile && newestSessionFile.item_kind !== "directory"
       ? newestSessionFile
       : null;
+  const composerTelegramCandidates = useMemo(
+    () =>
+      [...sessionFiles]
+        .filter((item) => item.item_kind !== "directory" && !!item.wsl_path)
+        .sort((left, right) => (right.created_at || 0) - (left.created_at || 0)),
+    [sessionFiles],
+  );
   const composerTelegramDisabledReason = !telegramConfigured
     ? "Telegram is not configured."
     : !selectedSession
       ? "Select a session first."
-      : !composerTelegramTarget
-        ? "No session file is available to send yet."
-        : "";
+      : "";
   const desktopFocusSummary = desktopFocusPoint
     ? `Focused target: ${desktopFocusPoint.x}, ${desktopFocusPoint.y}`
     : "No desktop target focused yet. Tap the remote desktop once first.";
@@ -3056,26 +3084,22 @@ export default function App() {
       setError("Telegram is not configured yet.");
       return;
     }
-    if (!composerTelegramTarget) {
-      setError("No session file is available to send yet.");
-      return;
-    }
-    const telegramCommand = buildTelegramSendCommand(
-      composerTelegramTarget.wsl_path || "",
-      composerTelegramTarget.title || composerTelegramTarget.file_name || "",
-    );
-    if (!telegramCommand) {
-      setError("Telegram command could not be prepared for the selected file.");
-      return;
-    }
+    const telegramInstruction = buildTelegramInferencePrompt({
+      selectedFile: selectedSessionFile,
+      newestFile: newestSessionFile,
+      candidateFiles: composerTelegramCandidates,
+    });
+    const combinedPrompt = promptText.trim()
+      ? `${promptText.trim()}\n\n${telegramInstruction}`
+      : telegramInstruction;
     setComposerTelegramBusy(true);
     try {
       const sent = await submitPromptText(
-        telegramCommand,
-        `Sent ${composerTelegramTarget.file_name || "file"} to Telegram.`,
+        combinedPrompt,
+        "Sent Telegram instruction to Codex.",
       );
       if (!sent) {
-        setPromptText(telegramCommand);
+        setPromptText(combinedPrompt);
       }
     } catch (error) {
       setError(`Telegram send failed: ${(error as Error).message}`);
@@ -3083,7 +3107,10 @@ export default function App() {
       setComposerTelegramBusy(false);
     }
   }, [
-    composerTelegramTarget,
+    composerTelegramCandidates,
+    newestSessionFile,
+    promptText,
+    selectedSessionFile,
     selectedSession,
     setError,
     submitPromptText,
@@ -4447,7 +4474,7 @@ export default function App() {
                                     aria-label="Send via Telegram"
                                     title={
                                       composerTelegramDisabledReason
-                                      || `Send ${composerTelegramTarget?.file_name || "the selected file"} to Telegram via /tgsend.`
+                                      || `Ask Codex to send ${composerTelegramTarget?.file_name || "the relevant output"} to Telegram with the existing helper.`
                                     }
                                     onClick={() => {
                                       if (composerTelegramDisabledReason) {

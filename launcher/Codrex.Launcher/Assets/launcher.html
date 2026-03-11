@@ -1,0 +1,452 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Codrex Launcher</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        --bg: #07101d;
+        --panel: #0d1a2b;
+        --panel-2: #102036;
+        --border: #234066;
+        --text: #e7eef9;
+        --muted: #96a8c5;
+        --blue: #48a7ff;
+        --green: #39d98a;
+        --amber: #ffb84d;
+        --red: #ff7d7d;
+        --shadow: 0 22px 64px rgba(0, 0, 0, 0.34);
+        --radius: 20px;
+      }
+
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        min-height: 100vh;
+        font-family: "Segoe UI", Inter, system-ui, sans-serif;
+        background:
+          radial-gradient(circle at top right, rgba(72, 167, 255, 0.14), transparent 30%),
+          linear-gradient(180deg, #07101d 0%, #09162a 100%);
+        color: var(--text);
+      }
+
+      .shell {
+        display: grid;
+        grid-template-columns: minmax(0, 1.35fr) 360px;
+        gap: 20px;
+        min-height: 100vh;
+        padding: 24px;
+      }
+
+      .panel {
+        background: linear-gradient(180deg, rgba(13, 26, 43, 0.96), rgba(10, 20, 35, 0.96));
+        border: 1px solid rgba(35, 64, 102, 0.85);
+        border-radius: var(--radius);
+        box-shadow: var(--shadow);
+        min-width: 0;
+      }
+
+      .main {
+        display: grid;
+        gap: 18px;
+        padding: 22px;
+      }
+
+      .hero {
+        display: flex;
+        justify-content: space-between;
+        gap: 16px;
+        align-items: flex-start;
+      }
+
+      .hero h1 {
+        margin: 0;
+        font-size: 1.8rem;
+        font-weight: 700;
+      }
+
+      .hero p {
+        margin: 8px 0 0;
+        color: var(--muted);
+        max-width: 48rem;
+        line-height: 1.45;
+      }
+
+      .status-strip {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px;
+        align-items: center;
+      }
+
+      .light {
+        width: 12px;
+        height: 12px;
+        border-radius: 999px;
+        display: inline-block;
+        box-shadow: 0 0 0 1px rgba(255,255,255,0.08), 0 0 14px currentColor;
+      }
+      .light.ok { color: var(--green); background: var(--green); }
+      .light.busy { color: var(--amber); background: var(--amber); }
+      .light.error { color: var(--red); background: var(--red); }
+      .light.idle { color: #6e7f98; background: #6e7f98; }
+
+      .badge {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        border-radius: 999px;
+        border: 1px solid rgba(72, 167, 255, 0.2);
+        background: rgba(18, 34, 58, 0.72);
+        padding: 8px 12px;
+        font-size: 0.92rem;
+        color: var(--muted);
+      }
+
+      .grid {
+        display: grid;
+        gap: 14px;
+      }
+
+      .controls {
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+      }
+
+      .routes {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+
+      button {
+        appearance: none;
+        border: 1px solid rgba(72, 167, 255, 0.14);
+        background: linear-gradient(180deg, #102846, #0c1f36);
+        color: var(--text);
+        border-radius: 16px;
+        padding: 15px 16px;
+        font-size: 0.98rem;
+        font-weight: 600;
+        cursor: pointer;
+        transition: transform 120ms ease, border-color 120ms ease, background 120ms ease, box-shadow 120ms ease;
+      }
+
+      button:hover:not(:disabled),
+      button:focus-visible:not(:disabled) {
+        outline: none;
+        transform: translateY(-1px);
+        border-color: rgba(72, 167, 255, 0.44);
+        box-shadow: 0 0 0 3px rgba(72, 167, 255, 0.16);
+      }
+
+      button:disabled {
+        opacity: 0.5;
+        cursor: not-allowed;
+      }
+
+      .button-accent {
+        background: linear-gradient(180deg, rgba(72, 167, 255, 0.2), rgba(13, 37, 64, 0.88));
+      }
+
+      .button-warn {
+        background: linear-gradient(180deg, rgba(255, 112, 112, 0.16), rgba(54, 15, 24, 0.86));
+        border-color: rgba(255, 125, 125, 0.2);
+      }
+
+      .button-active {
+        border-color: rgba(72, 167, 255, 0.7);
+        box-shadow: 0 0 0 2px rgba(72, 167, 255, 0.18), 0 0 18px rgba(72, 167, 255, 0.2);
+      }
+
+      .summary-card,
+      .route-card,
+      .detail-card {
+        padding: 18px;
+      }
+
+      .section-title {
+        margin: 0 0 10px;
+        font-size: 1rem;
+        font-weight: 700;
+      }
+
+      .subtle {
+        color: var(--muted);
+        line-height: 1.45;
+        font-size: 0.95rem;
+      }
+
+      .status-card {
+        display: flex;
+        justify-content: space-between;
+        gap: 14px;
+        padding: 18px;
+        align-items: center;
+      }
+
+      .status-card strong {
+        display: block;
+        font-size: 1.04rem;
+      }
+
+      .status-card p {
+        margin: 6px 0 0;
+        color: var(--muted);
+      }
+
+      .meta-grid {
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        gap: 12px;
+      }
+
+      .meta-tile {
+        padding: 14px;
+        border-radius: 14px;
+        border: 1px solid rgba(35, 64, 102, 0.75);
+        background: rgba(8, 16, 28, 0.55);
+      }
+
+      .meta-tile span {
+        display: block;
+        font-size: 0.84rem;
+        color: var(--muted);
+      }
+
+      .meta-tile strong {
+        margin-top: 6px;
+        display: block;
+      }
+
+      .side {
+        display: grid;
+        gap: 18px;
+        padding: 18px;
+        align-content: start;
+      }
+
+      .qr-box {
+        min-height: 320px;
+        display: grid;
+        place-items: center;
+        border: 1px dashed rgba(72, 167, 255, 0.22);
+        border-radius: 20px;
+        background: rgba(4, 10, 18, 0.36);
+        overflow: hidden;
+      }
+
+      .qr-box img {
+        max-width: 100%;
+        height: auto;
+        display: block;
+      }
+
+      .pair-link {
+        width: 100%;
+        padding: 12px 14px;
+        border-radius: 14px;
+        border: 1px solid rgba(35, 64, 102, 0.8);
+        background: rgba(6, 12, 20, 0.92);
+        color: var(--text);
+      }
+
+      .advanced {
+        display: none;
+        gap: 12px;
+      }
+
+      .advanced.visible {
+        display: grid;
+      }
+
+      @media (max-width: 1040px) {
+        .shell {
+          grid-template-columns: 1fr;
+        }
+
+        .controls,
+        .meta-grid {
+          grid-template-columns: repeat(2, minmax(0, 1fr));
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main class="shell">
+      <section class="panel main">
+        <header class="hero">
+          <div>
+            <h1>Codrex Launcher</h1>
+            <p>Use this desktop launcher to start and stop Codrex, pick the pairing route, generate QR codes on demand, and open the local web UI only when you want it.</p>
+          </div>
+          <div class="status-strip">
+            <span class="badge"><span id="statusLight" class="light idle"></span><strong id="statusLabel">Checking</strong></span>
+            <span class="badge">Route <strong id="routeLabel">LAN</strong></span>
+          </div>
+        </header>
+
+        <section class="panel status-card">
+          <div>
+            <strong id="statusHeadline">Checking Codrex runtime...</strong>
+            <p id="statusDetail">Launcher ready.</p>
+          </div>
+          <div class="badge"><span class="light idle" id="busyLight"></span><span id="busyLabel">idle</span></div>
+        </section>
+
+        <section class="meta-grid">
+          <div class="meta-tile"><span>Version</span><strong id="appVersion">n/a</strong></div>
+          <div class="meta-tile"><span>Revision</span><strong id="repoRev">n/a</strong></div>
+          <div class="meta-tile"><span>Controller Port</span><strong id="controllerPort">n/a</strong></div>
+          <div class="meta-tile"><span>Selected Host</span><strong id="selectedHost">n/a</strong></div>
+        </section>
+
+        <section class="grid controls">
+          <button id="startButton" class="button-accent">Start</button>
+          <button id="stopButton" class="button-warn">Stop</button>
+          <button id="openAppButton">Open App</button>
+          <button id="showQrButton">Show Pair QR</button>
+          <button id="openNetworkButton">Open Network App</button>
+          <button id="advancedButton">Advanced</button>
+        </section>
+
+        <section class="grid routes">
+          <button id="lanRouteButton" class="button-active">Use LAN</button>
+          <button id="tailscaleRouteButton">Use Tailscale</button>
+        </section>
+
+        <section class="panel route-card">
+          <h2 class="section-title">Route Details</h2>
+          <p class="subtle" id="routeSummary">LAN route is selected.</p>
+        </section>
+
+        <section id="advancedPanel" class="panel detail-card advanced">
+          <h2 class="section-title">Advanced</h2>
+          <div class="grid controls">
+            <button id="openFallbackButton">Open Fallback</button>
+            <button id="openLogsButton">Open Logs</button>
+            <button id="copyPairLinkButton">Copy Pair Link</button>
+            <button id="copyLogPathButton">Copy Log Path</button>
+            <button id="copyLastErrorButton">Copy Last Error</button>
+          </div>
+          <p class="subtle" id="logPathLine">Logs: n/a</p>
+        </section>
+      </section>
+
+      <aside class="panel side">
+        <div>
+          <h2 class="section-title">Pairing QR</h2>
+          <p class="subtle" id="pairStatus">Press Show Pair QR after Codrex is running.</p>
+        </div>
+        <div class="qr-box" id="qrBox"><span class="subtle">QR will appear here.</span></div>
+        <input id="pairLink" class="pair-link" readonly value="" />
+      </aside>
+    </main>
+
+    <script>
+      const state = {
+        status: "checking",
+        route: "lan",
+        advancedVisible: false,
+        pairLink: "",
+        qrImageUrl: "",
+      };
+
+      const els = {
+        statusLight: document.getElementById("statusLight"),
+        busyLight: document.getElementById("busyLight"),
+        statusLabel: document.getElementById("statusLabel"),
+        routeLabel: document.getElementById("routeLabel"),
+        statusHeadline: document.getElementById("statusHeadline"),
+        statusDetail: document.getElementById("statusDetail"),
+        busyLabel: document.getElementById("busyLabel"),
+        appVersion: document.getElementById("appVersion"),
+        repoRev: document.getElementById("repoRev"),
+        controllerPort: document.getElementById("controllerPort"),
+        selectedHost: document.getElementById("selectedHost"),
+        routeSummary: document.getElementById("routeSummary"),
+        startButton: document.getElementById("startButton"),
+        stopButton: document.getElementById("stopButton"),
+        openAppButton: document.getElementById("openAppButton"),
+        showQrButton: document.getElementById("showQrButton"),
+        openNetworkButton: document.getElementById("openNetworkButton"),
+        advancedButton: document.getElementById("advancedButton"),
+        lanRouteButton: document.getElementById("lanRouteButton"),
+        tailscaleRouteButton: document.getElementById("tailscaleRouteButton"),
+        advancedPanel: document.getElementById("advancedPanel"),
+        openFallbackButton: document.getElementById("openFallbackButton"),
+        openLogsButton: document.getElementById("openLogsButton"),
+        copyPairLinkButton: document.getElementById("copyPairLinkButton"),
+        copyLogPathButton: document.getElementById("copyLogPathButton"),
+        copyLastErrorButton: document.getElementById("copyLastErrorButton"),
+        logPathLine: document.getElementById("logPathLine"),
+        pairStatus: document.getElementById("pairStatus"),
+        qrBox: document.getElementById("qrBox"),
+        pairLink: document.getElementById("pairLink"),
+      };
+
+      function post(type, extra = {}) {
+        window.chrome?.webview?.postMessage({ type, ...extra });
+      }
+
+      function setRoute(route) {
+        post("route", { route });
+      }
+
+      function render(next) {
+        Object.assign(state, next);
+        const tone = state.statusTone || "idle";
+        els.statusLight.className = `light ${tone}`;
+        els.busyLight.className = `light ${tone === "error" ? "error" : state.actionBusy ? "busy" : tone}`;
+        els.statusLabel.textContent = state.status || "checking";
+        els.routeLabel.textContent = (state.route || "lan").toUpperCase();
+        els.statusHeadline.textContent = state.status === "running" ? "Codrex is running." : state.status === "stopped" ? "Codrex is stopped." : "Codrex status update";
+        els.statusDetail.textContent = state.detail || "Launcher ready.";
+        els.busyLabel.textContent = state.actionBusy ? state.actionLabel || "working" : "idle";
+        els.appVersion.textContent = state.appVersion || "n/a";
+        els.repoRev.textContent = state.repoRev || "n/a";
+        els.controllerPort.textContent = state.controllerPort ? String(state.controllerPort) : "n/a";
+        els.selectedHost.textContent = state.routeHost || "n/a";
+        els.routeSummary.textContent = state.route === "tailscale"
+          ? (state.tailscaleAvailable ? `Tailscale route selected: ${state.tailscaleHost}` : "Tailscale route selected, but no Tailscale IP is available.")
+          : (state.lanAvailable ? `LAN route selected: ${state.lanHost}` : "LAN route selected, but no LAN IP is available.");
+        els.startButton.disabled = !state.startEnabled;
+        els.stopButton.disabled = !state.stopEnabled;
+        els.openAppButton.disabled = !state.openAppEnabled;
+        els.showQrButton.disabled = !state.showQrEnabled;
+        els.openNetworkButton.disabled = !state.openNetworkEnabled;
+        els.lanRouteButton.classList.toggle("button-active", state.route === "lan");
+        els.tailscaleRouteButton.classList.toggle("button-active", state.route === "tailscale");
+        els.advancedPanel.classList.toggle("visible", !!state.advancedVisible);
+        els.logPathLine.textContent = state.logsDir ? `Logs: ${state.logsDir}` : "Logs: n/a";
+        els.pairStatus.textContent = state.pairDetail || (state.qrVisible ? "Pairing QR ready." : "Press Show Pair QR after Codrex is running.");
+        els.pairLink.value = state.pairLink || "";
+
+        if (state.qrVisible && state.qrImageUrl) {
+          els.qrBox.innerHTML = `<img alt="Codrex pairing QR" src="${state.qrImageUrl}" />`;
+        } else {
+          els.qrBox.innerHTML = `<span class="subtle">QR will appear here.</span>`;
+        }
+      }
+
+      window.chrome?.webview?.addEventListener("message", (event) => {
+        render(event.data || {});
+      });
+
+      els.startButton.addEventListener("click", () => post("start"));
+      els.stopButton.addEventListener("click", () => post("stop"));
+      els.openAppButton.addEventListener("click", () => post("openApp"));
+      els.showQrButton.addEventListener("click", () => post("showQr"));
+      els.openNetworkButton.addEventListener("click", () => post("openNetworkApp"));
+      els.advancedButton.addEventListener("click", () => post("toggleAdvanced"));
+      els.lanRouteButton.addEventListener("click", () => setRoute("lan"));
+      els.tailscaleRouteButton.addEventListener("click", () => setRoute("tailscale"));
+      els.openFallbackButton.addEventListener("click", () => post("openFallback"));
+      els.openLogsButton.addEventListener("click", () => post("openLogs"));
+      els.copyPairLinkButton.addEventListener("click", () => post("copyPairLink"));
+      els.copyLogPathButton.addEventListener("click", () => post("copyLogPath"));
+      els.copyLastErrorButton.addEventListener("click", () => post("copyLastError"));
+
+      post("ready");
+    </script>
+  </body>
+</html>

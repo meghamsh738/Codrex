@@ -91,12 +91,13 @@ What this does:
 ### 5) Start full mobile stack
 
 ```powershell
-Set-Location "E:\coding projects\codex-remote-ui"
+Set-Location "D:\codex-remote-ui"
 .\Codrex.cmd
 ```
 
 Primary Windows launcher:
 - `Codrex.cmd`
+- `Setup.cmd` builds the WebView2 desktop launcher when .NET 8 SDK is installed on Windows
 
 Expected URLs:
 - App + controller: `http://<your-lan-ip>:<codrex-port>`
@@ -106,7 +107,7 @@ Expected URLs:
 ### 6) Auth and pairing
 
 On laptop browser:
-1. Open the URL shown by `Codrex.cmd` or the launcher. On a clean setup this is usually `http://127.0.0.1:48787`.
+1. Start `Codrex.cmd`, then click `Open App` from the launcher when you want the local browser UI. On a clean setup this is usually `http://127.0.0.1:48787`.
 2. Go to **Pair** tab
 3. Keep **Tailscale** route (default and recommended)
 4. Generate QR
