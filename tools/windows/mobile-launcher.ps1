@@ -392,6 +392,45 @@ function Test-LauncherProcessAlive {
   return $false
 }
 
+function Stop-LauncherProcess {
+  param(
+    [int]$Pid
+  )
+  if ($Pid -le 0) {
+    return $false
+  }
+  try {
+    $proc = Get-Process -Id $Pid -ErrorAction SilentlyContinue
+    if (-not $proc) {
+      return $false
+    }
+    Stop-Process -Id $Pid -Force -ErrorAction Stop
+    return $true
+  } catch {}
+  return $false
+}
+
+function Clear-PendingRuntimeActionState {
+  $script:pendingRuntimeAction = ""
+  $script:pendingRuntimeHelperPid = 0
+  $script:pendingRuntimeActionAt = [DateTime]::MinValue
+}
+
+function Abort-StaleRuntimeHelper {
+  param(
+    [string]$Reason = "launcher-reset"
+  )
+  $helperPid = [int]$script:pendingRuntimeHelperPid
+  $pendingAction = [string]$script:pendingRuntimeAction
+  if ($helperPid -gt 0 -and (Test-LauncherProcessAlive -Pid $helperPid)) {
+    $stopped = Stop-LauncherProcess -Pid $helperPid
+    if ($stopped) {
+      Append-Log ("Stopped stale Codrex runtime helper PID {0} ({1}, reason: {2})." -f $helperPid, $(if ($pendingAction) { $pendingAction } else { "unknown" }), $Reason) -Action "runtime-helper"
+    }
+  }
+  Clear-PendingRuntimeActionState
+}
+
 function Wait-ForPortsReleased {
   param(
     [int[]]$Ports,
@@ -1521,30 +1560,26 @@ function Refresh-State {
       $ageSeconds = [int]([DateTime]::UtcNow - $script:pendingRuntimeActionAt).TotalSeconds
       if ($pendingAction -eq "start") {
         if ($snapshot.status -eq "running" -and -not $helperAlive) {
-          $script:pendingRuntimeAction = ""
-          $script:pendingRuntimeHelperPid = 0
+          Clear-PendingRuntimeActionState
           Append-Log ("Start complete. App ready on port {0} (v{1}). Click Open App to launch the browser UI." -f $snapshot.controller_port, $(if ($snapshot.version) { $snapshot.version } else { "n/a" }))
         } elseif ($ageSeconds -le $script:pendingRuntimeTimeoutSec) {
           $snapshot.status = "starting"
           $snapshot.detail = if ($snapshot.status -eq "running") { "Finalizing Codrex runtime start..." } else { "Waiting for Codrex runtime to report ready..." }
         } else {
-          Append-Log "Start request timed out while waiting for runtime readiness."
-          $script:pendingRuntimeAction = ""
-          $script:pendingRuntimeHelperPid = 0
+          Append-Log "Start request timed out while waiting for runtime readiness." -Level "error" -Action "start"
+          Abort-StaleRuntimeHelper -Reason "start-timeout"
         }
       } elseif ($pendingAction -eq "stop") {
         if ($snapshot.status -eq "stopped" -and -not $helperAlive) {
-          $script:pendingRuntimeAction = ""
-          $script:pendingRuntimeHelperPid = 0
+          Clear-PendingRuntimeActionState
           Clear-PairingState
           Append-Log "Stop complete."
         } elseif ($ageSeconds -le $script:pendingRuntimeTimeoutSec) {
           $snapshot.status = "checking"
           $snapshot.detail = if ($snapshot.status -eq "stopped") { "Finalizing Codrex runtime stop..." } else { "Waiting for Codrex runtime to stop..." }
         } else {
-          Append-Log "Stop request timed out while waiting for runtime shutdown."
-          $script:pendingRuntimeAction = ""
-          $script:pendingRuntimeHelperPid = 0
+          Append-Log "Stop request timed out while waiting for runtime shutdown." -Level "error" -Action "stop"
+          Abort-StaleRuntimeHelper -Reason "stop-timeout"
         }
       }
     }
@@ -1578,6 +1613,9 @@ function Refresh-State {
 }
 
 function Start-Stack {
+  if ([bool]$script:pendingRuntimeAction -or (Test-LauncherProcessAlive -Pid ([int]$script:pendingRuntimeHelperPid))) {
+    Abort-StaleRuntimeHelper -Reason "start-replaced"
+  }
   $existingSnapshot = Get-LauncherStatusSnapshot
   if ($existingSnapshot.controller_on -or $existingSnapshot.session_state -eq "present" -or $existingSnapshot.status -eq "running") {
     Append-Log ("Codrex is already running on port {0}." -f $existingSnapshot.controller_port) -Action "start"
@@ -1586,7 +1624,6 @@ function Start-Stack {
   Append-Log "Starting mobile stack..." -Action "start"
   Set-ActionStatus -State "starting" -Detail "Launching Codrex runtime..." -ControllerPort $existingSnapshot.controller_port
   $script:pendingRuntimeAction = "start"
-  $script:pendingRuntimeHelperPid = 0
   $script:pendingRuntimeActionAt = [DateTime]::UtcNow
   $helperPid = Start-DetachedRuntimeAction -ActionName "start"
   $script:pendingRuntimeHelperPid = $helperPid
@@ -1594,6 +1631,9 @@ function Start-Stack {
 }
 
 function Stop-Stack {
+  if ([bool]$script:pendingRuntimeAction -or (Test-LauncherProcessAlive -Pid ([int]$script:pendingRuntimeHelperPid))) {
+    Abort-StaleRuntimeHelper -Reason "stop-replaced"
+  }
   $existingSnapshot = Get-LauncherStatusSnapshot
   if (-not $existingSnapshot.controller_on -and $existingSnapshot.session_state -ne "present" -and $existingSnapshot.status -eq "stopped") {
     Append-Log "Codrex is already stopped." -Action "stop"
@@ -1603,7 +1643,6 @@ function Stop-Stack {
   Append-Log "Stopping mobile stack..." -Action "stop"
   Set-ActionStatus -State "stopping" -Detail "Stopping Codrex runtime..." -ControllerPort $existingSnapshot.controller_port
   $script:pendingRuntimeAction = "stop"
-  $script:pendingRuntimeHelperPid = 0
   $script:pendingRuntimeActionAt = [DateTime]::UtcNow
   $helperPid = Start-DetachedRuntimeAction -ActionName "stop"
   $script:pendingRuntimeHelperPid = $helperPid
