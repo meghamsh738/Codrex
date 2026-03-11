@@ -310,11 +310,17 @@ function Invoke-RuntimeAction {
     throw "Codrex runtime '$ActionName' returned an empty payload."
   }
   $script:lastRuntimeActionPayload = $payload
-  if ($payload.last_action_path) { $script:lastActionLogPath = [string]$payload.last_action_path }
-  if ($payload.last_error_path) { $script:lastRuntimeErrorPath = [string]$payload.last_error_path }
+  $lastActionProp = $payload.PSObject.Properties["last_action_path"]
+  if ($lastActionProp -and $lastActionProp.Value) {
+    $script:lastActionLogPath = [string]$lastActionProp.Value
+  }
+  $lastErrorProp = $payload.PSObject.Properties["last_error_path"]
+  if ($lastErrorProp -and $lastErrorProp.Value) {
+    $script:lastRuntimeErrorPath = [string]$lastErrorProp.Value
+  }
   if ($exitCode -ne 0 -or (-not $payload.ok)) {
     $detail = if ($payload.detail) { [string]$payload.detail } else { $jsonText }
-    $errorPath = if ($payload.last_error_path) { [string]$payload.last_error_path } else { $script:DiagnosticsLayout.last_error_path }
+    $errorPath = if ($lastErrorProp -and $lastErrorProp.Value) { [string]$lastErrorProp.Value } else { $script:DiagnosticsLayout.last_error_path }
     throw "Codrex runtime '$ActionName' failed. $detail See: $errorPath"
   }
   return $payload
