@@ -1566,11 +1566,10 @@ function Start-Stack {
   }
   Append-Log "Starting mobile stack..." -Action "start"
   Set-ActionStatus -State "starting" -Detail "Launching Codrex runtime..." -ControllerPort $existingSnapshot.controller_port
-  $script:pendingRuntimeAction = ""
-  $payload = Invoke-RuntimeAction -ActionName "start"
-  $port = if ($payload.controller_port) { [int]$payload.controller_port } else { [int]$existingSnapshot.controller_port }
-  $version = if ($payload.app_version) { [string]$payload.app_version } else { "n/a" }
-  Append-Log ("Start complete. App ready on port {0} (v{1}). Click Open App to launch the browser UI." -f $port, $version) -Action "start"
+  $script:pendingRuntimeAction = "start"
+  $script:pendingRuntimeActionAt = [DateTime]::UtcNow
+  $helperPid = Start-DetachedRuntimeAction -ActionName "start"
+  Append-Log ("Start requested via runtime helper PID {0}." -f $helperPid) -Action "start"
 }
 
 function Stop-Stack {

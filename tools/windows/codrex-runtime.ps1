@@ -420,12 +420,41 @@ function Invoke-ScriptCapture {
   if ($Arguments) {
     $invokeArgs += $Arguments
   }
-  $lines = @(& powershell.exe @invokeArgs 2>&1 | ForEach-Object { [string]$_ })
-  $exitCode = if ($LASTEXITCODE -is [int]) { [int]$LASTEXITCODE } else { 0 }
-  return [pscustomobject]@{
-    exit_code = $exitCode
-    lines = @($lines)
-    text = (($lines | Where-Object { $_ -ne $null }) -join "`n").Trim()
+  $stdoutPath = [System.IO.Path]::GetTempFileName()
+  $stderrPath = [System.IO.Path]::GetTempFileName()
+  try {
+    $proc = Start-Process -FilePath "powershell.exe" `
+      -ArgumentList $invokeArgs `
+      -Wait `
+      -PassThru `
+      -WindowStyle Hidden `
+      -RedirectStandardOutput $stdoutPath `
+      -RedirectStandardError $stderrPath
+
+    $lines = New-Object System.Collections.Generic.List[string]
+    foreach ($capturePath in @($stdoutPath, $stderrPath)) {
+      if (-not (Test-Path $capturePath)) {
+        continue
+      }
+      try {
+        foreach ($line in (Get-Content -Path $capturePath -ErrorAction SilentlyContinue)) {
+          $lines.Add([string]$line) | Out-Null
+        }
+      } catch {}
+    }
+    $allLines = @($lines)
+    $exitCode = if ($proc -and $null -ne $proc.ExitCode) { [int]$proc.ExitCode } else { 0 }
+    return [pscustomobject]@{
+      exit_code = $exitCode
+      lines = $allLines
+      text = (($allLines | Where-Object { $_ -ne $null }) -join "`n").Trim()
+    }
+  } finally {
+    foreach ($capturePath in @($stdoutPath, $stderrPath)) {
+      if ($capturePath -and (Test-Path $capturePath)) {
+        Remove-Item -Path $capturePath -Force -ErrorAction SilentlyContinue
+      }
+    }
   }
 }
 
