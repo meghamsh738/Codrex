@@ -1003,6 +1003,14 @@ $btnAdvanced = New-Object System.Windows.Forms.Button
 $btnAdvanced.Text = "Advanced"
 $rowRoute.Controls.Add($btnAdvanced) | Out-Null
 
+$lblRouteInfo = New-Object System.Windows.Forms.Label
+$lblRouteInfo.Text = "Selected: LAN"
+$lblRouteInfo.AutoSize = $true
+$lblRouteInfo.Margin = New-Object System.Windows.Forms.Padding(8, 9, 0, 10)
+$lblRouteInfo.ForeColor = $colorAccent
+$lblRouteInfo.Font = New-Object System.Drawing.Font("Segoe UI Semibold", 9)
+$rowRoute.Controls.Add($lblRouteInfo) | Out-Null
+
 $rowOpen = New-Object System.Windows.Forms.FlowLayoutPanel
 $rowOpen.Dock = "Fill"
 $rowOpen.FlowDirection = [System.Windows.Forms.FlowDirection]::LeftToRight
@@ -1126,6 +1134,7 @@ $lblLog.ForeColor = $colorMuted
 $lblQr.ForeColor = $colorAccent
 $lblQrInfo.ForeColor = $colorText
 $lblHint.ForeColor = $colorMuted
+$lblRouteInfo.ForeColor = $colorAccent
 $txtPair.BackColor = $colorSurfaceSoft
 $txtPair.ForeColor = $colorText
 $txtPair.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
@@ -1234,8 +1243,15 @@ function Apply-RouteSelection {
     [bool]$Busy = $false,
     [switch]$Persist
   )
+  if (-not $Busy) {
+    $script:lastKnownLanIp = Get-CachedLanIp
+    $script:lastKnownTailnetIp = Get-CachedTailscaleIp
+  }
   $normalized = if ($Route -eq "tailscale") { "tailscale" } else { "lan" }
   $script:selectedPairRoute = $normalized
+  $activeLabel = Resolve-SelectedRouteLabel
+  $activeHost = Resolve-SelectedRouteHost
+  $lblRouteInfo.Text = "Selected: $activeLabel ($activeHost)"
   $lanAvailable = [bool]($script:lastKnownLanIp -and $script:lastKnownLanIp -ne "127.0.0.1")
   $tailAvailable = [bool]($script:lastKnownTailnetIp)
   Set-RouteButtonState -Button $btnRouteLan -IsActive:($normalized -eq "lan") -IsAvailable:(($lanAvailable -or -not $tailAvailable) -and (-not $Busy))
@@ -1658,15 +1674,31 @@ $btnOpenNetwork.Add_Click({
   $null = Write-LauncherActionRecord -ActionName "open-network-app" -Ok:$ok -Detail $(if ($ok) { "Opened network app." } else { "Could not open network app." }) -Extra ([pscustomobject]@{ url = $url })
 })
 $btnRouteLan.Add_Click({
+  $script:lastKnownLanIp = Get-CachedLanIp
+  $script:lastKnownTailnetIp = Get-CachedTailscaleIp
   Apply-RouteSelection -Route "lan" -Persist
-  Append-Log "Preferred pair route set to LAN." -Action "route-lan"
-  $null = Write-LauncherActionRecord -ActionName "route-lan" -Ok:$true -Detail "Preferred pair route set to LAN."
+  Append-Log ("Preferred pair route set to LAN ({0})." -f (Resolve-SelectedRouteHost)) -Action "route-lan"
+  $null = Write-LauncherActionRecord -ActionName "route-lan" -Ok:$true -Detail ("Preferred pair route set to LAN ({0})." -f (Resolve-SelectedRouteHost))
   Refresh-State -Force
 })
 $btnRouteTailscale.Add_Click({
+  $script:lastKnownLanIp = Get-CachedLanIp
+  $script:lastKnownTailnetIp = Get-CachedTailscaleIp
+  if (-not $script:lastKnownTailnetIp) {
+    $message = "Tailscale is installed, but no active Tailscale IPv4 is available right now."
+    Append-Log $message -Level "error" -Action "route-tailscale"
+    $null = Write-LauncherActionRecord -ActionName "route-tailscale" -Ok:$false -Detail $message
+    [System.Windows.Forms.MessageBox]::Show(
+      $message,
+      "Codrex",
+      [System.Windows.Forms.MessageBoxButtons]::OK,
+      [System.Windows.Forms.MessageBoxIcon]::Warning
+    ) | Out-Null
+    return
+  }
   Apply-RouteSelection -Route "tailscale" -Persist
-  Append-Log "Preferred pair route set to Tailscale." -Action "route-tailscale"
-  $null = Write-LauncherActionRecord -ActionName "route-tailscale" -Ok:$true -Detail "Preferred pair route set to Tailscale."
+  Append-Log ("Preferred pair route set to Tailscale ({0})." -f (Resolve-SelectedRouteHost)) -Action "route-tailscale"
+  $null = Write-LauncherActionRecord -ActionName "route-tailscale" -Ok:$true -Detail ("Preferred pair route set to Tailscale ({0})." -f (Resolve-SelectedRouteHost))
   Refresh-State -Force
 })
 $btnOpenController.Add_Click({
