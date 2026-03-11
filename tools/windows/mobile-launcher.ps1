@@ -981,22 +981,9 @@ $rowStartStop.Controls.Add($btnStart) | Out-Null
 $btnOpenLocal = New-Object System.Windows.Forms.Button
 $btnOpenLocal.Text = "Open App"
 $rowStartStop.Controls.Add($btnOpenLocal) | Out-Null
-
-$btnRouteLan = New-Object System.Windows.Forms.Button
-$btnRouteLan.Text = "Use LAN"
-$rowStartStop.Controls.Add($btnRouteLan) | Out-Null
-
-$btnRouteTailscale = New-Object System.Windows.Forms.Button
-$btnRouteTailscale.Text = "Use Tailscale"
-$rowStartStop.Controls.Add($btnRouteTailscale) | Out-Null
-
 $btnGenQr = New-Object System.Windows.Forms.Button
 $btnGenQr.Text = "Show Pair QR"
 $rowStartStop.Controls.Add($btnGenQr) | Out-Null
-
-$btnAdvanced = New-Object System.Windows.Forms.Button
-$btnAdvanced.Text = "Advanced"
-$rowStartStop.Controls.Add($btnAdvanced) | Out-Null
 
 $rowRoute = New-Object System.Windows.Forms.FlowLayoutPanel
 $rowRoute.Dock = "Fill"
@@ -1004,21 +991,17 @@ $rowRoute.FlowDirection = [System.Windows.Forms.FlowDirection]::LeftToRight
 $rowRoute.WrapContents = $true
 $actionsGrid.Controls.Add($rowRoute, 0, 1)
 
-$lblRoute = New-Object System.Windows.Forms.Label
-$lblRoute.Text = "Pair route:"
-$lblRoute.AutoSize = $true
-$lblRoute.Margin = New-Object System.Windows.Forms.Padding(0, 9, 10, 10)
-$lblRoute.ForeColor = $colorMuted
-$lblRoute.Font = New-Object System.Drawing.Font("Segoe UI Semibold", 9)
-$rowRoute.Controls.Add($lblRoute) | Out-Null
+$btnRouteLan = New-Object System.Windows.Forms.Button
+$btnRouteLan.Text = "Use LAN"
+$rowRoute.Controls.Add($btnRouteLan) | Out-Null
 
-$lblRouteValue = New-Object System.Windows.Forms.Label
-$lblRouteValue.Text = "LAN"
-$lblRouteValue.AutoSize = $true
-$lblRouteValue.Margin = New-Object System.Windows.Forms.Padding(0, 9, 0, 10)
-$lblRouteValue.ForeColor = $colorAccent
-$lblRouteValue.Font = New-Object System.Drawing.Font("Segoe UI Semibold", 9)
-$rowRoute.Controls.Add($lblRouteValue) | Out-Null
+$btnRouteTailscale = New-Object System.Windows.Forms.Button
+$btnRouteTailscale.Text = "Use Tailscale"
+$rowRoute.Controls.Add($btnRouteTailscale) | Out-Null
+
+$btnAdvanced = New-Object System.Windows.Forms.Button
+$btnAdvanced.Text = "Advanced"
+$rowRoute.Controls.Add($btnAdvanced) | Out-Null
 
 $rowOpen = New-Object System.Windows.Forms.FlowLayoutPanel
 $rowOpen.Dock = "Fill"
@@ -1253,8 +1236,6 @@ function Apply-RouteSelection {
   )
   $normalized = if ($Route -eq "tailscale") { "tailscale" } else { "lan" }
   $script:selectedPairRoute = $normalized
-  $activeLabel = if ($normalized -eq "tailscale") { "Tailscale" } else { "LAN" }
-  $lblRouteValue.Text = $activeLabel
   $lanAvailable = [bool]($script:lastKnownLanIp -and $script:lastKnownLanIp -ne "127.0.0.1")
   $tailAvailable = [bool]($script:lastKnownTailnetIp)
   Set-RouteButtonState -Button $btnRouteLan -IsActive:($normalized -eq "lan") -IsAvailable:(($lanAvailable -or -not $tailAvailable) -and (-not $Busy))
