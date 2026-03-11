@@ -106,6 +106,13 @@ export async function installMockController(
     }),
   );
 
+  await page.route(/\/telegram\/send-text(?:\?.*)?$/, async (route) =>
+    json(route, {
+      ok: true,
+      detail: "Sent to Telegram.",
+    }),
+  );
+
   await page.route(/\/power\/status(?:\?.*)?$/, async (route) =>
     json(route, {
       ok: true,
@@ -234,6 +241,13 @@ export async function installMockController(
       ok: true,
       session: decodeSessionName(route.request().url()),
       items: [],
+    }),
+  );
+
+  await page.route(/\/codex\/session\/[^/]+\/files\/[^/]+\/telegram(?:\?.*)?$/, async (route) =>
+    json(route, {
+      ok: true,
+      detail: "Sent to Telegram.",
     }),
   );
 

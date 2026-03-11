@@ -12,6 +12,7 @@ test.describe("mobile Sessions flow", () => {
 
   test("renders a mobile session, loads output, and sends a prompt", async ({ page }, testInfo) => {
     const mock = await installMockController(page, {
+      telegramConfigured: true,
       sessions: [
         {
           session: "codex_demo",
@@ -57,6 +58,9 @@ test.describe("mobile Sessions flow", () => {
     await expect.poll(() => mock.promptRequests.length).toBe(1);
     await expect.poll(() => mock.promptRequests[0]?.session ?? "").toBe("codex_demo");
     await expect.poll(() => mock.promptRequests[0]?.prompt ?? "").toBe("Summarize the latest build status.");
+
+    await page.getByTestId("composer-send-telegram").click();
+    await page.getByRole("menuitem", { name: "Latest Response" }).click();
 
     const notesInput = page.getByTestId("session-notes-input");
     await notesInput.fill("Release checklist");
@@ -117,7 +121,10 @@ test.describe("mobile Sessions flow", () => {
 
     await page.getByRole("button", { name: /codex_demo/i }).click();
     await page.getByTestId("session-pane-tab-files").click();
+    await expect(page.getByTestId("session-files-panel")).toBeVisible();
     await page.getByTestId("session-pane-tab-setup").click();
+    await expect(page.getByTestId("session-reasoning-select")).toBeVisible();
+    await expect(page.getByTestId("session-setup-panel")).not.toContainText("Model Selection");
     await page.getByTestId("session-pane-tab-notes").click();
 
     const overflow = await page.getByTestId("session-detail").evaluate((node) => ({

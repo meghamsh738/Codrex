@@ -91,6 +91,7 @@ const createSessionMock = vi.mocked(api.createSessionWithOptions);
 const registerSessionFileMock = vi.mocked(api.registerSessionFile);
 const deleteSessionFileMock = vi.mocked(api.deleteSessionFile);
 const sendSessionFileToTelegramMock = vi.mocked(api.sendSessionFileToTelegram);
+const sendTelegramTextMock = vi.mocked(api.sendTelegramText);
 const createThreadRecordMock = vi.mocked(api.createThreadRecord);
 const updateThreadRecordMock = vi.mocked(api.updateThreadRecord);
 const deleteThreadRecordMock = vi.mocked(api.deleteThreadRecord);
@@ -228,6 +229,10 @@ function setupDefaultMocks(): void {
     },
   });
   sendSessionFileToTelegramMock.mockResolvedValue({
+    ok: true,
+    detail: "Sent to Telegram.",
+  });
+  sendTelegramTextMock.mockResolvedValue({
     ok: true,
     detail: "Sent to Telegram.",
   });
@@ -562,7 +567,6 @@ describe("app shell tabs", () => {
       expect(createSessionMock).toHaveBeenCalledWith({
         name: "review-session",
         cwd: "",
-        model: "gpt-5-codex",
         reasoning_effort: "high",
       });
     });
@@ -586,7 +590,6 @@ describe("app shell tabs", () => {
       expect(createSessionMock).toHaveBeenCalledWith({
         name: "resume-session",
         cwd: "",
-        model: "gpt-5-codex",
         reasoning_effort: "high",
         resume_last: true,
       });
@@ -771,7 +774,12 @@ describe("app shell tabs", () => {
     render(<App />);
 
     const notesInput = await screen.findByTestId("session-notes-input");
+    await screen.findByText(/Plan heading/);
+    await waitFor(() => {
+      expect(notesInput).toHaveValue("");
+    });
     fireEvent.change(notesInput, { target: { value: "Ship checklist" } });
+    expect(notesInput).toHaveValue("Ship checklist");
     await waitFor(() => {
       expect(screen.getByRole("button", { name: "Save" })).toBeEnabled();
     });
@@ -947,13 +955,78 @@ describe("app shell tabs", () => {
     render(<App />);
     fireEvent.click(await screen.findByTestId("session-pane-tab-files"));
     const panel = await screen.findByTestId("session-files-panel");
-    await within(panel).findByText("Result Plot");
+    await within(panel).findAllByText("Result Plot");
 
     fireEvent.click(within(panel).getByRole("button", { name: "Send via Telegram" }));
 
     await waitFor(() => {
       expect(sendSessionFileToTelegramMock).toHaveBeenCalledWith("codex_demo", "sf_abc", "Result Plot");
     });
+  });
+
+  it("sends the latest response to telegram from the composer shortcut", async () => {
+    getAuthStatusMock.mockResolvedValue({
+      ok: true,
+      auth_required: true,
+      authenticated: true,
+    });
+    getSessionsMock.mockResolvedValue({
+      ok: true,
+      sessions: [
+        {
+          session: "codex_demo",
+          pane_id: "%1",
+          current_command: "codex",
+          cwd: "/home/megha/work",
+          state: "idle",
+          updated_at: Date.now(),
+          snippet: "Assistant ready",
+        },
+      ],
+    });
+    getTelegramStatusMock.mockResolvedValue({
+      ok: true,
+      configured: true,
+    });
+    getSessionScreenMock.mockResolvedValue({
+      ok: true,
+      text: "Summary heading\n\nFirst action\nSecond action",
+    });
+
+    render(<App />);
+
+    await screen.findByText(/Summary heading/);
+    const telegramButton = await screen.findByTestId("composer-send-telegram");
+    fireEvent.click(telegramButton);
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Latest Response" }));
+
+    await waitFor(() => {
+      expect(sendTelegramTextMock).toHaveBeenCalledWith("Summary heading\nFirst action\nSecond action");
+    });
+  });
+
+  it("shows setup controls without a model selector", async () => {
+    getSessionsMock.mockResolvedValue({
+      ok: true,
+      sessions: [
+        {
+          session: "codex_demo",
+          pane_id: "%1",
+          current_command: "codex",
+          cwd: "/home/megha/work",
+          state: "idle",
+          updated_at: Date.now(),
+          snippet: "Assistant ready",
+        },
+      ],
+    });
+
+    render(<App />);
+    fireEvent.click(await screen.findByTestId("session-pane-tab-setup"));
+
+    expect(await screen.findByTestId("session-setup-panel")).toBeVisible();
+    expect(screen.queryByTestId("session-model-select")).not.toBeInTheDocument();
+    expect(screen.getByTestId("session-reasoning-select")).toBeInTheDocument();
   });
 
   it("keeps session files panel visible when telegram is configured", async () => {
@@ -1009,7 +1082,6 @@ describe("app shell tabs", () => {
       expect(createSessionMock).toHaveBeenCalledWith({
         name: "auto-live-session",
         cwd: "",
-        model: "gpt-5-codex",
         reasoning_effort: "high",
       });
     });
