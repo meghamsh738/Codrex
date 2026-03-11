@@ -92,6 +92,7 @@ type MainTab = "sessions" | "threads" | "remote" | "pair" | "settings" | "debug"
 type ThemeMode = "system" | "light" | "dark";
 type ReasoningEffort = "minimal" | "low" | "medium" | "high" | "xhigh";
 type SessionViewMode = "grouped" | "flat";
+type SessionWorkspacePane = "notes" | "files" | "setup";
 type StreamProfile = "fast" | "balanced" | "battery";
 type TmuxShellProfile = "ubuntu" | "powershell" | "cmd";
 type OutputFeedState = "off" | "polling" | "connecting" | "live" | "error";
@@ -148,6 +149,7 @@ const MODEL_STORAGE = "codrex.ui.model.v1";
 const REASONING_EFFORT_STORAGE = "codrex.ui.reasoning_effort.v1";
 const THEME_MODE_STORAGE = "codrex.ui.theme_mode.v1";
 const SESSION_VIEW_STORAGE = "codrex.ui.session_view_mode.v1";
+const SESSION_WORKSPACE_PANE_STORAGE = "codrex.ui.session_workspace_pane.v1";
 const STREAM_PROFILE_STORAGE = "codrex.ui.stream_profile.v1";
 const STREAM_ENABLED_STORAGE = "codrex.ui.stream_enabled.v1";
 const SWIPE_HINT_SEEN_STORAGE = "codrex.ui.swipe_hint_seen.v1";
@@ -355,6 +357,13 @@ function parseSessionViewMode(raw: string): SessionViewMode {
     return "flat";
   }
   return "grouped";
+}
+
+function parseSessionWorkspacePane(raw: string): SessionWorkspacePane {
+  if (raw === "files" || raw === "setup") {
+    return raw;
+  }
+  return "notes";
 }
 
 function parseStreamProfile(raw: string): StreamProfile {
@@ -695,6 +704,9 @@ export default function App() {
   const [sessionProjectFilter, setSessionProjectFilter] = useState("all");
   const [sessionViewMode, setSessionViewMode] = useState<SessionViewMode>(() =>
     parseSessionViewMode(safeStorageGet(SESSION_VIEW_STORAGE)),
+  );
+  const [sessionWorkspacePane, setSessionWorkspacePane] = useState<SessionWorkspacePane>(() =>
+    parseSessionWorkspacePane(safeStorageGet(SESSION_WORKSPACE_PANE_STORAGE)),
   );
   const [promptText, setPromptText] = useState("");
   const [modelOptions, setModelOptions] = useState<string[]>(FALLBACK_MODELS);
@@ -2125,6 +2137,10 @@ export default function App() {
   }, [sessionViewMode]);
 
   useEffect(() => {
+    safeStorageSet(SESSION_WORKSPACE_PANE_STORAGE, sessionWorkspacePane);
+  }, [sessionWorkspacePane]);
+
+  useEffect(() => {
     safeStorageSet(STREAM_PROFILE_STORAGE, streamProfile);
   }, [streamProfile]);
 
@@ -2220,6 +2236,13 @@ export default function App() {
   const powerWakeWarning = (powerStatus?.wake_warning || "").trim();
   const sessionCountLabel = `${sessions.length} session${sessions.length === 1 ? "" : "s"}`;
   const visibleSessionCountLabel = `${filteredSessions.length} visible`;
+  const sessionWorkspaceTabs: Array<{ key: SessionWorkspacePane; label: string; detail: string }> = [
+    { key: "notes", label: "Notes", detail: "Plans, checkpoints, and captured Codex replies." },
+    { key: "files", label: "Files", detail: "Session attachments, browse, and share paths." },
+    { key: "setup", label: "Setup", detail: "Image delivery and model profile for the active session." },
+  ];
+  const activeSessionWorkspaceTab =
+    sessionWorkspaceTabs.find((tab) => tab.key === sessionWorkspacePane) || sessionWorkspaceTabs[0];
   const runningRuns = debugRuns.filter((run) => run.status === "running").length;
   const totalEvents = eventLog.length;
   const errorEvents = eventLog.filter((evt) => evt.level === "error").length;
@@ -4241,7 +4264,7 @@ export default function App() {
                       </span>
                       <button
                         type="button"
-                        className="button soft compact"
+                        className={`button soft compact button-light ${streamEnabled ? "is-active" : ""}`}
                         data-testid="toggle-live-output"
                         onClick={() => setStreamEnabled((current) => !current)}
                       >
@@ -4263,76 +4286,48 @@ export default function App() {
                     </div>
 
                     <div className="session-workspace">
-                      <div className="session-main-pane">
-                        <div className="prompt-composer">
-                          <label className="field">
-                            <span>Prompt Composer</span>
-                            <div className="composer-input-wrap">
-                              <textarea
-                                value={promptText}
-                                onChange={(event) => setPromptText(event.target.value)}
-                                rows={5}
-                                placeholder="Type your prompt. Codrex will send Enter + Enter to submit."
-                              />
-                              <button
-                                type="button"
-                                className="composer-send-btn"
-                                data-testid="composer-send-prompt"
-                                aria-label={sessionBusy ? "Sending prompt" : "Send prompt"}
-                                onClick={() => void onSendPrompt()}
-                                disabled={sessionBusy || !canSendPrompt}
-                              >
-                                <svg viewBox="0 0 24 24" aria-hidden="true">
-                                  <path
-                                    d="M3 11.8 20.6 4.3a1 1 0 0 1 1.3 1.3L14.4 23.2a1 1 0 0 1-1.9-.3l-1-6-6-1a1 1 0 0 1-.3-1.9Z"
-                                    fill="currentColor"
-                                  />
-                                </svg>
-                              </button>
+                      <section className="session-live-shell">
+                        <div className="quick-open-card session-composer-shell">
+                          <div className="session-pane-head">
+                            <div>
+                              <h3>Prompt Composer</h3>
+                              <p className="small">Draft on the left, then keep one tap to send while the transcript stays visible.</p>
                             </div>
-                          </label>
-                        </div>
-
-                        <div className="quick-open-card session-image-card">
-                          <h3>Image Upload</h3>
-                          <p className="small">Upload an image, then choose how to deliver it into your active Codex workflow.</p>
-                          <div className="row">
-                            <input
-                              type="file"
-                              accept="image/*"
-                              onChange={(event) => setSessionImageFile(event.target.files?.[0] || null)}
-                            />
-                            <input
-                              type="text"
-                              value={sessionImagePrompt}
-                              onChange={(event) => setSessionImagePrompt(event.target.value)}
-                              placeholder="Optional instruction for this image"
-                            />
-                            <label className="field inline">
-                              <span>Mode</span>
-                              <select
-                                value={sessionImageDeliveryMode}
-                                onChange={(event) => setSessionImageDeliveryMode(parseSessionImageDeliveryMode(event.target.value))}
-                              >
-                                <option value="insert_path">Insert path in composer</option>
-                                <option value="desktop_clipboard">Paste image (Ctrl+V)</option>
-                                <option value="session_path">Send path as message</option>
-                              </select>
-                            </label>
-                            <button type="button" className="button soft compact" onClick={() => void onSendSessionImage()} disabled={sessionBusy || !sessionImageFile}>
-                              Send Image
-                            </button>
+                            <span className={`mode-pill ${canSendPrompt ? "mode-ready" : "mode-muted"}`}>
+                              {canSendPrompt ? "ready to send" : "composer idle"}
+                            </span>
                           </div>
-                          <p className="small">
-                            {sessionImageDeliveryMode === "insert_path"
-                              ? "Inserts the local image path into Codex composer without submitting; continue typing and press Send."
-                              : sessionImageDeliveryMode === "desktop_clipboard"
-                                ? "Requires Codex input focused on laptop; copies image to clipboard and sends Ctrl+V."
-                                : "Sends a path message directly to session transcript and submits immediately."}
-                          </p>
+                          <div className="prompt-composer">
+                            <label className="field">
+                              <span>Prompt Composer</span>
+                              <div className="composer-input-wrap">
+                                <textarea
+                                  value={promptText}
+                                  onChange={(event) => setPromptText(event.target.value)}
+                                  rows={5}
+                                  placeholder="Type your prompt. Codrex will send Enter + Enter to submit."
+                                />
+                                <button
+                                  type="button"
+                                  className="composer-send-btn"
+                                  data-testid="composer-send-prompt"
+                                  aria-label={sessionBusy ? "Sending prompt" : "Send prompt"}
+                                  onClick={() => void onSendPrompt()}
+                                  disabled={sessionBusy || !canSendPrompt}
+                                >
+                                  <svg viewBox="0 0 24 24" aria-hidden="true">
+                                    <path
+                                      d="M3 11.8 20.6 4.3a1 1 0 0 1 1.3 1.3L14.4 23.2a1 1 0 0 1-1.9-.3l-1-6-6-1a1 1 0 0 1-.3-1.9Z"
+                                      fill="currentColor"
+                                    />
+                                  </svg>
+                                </button>
+                              </div>
+                            </label>
+                          </div>
                         </div>
 
-                        <div className="session-console-card">
+                        <div className="session-console-card session-console-primary">
                           <div className="session-console-head">
                             <div>
                               <h3>Live Transcript</h3>
@@ -4340,11 +4335,11 @@ export default function App() {
                                 {streamEnabled ? "Structured session stream over WebSocket." : "Polling snapshot fallback only."}
                               </p>
                             </div>
-                            <div className="row">
+                            <div className="session-console-meta">
                               {!sessionAutoFollow && sessionUnreadCount > 0 ? (
                                 <button
                                   type="button"
-                                  className="button soft compact"
+                                  className="button soft compact button-light is-warn"
                                   onClick={() => {
                                     setSessionAutoFollow(true);
                                     setSessionUnreadCount(0);
@@ -4353,8 +4348,11 @@ export default function App() {
                                   Jump to Live ({sessionUnreadCount})
                                 </button>
                               ) : null}
-                              <span className={`badge ${sessionAutoFollow ? "" : "muted"}`}>
-                                {sessionAutoFollow ? "Auto-follow" : "Reader mode"}
+                              <span className={`mode-pill ${streamEnabled ? "mode-live" : "mode-muted"}`}>
+                                {streamEnabled ? outputFeedState : "polling only"}
+                              </span>
+                              <span className={`mode-pill ${sessionAutoFollow ? "mode-ready" : "mode-muted"}`}>
+                                {sessionAutoFollow ? "auto-follow" : "reader mode"}
                               </span>
                             </div>
                           </div>
@@ -4370,359 +4368,451 @@ export default function App() {
                           </pre>
                         </div>
 
-                        <div className="quick-open-card session-notes-card" data-testid="session-notes-panel">
-                          <div className="session-files-subhead">
-                            <div>
-                              <h3>Session Notes</h3>
-                              <p className="small">Keep planning notes and save the latest Codex response directly into this session.</p>
-                            </div>
-                            <span className="badge muted">
-                              {sessionNotesInfo?.updated_at ? `Saved ${formatClock(sessionNotesInfo.updated_at)}` : "Not saved yet"}
-                            </span>
-                          </div>
-                          <div className="row">
-                            <button
-                              type="button"
-                              className="button soft compact"
-                              onClick={() => void onSaveSessionNotes()}
-                              disabled={sessionNotesBusy || sessionNotesLoading}
-                            >
-                              {sessionNotesBusy ? "Saving..." : "Save"}
-                            </button>
-                            <button
-                              type="button"
-                              className="button soft compact"
-                              onClick={() => void onAppendLatestToSessionNotes()}
-                              disabled={sessionNotesBusy || sessionNotesLoading || !selectedSession}
-                            >
-                              Append Latest Response
-                            </button>
-                            <button
-                              type="button"
-                              className="button soft compact"
-                              onClick={() => void onCopyLatestSessionResponse()}
-                              disabled={!latestSessionResponseSnapshot && !sessionNotesInfo?.last_response_snapshot}
-                            >
-                              Copy Latest Response
-                            </button>
-                            <button
-                              type="button"
-                              className="button soft compact"
-                              onClick={() => void onCopySessionNotes()}
-                              disabled={!sessionNotes.trim()}
-                            >
-                              Copy Notes
-                            </button>
-                            <button
-                              type="button"
-                              className="button danger compact"
-                              onClick={onClearSessionNotes}
-                              disabled={sessionNotesBusy || sessionNotesLoading || !sessionNotes.trim()}
-                            >
-                              Clear Notes
-                            </button>
-                          </div>
-                          {sessionNotesLoading ? <p className="small">Loading notes...</p> : null}
-                          {!sessionNotesLoading && !sessionNotes.trim() ? (
-                            <div className="empty-state panel-empty">
-                              <h3>No notes yet</h3>
-                              <p>Use this space for plans, checklists, or summaries from the current Codex session.</p>
-                            </div>
-                          ) : null}
-                          <label className="field">
-                            <span>Notes</span>
-                            <textarea
-                              data-testid="session-notes-input"
-                              value={sessionNotes}
-                              onChange={(event) => setSessionNotes(event.target.value)}
-                              rows={8}
-                              placeholder="Write session notes here. Save keeps them attached to this Codex session."
-                            />
-                          </label>
-                          <p className="small">
-                            Latest response snapshot: <strong>{latestSessionResponseSnapshot ? "available" : "not captured yet"}</strong>
-                          </p>
-                        </div>
-
                         <div className="session-action-dock" data-testid="session-action-dock">
                           <div className="session-action-group session-action-group-wide" role="group" aria-label="Session utility controls">
                             <button
                               type="button"
-                              className="button soft compact action-chip"
+                              className="button soft compact action-chip button-light"
                               data-short="REF"
                               onClick={() => void refreshScreen(selectedSessionInfo.session)}
                             >
                               <span className="btn-glyph" aria-hidden="true">↻</span>
                               <span className="btn-text">Refresh</span>
                             </button>
-                            <button type="button" className="button soft compact action-chip" data-short="ENT" onClick={() => void onSendEnter()} disabled={sessionBusy}>
+                            <button type="button" className="button soft compact action-chip button-light is-active" data-short="ENT" onClick={() => void onSendEnter()} disabled={sessionBusy}>
                               <span className="btn-glyph" aria-hidden="true">↵</span>
                               <span className="btn-text">Enter</span>
                             </button>
                           </div>
                           <div className="arrow-cluster" role="group" aria-label="Session arrow keys">
                             <span className="arrow-cluster-gap" aria-hidden="true" />
-                            <button type="button" className="button soft compact arrow-key" data-short="UP" aria-label="Up" onClick={() => void onSendArrowKey("up")} disabled={sessionBusy}>
+                            <button type="button" className="button soft compact arrow-key button-light" data-short="UP" aria-label="Up" onClick={() => void onSendArrowKey("up")} disabled={sessionBusy}>
                               <span className="btn-text" aria-hidden="true">↑</span>
                             </button>
                             <span className="arrow-cluster-gap" aria-hidden="true" />
-                            <button type="button" className="button soft compact arrow-key" data-short="LT" aria-label="Left" onClick={() => void onSendArrowKey("left")} disabled={sessionBusy}>
+                            <button type="button" className="button soft compact arrow-key button-light" data-short="LT" aria-label="Left" onClick={() => void onSendArrowKey("left")} disabled={sessionBusy}>
                               <span className="btn-text" aria-hidden="true">←</span>
                             </button>
-                            <button type="button" className="button soft compact arrow-key" data-short="DN" aria-label="Down" onClick={() => void onSendArrowKey("down")} disabled={sessionBusy}>
+                            <button type="button" className="button soft compact arrow-key button-light" data-short="DN" aria-label="Down" onClick={() => void onSendArrowKey("down")} disabled={sessionBusy}>
                               <span className="btn-text" aria-hidden="true">↓</span>
                             </button>
-                            <button type="button" className="button soft compact arrow-key" data-short="RT" aria-label="Right" onClick={() => void onSendArrowKey("right")} disabled={sessionBusy}>
+                            <button type="button" className="button soft compact arrow-key button-light" data-short="RT" aria-label="Right" onClick={() => void onSendArrowKey("right")} disabled={sessionBusy}>
                               <span className="btn-text" aria-hidden="true">→</span>
                             </button>
                           </div>
                           <div className="session-action-group" role="group" aria-label="Session safety controls">
-                            <button type="button" className="button warn compact action-chip" data-short="INT" onClick={() => void onInterrupt()} disabled={sessionBusy}>
+                            <button type="button" className="button warn compact action-chip button-light is-warn" data-short="INT" onClick={() => void onInterrupt()} disabled={sessionBusy}>
                               <span className="btn-text">Interrupt</span>
                             </button>
-                            <button type="button" className="button danger compact action-chip" data-short="C^C" onClick={() => void onCtrlC()} disabled={sessionBusy}>
+                            <button type="button" className="button danger compact action-chip button-light is-danger" data-short="C^C" onClick={() => void onCtrlC()} disabled={sessionBusy}>
                               <span className="btn-text">Ctrl+C</span>
                             </button>
-                            <button type="button" className="button danger compact action-chip" data-short="CLS" onClick={() => void onCloseSession()} disabled={sessionBusy}>
+                            <button type="button" className="button danger compact action-chip button-light is-danger" data-short="CLS" onClick={() => void onCloseSession()} disabled={sessionBusy}>
                               <span className="btn-text">Close</span>
                             </button>
                           </div>
                         </div>
+                      </section>
 
-                        <div className="quick-open-card session-model-card">
-                          <h3>Model Selection</h3>
-                          <p className="small">Defaults for new sessions. Apply to current session only when you choose.</p>
-                          <div className="row">
-                            <label className="field inline">
-                              <span>Model</span>
-                              <select
-                                data-testid="session-model-select"
-                                value={selectedModel}
-                                onChange={(event) => setSelectedModel(event.target.value)}
+                      <aside className="session-secondary-shell">
+                        <div className="session-secondary-card">
+                          <div className="session-pane-head">
+                            <div>
+                              <h3>{activeSessionWorkspaceTab.label}</h3>
+                              <p className="small">{activeSessionWorkspaceTab.detail}</p>
+                            </div>
+                            <span className="mode-pill mode-muted">secondary pane</span>
+                          </div>
+                          <div className="segmented session-pane-tabs" role="tablist" aria-label="Session workspace sections">
+                            {sessionWorkspaceTabs.map((tab) => (
+                              <button
+                                key={tab.key}
+                                type="button"
+                                role="tab"
+                                data-testid={`session-pane-tab-${tab.key}`}
+                                aria-selected={sessionWorkspacePane === tab.key}
+                                className={`seg-item session-pane-tab ${sessionWorkspacePane === tab.key ? "active" : ""}`}
+                                onClick={() => setSessionWorkspacePane(tab.key)}
                               >
-                                {modelOptions.map((model) => (
-                                  <option key={model} value={model}>
-                                    {model}
-                                  </option>
-                                ))}
-                              </select>
-                            </label>
-                            <label className="field inline">
-                              <span>Reasoning</span>
-                              <select
-                                data-testid="session-reasoning-select"
-                                value={selectedReasoningEffort}
-                                onChange={(event) => setSelectedReasoningEffort(parseReasoningEffort(event.target.value))}
-                              >
-                                {sessionAllowedReasoningOptions.map((effort) => (
-                                  <option key={effort} value={effort}>
-                                    {effort}
-                                  </option>
-                                ))}
-                              </select>
-                            </label>
-                            <button
-                              type="button"
-                              className="button soft compact"
-                              onClick={() => void onApplySessionProfile()}
-                              disabled={sessionBusy || !selectedSession}
-                            >
-                              Apply to Current Session
-                            </button>
+                                {tab.label}
+                              </button>
+                            ))}
                           </div>
-                        </div>
-                      </div>
 
-                      <aside className="session-files-pane" data-testid="session-files-panel">
-                        <div className="session-files-head">
-                          <div>
-                            <h3>Session Files</h3>
-                            <p className="small">Each Codex session keeps its own attachments and registered paths.</p>
-                          </div>
-                          <span className="badge muted">{sessionFileCountLabel}</span>
-                        </div>
-
-                        <div className="quick-open-card">
-                          <h3>Upload</h3>
-                          <div className="row">
-                            <input
-                              type="file"
-                              data-testid="session-file-upload-input"
-                              onChange={(event) => setSessionUploadFile(event.target.files?.[0] || null)}
-                            />
-                            <input
-                              type="text"
-                              value={sessionUploadTitle}
-                              onChange={(event) => setSessionUploadTitle(event.target.value)}
-                              placeholder="Optional title"
-                            />
-                            <button
-                              type="button"
-                              className="button soft compact"
-                              onClick={() => void onUploadSessionFile()}
-                              disabled={sessionFilesBusy || !sessionUploadFile}
-                            >
-                              Attach
-                            </button>
-                          </div>
-                        </div>
-
-                        <div className="quick-open-card">
-                          <div className="session-files-subhead">
-                            <h3>Browse</h3>
+                          <div
+                            className={`session-pane-card ${sessionWorkspacePane === "notes" ? "active" : "inactive"}`}
+                            data-testid="session-notes-panel"
+                            hidden={sessionWorkspacePane !== "notes"}
+                          >
+                            <div className="session-files-subhead">
+                              <div>
+                                <h3>Session Notes</h3>
+                                <p className="small">Keep planning notes and save the latest Codex response directly into this session.</p>
+                              </div>
+                              <span className={`mode-pill ${sessionNotesInfo?.updated_at ? "mode-ready" : "mode-muted"}`}>
+                                {sessionNotesInfo?.updated_at ? `Saved ${formatClock(sessionNotesInfo.updated_at)}` : "Not saved yet"}
+                              </span>
+                            </div>
                             <div className="row">
-                              <label className="field inline">
-                                <span>Root</span>
-                                <select
-                                  data-testid="browser-root-select"
-                                  value={browserRoot}
-                                  onChange={(event) => setBrowserRoot(event.target.value)}
-                                >
-                                  {browserRoots.map((root) => (
-                                    <option key={root.id} value={root.id}>
-                                      {root.label}
-                                    </option>
-                                  ))}
-                                </select>
-                              </label>
-                              <button type="button" className="button soft compact" onClick={() => void onBrowseUp()}>
-                                Up
+                              <button
+                                type="button"
+                                className="button soft compact button-light is-active"
+                                onClick={() => void onSaveSessionNotes()}
+                                disabled={sessionNotesBusy || sessionNotesLoading}
+                              >
+                                {sessionNotesBusy ? "Saving..." : "Save"}
                               </button>
-                              <button type="button" className="button soft compact" onClick={() => void refreshBrowser(browserRoot, browserState?.current_path || "")}>
-                                Refresh
+                              <button
+                                type="button"
+                                className="button soft compact button-light"
+                                onClick={() => void onAppendLatestToSessionNotes()}
+                                disabled={sessionNotesBusy || sessionNotesLoading || !selectedSession}
+                              >
+                                Append Latest Response
+                              </button>
+                              <button
+                                type="button"
+                                className="button soft compact button-light"
+                                onClick={() => void onCopyLatestSessionResponse()}
+                                disabled={!latestSessionResponseSnapshot && !sessionNotesInfo?.last_response_snapshot}
+                              >
+                                Copy Latest Response
+                              </button>
+                              <button
+                                type="button"
+                                className="button soft compact button-light"
+                                onClick={() => void onCopySessionNotes()}
+                                disabled={!sessionNotes.trim()}
+                              >
+                                Copy Notes
+                              </button>
+                              <button
+                                type="button"
+                                className="button danger compact button-light is-danger"
+                                onClick={onClearSessionNotes}
+                                disabled={sessionNotesBusy || sessionNotesLoading || !sessionNotes.trim()}
+                              >
+                                Clear Notes
                               </button>
                             </div>
+                            {sessionNotesLoading ? <p className="small">Loading notes...</p> : null}
+                            {!sessionNotesLoading && !sessionNotes.trim() ? (
+                              <div className="empty-state panel-empty">
+                                <h3>No notes yet</h3>
+                                <p>Use this space for plans, checklists, or summaries from the current Codex session.</p>
+                              </div>
+                            ) : null}
+                            <label className="field">
+                              <span>Notes</span>
+                              <textarea
+                                data-testid="session-notes-input"
+                                value={sessionNotes}
+                                onChange={(event) => setSessionNotes(event.target.value)}
+                                rows={10}
+                                placeholder="Write session notes here. Save keeps them attached to this Codex session."
+                              />
+                            </label>
+                            <p className="small">
+                              Latest response snapshot: <strong>{latestSessionResponseSnapshot ? "available" : "not captured yet"}</strong>
+                            </p>
                           </div>
-                          <p className="small">
-                            {browserState?.display_path || "Loading browser..."}
-                          </p>
-                          {selectedBrowserEntry ? (
-                            <div className="session-path-pill">
-                              <strong>{selectedBrowserEntry.name}</strong>
-                              <span>{selectedBrowserEntry.wsl_path}</span>
-                            </div>
-                          ) : null}
-                          {lastCopiedSessionPath ? <p className="small">Copied path: <code>{lastCopiedSessionPath}</code></p> : null}
-                          {browserLoading ? <p className="small">Loading browser...</p> : null}
-                          {!browserLoading && (!browserState?.items || browserState.items.length === 0) ? (
-                            <div className="empty-state panel-empty">
-                              <h3>No items here</h3>
-                              <p>Select another root or move up a directory.</p>
-                            </div>
-                          ) : null}
-                          {!browserLoading && browserState?.items?.length ? (
-                            <div className="session-file-list" role="list" aria-label="Browser entries">
-                              {browserState.items.map((item) => {
-                                const selected = item.wsl_path === browserSelectedPath;
-                                return (
-                                  <div
-                                    key={item.wsl_path}
-                                    className={`session-file-item ${selected ? "selected" : ""}`}
-                                    role="button"
-                                    tabIndex={0}
-                                    onClick={() => setBrowserSelectedPath(item.wsl_path)}
-                                    onKeyDown={(event) => {
-                                      if (event.key === "Enter" || event.key === " ") {
-                                        event.preventDefault();
-                                        setBrowserSelectedPath(item.wsl_path);
-                                      }
-                                    }}
-                                  >
-                                    <div className="session-row">
-                                      <strong>{item.name}</strong>
-                                      <span className="badge muted">{item.kind}</span>
-                                    </div>
-                                    <p>{item.display_path}</p>
-                                    <small>{item.kind === "directory" ? "Folder path available to Codex" : formatFileSize(item.size_bytes)}</small>
-                                    <div className="row">
-                                      {item.kind === "directory" ? (
-                                        <button type="button" className="button soft compact" onClick={() => void onBrowseOpen(item)}>
-                                          Open
-                                        </button>
-                                      ) : null}
-                                      <button type="button" className="button soft compact" onClick={() => void onCopySessionPath(item)}>
-                                        Copy Path
-                                      </button>
-                                      <button type="button" className="button soft compact" onClick={() => onUseSessionPath(item)}>
-                                        Use Path
-                                      </button>
-                                      <button type="button" className="button soft compact" onClick={() => void onRegisterBrowserItem(item)} disabled={sessionFilesBusy}>
-                                        Attach
-                                      </button>
-                                    </div>
-                                  </div>
-                                );
-                              })}
-                            </div>
-                          ) : null}
-                        </div>
 
-                        <div className="quick-open-card">
-                          <div className="session-files-subhead">
-                            <h3>Attached to {selectedSessionInfo.session}</h3>
-                            <button type="button" className="button soft compact" onClick={() => void refreshSessionFiles(selectedSessionInfo.session)}>
-                              Refresh
-                            </button>
-                          </div>
-                          {!telegramConfigured ? (
-                            <p className="small">Telegram is not configured yet. You can still attach and copy paths now.</p>
-                          ) : null}
-                          {sessionFilesLoading ? <p className="small">Loading session files...</p> : null}
-                          {!sessionFilesLoading && sessionFiles.length === 0 ? (
-                            <div className="empty-state panel-empty">
-                              <h3>No files attached</h3>
-                              <p>Upload a file or attach a path from the browser above.</p>
+                          <div
+                            className={`session-pane-card session-files-pane ${sessionWorkspacePane === "files" ? "active" : "inactive"}`}
+                            data-testid="session-files-panel"
+                            hidden={sessionWorkspacePane !== "files"}
+                          >
+                            <div className="session-files-head">
+                              <div>
+                                <h3>Session Files</h3>
+                                <p className="small">Each Codex session keeps its own attachments and registered paths.</p>
+                              </div>
+                              <span className={`mode-pill ${sessionFiles.length > 0 ? "mode-ready" : "mode-muted"}`}>{sessionFileCountLabel}</span>
                             </div>
-                          ) : null}
-                          {!sessionFilesLoading && sessionFiles.length > 0 ? (
-                            <div className="session-file-list" role="list" aria-label="Session files">
-                              {sessionFiles.map((item) => (
-                                <div key={item.id} className="session-file-item">
-                                  <div className="session-row">
-                                    <strong>{item.title || item.file_name}</strong>
-                                    <span className="badge muted">{item.item_kind || "file"}</span>
-                                  </div>
-                                  <p>{item.display_path || item.wsl_path}</p>
-                                  <small>
-                                    {item.source_kind || "registered"} | {item.item_kind === "directory" ? "folder" : formatFileSize(item.size_bytes)}
-                                  </small>
-                                  <div className="row">
-                                    <button type="button" className="button soft compact" onClick={() => void onCopySessionPath(item)}>
-                                      Copy Path
-                                    </button>
-                                    <button type="button" className="button soft compact" onClick={() => onUseSessionPath(item)}>
-                                      Use Path
-                                    </button>
-                                    {item.item_kind !== "directory" && item.download_url ? (
-                                      <button
-                                        type="button"
-                                        className="button soft compact"
-                                        onClick={() => window.open(item.download_url, "_blank", "noopener,noreferrer")}
-                                      >
-                                        Open
-                                      </button>
-                                    ) : null}
-                                    <button
-                                      type="button"
-                                      className="button soft compact"
-                                      onClick={() => void onSendSessionFileRowToTelegram(item)}
-                                      disabled={sessionFilesBusy || !telegramConfigured || item.item_kind === "directory"}
+
+                            <div className="quick-open-card compact-card">
+                              <h3>Upload</h3>
+                              <div className="row">
+                                <input
+                                  type="file"
+                                  data-testid="session-file-upload-input"
+                                  onChange={(event) => setSessionUploadFile(event.target.files?.[0] || null)}
+                                />
+                                <input
+                                  type="text"
+                                  value={sessionUploadTitle}
+                                  onChange={(event) => setSessionUploadTitle(event.target.value)}
+                                  placeholder="Optional title"
+                                />
+                                <button
+                                  type="button"
+                                  className="button soft compact button-light is-active"
+                                  onClick={() => void onUploadSessionFile()}
+                                  disabled={sessionFilesBusy || !sessionUploadFile}
+                                >
+                                  Attach
+                                </button>
+                              </div>
+                            </div>
+
+                            <div className="quick-open-card compact-card">
+                              <div className="session-files-subhead">
+                                <h3>Browse</h3>
+                                <div className="row">
+                                  <label className="field inline">
+                                    <span>Root</span>
+                                    <select
+                                      data-testid="browser-root-select"
+                                      value={browserRoot}
+                                      onChange={(event) => setBrowserRoot(event.target.value)}
                                     >
-                                      Send via Telegram
-                                    </button>
-                                    <button
-                                      type="button"
-                                      className="button danger compact"
-                                      onClick={() => void onDeleteSessionFileRow(item)}
-                                      disabled={sessionFilesBusy}
-                                    >
-                                      {item.source_kind === "upload" ? "Delete" : "Detach"}
-                                    </button>
-                                  </div>
+                                      {browserRoots.map((root) => (
+                                        <option key={root.id} value={root.id}>
+                                          {root.label}
+                                        </option>
+                                      ))}
+                                    </select>
+                                  </label>
+                                  <button type="button" className="button soft compact button-light" onClick={() => void onBrowseUp()}>
+                                    Up
+                                  </button>
+                                  <button type="button" className="button soft compact button-light" onClick={() => void refreshBrowser(browserRoot, browserState?.current_path || "")}>
+                                    Refresh
+                                  </button>
                                 </div>
-                              ))}
+                              </div>
+                              <p className="small">
+                                {browserState?.display_path || "Loading browser..."}
+                              </p>
+                              {selectedBrowserEntry ? (
+                                <div className="session-path-pill">
+                                  <strong>{selectedBrowserEntry.name}</strong>
+                                  <span>{selectedBrowserEntry.wsl_path}</span>
+                                </div>
+                              ) : null}
+                              {lastCopiedSessionPath ? <p className="small">Copied path: <code>{lastCopiedSessionPath}</code></p> : null}
+                              {browserLoading ? <p className="small">Loading browser...</p> : null}
+                              {!browserLoading && (!browserState?.items || browserState.items.length === 0) ? (
+                                <div className="empty-state panel-empty">
+                                  <h3>No items here</h3>
+                                  <p>Select another root or move up a directory.</p>
+                                </div>
+                              ) : null}
+                              {!browserLoading && browserState?.items?.length ? (
+                                <div className="session-file-list" role="list" aria-label="Browser entries">
+                                  {browserState.items.map((item) => {
+                                    const selected = item.wsl_path === browserSelectedPath;
+                                    return (
+                                      <div
+                                        key={item.wsl_path}
+                                        className={`session-file-item ${selected ? "selected" : ""}`}
+                                        role="button"
+                                        tabIndex={0}
+                                        onClick={() => setBrowserSelectedPath(item.wsl_path)}
+                                        onKeyDown={(event) => {
+                                          if (event.key === "Enter" || event.key === " ") {
+                                            event.preventDefault();
+                                            setBrowserSelectedPath(item.wsl_path);
+                                          }
+                                        }}
+                                      >
+                                        <div className="session-row">
+                                          <strong>{item.name}</strong>
+                                          <span className="badge muted">{item.kind}</span>
+                                        </div>
+                                        <p>{item.display_path}</p>
+                                        <small>{item.kind === "directory" ? "Folder path available to Codex" : formatFileSize(item.size_bytes)}</small>
+                                        <div className="row">
+                                          {item.kind === "directory" ? (
+                                            <button type="button" className="button soft compact button-light" onClick={() => void onBrowseOpen(item)}>
+                                              Open
+                                            </button>
+                                          ) : null}
+                                          <button type="button" className="button soft compact button-light" onClick={() => void onCopySessionPath(item)}>
+                                            Copy Path
+                                          </button>
+                                          <button type="button" className="button soft compact button-light" onClick={() => onUseSessionPath(item)}>
+                                            Use Path
+                                          </button>
+                                          <button type="button" className="button soft compact button-light is-active" onClick={() => void onRegisterBrowserItem(item)} disabled={sessionFilesBusy}>
+                                            Attach
+                                          </button>
+                                        </div>
+                                      </div>
+                                    );
+                                  })}
+                                </div>
+                              ) : null}
                             </div>
-                          ) : null}
+
+                            <div className="quick-open-card compact-card">
+                              <div className="session-files-subhead">
+                                <h3>Attached to {selectedSessionInfo.session}</h3>
+                                <button type="button" className="button soft compact button-light" onClick={() => void refreshSessionFiles(selectedSessionInfo.session)}>
+                                  Refresh
+                                </button>
+                              </div>
+                              {!telegramConfigured ? (
+                                <p className="small">Telegram is not configured yet. You can still attach and copy paths now.</p>
+                              ) : null}
+                              {sessionFilesLoading ? <p className="small">Loading session files...</p> : null}
+                              {!sessionFilesLoading && sessionFiles.length === 0 ? (
+                                <div className="empty-state panel-empty">
+                                  <h3>No files attached</h3>
+                                  <p>Upload a file or attach a path from the browser above.</p>
+                                </div>
+                              ) : null}
+                              {!sessionFilesLoading && sessionFiles.length > 0 ? (
+                                <div className="session-file-list" role="list" aria-label="Session files">
+                                  {sessionFiles.map((item) => (
+                                    <div key={item.id} className="session-file-item">
+                                      <div className="session-row">
+                                        <strong>{item.title || item.file_name}</strong>
+                                        <span className="badge muted">{item.item_kind || "file"}</span>
+                                      </div>
+                                      <p>{item.display_path || item.wsl_path}</p>
+                                      <small>
+                                        {item.source_kind || "registered"} | {item.item_kind === "directory" ? "folder" : formatFileSize(item.size_bytes)}
+                                      </small>
+                                      <div className="row">
+                                        <button type="button" className="button soft compact button-light" onClick={() => void onCopySessionPath(item)}>
+                                          Copy Path
+                                        </button>
+                                        <button type="button" className="button soft compact button-light" onClick={() => onUseSessionPath(item)}>
+                                          Use Path
+                                        </button>
+                                        {item.item_kind !== "directory" && item.download_url ? (
+                                          <button
+                                            type="button"
+                                            className="button soft compact button-light"
+                                            onClick={() => window.open(item.download_url, "_blank", "noopener,noreferrer")}
+                                          >
+                                            Open
+                                          </button>
+                                        ) : null}
+                                        <button
+                                          type="button"
+                                          className="button soft compact button-light is-active"
+                                          onClick={() => void onSendSessionFileRowToTelegram(item)}
+                                          disabled={sessionFilesBusy || !telegramConfigured || item.item_kind === "directory"}
+                                        >
+                                          Send via Telegram
+                                        </button>
+                                        <button
+                                          type="button"
+                                          className="button danger compact button-light is-danger"
+                                          onClick={() => void onDeleteSessionFileRow(item)}
+                                          disabled={sessionFilesBusy}
+                                        >
+                                          {item.source_kind === "upload" ? "Delete" : "Detach"}
+                                        </button>
+                                      </div>
+                                    </div>
+                                  ))}
+                                </div>
+                              ) : null}
+                            </div>
+                          </div>
+
+                          <div
+                            className={`session-pane-card session-setup-pane ${sessionWorkspacePane === "setup" ? "active" : "inactive"}`}
+                            data-testid="session-setup-panel"
+                            hidden={sessionWorkspacePane !== "setup"}
+                          >
+                            <div className="quick-open-card session-image-card compact-card">
+                              <div className="session-pane-head">
+                                <div>
+                                  <h3>Image Upload</h3>
+                                  <p className="small">Upload an image, then choose how to deliver it into your active Codex workflow.</p>
+                                </div>
+                                <span className={`mode-pill ${sessionImageFile ? "mode-ready" : "mode-muted"}`}>
+                                  {sessionImageFile ? "image ready" : "no image yet"}
+                                </span>
+                              </div>
+                              <div className="row">
+                                <input
+                                  type="file"
+                                  accept="image/*"
+                                  onChange={(event) => setSessionImageFile(event.target.files?.[0] || null)}
+                                />
+                                <input
+                                  type="text"
+                                  value={sessionImagePrompt}
+                                  onChange={(event) => setSessionImagePrompt(event.target.value)}
+                                  placeholder="Optional instruction for this image"
+                                />
+                                <label className="field inline">
+                                  <span>Mode</span>
+                                  <select
+                                    value={sessionImageDeliveryMode}
+                                    onChange={(event) => setSessionImageDeliveryMode(parseSessionImageDeliveryMode(event.target.value))}
+                                  >
+                                    <option value="insert_path">Insert path in composer</option>
+                                    <option value="desktop_clipboard">Paste image (Ctrl+V)</option>
+                                    <option value="session_path">Send path as message</option>
+                                  </select>
+                                </label>
+                                <button type="button" className="button soft compact button-light is-active" onClick={() => void onSendSessionImage()} disabled={sessionBusy || !sessionImageFile}>
+                                  Send Image
+                                </button>
+                              </div>
+                              <p className="small">
+                                {sessionImageDeliveryMode === "insert_path"
+                                  ? "Inserts the local image path into Codex composer without submitting; continue typing and press Send."
+                                  : sessionImageDeliveryMode === "desktop_clipboard"
+                                    ? "Requires Codex input focused on laptop; copies image to clipboard and sends Ctrl+V."
+                                    : "Sends a path message directly to session transcript and submits immediately."}
+                              </p>
+                            </div>
+
+                            <div className="quick-open-card session-model-card compact-card">
+                              <div className="session-pane-head">
+                                <div>
+                                  <h3>Model Selection</h3>
+                                  <p className="small">Defaults for new sessions. Apply to current session only when you choose.</p>
+                                </div>
+                                <span className="mode-pill mode-ready">{selectedModel}</span>
+                              </div>
+                              <div className="row">
+                                <label className="field inline">
+                                  <span>Model</span>
+                                  <select
+                                    data-testid="session-model-select"
+                                    value={selectedModel}
+                                    onChange={(event) => setSelectedModel(event.target.value)}
+                                  >
+                                    {modelOptions.map((model) => (
+                                      <option key={model} value={model}>
+                                        {model}
+                                      </option>
+                                    ))}
+                                  </select>
+                                </label>
+                                <label className="field inline">
+                                  <span>Reasoning</span>
+                                  <select
+                                    data-testid="session-reasoning-select"
+                                    value={selectedReasoningEffort}
+                                    onChange={(event) => setSelectedReasoningEffort(parseReasoningEffort(event.target.value))}
+                                  >
+                                    {sessionAllowedReasoningOptions.map((effort) => (
+                                      <option key={effort} value={effort}>
+                                        {effort}
+                                      </option>
+                                    ))}
+                                  </select>
+                                </label>
+                                <button
+                                  type="button"
+                                  className="button soft compact button-light is-active"
+                                  onClick={() => void onApplySessionProfile()}
+                                  disabled={sessionBusy || !selectedSession}
+                                >
+                                  Apply to Current Session
+                                </button>
+                              </div>
+                            </div>
+                          </div>
                         </div>
                       </aside>
                     </div>

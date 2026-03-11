@@ -421,8 +421,7 @@ if ($DevUi) {
     $uiPid = [int]$uiProc.Id
 
     $uiReady = $false
-    for ($i = 0; $i -lt 50; $i++) {
-      Start-Sleep -Milliseconds 200
+    for ($i = 0; $i -lt 40; $i++) {
       if (Test-HttpReady -Url ("http://127.0.0.1:{0}/" -f $UiPort)) {
         $uiReady = $true
         break
@@ -430,6 +429,7 @@ if ($DevUi) {
       if (-not (Get-Process -Id $uiPid -ErrorAction SilentlyContinue)) {
         break
       }
+      Start-Sleep -Milliseconds 150
     }
     if (-not $uiReady) {
       try { Stop-Process -Id $uiPid -Force -ErrorAction SilentlyContinue } catch {}
@@ -442,14 +442,14 @@ if ($DevUi) {
 } else {
   $appReady = $false
   $appHealth = $null
-  for ($i = 0; $i -lt 50; $i++) {
-    Start-Sleep -Milliseconds 200
+  for ($i = 0; $i -lt 40; $i++) {
     $controllerPort = Read-ControllerPort -ConfigPath $configPath -LocalConfigPath $localConfigPath -LegacyLocalConfigPath $legacyLocalConfigPath
     $appHealth = Get-AppHealth -Port $controllerPort
     if ($appHealth -and $appHealth.ok -and $appHealth.ui_mode -eq "built") {
       $appReady = $true
       break
     }
+    Start-Sleep -Milliseconds 150
   }
   if (-not $appReady) {
     $detail = if ($appHealth -and $appHealth.detail) { [string]$appHealth.detail } else { "Controller app health never reached built mode." }

@@ -501,19 +501,26 @@ function Apply-LauncherStatus {
   $revSuffix = if ($Snapshot.repo_rev) { " | Rev: $($Snapshot.repo_rev)" } else { "" }
   $routeLabel = Resolve-SelectedRouteLabel
   $networkHost = Resolve-SelectedRouteHost
-  $lblStatus.Text = "Launcher shell | State: $($Snapshot.status) | Mode: $($Snapshot.app_mode)`r`nBuild: v$($Snapshot.version)$revSuffix | Port: $($Snapshot.controller_port) | Session: $($Snapshot.session_state)`r`nApp: $($Snapshot.local_url)`r`nPair route: $routeLabel ($networkHost) | Repo: $($Snapshot.repo_label)`r`nDetail: $($Snapshot.detail)"
+  $stateLamp = switch ([string]$Snapshot.status) {
+    "running" { "●" }
+    "checking" { "◐" }
+    "recovering" { "◒" }
+    "error" { "●" }
+    default { "○" }
+  }
+  $lblStatus.Text = "$stateLamp  Launcher shell | State: $($Snapshot.status) | Mode: $($Snapshot.app_mode)`r`nBuild: v$($Snapshot.version)$revSuffix | Port: $($Snapshot.controller_port) | Session: $($Snapshot.session_state)`r`nPair route: $routeLabel ($networkHost)`r`nDetail: $($Snapshot.detail)"
   switch ([string]$Snapshot.status) {
     "running" {
-      $statusCard.BackColor = [System.Drawing.ColorTranslator]::FromHtml("#0d2f53")
-      $lblStatus.ForeColor = $colorAccent
+      $statusCard.BackColor = $colorOkSoft
+      $lblStatus.ForeColor = $colorOk
     }
     "checking" {
       $statusCard.BackColor = [System.Drawing.ColorTranslator]::FromHtml("#3c3110")
-      $lblStatus.ForeColor = [System.Drawing.ColorTranslator]::FromHtml("#ffd166")
+      $lblStatus.ForeColor = $colorWarn
     }
     "recovering" {
       $statusCard.BackColor = [System.Drawing.ColorTranslator]::FromHtml("#2f2b0d")
-      $lblStatus.ForeColor = [System.Drawing.ColorTranslator]::FromHtml("#ffd166")
+      $lblStatus.ForeColor = $colorWarn
     }
     "error" {
       $statusCard.BackColor = [System.Drawing.ColorTranslator]::FromHtml("#3a1620")
@@ -533,13 +540,14 @@ function Set-ActionStatus {
     [int]$ControllerPort = 0
   )
   $portText = if ($ControllerPort -gt 0) { [string]$ControllerPort } else { "pending" }
-  $lblStatus.Text = "Launcher shell | State: $State | Mode: action`r`nPort: $portText | Detail: $Detail`r`nLogs: $logsDir"
+  $stateLamp = if ($State -eq "error") { "●" } else { "◐" }
+  $lblStatus.Text = "$stateLamp  Launcher shell | State: $State | Mode: action`r`nPort: $portText | Detail: $Detail`r`nLogs: $logsDir"
   if ($State -eq "error") {
     $statusCard.BackColor = [System.Drawing.ColorTranslator]::FromHtml("#3a1620")
     $lblStatus.ForeColor = $colorDanger
   } else {
     $statusCard.BackColor = [System.Drawing.ColorTranslator]::FromHtml("#3c3110")
-    $lblStatus.ForeColor = [System.Drawing.ColorTranslator]::FromHtml("#ffd166")
+    $lblStatus.ForeColor = $colorWarn
   }
 }
 
@@ -663,6 +671,9 @@ $colorText = [System.Drawing.ColorTranslator]::FromHtml("#e8f4ff")
 $colorMuted = [System.Drawing.ColorTranslator]::FromHtml("#9cb8d6")
 $colorAccent = [System.Drawing.ColorTranslator]::FromHtml("#1cc8ff")
 $colorAccentSoft = [System.Drawing.ColorTranslator]::FromHtml("#0d2f53")
+$colorOk = [System.Drawing.ColorTranslator]::FromHtml("#4ade80")
+$colorOkSoft = [System.Drawing.ColorTranslator]::FromHtml("#0f2f20")
+$colorWarn = [System.Drawing.ColorTranslator]::FromHtml("#ffd166")
 $colorDanger = [System.Drawing.ColorTranslator]::FromHtml("#ff5f7d")
 $script:cachedControllerConfig = $null
 $script:cachedControllerConfigAt = [DateTime]::MinValue
@@ -730,6 +741,18 @@ function Resolve-SelectedRouteLabel {
   }
 }
 
+function Get-RouteButtonLabel {
+  param(
+    [string]$Route,
+    [bool]$IsActive
+  )
+  $base = if ($Route -eq "tailscale") { "Tailscale" } else { "LAN" }
+  if ($IsActive) {
+    return ("● {0}" -f $base)
+  }
+  return ("○ {0}" -f $base)
+}
+
 function Resolve-SelectedRouteHost {
   $candidate = Resolve-SelectedRouteIp
   if ($candidate -and $candidate -ne "127.0.0.1") {
@@ -745,7 +768,8 @@ function Set-LauncherButtonStyle {
   param(
     [System.Windows.Forms.Button]$Button,
     [bool]$Primary = $false,
-    [bool]$Danger = $false
+    [bool]$Danger = $false,
+    [bool]$Success = $false
   )
   if (-not $Button) { return }
   $Button.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
@@ -753,10 +777,10 @@ function Set-LauncherButtonStyle {
   $Button.FlatAppearance.MouseOverBackColor = [System.Drawing.ColorTranslator]::FromHtml("#15466f")
   $Button.FlatAppearance.MouseDownBackColor = [System.Drawing.ColorTranslator]::FromHtml("#0b3556")
   $Button.Font = New-Object System.Drawing.Font("Segoe UI Semibold", 9.5)
-  $Button.MinimumSize = New-Object System.Drawing.Size(136, 38)
-  $Button.Margin = New-Object System.Windows.Forms.Padding(0, 0, 10, 10)
+  $Button.MinimumSize = New-Object System.Drawing.Size(140, 40)
+  $Button.Margin = New-Object System.Windows.Forms.Padding(0, 0, 10, 8)
   $Button.AutoSize = $false
-  $Button.Size = New-Object System.Drawing.Size(152, 38)
+  $Button.Size = New-Object System.Drawing.Size(160, 40)
   $kind = "default"
   $normalBack = $colorAccentSoft
   $normalFore = $colorText
@@ -772,6 +796,14 @@ function Set-LauncherButtonStyle {
     $pressedBack = [System.Drawing.ColorTranslator]::FromHtml("#4b1d2d")
     $pressedFore = [System.Drawing.ColorTranslator]::FromHtml("#ffd9e1")
     $pressedBorder = [System.Drawing.ColorTranslator]::FromHtml("#ff9ab1")
+  } elseif ($Success) {
+    $kind = "success"
+    $normalBack = [System.Drawing.ColorTranslator]::FromHtml("#103624")
+    $normalFore = $colorOk
+    $normalBorder = [System.Drawing.ColorTranslator]::FromHtml("#2f855a")
+    $pressedBack = [System.Drawing.ColorTranslator]::FromHtml("#155f3a")
+    $pressedFore = [System.Drawing.ColorTranslator]::FromHtml("#ecfdf3")
+    $pressedBorder = [System.Drawing.ColorTranslator]::FromHtml("#6ee7b7")
   } elseif ($Primary) {
     $kind = "primary"
     $normalBack = [System.Drawing.ColorTranslator]::FromHtml("#0c3f63")
@@ -942,7 +974,7 @@ $titleStack.Controls.Add($lblSubtitle, 0, 1)
 
 $statusCard = New-Object System.Windows.Forms.Panel
 $statusCard.Dock = "Fill"
-$statusCard.Padding = New-Object System.Windows.Forms.Padding(12, 6, 12, 6)
+$statusCard.Padding = New-Object System.Windows.Forms.Padding(14, 8, 14, 8)
 $statusCard.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
 $left.Controls.Add($statusCard, 0, 1)
 
@@ -950,11 +982,12 @@ $lblStatus = New-Object System.Windows.Forms.Label
 $lblStatus.Text = "State: checking..."
 $lblStatus.Dock = "Fill"
 $lblStatus.TextAlign = "MiddleLeft"
+$lblStatus.Font = New-Object System.Drawing.Font("Segoe UI Semibold", 9.2)
 $statusCard.Controls.Add($lblStatus)
 
 $actionsCard = New-Object System.Windows.Forms.Panel
 $actionsCard.Dock = "Fill"
-$actionsCard.Padding = New-Object System.Windows.Forms.Padding(12, 10, 12, 4)
+$actionsCard.Padding = New-Object System.Windows.Forms.Padding(14, 12, 14, 6)
 $actionsCard.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
 $left.Controls.Add($actionsCard, 0, 2)
 
@@ -1004,7 +1037,7 @@ $btnAdvanced.Text = "Advanced"
 $rowRoute.Controls.Add($btnAdvanced) | Out-Null
 
 $lblRouteInfo = New-Object System.Windows.Forms.Label
-$lblRouteInfo.Text = "Selected: LAN"
+$lblRouteInfo.Text = "Selected route: LAN"
 $lblRouteInfo.AutoSize = $true
 $lblRouteInfo.Margin = New-Object System.Windows.Forms.Padding(8, 9, 0, 10)
 $lblRouteInfo.ForeColor = $colorAccent
@@ -1216,13 +1249,30 @@ function Set-PrimaryActionStyle {
   Reset-LauncherButtonVisual -Button $btnStart
 }
 
+function Set-QrButtonState {
+  param(
+    [bool]$Ready
+  )
+  if (-not $btnGenQr) { return }
+  if ($Ready) {
+    $btnGenQr.Text = "● QR Ready"
+    Set-LauncherButtonStyle -Button $btnGenQr -Success $true
+  } else {
+    $btnGenQr.Text = "Show Pair QR"
+    Set-LauncherButtonStyle -Button $btnGenQr -Primary $true
+  }
+  Reset-LauncherButtonVisual -Button $btnGenQr
+}
+
 function Set-RouteButtonState {
   param(
     [System.Windows.Forms.Button]$Button,
+    [string]$Route,
     [bool]$IsActive,
     [bool]$IsAvailable
   )
   if (-not $Button) { return }
+  $Button.Text = Get-RouteButtonLabel -Route $Route -IsActive:$IsActive
   if ($IsActive) {
     Set-LauncherButtonStyle -Button $Button -Primary $true
   } else {
@@ -1251,11 +1301,11 @@ function Apply-RouteSelection {
   $script:selectedPairRoute = $normalized
   $activeLabel = Resolve-SelectedRouteLabel
   $activeHost = Resolve-SelectedRouteHost
-  $lblRouteInfo.Text = "Selected: $activeLabel ($activeHost)"
+  $lblRouteInfo.Text = "Selected route: $activeLabel  •  Host: $activeHost"
   $lanAvailable = [bool]($script:lastKnownLanIp -and $script:lastKnownLanIp -ne "127.0.0.1")
   $tailAvailable = [bool]($script:lastKnownTailnetIp)
-  Set-RouteButtonState -Button $btnRouteLan -IsActive:($normalized -eq "lan") -IsAvailable:(($lanAvailable -or -not $tailAvailable) -and (-not $Busy))
-  Set-RouteButtonState -Button $btnRouteTailscale -IsActive:($normalized -eq "tailscale") -IsAvailable:($tailAvailable -and (-not $Busy))
+  Set-RouteButtonState -Button $btnRouteLan -Route "lan" -IsActive:($normalized -eq "lan") -IsAvailable:(($lanAvailable -or -not $tailAvailable) -and (-not $Busy))
+  Set-RouteButtonState -Button $btnRouteTailscale -Route "tailscale" -IsActive:($normalized -eq "tailscale") -IsAvailable:($tailAvailable -and (-not $Busy))
   if ($Persist) {
     Save-LauncherState
   }
@@ -1286,6 +1336,7 @@ function Clear-PairingState {
     try { $picQr.Image.Dispose() } catch {}
   }
   $picQr.Image = $null
+  Set-QrButtonState -Ready:$false
   $lblQrInfo.Text = "Press Show Pair QR, then scan on phone/tablet."
   $lblHint.Text = "Browser app opens only when you click Open App. This window is the local launcher and status shell."
 }
@@ -1576,6 +1627,7 @@ function Generate-PairQr {
     try { $picQr.Image.Dispose() } catch {}
   }
   $picQr.Image = $img
+  Set-QrButtonState -Ready:$true
   $expires = if ($create.expires_in) { [int]$create.expires_in } else { 0 }
   $lblQrInfo.Text = "Route: $route | Host: $pairHost | Expires in: ${expires}s"
   $lblHint.Text = "Scan now. Route stays pinned until you switch it."
@@ -1761,7 +1813,7 @@ $form.Add_Shown({
 })
 
 $script:refreshTimer = New-Object System.Windows.Forms.Timer
-$script:refreshTimer.Interval = 1200
+$script:refreshTimer.Interval = 850
 $script:refreshTimer.Add_Tick({ Refresh-State })
 $script:refreshTimer.Start()
 

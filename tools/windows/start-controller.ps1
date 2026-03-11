@@ -442,8 +442,7 @@ if ($primaryIp -and $primaryIp -ne "127.0.0.1") {
   $probeHosts += $primaryIp
 }
 $probeHosts = $probeHosts | Select-Object -Unique
-for ($i = 0; $i -lt 36; $i++) {
-  Start-Sleep -Milliseconds 200
+for ($i = 0; $i -lt 32; $i++) {
   foreach ($h in $probeHosts) {
     if (Test-ControllerReady -ProbeHost $h -Port $cfg.port -Token $cfg.token) {
       $ok = $true
@@ -452,6 +451,7 @@ for ($i = 0; $i -lt 36; $i++) {
     }
   }
   if ($ok) { break }
+  Start-Sleep -Milliseconds 150
 }
 
 if (-not $ok) {

@@ -93,4 +93,45 @@ test.describe("mobile Sessions flow", () => {
     await page.getByTestId("session-search-input").fill("missing-session-name");
     await expect(page.getByTestId("tab-panel-sessions")).toContainText("No matching sessions");
   });
+
+  test("keeps the sessions workspace readable on tablet landscape without horizontal overflow", async ({ page }, testInfo) => {
+    const mock = await installMockController(page, {
+      sessions: [
+        {
+          session: "codex_demo",
+          pane_id: "%7",
+          cwd: "/home/megha/codrex-work/mobile-app",
+          state: "running",
+          current_command: "codex",
+          snippet: "Generating release notes...",
+          model: "gpt-5-codex",
+          reasoning_effort: "high",
+          screenText: "Generating release notes...\nStreaming mobile session output.\n\nChecklist:\n- Review build\n- Publish notes\n- Send rollout update",
+        },
+      ],
+    });
+
+    await page.setViewportSize({ width: 1180, height: 820 });
+    await page.goto("/", { waitUntil: "domcontentloaded" });
+    await dismissSwipeHint(page);
+
+    await page.getByRole("button", { name: /codex_demo/i }).click();
+    await page.getByTestId("session-pane-tab-files").click();
+    await page.getByTestId("session-pane-tab-setup").click();
+    await page.getByTestId("session-pane-tab-notes").click();
+
+    const overflow = await page.getByTestId("session-detail").evaluate((node) => ({
+      clientWidth: node.clientWidth,
+      scrollWidth: node.scrollWidth,
+    }));
+    expect(overflow.scrollWidth).toBeLessThanOrEqual(overflow.clientWidth + 1);
+
+    await expect(page.getByTestId("session-console")).toContainText("Streaming mobile session output.");
+    await expect.poll(() => mock.promptRequests.length).toBe(0);
+
+    await testInfo.attach("sessions-tablet-landscape", {
+      body: await page.screenshot({ fullPage: true }),
+      contentType: "image/png",
+    });
+  });
 });

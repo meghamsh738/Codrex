@@ -134,6 +134,7 @@ const uploadWslFileMock = vi.mocked(api.uploadWslFile);
 function setupDefaultMocks(): void {
   window.localStorage.removeItem("codrex.ui.controller_base.v1");
   window.localStorage.removeItem("codrex.ui.stream_enabled.v1");
+  window.localStorage.removeItem("codrex.ui.session_workspace_pane.v1");
   window.localStorage.removeItem("codrex.ui.threads.v2");
   window.localStorage.removeItem("codrex.ui.thread_messages.v2");
   window.localStorage.removeItem("codrex.ui.thread_messages.v1");
@@ -731,7 +732,7 @@ describe("app shell tabs", () => {
 
     render(<App />);
 
-    expect(await screen.findByText("Prompt Composer")).toBeInTheDocument();
+    expect(await screen.findByTestId("composer-send-prompt")).toBeInTheDocument();
 
     fireEvent.change(screen.getByPlaceholderText("Type your prompt. Codrex will send Enter + Enter to submit."), {
       target: { value: "Create a release checklist" },
@@ -771,6 +772,9 @@ describe("app shell tabs", () => {
 
     const notesInput = await screen.findByTestId("session-notes-input");
     fireEvent.change(notesInput, { target: { value: "Ship checklist" } });
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "Save" })).toBeEnabled();
+    });
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
 
     await waitFor(() => {
@@ -785,6 +789,33 @@ describe("app shell tabs", () => {
     await waitFor(() => {
       expect(appendLatestSessionNotesMock).toHaveBeenCalledWith("codex_demo");
     });
+  });
+
+  it("switches between notes, files, and setup panes inside the sessions workspace", async () => {
+    getSessionsMock.mockResolvedValue({
+      ok: true,
+      sessions: [
+        {
+          session: "codex_demo",
+          pane_id: "%1",
+          current_command: "codex",
+          cwd: "/home/megha/work",
+          state: "idle",
+          updated_at: Date.now(),
+          snippet: "Assistant ready",
+        },
+      ],
+    });
+
+    render(<App />);
+
+    expect(await screen.findByTestId("session-notes-panel")).toBeVisible();
+
+    fireEvent.click(screen.getByTestId("session-pane-tab-files"));
+    expect(await screen.findByTestId("session-files-panel")).toBeVisible();
+
+    fireEvent.click(screen.getByTestId("session-pane-tab-setup"));
+    expect(await screen.findByTestId("session-setup-panel")).toBeVisible();
   });
 
   it("sends arrow key to session from action dock", async () => {
@@ -859,6 +890,7 @@ describe("app shell tabs", () => {
     });
 
     render(<App />);
+    fireEvent.click(await screen.findByTestId("session-pane-tab-files"));
     const panel = await screen.findByTestId("session-files-panel");
     const itemCard = within(panel).getByText("/home/megha/codrex-work/output/result.png").closest(".session-file-item");
     expect(itemCard).not.toBeNull();
@@ -913,6 +945,7 @@ describe("app shell tabs", () => {
     });
 
     render(<App />);
+    fireEvent.click(await screen.findByTestId("session-pane-tab-files"));
     const panel = await screen.findByTestId("session-files-panel");
     await within(panel).findByText("Result Plot");
 
@@ -944,7 +977,8 @@ describe("app shell tabs", () => {
     });
 
     render(<App />);
-    expect(await screen.findByTestId("session-files-panel")).toBeInTheDocument();
+    fireEvent.click(await screen.findByTestId("session-pane-tab-files"));
+    expect(await screen.findByTestId("session-files-panel")).toBeVisible();
   });
 
   it("enables live output automatically when creating a session", async () => {
@@ -1003,7 +1037,7 @@ describe("app shell tabs", () => {
 
     render(<App />);
 
-    expect(await screen.findByText("Prompt Composer")).toBeInTheDocument();
+    expect(await screen.findByTestId("composer-send-prompt")).toBeInTheDocument();
 
     fireEvent.change(screen.getByPlaceholderText("Type your prompt. Codrex will send Enter + Enter to submit."), {
       target: { value: "Review latest logs and summarize key errors." },
