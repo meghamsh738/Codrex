@@ -352,6 +352,30 @@
         pairLink: "",
         qrImageUrl: "",
       };
+      const rendered = {
+        tone: "",
+        busyTone: "",
+        status: "",
+        route: "",
+        headline: "",
+        detail: "",
+        actionBusy: null,
+        actionLabel: "",
+        appVersion: "",
+        repoRev: "",
+        controllerPort: "",
+        routeHost: "",
+        routeSummary: "",
+        startEnabled: null,
+        stopEnabled: null,
+        openAppEnabled: null,
+        showQrEnabled: null,
+        openNetworkEnabled: null,
+        advancedVisible: null,
+        logsDir: "",
+        pairStatus: "",
+        pairLink: "",
+      };
       let renderedQrUrl = "";
       let renderedQrVisible = false;
 
@@ -396,34 +420,65 @@
         post("route", { route });
       }
 
+      function setText(el, value, key) {
+        if (rendered[key] === value) return;
+        rendered[key] = value;
+        el.textContent = value;
+      }
+
+      function setDisabled(el, value, key) {
+        if (rendered[key] === value) return;
+        rendered[key] = value;
+        el.disabled = value;
+      }
+
+      function setClassToggle(el, className, value, key) {
+        if (rendered[key] === value) return;
+        rendered[key] = value;
+        el.classList.toggle(className, value);
+      }
+
       function render(next) {
         Object.assign(state, next);
         const tone = state.statusTone || "idle";
-        els.statusLight.className = `light ${tone}`;
-        els.busyLight.className = `light ${tone === "error" ? "error" : state.actionBusy ? "busy" : tone}`;
-        els.statusLabel.textContent = state.status || "checking";
-        els.routeLabel.textContent = (state.route || "lan").toUpperCase();
-        els.statusHeadline.textContent = state.status === "running" ? "Codrex is running." : state.status === "stopped" ? "Codrex is stopped." : "Codrex status update";
-        els.statusDetail.textContent = state.detail || "Launcher ready.";
-        els.busyLabel.textContent = state.actionBusy ? state.actionLabel || "working" : "idle";
-        els.appVersion.textContent = state.appVersion || "n/a";
-        els.repoRev.textContent = state.repoRev || "n/a";
-        els.controllerPort.textContent = state.controllerPort ? String(state.controllerPort) : "n/a";
-        els.selectedHost.textContent = state.routeHost || "n/a";
-        els.routeSummary.textContent = state.route === "tailscale"
+        const busyTone = tone === "error" ? "error" : state.actionBusy ? "busy" : tone;
+        if (rendered.tone !== tone) {
+          rendered.tone = tone;
+          els.statusLight.className = `light ${tone}`;
+        }
+        if (rendered.busyTone !== busyTone) {
+          rendered.busyTone = busyTone;
+          els.busyLight.className = `light ${busyTone}`;
+        }
+        setText(els.statusLabel, state.status || "checking", "status");
+        setText(els.routeLabel, (state.route || "lan").toUpperCase(), "route");
+        const headline = state.status === "running" ? "Codrex is running." : state.status === "stopped" ? "Codrex is stopped." : "Codrex status update";
+        setText(els.statusHeadline, headline, "headline");
+        setText(els.statusDetail, state.detail || "Launcher ready.", "detail");
+        setText(els.busyLabel, state.actionBusy ? state.actionLabel || "working" : "idle", "actionLabel");
+        rendered.actionBusy = state.actionBusy;
+        setText(els.appVersion, state.appVersion || "n/a", "appVersion");
+        setText(els.repoRev, state.repoRev || "n/a", "repoRev");
+        setText(els.controllerPort, state.controllerPort ? String(state.controllerPort) : "n/a", "controllerPort");
+        setText(els.selectedHost, state.routeHost || "n/a", "routeHost");
+        const routeSummary = state.route === "tailscale"
           ? (state.tailscaleAvailable ? `Tailscale route selected: ${state.tailscaleHost}` : "Tailscale route selected, but no Tailscale IP is available.")
           : (state.lanAvailable ? `LAN route selected: ${state.lanHost}` : "LAN route selected, but no LAN IP is available.");
-        els.startButton.disabled = !state.startEnabled;
-        els.stopButton.disabled = !state.stopEnabled;
-        els.openAppButton.disabled = !state.openAppEnabled;
-        els.showQrButton.disabled = !state.showQrEnabled;
-        els.openNetworkButton.disabled = !state.openNetworkEnabled;
-        els.lanRouteButton.classList.toggle("button-active", state.route === "lan");
-        els.tailscaleRouteButton.classList.toggle("button-active", state.route === "tailscale");
-        els.advancedPanel.classList.toggle("visible", !!state.advancedVisible);
-        els.logPathLine.textContent = state.logsDir ? `Logs: ${state.logsDir}` : "Logs: n/a";
-        els.pairStatus.textContent = state.pairDetail || (state.qrVisible ? "Pairing QR ready." : "Press Show Pair QR after Codrex is running.");
-        els.pairLink.value = state.pairLink || "";
+        setText(els.routeSummary, routeSummary, "routeSummary");
+        setDisabled(els.startButton, !state.startEnabled, "startEnabled");
+        setDisabled(els.stopButton, !state.stopEnabled, "stopEnabled");
+        setDisabled(els.openAppButton, !state.openAppEnabled, "openAppEnabled");
+        setDisabled(els.showQrButton, !state.showQrEnabled, "showQrEnabled");
+        setDisabled(els.openNetworkButton, !state.openNetworkEnabled, "openNetworkEnabled");
+        setClassToggle(els.lanRouteButton, "button-active", state.route === "lan", "lanActive");
+        setClassToggle(els.tailscaleRouteButton, "button-active", state.route === "tailscale", "tailscaleActive");
+        setClassToggle(els.advancedPanel, "visible", !!state.advancedVisible, "advancedVisible");
+        setText(els.logPathLine, state.logsDir ? `Logs: ${state.logsDir}` : "Logs: n/a", "logsDir");
+        setText(els.pairStatus, state.pairDetail || (state.qrVisible ? "Pairing QR ready." : "Press Show Pair QR after Codrex is running."), "pairStatus");
+        if (rendered.pairLink !== (state.pairLink || "")) {
+          rendered.pairLink = state.pairLink || "";
+          els.pairLink.value = rendered.pairLink;
+        }
 
         const nextQrVisible = !!(state.qrVisible && state.qrImageUrl);
         const nextQrUrl = nextQrVisible ? state.qrImageUrl : "";
