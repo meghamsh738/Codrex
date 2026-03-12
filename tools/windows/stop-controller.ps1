@@ -32,6 +32,7 @@ if (-not $script:DiagActionName) {
 }
 $script:DiagSource = "stop-controller"
 $script:StoppedProcessIds = @()
+$stopTimer = [System.Diagnostics.Stopwatch]::StartNew()
 
 function Write-StopControllerDiagnostic {
   param(
@@ -158,6 +159,7 @@ if (-not $procs) {
   }
   Write-StopControllerDiagnostic -Ok:$true -Detail ("No controller process found on port {0}." -f $Port) -Extra ([pscustomobject]@{
     stopped_any = $false
+    stop_complete_ms = [int]$stopTimer.ElapsedMilliseconds
   })
   exit 0
 }
@@ -167,5 +169,6 @@ foreach ($p in $procs) {
 }
 Write-StopControllerDiagnostic -Ok:$true -Detail ("Controller stop completed for port {0}." -f $Port) -Extra ([pscustomobject]@{
   stopped_any = [bool]$stoppedAny
+  stop_complete_ms = [int]$stopTimer.ElapsedMilliseconds
 })
 exit 0

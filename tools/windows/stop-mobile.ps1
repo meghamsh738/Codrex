@@ -126,6 +126,7 @@ if (-not $script:DiagActionName) {
   $script:DiagActionName = "stop"
 }
 $script:DiagSource = "stop-mobile"
+$stopTimer = [System.Diagnostics.Stopwatch]::StartNew()
 
 function Write-StopMobileDiagnostic {
   param(
@@ -197,6 +198,8 @@ if ($session -and $session.controller_pid) {
 }
 if ($session -and $session.ui_port) {
   $UiPort = [int]$session.ui_port
+} elseif ($session -and $session.ui_mode -and [string]$session.ui_mode -ne "dev") {
+  $UiPort = 0
 }
 $script:DiagBeforeSessionState = if ($session) { "present" } else { "missing" }
 $script:DiagBeforeControllerSnapshot = Get-CodrexPortDiagnosticsSnapshot -Ports @($controllerPort)
@@ -209,12 +212,17 @@ $null = Write-CodrexEventLog -RuntimeDir $runtimeDir -Source $script:DiagSource 
 }
 
 $uiStoppedBySession = $false
-if ($session -and $session.ui_pid) {
-  $uiStoppedBySession = Stop-UiProcessById -ProcId ([int]$session.ui_pid)
-}
-$uiStoppedByPort = Stop-UiByPort -Port $UiPort
-if (-not $uiStoppedBySession -and -not $uiStoppedByPort) {
-  Write-Host "No mobile UI process stopped (port $UiPort)."
+$uiStoppedByPort = $false
+if ($UiPort -gt 0 -or ($session -and $session.ui_pid)) {
+  if ($session -and $session.ui_pid) {
+    $uiStoppedBySession = Stop-UiProcessById -ProcId ([int]$session.ui_pid)
+  }
+  if ($UiPort -gt 0) {
+    $uiStoppedByPort = Stop-UiByPort -Port $UiPort
+  }
+  if (-not $uiStoppedBySession -and -not $uiStoppedByPort -and $UiPort -gt 0) {
+    Write-Host "No mobile UI process stopped (port $UiPort)."
+  }
 }
 
 if (-not $KeepController) {
@@ -256,6 +264,7 @@ Write-StopMobileDiagnostic -Ok:([bool]$result.ok) -Detail $(if ($result.ok) { "M
   controller_status = $result.controller_status
   ui_stopped = [bool]$result.ui_stopped
   stale_session_file_removed = [bool]$result.stale_session_file_removed
+  stop_complete_ms = [int]$stopTimer.ElapsedMilliseconds
 })
 $result | ConvertTo-Json -Compress | Write-Output
 if (-not $result.ok) {
