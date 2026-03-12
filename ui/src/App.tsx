@@ -204,6 +204,11 @@ const DESKTOP_PROFILE_STREAM: Record<DesktopStreamProfile, { fps: number; level:
   extreme: { fps: 2, level: 3, scale: 4, bw: true },
 };
 const SESSION_SUMMARY_POLL_MS = 3000;
+const SESSION_SUMMARY_HIDDEN_POLL_MS = 9000;
+const REMOTE_POLL_MS = 3500;
+const REMOTE_HIDDEN_POLL_MS = 7000;
+const DEFAULT_BACKGROUND_POLL_MS = 5000;
+const SESSION_MUTATION_REVALIDATE_MS = 900;
 const POWER_ACTION_LABELS: Record<"lock" | "sleep" | "hibernate" | "restart" | "shutdown", string> = {
   lock: "Lock",
   sleep: "Sleep",
@@ -735,6 +740,9 @@ export default function App() {
   const [sessionNotesBusy, setSessionNotesBusy] = useState(false);
   const [telegramConfigured, setTelegramConfigured] = useState(false);
   const [composerTelegramBusy, setComposerTelegramBusy] = useState(false);
+  const [pageVisible, setPageVisible] = useState(() =>
+    typeof document === "undefined" ? true : !document.hidden,
+  );
 
   const [threads, setThreads] = useState<ChatThread[]>(() => {
     const stored = parseThreads(safeStorageGet(THREADS_STORAGE));
@@ -842,9 +850,13 @@ export default function App() {
   const screenShellRef = useRef<HTMLElement | null>(null);
   const sessionOutputRef = useRef<HTMLPreElement | null>(null);
   const sessionTranscriptRef = useRef<TranscriptChunk[]>([]);
+  const sessionTranscriptCacheRef = useRef<Record<string, TranscriptChunk[]>>({});
   const sessionStreamQueueRef = useRef<SessionStreamEvent[]>([]);
   const sessionStreamFrameRef = useRef<number | null>(null);
   const sessionStreamSeqRef = useRef<Record<string, number>>({});
+  const sessionsRefreshInFlightRef = useRef(false);
+  const sessionScreenRefreshInFlightRef = useRef<Set<string>>(new Set());
+  const scheduledSessionsRefreshRef = useRef<number | null>(null);
   const remoteStageRef = useRef<HTMLDivElement | null>(null);
   const desktopFrameRef = useRef<HTMLImageElement | null>(null);
   const desktopPointerRef = useRef<{ active: boolean; x: number; y: number; moved: boolean }>({
@@ -1171,6 +1183,10 @@ export default function App() {
   }, [addEvent]);
 
   const refreshSessions = useCallback(async () => {
+    if (sessionsRefreshInFlightRef.current) {
+      return;
+    }
+    sessionsRefreshInFlightRef.current = true;
     try {
       const response = await getSessions();
       if (!response.ok) {
@@ -1199,9 +1215,24 @@ export default function App() {
         setError(`Could not read sessions: ${detail}`);
       }
     } finally {
+      sessionsRefreshInFlightRef.current = false;
       setSessionsLoading(false);
     }
   }, [setError, setStatus]);
+
+  const scheduleSessionsRefresh = useCallback((delayMs = SESSION_MUTATION_REVALIDATE_MS) => {
+    if (typeof window === "undefined") {
+      void refreshSessions();
+      return;
+    }
+    if (scheduledSessionsRefreshRef.current != null) {
+      window.clearTimeout(scheduledSessionsRefreshRef.current);
+    }
+    scheduledSessionsRefreshRef.current = window.setTimeout(() => {
+      scheduledSessionsRefreshRef.current = null;
+      void refreshSessions();
+    }, delayMs);
+  }, [refreshSessions]);
 
   const refreshSessionNotes = useCallback(async (session: string) => {
     if (!session) {
@@ -1421,18 +1452,45 @@ export default function App() {
       sessionStreamSeqRef.current = {};
       return;
     }
+    if (sessionScreenRefreshInFlightRef.current.has(session)) {
+      return;
+    }
+    sessionScreenRefreshInFlightRef.current.add(session);
     try {
       const response = await getSessionScreen(session);
       if (!response.ok) {
         throw new Error(response.detail || response.error || "Failed to read session screen.");
       }
       const nextText = response.text || "";
-      setSessionTranscriptChunks(chunkTranscript(nextText));
+      const nextChunks = chunkTranscript(nextText);
+      sessionTranscriptCacheRef.current[session] = nextChunks;
+      if (session === selectedSession) {
+        setSessionTranscriptChunks(nextChunks);
+      }
       setSessionUnreadCount(0);
     } catch (error) {
       setError(`Could not read screen: ${(error as Error).message}`);
+    } finally {
+      sessionScreenRefreshInFlightRef.current.delete(session);
     }
-  }, [setError]);
+  }, [selectedSession, setError]);
+
+  const shouldUseLiveSessionStream = useCallback((session: string) => {
+    return (
+      !!session &&
+      activeTab === "sessions" &&
+      streamEnabled &&
+      selectedSession === session &&
+      (outputFeedState === "connecting" || outputFeedState === "live")
+    );
+  }, [activeTab, outputFeedState, selectedSession, streamEnabled]);
+
+  const revalidateSessionAfterMutation = useCallback((session: string) => {
+    if (!shouldUseLiveSessionStream(session)) {
+      void refreshScreen(session);
+    }
+    scheduleSessionsRefresh();
+  }, [refreshScreen, scheduleSessionsRefresh, shouldUseLiveSessionStream]);
 
   const flushSessionStreamQueue = useCallback(() => {
     sessionStreamFrameRef.current = null;
@@ -1564,8 +1622,32 @@ export default function App() {
   }, [addIpc]);
 
   useEffect(() => {
+    return () => {
+      if (scheduledSessionsRefreshRef.current != null && typeof window !== "undefined") {
+        window.clearTimeout(scheduledSessionsRefreshRef.current);
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    if (typeof document === "undefined") {
+      return;
+    }
+    const onVisibilityChange = () => {
+      setPageVisible(!document.hidden);
+    };
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    return () => {
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+    };
+  }, []);
+
+  useEffect(() => {
     sessionTranscriptRef.current = sessionTranscriptChunks;
-  }, [sessionTranscriptChunks]);
+    if (selectedSession) {
+      sessionTranscriptCacheRef.current[selectedSession] = sessionTranscriptChunks;
+    }
+  }, [selectedSession, sessionTranscriptChunks]);
 
   useEffect(() => {
     const node = sessionOutputRef.current;
@@ -1773,15 +1855,23 @@ export default function App() {
 
   useEffect(() => {
     const intervalMs =
-      activeTab === "remote"
-        ? 3500
-        : activeTab === "sessions"
-          ? SESSION_SUMMARY_POLL_MS
-          : 2500;
+      !pageVisible
+        ? activeTab === "remote"
+          ? REMOTE_HIDDEN_POLL_MS
+          : SESSION_SUMMARY_HIDDEN_POLL_MS
+        : activeTab === "remote"
+          ? REMOTE_POLL_MS
+          : activeTab === "sessions"
+            ? SESSION_SUMMARY_POLL_MS
+            : DEFAULT_BACKGROUND_POLL_MS;
     const interval = window.setInterval(() => {
       const shouldPollSessions = activeTab === "sessions";
       if (shouldPollSessions) {
         void refreshSessions();
+      }
+
+      if (!pageVisible) {
+        return;
       }
 
       if (activeTab === "sessions") {
@@ -1828,6 +1918,7 @@ export default function App() {
     selectedTmuxPane,
     streamEnabled,
     streamProfile,
+    pageVisible,
   ]);
 
   useEffect(() => {
@@ -1840,10 +1931,23 @@ export default function App() {
     }
     setSessionAutoFollow(true);
     setSessionUnreadCount(0);
-    void refreshScreen(selectedSession);
+    const cachedTranscript = sessionTranscriptCacheRef.current[selectedSession];
+    if (cachedTranscript) {
+      setSessionTranscriptChunks(cachedTranscript);
+    } else {
+      setSessionTranscriptChunks([]);
+    }
+    const canUseStreamBootstrap =
+      activeTab === "sessions" &&
+      streamEnabled &&
+      typeof window !== "undefined" &&
+      typeof window.WebSocket === "function";
+    if (!canUseStreamBootstrap) {
+      void refreshScreen(selectedSession);
+    }
     setSessionNotesLoading(true);
     void refreshSessionNotes(selectedSession);
-  }, [refreshScreen, refreshSessionNotes, selectedSession]);
+  }, [activeTab, refreshScreen, refreshSessionNotes, selectedSession, streamEnabled]);
 
   useEffect(() => {
     if (!selectedTmuxPane) {
@@ -2446,7 +2550,7 @@ export default function App() {
       setSelectedSession(response.session);
       setStreamEnabled(true);
       setOutputFeedState("polling");
-      await refreshSessions();
+      scheduleSessionsRefresh(250);
       setActiveTab("sessions");
       setStatus(`Created ${response.session} (${response.reasoning_effort || createReasoningEffort}).`);
     } catch (error) {
@@ -2457,8 +2561,8 @@ export default function App() {
   }, [
     newSessionCwd,
     newSessionName,
-    refreshSessions,
     reasoningEffortOptions,
+    scheduleSessionsRefresh,
     selectedModel,
     selectedReasoningEffort,
     setError,
@@ -2482,7 +2586,7 @@ export default function App() {
       setSelectedSession(response.session);
       setStreamEnabled(true);
       setOutputFeedState("polling");
-      await refreshSessions();
+      scheduleSessionsRefresh(250);
       setActiveTab("sessions");
       setStatus(`Started ${response.session} in resume-last mode.`);
     } catch (error) {
@@ -2494,7 +2598,7 @@ export default function App() {
     newSessionCwd,
     newSessionName,
     reasoningEffortOptions,
-    refreshSessions,
+    scheduleSessionsRefresh,
     selectedModel,
     selectedReasoningEffort,
     setError,
@@ -2513,14 +2617,13 @@ export default function App() {
         throw new Error(response.detail || response.error || "Enter failed.");
       }
       setStatus(`Sent Enter to ${selectedSession}.`);
-      await refreshScreen(selectedSession);
-      await refreshSessions();
+      revalidateSessionAfterMutation(selectedSession);
     } catch (error) {
       setError(`Enter failed: ${(error as Error).message}`);
     } finally {
       setSessionBusy(false);
     }
-  }, [refreshScreen, refreshSessions, selectedSession, setError, setStatus]);
+  }, [revalidateSessionAfterMutation, selectedSession, setError, setStatus]);
 
   const onSendBackspace = useCallback(async () => {
     if (!selectedSession) {
@@ -2534,14 +2637,13 @@ export default function App() {
         throw new Error(response.detail || response.error || "Backspace failed.");
       }
       setStatus(`Sent Backspace to ${selectedSession}.`);
-      await refreshScreen(selectedSession);
-      await refreshSessions();
+      revalidateSessionAfterMutation(selectedSession);
     } catch (error) {
       setError(`Backspace failed: ${(error as Error).message}`);
     } finally {
       setSessionBusy(false);
     }
-  }, [refreshScreen, refreshSessions, selectedSession, setError, setStatus]);
+  }, [revalidateSessionAfterMutation, selectedSession, setError, setStatus]);
 
   const onSendArrowKey = useCallback(async (key: "up" | "down" | "left" | "right") => {
     if (!selectedSession) {
@@ -2555,14 +2657,13 @@ export default function App() {
         throw new Error(response.detail || response.error || "Arrow key failed.");
       }
       setStatus(`Sent ${key} arrow to ${selectedSession}.`);
-      await refreshScreen(selectedSession);
-      await refreshSessions();
+      revalidateSessionAfterMutation(selectedSession);
     } catch (error) {
       setError(`Arrow key failed: ${(error as Error).message}`);
     } finally {
       setSessionBusy(false);
     }
-  }, [refreshScreen, refreshSessions, selectedSession, setError, setStatus]);
+  }, [revalidateSessionAfterMutation, selectedSession, setError, setStatus]);
 
   const onInterrupt = useCallback(async () => {
     if (!selectedSession) {
@@ -2576,14 +2677,13 @@ export default function App() {
         throw new Error(response.detail || response.error || "Interrupt failed.");
       }
       setStatus(`Interrupted ${selectedSession}.`);
-      await refreshScreen(selectedSession);
-      await refreshSessions();
+      revalidateSessionAfterMutation(selectedSession);
     } catch (error) {
       setError(`Interrupt failed: ${(error as Error).message}`);
     } finally {
       setSessionBusy(false);
     }
-  }, [refreshScreen, refreshSessions, selectedSession, setError, setStatus]);
+  }, [revalidateSessionAfterMutation, selectedSession, setError, setStatus]);
 
   const onCtrlC = useCallback(async () => {
     if (!selectedSession) {
@@ -2597,14 +2697,13 @@ export default function App() {
         throw new Error(response.detail || response.error || "Ctrl+C failed.");
       }
       setStatus(`Sent Ctrl+C to ${selectedSession}.`);
-      await refreshScreen(selectedSession);
-      await refreshSessions();
+      revalidateSessionAfterMutation(selectedSession);
     } catch (error) {
       setError(`Ctrl+C failed: ${(error as Error).message}`);
     } finally {
       setSessionBusy(false);
     }
-  }, [refreshScreen, refreshSessions, selectedSession, setError, setStatus]);
+  }, [revalidateSessionAfterMutation, selectedSession, setError, setStatus]);
 
   const onInstallCta = useCallback(async () => {
     if (installState === "installed") {
@@ -2644,16 +2743,22 @@ export default function App() {
       if (!response.ok) {
         throw new Error(response.detail || response.error || "Close failed.");
       }
+      const closingSession = selectedSession;
       setStatus(`Closed ${selectedSession}.`);
-      await refreshSessions();
+      setSessions((current) => current.filter((item) => item.session !== closingSession));
+      sessionTranscriptCacheRef.current[closingSession] = [];
       setSessionTranscriptChunks([]);
-      delete sessionStreamSeqRef.current[selectedSession];
+      setSessionNotes("");
+      setSessionNotesInfo(null);
+      delete sessionStreamSeqRef.current[closingSession];
+      setSelectedSession((current) => (current === closingSession ? "" : current));
+      scheduleSessionsRefresh(200);
     } catch (error) {
       setError(`Close session failed: ${(error as Error).message}`);
     } finally {
       setSessionBusy(false);
     }
-  }, [refreshSessions, selectedSession, setError, setStatus]);
+  }, [scheduleSessionsRefresh, selectedSession, setError, setStatus]);
 
   const onSendSessionImage = useCallback(async () => {
     if (!selectedSession) {
@@ -2681,14 +2786,14 @@ export default function App() {
       } else {
         setStatus(`Image sent to ${selectedSession}.`);
       }
-      await refreshScreen(selectedSession);
+      revalidateSessionAfterMutation(selectedSession);
     } catch (error) {
       setError(`Send image failed: ${(error as Error).message}`);
     } finally {
       setSessionBusy(false);
     }
   }, [
-    refreshScreen,
+    revalidateSessionAfterMutation,
     selectedSession,
     sessionImageDeliveryMode,
     sessionImageFile,
@@ -2771,7 +2876,7 @@ export default function App() {
           setPromptText("");
         }
         setStatus(response.detail || `Attached ${(response.session_file || response.shared_file)?.file_name || "item"} to session files.`);
-        await refreshSessions();
+        scheduleSessionsRefresh();
         return true;
       }
       if (!preserveComposer) {
@@ -2785,8 +2890,7 @@ export default function App() {
         }
       }
       setStatus(successMessage || `Sent prompt to ${selectedSession}.`);
-      await refreshScreen(selectedSession);
-      await refreshSessions();
+      revalidateSessionAfterMutation(selectedSession);
       window.setTimeout(async () => {
         try {
           const snapshot = await getSessionScreen(selectedSession);
@@ -2806,8 +2910,8 @@ export default function App() {
     addThreadMessage,
     captureAssistantSnapshot,
     ensureThreadForSession,
-    refreshScreen,
-    refreshSessions,
+    revalidateSessionAfterMutation,
+    scheduleSessionsRefresh,
     selectedSession,
     setError,
     setStatus,
@@ -3723,14 +3827,18 @@ export default function App() {
                       if (!response.ok) {
                         throw new Error(response.detail || response.error || "Could not close session.");
                       }
+                      const closingSession = session.session;
                       setStatus(`Closed ${session.session}.`);
-                      await refreshSessions();
-                      if (selectedSession === session.session) {
+                      setSessions((current) => current.filter((item) => item.session !== closingSession));
+                      sessionTranscriptCacheRef.current[closingSession] = [];
+                      if (selectedSession === closingSession) {
                         setSessionTranscriptChunks([]);
                         setSessionNotes("");
                         setSessionNotesInfo(null);
+                        setSelectedSession("");
                       }
-                      delete sessionStreamSeqRef.current[session.session];
+                      delete sessionStreamSeqRef.current[closingSession];
+                      scheduleSessionsRefresh(200);
                     } catch (error) {
                       setError(`Close session failed: ${(error as Error).message}`);
                     } finally {
@@ -3754,7 +3862,7 @@ export default function App() {
         </div>
       );
     },
-    [closeSession, refreshSessions, selectedSession, sessionBusy, setError, setStatus],
+    [closeSession, scheduleSessionsRefresh, selectedSession, sessionBusy, setError, setStatus],
   );
 
   const renderNavIcon = useCallback((tab: MainTab) => {

@@ -451,7 +451,7 @@ for ($i = 0; $i -lt 32; $i++) {
     }
   }
   if ($ok) { break }
-  Start-Sleep -Milliseconds 150
+  Start-Sleep -Milliseconds 100
 }
 
 if (-not $ok) {

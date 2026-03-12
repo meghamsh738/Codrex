@@ -429,7 +429,7 @@ if ($DevUi) {
       if (-not (Get-Process -Id $uiPid -ErrorAction SilentlyContinue)) {
         break
       }
-      Start-Sleep -Milliseconds 150
+      Start-Sleep -Milliseconds 100
     }
     if (-not $uiReady) {
       try { Stop-Process -Id $uiPid -Force -ErrorAction SilentlyContinue } catch {}
@@ -449,7 +449,7 @@ if ($DevUi) {
       $appReady = $true
       break
     }
-    Start-Sleep -Milliseconds 150
+    Start-Sleep -Milliseconds 100
   }
   if (-not $appReady) {
     $detail = if ($appHealth -and $appHealth.detail) { [string]$appHealth.detail } else { "Controller app health never reached built mode." }

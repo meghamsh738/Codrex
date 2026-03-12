@@ -10,6 +10,10 @@ namespace Codrex.Launcher;
 
 public partial class MainWindow : Window
 {
+    private static readonly TimeSpan IdleRefreshInterval = TimeSpan.FromSeconds(4);
+    private static readonly TimeSpan BusyRefreshInterval = TimeSpan.FromMilliseconds(700);
+    private static readonly TimeSpan NetInfoRefreshInterval = TimeSpan.FromSeconds(15);
+
     private readonly LauncherRuntimeService _runtimeService;
     private readonly LauncherStateStore _stateStore;
     private readonly DispatcherTimer _refreshTimer;
@@ -23,6 +27,8 @@ public partial class MainWindow : Window
     private string _pendingAction = "";
     private string _statusDetail = "Launcher ready.";
     private string _errorDetail = "";
+    private string _lastPublishedStateJson = "";
+    private DateTime _lastNetInfoRefreshUtc = DateTime.MinValue;
 
     public MainWindow()
     {
@@ -33,11 +39,16 @@ public partial class MainWindow : Window
         _preferences = _stateStore.LoadPreferences();
         _refreshTimer = new DispatcherTimer
         {
-            Interval = TimeSpan.FromSeconds(1.25),
+            Interval = IdleRefreshInterval,
         };
         _refreshTimer.Tick += async (_, _) => await RefreshStateAsync();
         Loaded += async (_, _) => await InitializeLauncherAsync();
         Closed += (_, _) => _refreshTimer.Stop();
+    }
+
+    private void UpdateRefreshInterval()
+    {
+        _refreshTimer.Interval = _actionBusy ? BusyRefreshInterval : IdleRefreshInterval;
     }
 
     private async Task InitializeLauncherAsync()
@@ -53,6 +64,7 @@ public partial class MainWindow : Window
             };
             var html = await LoadLauncherHtmlAsync();
             LauncherView.NavigateToString(html);
+            UpdateRefreshInterval();
             _refreshTimer.Start();
             await RefreshStateAsync();
         }
@@ -195,6 +207,7 @@ public partial class MainWindow : Window
         _errorDetail = "";
         _currentPairing = action == "stop" ? null : _currentPairing;
         _statusDetail = action == "start" ? "Starting Codrex runtime..." : action == "stop" ? "Stopping Codrex runtime..." : "Running Codrex action...";
+        UpdateRefreshInterval();
         await PublishStateAsync();
 
         try
@@ -240,6 +253,7 @@ public partial class MainWindow : Window
             {
                 _actionBusy = false;
                 _pendingAction = "";
+                UpdateRefreshInterval();
                 await RefreshStateAsync();
             }
         }
@@ -284,12 +298,21 @@ public partial class MainWindow : Window
             TryCompletePendingActionFromLiveState(_lastRuntime);
             if (_lastRuntime.Ok && _lastRuntime.Status.Equals("running", StringComparison.OrdinalIgnoreCase))
             {
-                var config = _runtimeService.ReadControllerConfig();
-                _lastNetInfo = await _runtimeService.GetNetInfoAsync(_lastRuntime.ControllerPort, config.Token);
+                var shouldRefreshNetInfo =
+                    _actionBusy ||
+                    _lastNetInfo is null ||
+                    DateTime.UtcNow - _lastNetInfoRefreshUtc >= NetInfoRefreshInterval;
+                if (shouldRefreshNetInfo)
+                {
+                    var config = _runtimeService.ReadControllerConfig();
+                    _lastNetInfo = await _runtimeService.GetNetInfoAsync(_lastRuntime.ControllerPort, config.Token);
+                    _lastNetInfoRefreshUtc = DateTime.UtcNow;
+                }
             }
             else
             {
                 _lastNetInfo = null;
+                _lastNetInfoRefreshUtc = DateTime.MinValue;
             }
         }
         catch (Exception ex)
@@ -315,6 +338,7 @@ public partial class MainWindow : Window
             _pendingAction = "";
             _errorDetail = "";
             _statusDetail = string.IsNullOrWhiteSpace(runtime.Detail) ? "Codrex start complete." : runtime.Detail;
+            UpdateRefreshInterval();
             return;
         }
 
@@ -326,6 +350,7 @@ public partial class MainWindow : Window
             _errorDetail = "";
             _currentPairing = null;
             _statusDetail = string.IsNullOrWhiteSpace(runtime.Detail) ? "Codrex stop complete." : runtime.Detail;
+            UpdateRefreshInterval();
         }
     }
 
@@ -386,7 +411,14 @@ public partial class MainWindow : Window
             openNetworkEnabled = !_actionBusy && runtime.Status.Equals("running", StringComparison.OrdinalIgnoreCase) && !string.IsNullOrWhiteSpace(selectedNetworkUrl),
         };
 
-        LauncherView.CoreWebView2.PostWebMessageAsJson(JsonSerializer.Serialize(state));
+        var stateJson = JsonSerializer.Serialize(state);
+        if (string.Equals(stateJson, _lastPublishedStateJson, StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        _lastPublishedStateJson = stateJson;
+        LauncherView.CoreWebView2.PostWebMessageAsJson(stateJson);
 
         string _statusDetailOrRuntime(string runtimeDetail) =>
             !string.IsNullOrWhiteSpace(_statusDetail) ? _statusDetail : runtimeDetail;

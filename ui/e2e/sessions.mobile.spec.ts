@@ -68,6 +68,7 @@ test.describe("mobile Sessions flow", () => {
 
     const sessionDetail = page.getByTestId("session-detail");
     await expect(sessionDetail).toContainText("codex_demo");
+    await page.getByTestId("session-action-dock").getByRole("button", { name: "Refresh" }).click();
     await expect(sessionDetail.locator(".console")).toContainText("Streaming mobile session output.");
 
     const composer = page.getByRole("textbox", { name: "Prompt Composer" });
@@ -145,6 +146,7 @@ test.describe("mobile Sessions flow", () => {
     await dismissSwipeHint(page);
 
     await page.getByRole("button", { name: /open codex_demo/i }).click();
+    await page.getByTestId("session-action-dock").getByRole("button", { name: "Refresh" }).click();
     await expect(page.getByTestId("session-notes-panel")).toBeVisible();
     await expect(page.getByTestId("composer-image-picker")).toBeVisible();
 

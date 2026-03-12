@@ -104,6 +104,7 @@ export interface SessionInfo {
 export interface SessionsMeta {
   total_sessions?: number;
   background_mode?: string;
+  summary_updated_at?: number;
 }
 
 export interface SessionsResult extends BasicResult {

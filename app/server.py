@@ -7246,6 +7246,15 @@ def _session_stream_interval_ms(profile: str) -> int:
     return 420
 
 
+def _session_stream_max_chars(profile: str) -> int:
+    selected = str(profile or "").strip().lower()
+    if selected == "fast":
+        return 18000
+    if selected == "battery":
+        return 9000
+    return 12000
+
+
 def _session_stream_state_unlocked(session: str) -> Dict[str, Any]:
     session_id = _validate_session_name(session)
     state = SESSION_STREAM_STATES.get(session_id)
@@ -7801,7 +7810,7 @@ async def codex_session_stream(websocket: WebSocket, session: str):
         if not replay_events and not replay_snapshot:
             pane = _session_pane(session_id)
             if pane:
-                initial = await asyncio.to_thread(_stream_capture_pane_text, pane["pane_id"], 25000)
+                initial = await asyncio.to_thread(_stream_capture_pane_text, pane["pane_id"], _session_stream_max_chars(selected_profile))
                 if initial.get("ok"):
                     current_text = str(initial.get("text") or "")
                     current_state = _infer_progress_state(current_text, pane.get("current_command", ""))
@@ -7840,7 +7849,7 @@ async def codex_session_stream(websocket: WebSocket, session: str):
                 continue
 
             waiting_for_pane = False
-            capture = await asyncio.to_thread(_stream_capture_pane_text, pane["pane_id"], 25000)
+            capture = await asyncio.to_thread(_stream_capture_pane_text, pane["pane_id"], _session_stream_max_chars(selected_profile))
             if not capture.get("ok"):
                 await websocket.send_json(
                     {
@@ -7988,6 +7997,7 @@ def codex_sessions_live():
         "meta": {
             "total_sessions": len(live),
             "background_mode": SESSION_BACKGROUND_MODE,
+            "summary_updated_at": now,
         },
     }
 

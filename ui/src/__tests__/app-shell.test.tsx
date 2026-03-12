@@ -969,7 +969,6 @@ describe("app shell tabs", () => {
     render(<App />);
 
     const notesInput = await screen.findByTestId("session-notes-input");
-    await screen.findByText(/Plan heading/);
     await waitFor(() => {
       expect(notesInput).toHaveValue("");
     });
@@ -983,7 +982,7 @@ describe("app shell tabs", () => {
     await waitFor(() => {
       expect(saveSessionNotesMock).toHaveBeenCalledWith("codex_demo", {
         content: "Ship checklist",
-        last_response_snapshot: "Plan heading\nFirst action\nSecond action",
+        last_response_snapshot: "",
       });
     });
 
@@ -1164,6 +1163,17 @@ describe("app shell tabs", () => {
     getSessionScreenMock.mockResolvedValue({
       ok: true,
       text: "Summary heading\n\nFirst action\nSecond action",
+    });
+    getSessionNotesMock.mockResolvedValue({
+      ok: true,
+      session: "codex_demo",
+      notes: {
+        session: "codex_demo",
+        content: "",
+        created_at: Date.now(),
+        updated_at: Date.now(),
+        last_response_snapshot: "Summary heading\nFirst action\nSecond action",
+      },
     });
 
     render(<App />);
