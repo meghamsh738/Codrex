@@ -673,19 +673,6 @@ function appendTranscriptChunks(chunks: TranscriptChunk[], text: string): Transc
   return next;
 }
 
-function applySessionStreamEventToChunks(chunks: TranscriptChunk[], event: SessionStreamEvent): TranscriptChunk[] {
-  if (!event.ok && event.type === "error") {
-    return chunks;
-  }
-  if (event.type === "append") {
-    return appendTranscriptChunks(chunks, event.text || "");
-  }
-  if (event.type === "snapshot" || event.type === "replace") {
-    return chunkTranscript(event.text || "");
-  }
-  return chunks;
-}
-
 export default function App() {
   const [activeTab, setActiveTab] = useState<MainTab>(() => parseInitialTab());
   const [tabTransitionClass, setTabTransitionClass] = useState<TabTransitionClass>("tab-still");
@@ -855,6 +842,8 @@ export default function App() {
   const sessionOutputRef = useRef<HTMLPreElement | null>(null);
   const sessionTranscriptRef = useRef<TranscriptChunk[]>([]);
   const sessionTranscriptCacheRef = useRef<Record<string, TranscriptChunk[]>>({});
+  const sessionTranscriptTextRef = useRef("");
+  const sessionTranscriptCacheTextRef = useRef<Record<string, string>>({});
   const sessionStreamQueueRef = useRef<SessionStreamEvent[]>([]);
   const sessionStreamFrameRef = useRef<number | null>(null);
   const sessionStreamSeqRef = useRef<Record<string, number>>({});
@@ -1453,6 +1442,7 @@ export default function App() {
   const refreshScreen = useCallback(async (session: string) => {
     if (!session) {
       setSessionTranscriptChunks([]);
+      sessionTranscriptTextRef.current = "";
       sessionStreamSeqRef.current = {};
       return;
     }
@@ -1466,8 +1456,14 @@ export default function App() {
         throw new Error(response.detail || response.error || "Failed to read session screen.");
       }
       const nextText = response.text || "";
+      const previousText = sessionTranscriptCacheTextRef.current[session] || "";
+      if (nextText === previousText) {
+        setSessionUnreadCount(0);
+        return;
+      }
       const nextChunks = chunkTranscript(nextText);
       sessionTranscriptCacheRef.current[session] = nextChunks;
+      sessionTranscriptCacheTextRef.current[session] = nextText;
       if (session === selectedSession) {
         setSessionTranscriptChunks(nextChunks);
       }
@@ -1505,15 +1501,29 @@ export default function App() {
 
     let nextChunks = sessionTranscriptRef.current;
     let didChange = false;
-    let latestText = transcriptToText(nextChunks);
+    let latestText = sessionTranscriptTextRef.current;
 
     queued.forEach((event) => {
       if (typeof event.seq === "number" && event.seq > 0) {
         sessionStreamSeqRef.current[event.session] = event.seq;
       }
-      if (event.type === "snapshot" || event.type === "append" || event.type === "replace") {
-        nextChunks = applySessionStreamEventToChunks(nextChunks, event);
-        latestText = transcriptToText(nextChunks);
+      if (event.type === "append") {
+        const appendedText = event.text || "";
+        if (!appendedText) {
+          return;
+        }
+        nextChunks = appendTranscriptChunks(nextChunks, appendedText);
+        latestText = `${latestText}${appendedText}`;
+        didChange = true;
+        return;
+      }
+      if (event.type === "snapshot" || event.type === "replace") {
+        const replacementText = event.text || "";
+        if (replacementText === latestText) {
+          return;
+        }
+        nextChunks = chunkTranscript(replacementText);
+        latestText = replacementText;
         didChange = true;
       }
     });
@@ -1522,6 +1532,7 @@ export default function App() {
       return;
     }
 
+    sessionTranscriptTextRef.current = latestText;
     setSessionTranscriptChunks(nextChunks);
     if (threadSession === selectedSession) {
       captureAssistantSnapshot(selectedSession, latestText);
@@ -1648,8 +1659,10 @@ export default function App() {
 
   useEffect(() => {
     sessionTranscriptRef.current = sessionTranscriptChunks;
+    sessionTranscriptTextRef.current = transcriptToText(sessionTranscriptChunks);
     if (selectedSession) {
       sessionTranscriptCacheRef.current[selectedSession] = sessionTranscriptChunks;
+      sessionTranscriptCacheTextRef.current[selectedSession] = sessionTranscriptTextRef.current;
     }
   }, [selectedSession, sessionTranscriptChunks]);
 
@@ -1928,6 +1941,7 @@ export default function App() {
   useEffect(() => {
     if (!selectedSession) {
       setSessionTranscriptChunks([]);
+      sessionTranscriptTextRef.current = "";
       setSessionNotes("");
       setSessionNotesInfo(null);
       setSessionNotesLoading(false);
@@ -1938,8 +1952,10 @@ export default function App() {
     const cachedTranscript = sessionTranscriptCacheRef.current[selectedSession];
     if (cachedTranscript) {
       setSessionTranscriptChunks(cachedTranscript);
+      sessionTranscriptTextRef.current = sessionTranscriptCacheTextRef.current[selectedSession] || transcriptToText(cachedTranscript);
     } else {
       setSessionTranscriptChunks([]);
+      sessionTranscriptTextRef.current = "";
     }
     const canUseStreamBootstrap =
       activeTab === "sessions" &&
@@ -2755,7 +2771,9 @@ export default function App() {
       setStatus(`Closed ${selectedSession}.`);
       setSessions((current) => current.filter((item) => item.session !== closingSession));
       sessionTranscriptCacheRef.current[closingSession] = [];
+      delete sessionTranscriptCacheTextRef.current[closingSession];
       setSessionTranscriptChunks([]);
+      sessionTranscriptTextRef.current = "";
       setSessionNotes("");
       setSessionNotesInfo(null);
       delete sessionStreamSeqRef.current[closingSession];
@@ -3887,8 +3905,10 @@ export default function App() {
                       setStatus(`Closed ${session.session}.`);
                       setSessions((current) => current.filter((item) => item.session !== closingSession));
                       sessionTranscriptCacheRef.current[closingSession] = [];
+                      delete sessionTranscriptCacheTextRef.current[closingSession];
                       if (selectedSession === closingSession) {
                         setSessionTranscriptChunks([]);
+                        sessionTranscriptTextRef.current = "";
                         setSessionNotes("");
                         setSessionNotesInfo(null);
                         setSelectedSession("");
