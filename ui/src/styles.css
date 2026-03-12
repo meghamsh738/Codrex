@@ -1001,6 +1001,11 @@ button:active,
   box-shadow: 0 10px 16px rgba(2, 132, 199, 0.12);
 }
 
+.session-item:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--brand-accent) 72%, white 28%);
+  outline-offset: 2px;
+}
+
 .session-item.selected {
   border-color: color-mix(in srgb, var(--brand-accent) 70%, var(--border) 30%);
   box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--brand-accent) 70%, var(--border) 30%);
@@ -1058,6 +1063,35 @@ button:active,
   justify-content: space-between;
   align-items: center;
   gap: 8px;
+}
+
+.session-row-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.session-close-chip {
+  border: 1px solid color-mix(in srgb, var(--danger) 55%, var(--border) 45%);
+  background: linear-gradient(180deg, color-mix(in srgb, var(--danger) 22%, var(--surface) 78%), color-mix(in srgb, var(--surface-soft) 92%, transparent));
+  color: color-mix(in srgb, var(--danger) 78%, #ffffff 22%);
+  border-radius: 999px;
+  min-width: 30px;
+  height: 30px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 1rem;
+  font-weight: 700;
+  line-height: 1;
+  padding: 0;
+  box-shadow: 0 0 0 1px rgba(239, 68, 68, 0.08);
+}
+
+.session-close-chip:hover:not(:disabled) {
+  border-color: color-mix(in srgb, var(--danger) 70%, var(--border) 30%);
+  box-shadow: 0 8px 14px rgba(239, 68, 68, 0.18);
 }
 
 .state {
