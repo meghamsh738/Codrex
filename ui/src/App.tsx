@@ -77,6 +77,7 @@ import type {
   TmuxPaneInfo,
 } from "./types";
 import type { IpcEvent } from "./api";
+import { SelectedSessionWorkspace } from "./components/sessions/SelectedSessionWorkspace";
 const PairTab = lazy(() => import("./tabs/PairTab"));
 const SettingsTab = lazy(() => import("./tabs/SettingsTab"));
 const DebugTab = lazy(() => import("./tabs/DebugTab"));
@@ -2322,6 +2323,10 @@ export default function App() {
     : !selectedSession
       ? "Select a session first."
       : "";
+  const sessionNotesSavedLabel = sessionNotesInfo?.updated_at ? `Saved ${formatClock(sessionNotesInfo.updated_at)}` : "Not saved yet";
+  const hasLatestSessionResponse = Boolean(
+    latestSessionResponseSnapshot.trim() || (sessionNotesInfo?.last_response_snapshot || "").trim(),
+  );
   const desktopFocusSummary = desktopFocusPoint
     ? `Focused target: ${desktopFocusPoint.x}, ${desktopFocusPoint.y}`
     : "No desktop target focused yet. Tap the remote desktop once first.";
@@ -3011,6 +3016,54 @@ export default function App() {
       setSessionUnreadCount(0);
     }
   }, []);
+
+  const onJumpToSessionLive = useCallback(() => {
+    setSessionAutoFollow(true);
+    setSessionUnreadCount(0);
+  }, []);
+
+  const onToggleSessionStream = useCallback(() => {
+    setStreamEnabled((current) => !current);
+  }, []);
+
+  const onStreamProfileChange = useCallback((value: string) => {
+    setStreamProfile(parseStreamProfile(value));
+  }, []);
+
+  const onPromptTextChange = useCallback((value: string) => {
+    setPromptText(value);
+  }, []);
+
+  const onOpenSessionImagePicker = useCallback(() => {
+    sessionImageInputRef.current?.click();
+  }, []);
+
+  const onSessionImageFileChange = useCallback((file: File | null) => {
+    setSessionImageFile(file);
+  }, []);
+
+  const onSessionImagePromptChange = useCallback((value: string) => {
+    setSessionImagePrompt(value);
+  }, []);
+
+  const onSessionNotesChange = useCallback((value: string) => {
+    setSessionNotes(value);
+  }, []);
+
+  const onRefreshSelectedSession = useCallback(() => {
+    if (!selectedSession) {
+      return;
+    }
+    void refreshScreen(selectedSession);
+  }, [refreshScreen, selectedSession]);
+
+  const onComposerTelegramRequest = useCallback(() => {
+    if (composerTelegramDisabledReason) {
+      setError(composerTelegramDisabledReason);
+      return;
+    }
+    void onSendComposerToTelegram();
+  }, [composerTelegramDisabledReason, onSendComposerToTelegram, setError]);
 
   const onCreateThread = useCallback(async () => {
     const sessionName = (threadSessionInput || selectedSession).trim();
@@ -4246,323 +4299,55 @@ export default function App() {
                     <p>Screen output and prompt composer appear here.</p>
                   </div>
                 ) : (
-                  <>
-                    <div className="detail-head">
-                      <div>
-                        <h3>{selectedSessionInfo.session}</h3>
-                        <p className="small">
-                          State: {selectedSessionInfo.state} | Command: {selectedSessionInfo.current_command || "(none)"}
-                        </p>
-                        <p className="small">
-                          Refresh updates pane output. Interrupt sends Esc (soft stop), Ctrl+C sends terminal interrupt,
-                          and Close ends the tmux session.
-                        </p>
-                      </div>
-                    </div>
-
-                    <div className="row output-controls session-composer-card">
-                      <span className={`badge ${outputFeedState === "live" ? "" : "muted"}`}>
-                        Output: {outputFeedState}
-                      </span>
-                      <button
-                        type="button"
-                        className={`button soft compact button-light ${streamEnabled ? "is-active" : ""}`}
-                        data-testid="toggle-live-output"
-                        onClick={() => setStreamEnabled((current) => !current)}
-                      >
-                        {streamEnabled ? "Live On" : "Live Off"}
-                      </button>
-                      <label className="field inline">
-                        <span>Profile</span>
-                        <select
-                          data-testid="stream-profile-select"
-                          value={streamProfile}
-                          onChange={(event) => setStreamProfile(parseStreamProfile(event.target.value))}
-                          disabled={!streamEnabled}
-                        >
-                          <option value="fast">Fast</option>
-                          <option value="balanced">Balanced</option>
-                          <option value="battery">Battery</option>
-                        </select>
-                      </label>
-                    </div>
-
-                    <div className="session-workspace">
-                      <section className="session-live-shell">
-                        <div className="session-console-card session-console-primary">
-                          <div className="session-console-head">
-                            <div>
-                              <h3>Live Transcript</h3>
-                              <p className="small">
-                                {streamEnabled ? "Structured session stream over WebSocket." : "Polling snapshot fallback only."}
-                              </p>
-                            </div>
-                            <div className="session-console-meta">
-                              {!sessionAutoFollow && sessionUnreadCount > 0 ? (
-                                <button
-                                  type="button"
-                                  className="button soft compact button-light is-warn"
-                                  onClick={() => {
-                                    setSessionAutoFollow(true);
-                                    setSessionUnreadCount(0);
-                                  }}
-                                >
-                                  Jump to Live ({sessionUnreadCount})
-                                </button>
-                              ) : null}
-                              <span className={`mode-pill ${streamEnabled ? "mode-live" : "mode-muted"}`}>
-                                {streamEnabled ? outputFeedState : "polling only"}
-                              </span>
-                              <span className={`mode-pill ${sessionAutoFollow ? "mode-ready" : "mode-muted"}`}>
-                                {sessionAutoFollow ? "auto-follow" : "reader mode"}
-                              </span>
-                            </div>
-                          </div>
-                          <pre
-                            ref={sessionOutputRef}
-                            className="console session-console"
-                            onScroll={onSessionOutputScroll}
-                            data-testid="session-console"
-                          >
-                            {sessionTranscriptChunks.length > 0
-                              ? sessionTranscriptChunks.map((chunk) => <span key={chunk.id}>{chunk.text}</span>)
-                              : "(No screen output captured yet)"}
-                          </pre>
-                        </div>
-
-                        <div className="quick-open-card session-composer-shell">
-                          <div className="session-pane-head">
-                            <div>
-                              <h3>Prompt Composer</h3>
-                              <p className="small">Draft on the left, then keep one tap to send while the transcript stays visible.</p>
-                            </div>
-                            <span className={`mode-pill ${canSendPrompt ? "mode-ready" : "mode-muted"}`}>
-                              {canSendPrompt ? "ready to send" : "composer idle"}
-                            </span>
-                          </div>
-                          <div className="prompt-composer">
-                            <label className="field">
-                              <span>Prompt Composer</span>
-                              <div className="composer-input-wrap">
-                                <textarea
-                                  value={promptText}
-                                  onChange={(event) => setPromptText(event.target.value)}
-                                  rows={5}
-                                  placeholder="Type your prompt. Codrex will send Enter + Enter to submit."
-                                />
-                                <div className="composer-action-stack">
-                                  <div className="composer-action-row">
-                                    <input
-                                      ref={sessionImageInputRef}
-                                      type="file"
-                                      accept="image/*"
-                                      data-testid="session-image-input"
-                                      className="sr-only"
-                                      onChange={(event) => setSessionImageFile(event.target.files?.[0] || null)}
-                                    />
-                                    <button
-                                      type="button"
-                                      className={`composer-icon-btn ${sessionImageFile ? "is-active" : ""}`}
-                                      data-testid="composer-image-picker"
-                                      aria-label={sessionImageFile ? `Selected image ${sessionImageFile.name}` : "Choose image"}
-                                      title={sessionImageFile ? `Selected image: ${sessionImageFile.name}` : "Choose an image to insert into the composer"}
-                                      onClick={() => sessionImageInputRef.current?.click()}
-                                    >
-                                      <span className="composer-telegram-glyph" aria-hidden="true">🖼</span>
-                                    </button>
-                                    <button
-                                      type="button"
-                                      className="composer-telegram-btn"
-                                      data-testid="composer-send-telegram"
-                                      aria-label="Ask Codex to send via Telegram"
-                                      title={
-                                        composerTelegramDisabledReason
-                                        || `Append a Telegram send instruction for the current task output and send it through ${selectedSession || "the active session"}.`
-                                      }
-                                      onClick={() => {
-                                        if (composerTelegramDisabledReason) {
-                                          setError(composerTelegramDisabledReason);
-                                          return;
-                                        }
-                                        void onSendComposerToTelegram();
-                                      }}
-                                      disabled={composerTelegramBusy || !!composerTelegramDisabledReason}
-                                    >
-                                      <span className="composer-telegram-glyph" aria-hidden="true">✈</span>
-                                      <span className="composer-telegram-label">{composerTelegramBusy ? "Asking..." : "Telegram"}</span>
-                                    </button>
-                                  </div>
-                                </div>
-                                <button
-                                  type="button"
-                                  className="composer-send-btn"
-                                  data-testid="composer-send-prompt"
-                                  aria-label={sessionBusy ? "Sending prompt" : "Send prompt"}
-                                  onClick={() => void onSendPrompt()}
-                                  disabled={sessionBusy || !canSendPrompt}
-                                >
-                                  <svg viewBox="0 0 24 24" aria-hidden="true">
-                                    <path
-                                      d="M3 11.8 20.6 4.3a1 1 0 0 1 1.3 1.3L14.4 23.2a1 1 0 0 1-1.9-.3l-1-6-6-1a1 1 0 0 1-.3-1.9Z"
-                                      fill="currentColor"
-                                    />
-                                  </svg>
-                                </button>
-                              </div>
-                            </label>
-                          </div>
-                          {sessionImageFile ? (
-                            <div className="composer-media-inline" data-testid="composer-image-panel">
-                              <span className="mode-pill mode-ready">{sessionImageFile.name}</span>
-                              <input
-                                type="text"
-                                value={sessionImagePrompt}
-                                onChange={(event) => setSessionImagePrompt(event.target.value)}
-                                placeholder="Optional image instruction"
-                              />
-                              <button
-                                type="button"
-                                className="button soft compact button-light is-active"
-                                onClick={() => void onSendSessionImage()}
-                                disabled={sessionBusy || !sessionImageFile}
-                              >
-                                Send Image
-                              </button>
-                            </div>
-                          ) : null}
-                        </div>
-
-                        <div className="session-action-dock" data-testid="session-action-dock">
-                          <div className="session-action-group session-action-group-wide" role="group" aria-label="Session utility controls">
-                            <button
-                              type="button"
-                              className="button soft compact action-chip button-light"
-                              data-short="REF"
-                              onClick={() => void refreshScreen(selectedSessionInfo.session)}
-                            >
-                              <span className="btn-glyph" aria-hidden="true">↻</span>
-                              <span className="btn-text">Refresh</span>
-                            </button>
-                            <button type="button" className="button soft compact action-chip button-light is-active" data-short="ENT" onClick={() => void onSendEnter()} disabled={sessionBusy}>
-                              <span className="btn-glyph" aria-hidden="true">↵</span>
-                              <span className="btn-text">Enter</span>
-                            </button>
-                            <button type="button" className="button soft compact action-chip button-light" data-short="⌫" onClick={() => void onSendBackspace()} disabled={sessionBusy}>
-                              <span className="btn-glyph" aria-hidden="true">⌫</span>
-                              <span className="btn-text">Backspace</span>
-                            </button>
-                          </div>
-                          <div className="arrow-cluster" role="group" aria-label="Session arrow keys">
-                            <span className="arrow-cluster-gap" aria-hidden="true" />
-                            <button type="button" className="button soft compact arrow-key button-light" data-short="UP" aria-label="Up" onClick={() => void onSendArrowKey("up")} disabled={sessionBusy}>
-                              <span className="btn-text" aria-hidden="true">↑</span>
-                            </button>
-                            <span className="arrow-cluster-gap" aria-hidden="true" />
-                            <button type="button" className="button soft compact arrow-key button-light" data-short="LT" aria-label="Left" onClick={() => void onSendArrowKey("left")} disabled={sessionBusy}>
-                              <span className="btn-text" aria-hidden="true">←</span>
-                            </button>
-                            <button type="button" className="button soft compact arrow-key button-light" data-short="DN" aria-label="Down" onClick={() => void onSendArrowKey("down")} disabled={sessionBusy}>
-                              <span className="btn-text" aria-hidden="true">↓</span>
-                            </button>
-                            <button type="button" className="button soft compact arrow-key button-light" data-short="RT" aria-label="Right" onClick={() => void onSendArrowKey("right")} disabled={sessionBusy}>
-                              <span className="btn-text" aria-hidden="true">→</span>
-                            </button>
-                          </div>
-                          <div className="session-action-group" role="group" aria-label="Session safety controls">
-                            <button type="button" className="button warn compact action-chip button-light is-warn" data-short="INT" onClick={() => void onInterrupt()} disabled={sessionBusy}>
-                              <span className="btn-text">Interrupt</span>
-                            </button>
-                            <button type="button" className="button danger compact action-chip button-light is-danger" data-short="C^C" onClick={() => void onCtrlC()} disabled={sessionBusy}>
-                              <span className="btn-text">Ctrl+C</span>
-                            </button>
-                            <button type="button" className="button danger compact action-chip button-light is-danger" data-short="CLS" onClick={() => void onCloseSession()} disabled={sessionBusy}>
-                              <span className="btn-text">Close</span>
-                            </button>
-                          </div>
-                        </div>
-                      </section>
-
-                      <section className="session-secondary-shell">
-                        <div className="session-secondary-card">
-                          <div className="session-pane-head">
-                            <div>
-                              <h3>Notes</h3>
-                              <p className="small">Keep plans, checkpoints, and captured Codex replies attached to this session.</p>
-                            </div>
-                            <span className={`mode-pill ${sessionNotesInfo?.updated_at ? "mode-ready" : "mode-muted"}`}>
-                              {sessionNotesInfo?.updated_at ? `Saved ${formatClock(sessionNotesInfo.updated_at)}` : "Not saved yet"}
-                            </span>
-                          </div>
-                          <div className="session-pane-card" data-testid="session-notes-panel">
-                            <div className="row">
-                              <button
-                                type="button"
-                                className="button soft compact button-light is-active"
-                                onClick={() => void onSaveSessionNotes()}
-                                disabled={sessionNotesBusy || sessionNotesLoading}
-                              >
-                                {sessionNotesBusy ? "Saving..." : "Save"}
-                              </button>
-                              <button
-                                type="button"
-                                className="button soft compact button-light"
-                                onClick={() => void onAppendLatestToSessionNotes()}
-                                disabled={sessionNotesBusy || sessionNotesLoading || !selectedSession}
-                              >
-                                Append Latest Response
-                              </button>
-                              <button
-                                type="button"
-                                className="button soft compact button-light"
-                                onClick={() => void onCopyLatestSessionResponse()}
-                                disabled={!latestSessionResponseSnapshot && !sessionNotesInfo?.last_response_snapshot}
-                              >
-                                Copy Latest Response
-                              </button>
-                              <button
-                                type="button"
-                                className="button soft compact button-light"
-                                onClick={() => void onCopySessionNotes()}
-                                disabled={!sessionNotes.trim()}
-                              >
-                                Copy Notes
-                              </button>
-                              <button
-                                type="button"
-                                className="button danger compact button-light is-danger"
-                                onClick={onClearSessionNotes}
-                                disabled={sessionNotesBusy || sessionNotesLoading || !sessionNotes.trim()}
-                              >
-                                Clear Notes
-                              </button>
-                            </div>
-                            <div className="session-pane-scroll">
-                              {sessionNotesLoading ? <p className="small">Loading notes...</p> : null}
-                              {!sessionNotesLoading && !sessionNotes.trim() ? (
-                                <div className="empty-state panel-empty">
-                                  <h3>No notes yet</h3>
-                                  <p>Use this space for plans, checklists, or summaries from the current Codex session.</p>
-                                </div>
-                              ) : null}
-                              <label className="field">
-                                <span>Notes</span>
-                                <textarea
-                                  data-testid="session-notes-input"
-                                  value={sessionNotes}
-                                  onChange={(event) => setSessionNotes(event.target.value)}
-                                  rows={12}
-                                  placeholder="Write session notes here. Save keeps them attached to this Codex session."
-                                />
-                              </label>
-                              <p className="small">
-                                Latest response snapshot: <strong>{latestSessionResponseSnapshot ? "available" : "not captured yet"}</strong>
-                              </p>
-                            </div>
-                          </div>
-                        </div>
-                      </section>
-                    </div>
-                  </>
+                  <SelectedSessionWorkspace
+                    selectedSessionInfo={selectedSessionInfo}
+                    outputFeedState={outputFeedState}
+                    streamEnabled={streamEnabled}
+                    streamProfile={streamProfile}
+                    onToggleStream={onToggleSessionStream}
+                    onStreamProfileChange={onStreamProfileChange}
+                    sessionAutoFollow={sessionAutoFollow}
+                    sessionUnreadCount={sessionUnreadCount}
+                    onJumpToLive={onJumpToSessionLive}
+                    sessionOutputRef={sessionOutputRef}
+                    onSessionOutputScroll={onSessionOutputScroll}
+                    sessionTranscriptChunks={sessionTranscriptChunks}
+                    promptText={promptText}
+                    onPromptTextChange={onPromptTextChange}
+                    canSendPrompt={canSendPrompt}
+                    sessionBusy={sessionBusy}
+                    composerTelegramBusy={composerTelegramBusy}
+                    composerTelegramDisabledReason={composerTelegramDisabledReason}
+                    onSendComposerToTelegram={onComposerTelegramRequest}
+                    onSendPrompt={onSendPrompt}
+                    sessionImageInputRef={sessionImageInputRef}
+                    sessionImageFile={sessionImageFile}
+                    onSessionImageFileChange={onSessionImageFileChange}
+                    sessionImagePrompt={sessionImagePrompt}
+                    onSessionImagePromptChange={onSessionImagePromptChange}
+                    onOpenImagePicker={onOpenSessionImagePicker}
+                    onSendSessionImage={onSendSessionImage}
+                    onRefreshSession={onRefreshSelectedSession}
+                    onSendEnter={onSendEnter}
+                    onSendBackspace={onSendBackspace}
+                    onSendArrowKey={onSendArrowKey}
+                    onInterrupt={onInterrupt}
+                    onCtrlC={onCtrlC}
+                    onCloseSession={onCloseSession}
+                    sessionNotesInfo={sessionNotesInfo}
+                    sessionNotesSavedLabel={sessionNotesSavedLabel}
+                    sessionNotesBusy={sessionNotesBusy}
+                    sessionNotesLoading={sessionNotesLoading}
+                    onSaveSessionNotes={onSaveSessionNotes}
+                    onAppendLatestToSessionNotes={onAppendLatestToSessionNotes}
+                    onCopyLatestSessionResponse={onCopyLatestSessionResponse}
+                    hasLatestSessionResponse={hasLatestSessionResponse}
+                    onCopySessionNotes={onCopySessionNotes}
+                    onClearSessionNotes={onClearSessionNotes}
+                    sessionNotes={sessionNotes}
+                    onSessionNotesChange={onSessionNotesChange}
+                    latestSessionResponseSnapshot={latestSessionResponseSnapshot}
+                  />
                 )}
               </div>
             </div>
