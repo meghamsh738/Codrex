@@ -20,6 +20,7 @@ public partial class MainWindow : Window
     private bool _webReady;
     private bool _actionBusy;
     private long _actionGeneration;
+    private string _pendingAction = "";
     private string _statusDetail = "Launcher ready.";
     private string _errorDetail = "";
 
@@ -190,6 +191,7 @@ public partial class MainWindow : Window
         _actionBusy = true;
         _actionGeneration += 1;
         var generation = _actionGeneration;
+        _pendingAction = action;
         _errorDetail = "";
         _currentPairing = action == "stop" ? null : _currentPairing;
         _statusDetail = action == "start" ? "Starting Codrex runtime..." : action == "stop" ? "Stopping Codrex runtime..." : "Running Codrex action...";
@@ -237,6 +239,7 @@ public partial class MainWindow : Window
             if (generation == _actionGeneration)
             {
                 _actionBusy = false;
+                _pendingAction = "";
                 await RefreshStateAsync();
             }
         }
@@ -278,6 +281,7 @@ public partial class MainWindow : Window
         try
         {
             _lastRuntime = await _runtimeService.GetStatusAsync();
+            TryCompletePendingActionFromLiveState(_lastRuntime);
             if (_lastRuntime.Ok && _lastRuntime.Status.Equals("running", StringComparison.OrdinalIgnoreCase))
             {
                 var config = _runtimeService.ReadControllerConfig();
@@ -294,6 +298,35 @@ public partial class MainWindow : Window
         }
 
         await PublishStateAsync();
+    }
+
+    private void TryCompletePendingActionFromLiveState(RuntimeActionResult? runtime)
+    {
+        if (!_actionBusy || runtime is null || !runtime.Ok)
+        {
+            return;
+        }
+
+        var status = (runtime.Status ?? string.Empty).Trim().ToLowerInvariant();
+        if (_pendingAction == "start" && status == "running")
+        {
+            _actionGeneration += 1;
+            _actionBusy = false;
+            _pendingAction = "";
+            _errorDetail = "";
+            _statusDetail = string.IsNullOrWhiteSpace(runtime.Detail) ? "Codrex start complete." : runtime.Detail;
+            return;
+        }
+
+        if (_pendingAction == "stop" && status == "stopped")
+        {
+            _actionGeneration += 1;
+            _actionBusy = false;
+            _pendingAction = "";
+            _errorDetail = "";
+            _currentPairing = null;
+            _statusDetail = string.IsNullOrWhiteSpace(runtime.Detail) ? "Codrex stop complete." : runtime.Detail;
+        }
     }
 
     private async Task PublishStateAsync()

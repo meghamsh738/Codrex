@@ -1377,6 +1377,16 @@ button:active,
   box-shadow: 0 10px 18px rgba(14, 155, 255, 0.2);
 }
 
+.composer-telegram-btn-secondary {
+  border-color: color-mix(in srgb, var(--border-strong) 62%, var(--brand-accent) 38%);
+  background: linear-gradient(
+    165deg,
+    color-mix(in srgb, var(--surface-soft) 96%, var(--brand-accent) 4%),
+    color-mix(in srgb, var(--surface) 98%, transparent)
+  );
+  box-shadow: 0 6px 12px rgba(8, 20, 44, 0.24);
+}
+
 .composer-telegram-btn:disabled {
   opacity: 0.58;
   cursor: not-allowed;
@@ -1779,9 +1789,11 @@ button:active,
   align-items: stretch;
 }
 
-.remote-text-controls input {
+.remote-text-controls textarea {
   flex: 2 1 320px;
   min-width: 220px;
+  min-height: 120px;
+  resize: vertical;
 }
 
 .remote-text-controls .button {
@@ -2062,7 +2074,7 @@ button:active,
     max-height: calc(100vh - 180px);
   }
 
-  .remote-text-controls input {
+  .remote-text-controls textarea {
     flex: 1 1 100%;
     min-width: 0;
   }

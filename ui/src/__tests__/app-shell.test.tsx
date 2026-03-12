@@ -520,11 +520,12 @@ describe("app shell tabs", () => {
     fireEvent.click(streamImage, { clientX: 140, clientY: 100 });
     desktopClickMock.mockClear();
 
-    fireEvent.click(screen.getByRole("button", { name: "Type Clipboard" }));
+    fireEvent.click(screen.getByRole("button", { name: "Paste Into Box" }));
 
     await waitFor(() => {
-      expect(desktopSendTextMock).toHaveBeenCalledWith("Clipboard payload");
+      expect(screen.getByDisplayValue("Clipboard payload")).toBeInTheDocument();
     });
+    expect(desktopSendTextMock).not.toHaveBeenCalled();
     expect(desktopClickMock).not.toHaveBeenCalled();
   });
 
@@ -1054,7 +1055,7 @@ describe("app shell tabs", () => {
     });
   });
 
-  it("submits an infer-style Telegram helper prompt with explicit helper fallback and session file hints", async () => {
+  it("sends the selected session file directly to Telegram from the composer action", async () => {
     getAuthStatusMock.mockResolvedValue({
       ok: true,
       auth_required: true,
@@ -1110,19 +1111,73 @@ describe("app shell tabs", () => {
     fireEvent.click(telegramButton);
 
     await waitFor(() => {
+      expect(sendSessionFileToTelegramMock).toHaveBeenCalledWith("codex_demo", "sf_abc", "Result Plot");
+    });
+    expect(sendToSessionMock).not.toHaveBeenCalled();
+  });
+
+  it("asks Codex to send the selected session file via exact /tgsend command", async () => {
+    getAuthStatusMock.mockResolvedValue({
+      ok: true,
+      auth_required: true,
+      authenticated: true,
+    });
+    getSessionsMock.mockResolvedValue({
+      ok: true,
+      sessions: [
+        {
+          session: "codex_demo",
+          pane_id: "%1",
+          current_command: "codex",
+          cwd: "/home/megha/work",
+          state: "idle",
+          updated_at: Date.now(),
+          snippet: "Assistant ready",
+        },
+      ],
+    });
+    getTelegramStatusMock.mockResolvedValue({
+      ok: true,
+      configured: true,
+    });
+    listSessionFilesMock.mockResolvedValue({
+      ok: true,
+      items: [
+        {
+          id: "sf_abc",
+          title: "Result Plot",
+          file_name: "result.png",
+          mime_type: "image/png",
+          size_bytes: 2048,
+          created_at: Date.now(),
+          expires_at: Date.now() + 24 * 3600 * 1000,
+          created_by: "session:codex_demo",
+          is_image: true,
+          item_kind: "file",
+          wsl_path: "/home/megha/codrex-work/output/result.png",
+          download_url: "/codex/session/codex_demo/files/sf_abc/download",
+        },
+      ],
+    });
+
+    render(<App />);
+
+    fireEvent.click(await screen.findByTestId("session-pane-tab-files"));
+    const panel = await screen.findByTestId("session-files-panel");
+    const itemCard = (await within(panel).findByText("/home/megha/codrex-work/output/result.png")).closest(".session-file-item");
+    expect(itemCard).not.toBeNull();
+    fireEvent.click(itemCard as HTMLElement);
+
+    const askCodexButton = await screen.findByTestId("composer-ask-codex-telegram");
+    fireEvent.click(askCodexButton);
+
+    await waitFor(() => {
       expect(sendToSessionMock).toHaveBeenCalledWith(
         "codex_demo",
-        expect.stringContaining("Use `tgsend` if it is available. If it is not on PATH, use `/home/megha/.local/bin/codrex-send --telegram` directly."),
-      );
-      expect(sendToSessionMock).toHaveBeenCalledWith(
-        "codex_demo",
-        expect.stringContaining("/home/megha/codrex-work/output/result.png"),
-      );
-      expect(sendToSessionMock).toHaveBeenCalledWith(
-        "codex_demo",
-        expect.stringContaining("Do not search for Telegram bot keys, secret files, or controller config files."),
+        '/tgsend "/home/megha/codrex-work/output/result.png" --caption "Result Plot"',
       );
     });
+    expect(sendSessionFileToTelegramMock).not.toHaveBeenCalled();
   });
 
   it("copies notes and latest response with the shared clipboard helper", async () => {

@@ -350,6 +350,8 @@
         pairLink: "",
         qrImageUrl: "",
       };
+      let renderedQrUrl = "";
+      let renderedQrVisible = false;
 
       const els = {
         statusLight: document.getElementById("statusLight"),
@@ -421,10 +423,22 @@
         els.pairStatus.textContent = state.pairDetail || (state.qrVisible ? "Pairing QR ready." : "Press Show Pair QR after Codrex is running.");
         els.pairLink.value = state.pairLink || "";
 
-        if (state.qrVisible && state.qrImageUrl) {
-          els.qrBox.innerHTML = `<img alt="Codrex pairing QR" src="${state.qrImageUrl}" />`;
-        } else {
-          els.qrBox.innerHTML = `<span class="subtle">QR will appear here.</span>`;
+        const nextQrVisible = !!(state.qrVisible && state.qrImageUrl);
+        const nextQrUrl = nextQrVisible ? state.qrImageUrl : "";
+        if (nextQrVisible !== renderedQrVisible || nextQrUrl !== renderedQrUrl) {
+          renderedQrVisible = nextQrVisible;
+          renderedQrUrl = nextQrUrl;
+          if (nextQrVisible) {
+            const img = document.createElement("img");
+            img.alt = "Codrex pairing QR";
+            img.src = nextQrUrl;
+            els.qrBox.replaceChildren(img);
+          } else {
+            const placeholder = document.createElement("span");
+            placeholder.className = "subtle";
+            placeholder.textContent = "QR will appear here.";
+            els.qrBox.replaceChildren(placeholder);
+          }
         }
       }
 

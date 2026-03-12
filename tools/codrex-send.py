@@ -9,6 +9,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import os
 import pathlib
@@ -199,6 +200,80 @@ def _controller_reachable(base_url: str, token: str) -> bool:
         return False
 
 
+def _running_in_wsl() -> bool:
+    if os.environ.get("WSL_DISTRO_NAME"):
+        return True
+    try:
+        version = pathlib.Path("/proc/version").read_text(encoding="utf-8", errors="ignore").lower()
+        return "microsoft" in version or "wsl" in version
+    except Exception:
+        return False
+
+
+def _request_json_via_windows(base_url: str, method: str, path: str, payload: Optional[Dict[str, Any]], token: str) -> Dict[str, Any]:
+    if not _running_in_wsl():
+        return {"ok": False, "error": "request_failed", "detail": "Windows bridge unavailable outside WSL."}
+
+    url = f"{base_url.rstrip('/')}{path}"
+    payload_json = json.dumps(payload) if payload is not None else ""
+    token_switch = "$true" if token else "$false"
+    script = f"""
+$ErrorActionPreference = 'Stop'
+$headers = @{{ Accept = 'application/json' }}
+if ({token_switch}) {{
+  $headers['x-auth-token'] = @'
+{token}
+'@
+}}
+$uri = @'
+{url}
+'@
+$body = @'
+{payload_json}
+'@
+try {{
+  if ($body.Length -gt 0) {{
+    $resp = Invoke-RestMethod -Uri $uri -Method {method.upper()} -Headers $headers -Body $body -ContentType 'application/json' -TimeoutSec 30
+  }} else {{
+    $resp = Invoke-RestMethod -Uri $uri -Method {method.upper()} -Headers $headers -TimeoutSec 30
+  }}
+  $resp | ConvertTo-Json -Depth 20 -Compress
+}} catch {{
+  $detail = ''
+  if ($_.ErrorDetails -and $_.ErrorDetails.Message) {{
+    $detail = $_.ErrorDetails.Message
+  }}
+  if (-not $detail) {{
+    $detail = $_.Exception.Message
+  }}
+  [pscustomobject]@{{ ok = $false; error = 'request_failed'; detail = $detail }} | ConvertTo-Json -Depth 20 -Compress
+}}
+"""
+    encoded = base64.b64encode(script.encode("utf-16le")).decode("ascii")
+    try:
+        result = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-EncodedCommand", encoded],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=35,
+        )
+    except Exception as exc:
+        return {"ok": False, "error": "request_failed", "detail": f"Windows bridge failed: {type(exc).__name__}: {exc}"}
+
+    stdout = (result.stdout or "").strip()
+    stderr = (result.stderr or "").strip()
+    for raw_line in reversed([line for line in stdout.splitlines() if line.strip()]):
+        try:
+            parsed = json.loads(raw_line)
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            continue
+    detail = stderr or stdout or f"Windows bridge exited with code {result.returncode}"
+    return {"ok": False, "error": "request_failed", "detail": detail}
+
+
 def _build_controller_candidates(env_base: str, cfg: Dict[str, Any], port: int) -> List[str]:
     candidates: List[str] = []
 
@@ -349,7 +424,11 @@ def _request_json(base_url: str, method: str, path: str, payload: Optional[Dict[
             pass
         return {"ok": False, "error": "http_error", "detail": f"HTTP {getattr(e, 'code', '?')}"}
     except Exception as e:
-        return {"ok": False, "error": "request_failed", "detail": f"{type(e).__name__}: {e}"}
+        via_windows = _request_json_via_windows(base_url, method, path, payload, token)
+        if via_windows.get("ok"):
+            return via_windows
+        fallback_detail = via_windows.get("detail") or f"{type(e).__name__}: {e}"
+        return {"ok": False, "error": "request_failed", "detail": f"{type(e).__name__}: {e}; windows_bridge={fallback_detail}"}
 
 
 def _request_json_with_fallback(

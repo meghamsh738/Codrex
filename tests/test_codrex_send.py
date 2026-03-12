@@ -2,6 +2,7 @@ import importlib.util
 import os
 import tempfile
 import unittest
+import urllib.error
 from pathlib import Path
 from unittest import mock
 
@@ -134,6 +135,39 @@ class CodrexSendConfigTests(unittest.TestCase):
 
         self.assertTrue(response.get("ok"))
         self.assertEqual(used_base, "http://100.64.0.9:48787")
+
+    def test_request_json_uses_windows_bridge_when_direct_http_fails(self):
+        with mock.patch("urllib.request.urlopen", side_effect=urllib.error.URLError("[Errno 111] Connection refused")), \
+             mock.patch.object(codrex_send, "_request_json_via_windows", return_value={"ok": True, "item": {"id": "share_123"}}) as bridge:
+            response = codrex_send._request_json(
+                "http://127.0.0.1:48787",
+                "POST",
+                "/shares",
+                {"path": "/home/megha/codrex-work/output/result.png"},
+                "runtime-token",
+            )
+
+        self.assertTrue(response.get("ok"))
+        bridge.assert_called_once()
+
+    def test_request_json_reports_bridge_failure_detail_when_all_paths_fail(self):
+        with mock.patch("urllib.request.urlopen", side_effect=urllib.error.URLError("[Errno 111] Connection refused")), \
+             mock.patch.object(
+                 codrex_send,
+                 "_request_json_via_windows",
+                 return_value={"ok": False, "error": "request_failed", "detail": "Windows bridge unreachable"},
+             ):
+            response = codrex_send._request_json(
+                "http://127.0.0.1:48787",
+                "POST",
+                "/shares",
+                {"path": "/home/megha/codrex-work/output/result.png"},
+                "runtime-token",
+            )
+
+        self.assertFalse(response.get("ok"))
+        self.assertEqual(response.get("error"), "request_failed")
+        self.assertIn("windows_bridge=Windows bridge unreachable", response.get("detail", ""))
 
 
 if __name__ == "__main__":
