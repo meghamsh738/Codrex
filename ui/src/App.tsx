@@ -77,6 +77,7 @@ import type {
   TmuxPaneInfo,
 } from "./types";
 import type { IpcEvent } from "./api";
+import { SessionListPanel } from "./components/sessions/SessionListPanel";
 import { SelectedSessionWorkspace } from "./components/sessions/SelectedSessionWorkspace";
 const PairTab = lazy(() => import("./tabs/PairTab"));
 const SettingsTab = lazy(() => import("./tabs/SettingsTab"));
@@ -3857,89 +3858,43 @@ export default function App() {
     }
   }, [selectedIpcEvent, setError, setStatus]);
 
-  const renderSessionButton = useCallback(
-    (session: SessionInfo) => {
-      const selected = session.session === selectedSession;
-      const project = inferProjectFromCwd(session.cwd);
-      const handleSelectSession = () => {
-        setSelectedSession(session.session);
-      };
-      return (
-        <div
-          key={session.session}
-          role="button"
-          tabIndex={0}
-          aria-label={`Open ${session.session}`}
-          className={`session-item ${selected ? "selected" : ""}`}
-          onClick={handleSelectSession}
-          onKeyDown={(event) => {
-            if (event.key === "Enter" || event.key === " ") {
-              event.preventDefault();
-              handleSelectSession();
-            }
-          }}
-        >
-          <div className="session-row">
-            <strong>{session.session}</strong>
-            <div className="session-row-actions">
-              <span className={`state state-${session.state}`}>{session.state}</span>
-              <button
-                type="button"
-                className="session-close-chip"
-                aria-label={`Close ${session.session}`}
-                title={`Close ${session.session}`}
-                onClick={(event) => {
-                  event.stopPropagation();
-                  if (sessionBusy) {
-                    return;
-                  }
-                  setSelectedSession(session.session);
-                  void (async () => {
-                    setSessionBusy(true);
-                    try {
-                      const response = await closeSession(session.session);
-                      if (!response.ok) {
-                        throw new Error(response.detail || response.error || "Could not close session.");
-                      }
-                      const closingSession = session.session;
-                      setStatus(`Closed ${session.session}.`);
-                      setSessions((current) => current.filter((item) => item.session !== closingSession));
-                      sessionTranscriptCacheRef.current[closingSession] = [];
-                      delete sessionTranscriptCacheTextRef.current[closingSession];
-                      if (selectedSession === closingSession) {
-                        setSessionTranscriptChunks([]);
-                        sessionTranscriptTextRef.current = "";
-                        setSessionNotes("");
-                        setSessionNotesInfo(null);
-                        setSelectedSession("");
-                      }
-                      delete sessionStreamSeqRef.current[closingSession];
-                      scheduleSessionsRefresh(200);
-                    } catch (error) {
-                      setError(`Close session failed: ${(error as Error).message}`);
-                    } finally {
-                      setSessionBusy(false);
-                    }
-                  })();
-                }}
-                disabled={sessionBusy}
-              >
-                ×
-              </button>
-            </div>
-          </div>
-          <p className="session-snippet">{session.snippet || "No output yet."}</p>
-          <small className="session-meta">
-            <span>{project}</span>
-            <span>{session.model || "default model"}</span>
-            <span>{session.reasoning_effort || "default reasoning"}</span>
-          </small>
-          <small className="session-cwd">{session.cwd || "Unknown cwd"}</small>
-        </div>
-      );
-    },
-    [closeSession, scheduleSessionsRefresh, selectedSession, sessionBusy, setError, setStatus],
-  );
+  const onSelectSessionCard = useCallback((session: string) => {
+    setSelectedSession(session);
+  }, []);
+
+  const onCloseSessionCard = useCallback((sessionName: string) => {
+    if (sessionBusy) {
+      return;
+    }
+    setSelectedSession(sessionName);
+    void (async () => {
+      setSessionBusy(true);
+      try {
+        const response = await closeSession(sessionName);
+        if (!response.ok) {
+          throw new Error(response.detail || response.error || "Could not close session.");
+        }
+        const closingSession = sessionName;
+        setStatus(`Closed ${sessionName}.`);
+        setSessions((current) => current.filter((item) => item.session !== closingSession));
+        sessionTranscriptCacheRef.current[closingSession] = [];
+        delete sessionTranscriptCacheTextRef.current[closingSession];
+        if (selectedSession === closingSession) {
+          setSessionTranscriptChunks([]);
+          sessionTranscriptTextRef.current = "";
+          setSessionNotes("");
+          setSessionNotesInfo(null);
+          setSelectedSession("");
+        }
+        delete sessionStreamSeqRef.current[closingSession];
+        scheduleSessionsRefresh(200);
+      } catch (error) {
+        setError(`Close session failed: ${(error as Error).message}`);
+      } finally {
+        setSessionBusy(false);
+      }
+    })();
+  }, [closeSession, scheduleSessionsRefresh, selectedSession, sessionBusy, setError, setStatus]);
 
   const renderNavIcon = useCallback((tab: MainTab) => {
     if (tab === "sessions") {
@@ -4274,42 +4229,20 @@ export default function App() {
                   </div>
                 </div>
 
-                <div className="session-summary-strip">
-                  <p className="small">{visibleSessionCountLabel}</p>
-                  <p className="small">
-                    {sessionsMeta?.background_mode === "selected_only"
-                      ? "Only the selected session stays live; background sessions use cached summaries."
-                      : sessionCountLabel}
-                  </p>
-                </div>
-
-                {sessionsLoading ? <p className="small">Loading sessions...</p> : null}
-                {!sessionsLoading && sessions.length === 0 ? (
-                  <div className="empty-state panel-empty">
-                    <h3>No sessions yet</h3>
-                    <p>Create one to start interacting with Codex from mobile.</p>
-                  </div>
-                ) : null}
-                {!sessionsLoading && sessions.length > 0 && filteredSessions.length === 0 ? (
-                  <div className="empty-state panel-empty">
-                    <h3>No matching sessions</h3>
-                    <p>Adjust search text or project filter.</p>
-                  </div>
-                ) : null}
-
-                {sessionViewMode === "grouped" ? (
-                  groupedSessions.map((group) => (
-                    <div key={group.project} className="session-group">
-                      <div className="session-group-head">
-                        <strong>{group.project}</strong>
-                        <span className="badge muted">{group.items.length}</span>
-                      </div>
-                      <div className="session-card-grid">{group.items.map((session) => renderSessionButton(session))}</div>
-                    </div>
-                  ))
-                ) : (
-                  <div className="session-card-grid">{filteredSessions.map((session) => renderSessionButton(session))}</div>
-                )}
+                <SessionListPanel
+                  sessionsLoading={sessionsLoading}
+                  sessionsCount={sessions.length}
+                  filteredCount={filteredSessions.length}
+                  visibleSessionCountLabel={visibleSessionCountLabel}
+                  sessionViewMode={sessionViewMode}
+                  groupedSessions={groupedSessions}
+                  filteredSessions={filteredSessions}
+                  selectedSession={selectedSession}
+                  sessionBusy={sessionBusy}
+                  onSelectSession={onSelectSessionCard}
+                  onCloseSession={onCloseSessionCard}
+                  inferProjectFromCwd={inferProjectFromCwd}
+                />
               </div>
 
               <div className="session-detail" data-testid="session-detail">
