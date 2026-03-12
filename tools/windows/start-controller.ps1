@@ -192,7 +192,7 @@ function Test-ControllerReady {
     $headers["x-auth-token"] = $Token
   }
   try {
-    $resp = Invoke-WebRequest -UseBasicParsing -Headers $headers -Uri ("http://{0}:{1}/auth/status" -f $ProbeHost, $Port) -TimeoutSec 2
+    $resp = Invoke-WebRequest -UseBasicParsing -Headers $headers -Uri ("http://{0}:{1}/auth/status" -f $ProbeHost, $Port) -TimeoutSec 1
     return ($resp.StatusCode -eq 200)
   } catch {}
   return $false
@@ -437,13 +437,8 @@ $null = Start-Process -FilePath "cmd.exe" -ArgumentList @("/d", "/c", $launchCom
 # Wait until endpoint responds.
 $ok = $false
 $readyHost = ""
-$probeHosts = @("127.0.0.1", "localhost")
-$primaryIp = Get-PrimaryIPv4
-if ($primaryIp -and $primaryIp -ne "127.0.0.1") {
-  $probeHosts += $primaryIp
-}
-$probeHosts = $probeHosts | Select-Object -Unique
-for ($i = 0; $i -lt 32; $i++) {
+$probeHosts = @("127.0.0.1", "localhost") | Select-Object -Unique
+for ($i = 0; $i -lt 40; $i++) {
   foreach ($h in $probeHosts) {
     if (Test-ControllerReady -ProbeHost $h -Port $cfg.port -Token $cfg.token) {
       $ok = $true
@@ -452,7 +447,7 @@ for ($i = 0; $i -lt 32; $i++) {
     }
   }
   if ($ok) { break }
-  Start-Sleep -Milliseconds 100
+  Start-Sleep -Milliseconds 50
 }
 
 if (-not $ok) {
