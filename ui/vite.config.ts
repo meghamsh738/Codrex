@@ -1,9 +1,14 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
+import packageJson from "./package.json";
 
 const backendOrigin = process.env["VITE_BACKEND_ORIGIN"] ?? "http://127.0.0.1:8787";
+const appBuild = `${packageJson.version}-${Date.now()}`;
 
 export default defineConfig({
+  define: {
+    "import.meta.env.VITE_APP_BUILD": JSON.stringify(appBuild),
+  },
   plugins: [react()],
   server: {
     proxy: {

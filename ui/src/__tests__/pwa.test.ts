@@ -25,31 +25,37 @@ describe("registerServiceWorker", () => {
     expect(register).not.toHaveBeenCalled();
   });
 
-  it("registers immediately once the document is already loaded", () => {
+  it("registers immediately once the document is already loaded", async () => {
     const register = vi.fn().mockResolvedValue(undefined);
-    vi.stubGlobal("navigator", { serviceWorker: { register } });
+    const getRegistrations = vi.fn().mockResolvedValue([]);
+    vi.stubGlobal("navigator", { serviceWorker: { register, getRegistrations } });
     Object.defineProperty(document, "readyState", {
       configurable: true,
       value: "complete",
     });
 
-    registerServiceWorker({ enabled: true, serviceWorkerUrl: "/sw.js" });
+    registerServiceWorker({ enabled: true, serviceWorkerUrl: "/sw.js", buildId: "build-1" });
+    await Promise.resolve();
+    await Promise.resolve();
 
-    expect(register).toHaveBeenCalledWith("/sw.js");
+    expect(register).toHaveBeenCalledWith("/sw.js?v=build-1");
   });
 
-  it("waits for the load event before registering", () => {
+  it("waits for the load event before registering", async () => {
     const register = vi.fn().mockResolvedValue(undefined);
-    vi.stubGlobal("navigator", { serviceWorker: { register } });
+    const getRegistrations = vi.fn().mockResolvedValue([]);
+    vi.stubGlobal("navigator", { serviceWorker: { register, getRegistrations } });
     Object.defineProperty(document, "readyState", {
       configurable: true,
       value: "loading",
     });
 
-    registerServiceWorker({ enabled: true, serviceWorkerUrl: "/sw.js" });
+    registerServiceWorker({ enabled: true, serviceWorkerUrl: "/sw.js", buildId: "build-1" });
     expect(register).not.toHaveBeenCalled();
 
     window.dispatchEvent(new Event("load"));
-    expect(register).toHaveBeenCalledWith("/sw.js");
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(register).toHaveBeenCalledWith("/sw.js?v=build-1");
   });
 });

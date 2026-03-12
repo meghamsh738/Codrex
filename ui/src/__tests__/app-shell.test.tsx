@@ -2,6 +2,7 @@ import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-li
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import App from "../App";
 import * as api from "../api";
+import type { SessionInfo } from "../types";
 
 vi.mock("../api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../api")>();
@@ -807,8 +808,8 @@ describe("app shell tabs", () => {
       target: { value: "project-alpha" },
     });
     const sessionList = screen.getByRole("list", { name: "Codex sessions" });
-    expect(await within(sessionList).findByRole("button", { name: /codex_alpha/i })).toBeInTheDocument();
-    expect(within(sessionList).queryByRole("button", { name: /codex_beta/i })).not.toBeInTheDocument();
+    expect(await within(sessionList).findByRole("button", { name: /open codex_alpha/i })).toBeInTheDocument();
+    expect(within(sessionList).queryByRole("button", { name: /open codex_beta/i })).not.toBeInTheDocument();
   });
 
   it("restores selected session and filter state after reload", async () => {
@@ -851,9 +852,64 @@ describe("app shell tabs", () => {
     expect((screen.getByTestId("session-search-input") as HTMLInputElement).value).toBe("beta");
 
     const sessionList = screen.getByRole("list", { name: "Codex sessions" });
-    const betaCard = await within(sessionList).findByRole("button", { name: /codex_beta/i });
+    const betaCard = await within(sessionList).findByRole("button", { name: /open codex_beta/i });
     expect(betaCard.className).toContain("selected");
     expect(screen.getByText("1 visible / 2 total")).toBeInTheDocument();
+  });
+
+  it("closes a session directly from its session card", async () => {
+    const alphaSession: SessionInfo = {
+      session: "codex_alpha",
+      pane_id: "%1",
+      current_command: "codex",
+      cwd: "/home/megha/project-alpha",
+      state: "idle",
+      updated_at: Date.now(),
+      snippet: "Alpha output",
+    };
+    const betaSession: SessionInfo = {
+      session: "codex_beta",
+      pane_id: "%2",
+      current_command: "codex",
+      cwd: "/home/megha/project-beta",
+      state: "running",
+      updated_at: Date.now(),
+      snippet: "Beta output",
+    };
+
+    getSessionsMock
+      .mockResolvedValueOnce({
+        ok: true,
+        sessions: [alphaSession, betaSession],
+        meta: {
+          total_sessions: 2,
+          background_mode: "selected_only",
+        },
+      })
+      .mockResolvedValue({
+        ok: true,
+        sessions: [betaSession],
+        meta: {
+          total_sessions: 1,
+          background_mode: "selected_only",
+        },
+      });
+
+    render(<App />);
+
+    const sessionList = await screen.findByRole("list", { name: "Codex sessions" });
+    expect(await within(sessionList).findByRole("button", { name: /open codex_alpha/i })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Close codex_alpha" }));
+
+    await waitFor(() => {
+      expect(closeSessionMock).toHaveBeenCalledWith("codex_alpha");
+    });
+
+    await waitFor(() => {
+      expect(within(sessionList).queryByRole("button", { name: /open codex_alpha/i })).not.toBeInTheDocument();
+    });
+    expect(within(sessionList).getByRole("button", { name: /open codex_beta/i })).toBeInTheDocument();
   });
 
   it("sends prompt text directly to session", async () => {
@@ -1103,7 +1159,7 @@ describe("app shell tabs", () => {
     });
   });
 
-  it("sends the selected session file directly to Telegram from the composer action", async () => {
+  it("asks Codex to send the selected session file via Telegram from the composer action", async () => {
     getAuthStatusMock.mockResolvedValue({
       ok: true,
       auth_required: true,
@@ -1159,73 +1215,15 @@ describe("app shell tabs", () => {
     fireEvent.click(telegramButton);
 
     await waitFor(() => {
-      expect(sendSessionFileToTelegramMock).toHaveBeenCalledWith("codex_demo", "sf_abc", "Result Plot");
-    });
-    expect(sendToSessionMock).not.toHaveBeenCalled();
-  });
-
-  it("asks Codex to send the selected session file via exact /tgsend command", async () => {
-    getAuthStatusMock.mockResolvedValue({
-      ok: true,
-      auth_required: true,
-      authenticated: true,
-    });
-    getSessionsMock.mockResolvedValue({
-      ok: true,
-      sessions: [
-        {
-          session: "codex_demo",
-          pane_id: "%1",
-          current_command: "codex",
-          cwd: "/home/megha/work",
-          state: "idle",
-          updated_at: Date.now(),
-          snippet: "Assistant ready",
-        },
-      ],
-    });
-    getTelegramStatusMock.mockResolvedValue({
-      ok: true,
-      configured: true,
-    });
-    listSessionFilesMock.mockResolvedValue({
-      ok: true,
-      items: [
-        {
-          id: "sf_abc",
-          title: "Result Plot",
-          file_name: "result.png",
-          mime_type: "image/png",
-          size_bytes: 2048,
-          created_at: Date.now(),
-          expires_at: Date.now() + 24 * 3600 * 1000,
-          created_by: "session:codex_demo",
-          is_image: true,
-          item_kind: "file",
-          wsl_path: "/home/megha/codrex-work/output/result.png",
-          download_url: "/codex/session/codex_demo/files/sf_abc/download",
-        },
-      ],
-    });
-
-    render(<App />);
-
-    fireEvent.click(await screen.findByTestId("session-pane-tab-files"));
-    const panel = await screen.findByTestId("session-files-panel");
-    const itemCard = (await within(panel).findByText("/home/megha/codrex-work/output/result.png")).closest(".session-file-item");
-    expect(itemCard).not.toBeNull();
-    fireEvent.click(itemCard as HTMLElement);
-
-    const askCodexButton = await screen.findByTestId("composer-ask-codex-telegram");
-    fireEvent.click(askCodexButton);
-
-    await waitFor(() => {
-      expect(sendToSessionMock).toHaveBeenCalledWith(
-        "codex_demo",
-        '/tgsend "/home/megha/codrex-work/output/result.png" --caption "Result Plot"',
-      );
+      expect(sendToSessionMock).toHaveBeenCalledTimes(1);
     });
     expect(sendSessionFileToTelegramMock).not.toHaveBeenCalled();
+    const [sessionName, prompt] = sendToSessionMock.mock.calls[0] || [];
+    expect(sessionName).toBe("codex_demo");
+    expect(prompt).toContain("Send Result Plot to me via Telegram");
+    expect(prompt).toContain('"/home/megha/codrex-work/output/result.png"');
+    expect(prompt).toContain("Do not search for Telegram bot keys or secret files.");
+    expect(prompt).toContain("tell me exactly which path you sent");
   });
 
   it("copies notes and latest response with the shared clipboard helper", async () => {

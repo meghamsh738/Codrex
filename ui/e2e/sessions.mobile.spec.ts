@@ -62,9 +62,9 @@ test.describe("mobile Sessions flow", () => {
     await dismissSwipeHint(page);
 
     await expect(page.getByTestId("tab-panel-sessions")).toBeVisible();
-    await expect(page.getByRole("button", { name: /codex_demo/i })).toBeVisible();
+    await expect(page.getByRole("button", { name: /open codex_demo/i })).toBeVisible();
 
-    await page.getByRole("button", { name: /codex_demo/i }).click();
+    await page.getByRole("button", { name: /open codex_demo/i }).click();
 
     const sessionDetail = page.getByTestId("session-detail");
     await expect(sessionDetail).toContainText("codex_demo");
@@ -79,9 +79,10 @@ test.describe("mobile Sessions flow", () => {
     await expect.poll(() => mock.promptRequests[0]?.prompt ?? "").toBe("Summarize the latest build status.");
 
     await page.getByTestId("composer-send-telegram").click();
-    await expect.poll(() => mock.telegramSendRequests.length).toBe(1);
-    await expect.poll(() => mock.telegramSendRequests[0]?.session ?? "").toBe("codex_demo");
-    await expect.poll(() => mock.telegramSendRequests[0]?.fileId ?? "").toBe("sf_plot");
+    await expect.poll(() => mock.promptRequests.length).toBe(2);
+    await expect.poll(() => mock.promptRequests[1]?.session ?? "").toBe("codex_demo");
+    await expect.poll(() => mock.promptRequests[1]?.prompt ?? "").toContain("Send Release Plot to me via Telegram");
+    await expect.poll(() => mock.promptRequests[1]?.prompt ?? "").toContain("/home/megha/codrex-work/output/release-plot.png");
 
     const notesInput = page.getByTestId("session-notes-input");
     await notesInput.fill("Release checklist");
@@ -140,7 +141,7 @@ test.describe("mobile Sessions flow", () => {
     await page.goto("/", { waitUntil: "domcontentloaded" });
     await dismissSwipeHint(page);
 
-    await page.getByRole("button", { name: /codex_demo/i }).click();
+    await page.getByRole("button", { name: /open codex_demo/i }).click();
     await page.getByTestId("session-pane-tab-files").click();
     await expect(page.getByTestId("session-files-panel")).toBeVisible();
     await page.getByTestId("session-pane-tab-setup").click();

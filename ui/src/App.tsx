@@ -116,12 +116,22 @@ interface SessionGroup {
   items: SessionInfo[];
 }
 
-function buildTelegramSessionCommand(target: SharedFileInfo): string {
+function buildTelegramSessionPrompt(target: SharedFileInfo): string {
   const path = (target.wsl_path || "").trim();
-  const caption = (target.title || target.file_name || "Codrex output").trim();
-  const escapedPath = path.replace(/(["\\$`])/g, "\\$1");
-  const escapedCaption = caption.replace(/(["\\$`])/g, "\\$1");
-  return `/tgsend "${escapedPath}" --caption "${escapedCaption}"`;
+  const title = (target.title || target.file_name || "this file").trim();
+  if (!path) {
+    return [
+      "Send the most relevant output file from this session to me via Telegram using the existing send program already available in this session.",
+      "Do not search for Telegram bot keys or secret files.",
+      "After sending, tell me exactly which path you sent.",
+    ].join(" ");
+  }
+  return [
+    `Send ${title} to me via Telegram using the existing send program already available in this session.`,
+    `Use this exact file path if it is the correct artifact: "${path}".`,
+    "Do not search for Telegram bot keys or secret files.",
+    "After sending, tell me exactly which path you sent.",
+  ].join(" ");
 }
 
 async function copyTextWithFallback(text: string): Promise<void> {
@@ -781,7 +791,6 @@ export default function App() {
   const [sessionNotesBusy, setSessionNotesBusy] = useState(false);
   const [telegramConfigured, setTelegramConfigured] = useState(false);
   const [composerTelegramBusy, setComposerTelegramBusy] = useState(false);
-  const [composerCodexTelegramBusy, setComposerCodexTelegramBusy] = useState(false);
 
   const [threads, setThreads] = useState<ChatThread[]>(() => {
     const stored = parseThreads(safeStorageGet(THREADS_STORAGE));
@@ -3065,49 +3074,12 @@ export default function App() {
       setError("Telegram is not configured yet.");
       return;
     }
-    if (!composerTelegramTarget || composerTelegramTarget.item_kind === "directory") {
-      setError("No session file is available to send to Telegram yet.");
-      return;
-    }
-    setComposerTelegramBusy(true);
-    try {
-      const response = await sendSessionFileToTelegram(
-        selectedSession,
-        composerTelegramTarget.id,
-        composerTelegramTarget.title || composerTelegramTarget.file_name,
-      );
-      if (!response.ok) {
-        throw new Error(response.detail || "Telegram send failed.");
-      }
-      setStatus(`Sent ${composerTelegramTarget.title || composerTelegramTarget.file_name} to Telegram.`);
-    } catch (error) {
-      setError(`Telegram send failed: ${(error as Error).message}`);
-    } finally {
-      setComposerTelegramBusy(false);
-    }
-  }, [
-    composerTelegramTarget,
-    selectedSession,
-    setError,
-    setStatus,
-    telegramConfigured,
-  ]);
-
-  const onAskCodexToSendTelegram = useCallback(async () => {
-    if (!selectedSession) {
-      setError("Select a session first.");
-      return;
-    }
-    if (!telegramConfigured) {
-      setError("Telegram is not configured yet.");
-      return;
-    }
     if (!composerTelegramTarget || composerTelegramTarget.item_kind === "directory" || !composerTelegramTarget.wsl_path) {
       setError("No session file is available to send through Codex yet.");
       return;
     }
-    const command = buildTelegramSessionCommand(composerTelegramTarget);
-    setComposerCodexTelegramBusy(true);
+    const command = buildTelegramSessionPrompt(composerTelegramTarget);
+    setComposerTelegramBusy(true);
     try {
       const sent = await submitPromptText(
         command,
@@ -3117,15 +3089,14 @@ export default function App() {
         setPromptText(command);
       }
     } catch (error) {
-      setError(`Ask Codex to send failed: ${(error as Error).message}`);
+      setError(`Telegram send request failed: ${(error as Error).message}`);
     } finally {
-      setComposerCodexTelegramBusy(false);
+      setComposerTelegramBusy(false);
     }
   }, [
     composerTelegramTarget,
     selectedSession,
     setError,
-    setStatus,
     setPromptText,
     submitPromptText,
     telegramConfigured,
@@ -4014,16 +3985,67 @@ export default function App() {
     (session: SessionInfo) => {
       const selected = session.session === selectedSession;
       const project = inferProjectFromCwd(session.cwd);
+      const handleSelectSession = () => {
+        setSelectedSession(session.session);
+      };
       return (
-        <button
+        <div
           key={session.session}
-          type="button"
+          role="button"
+          tabIndex={0}
+          aria-label={`Open ${session.session}`}
           className={`session-item ${selected ? "selected" : ""}`}
-          onClick={() => setSelectedSession(session.session)}
+          onClick={handleSelectSession}
+          onKeyDown={(event) => {
+            if (event.key === "Enter" || event.key === " ") {
+              event.preventDefault();
+              handleSelectSession();
+            }
+          }}
         >
           <div className="session-row">
             <strong>{session.session}</strong>
-            <span className={`state state-${session.state}`}>{session.state}</span>
+            <div className="session-row-actions">
+              <span className={`state state-${session.state}`}>{session.state}</span>
+              <button
+                type="button"
+                className="session-close-chip"
+                aria-label={`Close ${session.session}`}
+                title={`Close ${session.session}`}
+                onClick={(event) => {
+                  event.stopPropagation();
+                  if (sessionBusy) {
+                    return;
+                  }
+                  setSelectedSession(session.session);
+                  void (async () => {
+                    setSessionBusy(true);
+                    try {
+                      const response = await closeSession(session.session);
+                      if (!response.ok) {
+                        throw new Error(response.detail || response.error || "Could not close session.");
+                      }
+                      setStatus(`Closed ${session.session}.`);
+                      await refreshSessions();
+                      if (selectedSession === session.session) {
+                        setSessionTranscriptChunks([]);
+                        setSessionFiles([]);
+                        setSessionNotes("");
+                        setSessionNotesInfo(null);
+                      }
+                      delete sessionStreamSeqRef.current[session.session];
+                    } catch (error) {
+                      setError(`Close session failed: ${(error as Error).message}`);
+                    } finally {
+                      setSessionBusy(false);
+                    }
+                  })();
+                }}
+                disabled={sessionBusy}
+              >
+                ×
+              </button>
+            </div>
           </div>
           <p className="session-snippet">{session.snippet || "No output yet."}</p>
           <small className="session-meta">
@@ -4032,10 +4054,10 @@ export default function App() {
             <span>{session.reasoning_effort || "default reasoning"}</span>
           </small>
           <small className="session-cwd">{session.cwd || "Unknown cwd"}</small>
-        </button>
+        </div>
       );
     },
-    [selectedSession],
+    [closeSession, refreshSessions, selectedSession, sessionBusy, setError, setStatus],
   );
 
   const renderNavIcon = useCallback((tab: MainTab) => {
@@ -4488,10 +4510,10 @@ export default function App() {
                                     type="button"
                                     className="composer-telegram-btn"
                                     data-testid="composer-send-telegram"
-                                    aria-label="Send file via Telegram"
+                                    aria-label="Ask Codex to send via Telegram"
                                     title={
                                       composerTelegramDisabledReason
-                                      || `Send ${composerTelegramTarget?.file_name || "the selected session file"} directly through the backend Telegram integration.`
+                                      || `Ask ${selectedSession || "the active session"} to send ${composerTelegramTarget?.file_name || "the selected session file"} via the existing Telegram helper.`
                                     }
                                     onClick={() => {
                                       if (composerTelegramDisabledReason) {
@@ -4503,28 +4525,7 @@ export default function App() {
                                     disabled={composerTelegramBusy || !!composerTelegramDisabledReason}
                                   >
                                     <span className="composer-telegram-glyph" aria-hidden="true">✈</span>
-                                    <span className="composer-telegram-label">{composerTelegramBusy ? "Sending..." : "Telegram"}</span>
-                                  </button>
-                                  <button
-                                    type="button"
-                                    className="composer-telegram-btn composer-telegram-btn-secondary"
-                                    data-testid="composer-ask-codex-telegram"
-                                    aria-label="Ask Codex to Send via Telegram"
-                                    title={
-                                      composerTelegramDisabledReason
-                                      || `Send an exact /tgsend command into ${selectedSession || "the active session"} for ${composerTelegramTarget?.file_name || "the selected session file"}.`
-                                    }
-                                    onClick={() => {
-                                      if (composerTelegramDisabledReason) {
-                                        setError(composerTelegramDisabledReason);
-                                        return;
-                                      }
-                                      void onAskCodexToSendTelegram();
-                                    }}
-                                    disabled={composerCodexTelegramBusy || sessionBusy || !!composerTelegramDisabledReason}
-                                  >
-                                    <span className="composer-telegram-glyph" aria-hidden="true">⌘</span>
-                                    <span className="composer-telegram-label">{composerCodexTelegramBusy ? "Asking..." : "Ask Codex"}</span>
+                                    <span className="composer-telegram-label">{composerTelegramBusy ? "Asking..." : "Telegram"}</span>
                                   </button>
                                 </div>
                                 <button
