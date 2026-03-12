@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { flushSync } from "react-dom";
 import {
   addThreadRecordMessage,
   appendLatestSessionNotes,
@@ -10,7 +11,6 @@ import {
   buildSuggestedControllerUrl,
   buildWslDownloadUrl,
   bootstrapLocalAuth,
-  applySessionProfile,
   closeSession,
   closeTmuxSession,
   createThreadRecord,
@@ -19,7 +19,6 @@ import {
   createPairCode,
   desktopMove,
   detectControllerPort,
-  deleteSessionFile,
   deleteThreadRecord,
   desktopClick,
   desktopScroll,
@@ -32,13 +31,11 @@ import {
   getAppRuntime,
   getDesktopInfo,
   getAuthStatus,
-  listBrowseEntries,
   getCodexOptions,
   getCodexRun,
   getCodexRuns,
   getNetInfo,
   getPowerStatus,
-  listSessionFiles,
   getTelegramStatus,
   getThreadStore,
   getTmuxHealth,
@@ -52,10 +49,8 @@ import {
   login,
   logout,
   reportIpcEvent,
-  registerSessionFile,
   saveSessionNotes,
   sendPowerAction,
-  sendSessionFileToTelegram,
   sendSessionImage,
   sendToPaneKey,
   sendToPane,
@@ -64,20 +59,16 @@ import {
   setIpcObserver,
   startCodexExec,
   updateThreadRecord,
-  uploadSessionFile,
   uploadWslFile,
 } from "./api";
 import type {
   AppRuntimeResult,
   AuthStatus,
-  BrowserEntryInfo,
-  BrowserListResult,
   CodexRunDetail,
   CodexRunSummary,
   DesktopInfoResult,
   NetInfo,
   PowerStatusResult,
-  SharedFileInfo,
   SessionInfo,
   SessionNoteInfo,
   SessionStreamEvent,
@@ -92,7 +83,6 @@ type MainTab = "sessions" | "threads" | "remote" | "pair" | "settings" | "debug"
 type ThemeMode = "system" | "light" | "dark";
 type ReasoningEffort = "minimal" | "low" | "medium" | "high" | "xhigh";
 type SessionViewMode = "grouped" | "flat";
-type SessionWorkspacePane = "notes" | "files" | "setup";
 type StreamProfile = "fast" | "balanced" | "battery";
 type TmuxShellProfile = "ubuntu" | "powershell" | "cmd";
 type OutputFeedState = "off" | "polling" | "connecting" | "live" | "error";
@@ -116,22 +106,22 @@ interface SessionGroup {
   items: SessionInfo[];
 }
 
-function buildTelegramSessionPrompt(target: SharedFileInfo): string {
-  const path = (target.wsl_path || "").trim();
-  const title = (target.title || target.file_name || "this file").trim();
-  if (!path) {
-    return [
-      "Send the most relevant output file from this session to me via Telegram using the existing send program already available in this session.",
-      "Do not search for Telegram bot keys or secret files.",
-      "After sending, tell me exactly which path you sent.",
-    ].join(" ");
-  }
+function buildTelegramSessionPrompt(): string {
   return [
-    `Send ${title} to me via Telegram using the existing send program already available in this session.`,
-    `Use this exact file path if it is the correct artifact: "${path}".`,
+    "Send the relevant generated output files for the current task to me via Telegram using the existing send program already available in this session.",
     "Do not search for Telegram bot keys or secret files.",
-    "After sending, tell me exactly which path you sent.",
+    "After sending, tell me exactly which paths you sent.",
   ].join(" ");
+}
+
+function waitForNextPaint(): Promise<void> {
+  return new Promise((resolve) => {
+    if (typeof window === "undefined" || typeof window.requestAnimationFrame !== "function") {
+      resolve();
+      return;
+    }
+    window.requestAnimationFrame(() => resolve());
+  });
 }
 
 async function copyTextWithFallback(text: string): Promise<void> {
@@ -195,7 +185,6 @@ const CONTROLLER_BASE_STORAGE = "codrex.ui.controller_base.v1";
 const REASONING_EFFORT_STORAGE = "codrex.ui.reasoning_effort.v1";
 const THEME_MODE_STORAGE = "codrex.ui.theme_mode.v1";
 const SESSION_VIEW_STORAGE = "codrex.ui.session_view_mode.v1";
-const SESSION_WORKSPACE_PANE_STORAGE = "codrex.ui.session_workspace_pane.v1";
 const SESSION_SELECTED_STORAGE = "codrex.ui.selected_session.v1";
 const SESSION_QUERY_STORAGE = "codrex.ui.session_query.v1";
 const SESSION_PROJECT_FILTER_STORAGE = "codrex.ui.session_project_filter.v1";
@@ -204,7 +193,6 @@ const STREAM_ENABLED_STORAGE = "codrex.ui.stream_enabled.v1";
 const SWIPE_HINT_SEEN_STORAGE = "codrex.ui.swipe_hint_seen.v1";
 const COMPACT_TRANSCRIPT_STORAGE = "codrex.ui.compact_transcript.v1";
 const TOUCH_COMFORT_STORAGE = "codrex.ui.touch_comfort.v1";
-const IMAGE_DELIVERY_MODE_STORAGE = "codrex.ui.image_delivery_mode.v1";
 const THREADS_STORAGE = "codrex.ui.threads.v2";
 const THREAD_MESSAGES_STORAGE = "codrex.ui.thread_messages.v2";
 const THREAD_MESSAGES_LEGACY_STORAGE = "codrex.ui.thread_messages.v1";
@@ -336,20 +324,6 @@ function formatClock(tsMs: number): string {
   }
 }
 
-function formatFileSize(bytes: number): string {
-  const value = Number.isFinite(bytes) ? Math.max(0, bytes) : 0;
-  if (value < 1024) {
-    return `${value} B`;
-  }
-  if (value < 1024 * 1024) {
-    return `${(value / 1024).toFixed(1)} KB`;
-  }
-  if (value < 1024 * 1024 * 1024) {
-    return `${(value / (1024 * 1024)).toFixed(1)} MB`;
-  }
-  return `${(value / (1024 * 1024 * 1024)).toFixed(1)} GB`;
-}
-
 function parseThemeMode(raw: string): ThemeMode {
   if (raw === "light" || raw === "dark") {
     return raw;
@@ -409,13 +383,6 @@ function parseSessionViewMode(raw: string): SessionViewMode {
   return "grouped";
 }
 
-function parseSessionWorkspacePane(raw: string): SessionWorkspacePane {
-  if (raw === "files" || raw === "setup") {
-    return raw;
-  }
-  return "notes";
-}
-
 function parseStreamProfile(raw: string): StreamProfile {
   if (raw === "fast" || raw === "battery") {
     return raw;
@@ -446,13 +413,6 @@ function parseStoredToggle(raw: string): boolean | null {
     return true;
   }
   return null;
-}
-
-function parseSessionImageDeliveryMode(raw: string): SessionImageDeliveryMode {
-  if (raw === "desktop_clipboard" || raw === "session_path") {
-    return raw;
-  }
-  return "insert_path";
 }
 
 function preferCompactTranscriptDefault(): boolean {
@@ -751,9 +711,6 @@ export default function App() {
   const [sessionViewMode, setSessionViewMode] = useState<SessionViewMode>(() =>
     parseSessionViewMode(safeStorageGet(SESSION_VIEW_STORAGE)),
   );
-  const [sessionWorkspacePane, setSessionWorkspacePane] = useState<SessionWorkspacePane>(() =>
-    parseSessionWorkspacePane(safeStorageGet(SESSION_WORKSPACE_PANE_STORAGE)),
-  );
   const [promptText, setPromptText] = useState("");
   const [reasoningEffortOptions, setReasoningEffortOptions] = useState<ReasoningEffort[]>(FALLBACK_REASONING_EFFORTS);
   const [selectedModel, setSelectedModel] = useState(FALLBACK_MODELS[0]);
@@ -768,23 +725,10 @@ export default function App() {
   const [sessionTranscriptChunks, setSessionTranscriptChunks] = useState<TranscriptChunk[]>([]);
   const [sessionAutoFollow, setSessionAutoFollow] = useState(true);
   const [sessionUnreadCount, setSessionUnreadCount] = useState(0);
-  const [lastCopiedSessionPath, setLastCopiedSessionPath] = useState("");
   const [sessionBusy, setSessionBusy] = useState(false);
   const [sessionImageFile, setSessionImageFile] = useState<File | null>(null);
   const [sessionImagePrompt, setSessionImagePrompt] = useState("");
-  const [sessionImageDeliveryMode, setSessionImageDeliveryMode] = useState<SessionImageDeliveryMode>(() =>
-    parseSessionImageDeliveryMode(safeStorageGet(IMAGE_DELIVERY_MODE_STORAGE)),
-  );
-  const [sessionFiles, setSessionFiles] = useState<SharedFileInfo[]>([]);
-  const [sessionFilesLoading, setSessionFilesLoading] = useState(true);
-  const [sessionFilesBusy, setSessionFilesBusy] = useState(false);
-  const [selectedSessionFileId, setSelectedSessionFileId] = useState("");
-  const [sessionUploadFile, setSessionUploadFile] = useState<File | null>(null);
-  const [sessionUploadTitle, setSessionUploadTitle] = useState("");
-  const [browserLoading, setBrowserLoading] = useState(true);
-  const [browserState, setBrowserState] = useState<BrowserListResult | null>(null);
-  const [browserRoot, setBrowserRoot] = useState("workspace");
-  const [browserSelectedPath, setBrowserSelectedPath] = useState("");
+  const sessionImageDeliveryMode: SessionImageDeliveryMode = "insert_path";
   const [sessionNotes, setSessionNotes] = useState("");
   const [sessionNotesInfo, setSessionNotesInfo] = useState<SessionNoteInfo | null>(null);
   const [sessionNotesLoading, setSessionNotesLoading] = useState(false);
@@ -914,6 +858,7 @@ export default function App() {
   const localThreadMessagesRef = useRef<Record<string, ThreadMessage[]>>({});
   const threadMigrationAttemptedRef = useRef(false);
   const localBootstrapAttemptedRef = useRef(false);
+  const sessionImageInputRef = useRef<HTMLInputElement | null>(null);
 
   const backendPort = useMemo(parsePort, []);
   const browserHostname = typeof window !== "undefined" ? window.location.hostname || "127.0.0.1" : "127.0.0.1";
@@ -926,9 +871,6 @@ export default function App() {
     return buildDesktopStreamUrl(profile);
   }, [desktopProfile]);
   const desktopInteractionDisabled = !desktopEnabled;
-  const sessionAllowedReasoningOptions = useMemo(() => {
-    return allowedReasoningForModel(selectedModel, reasoningEffortOptions);
-  }, [reasoningEffortOptions, selectedModel]);
   const threadTmuxPanes = useMemo(() => {
     return tmuxPanes.filter((pane) => !isCodexTmuxPane(pane));
   }, [tmuxPanes]);
@@ -1261,25 +1203,6 @@ export default function App() {
     }
   }, [setError, setStatus]);
 
-  const refreshSessionFiles = useCallback(async (session: string) => {
-    if (!session) {
-      setSessionFiles([]);
-      setSessionFilesLoading(false);
-      return;
-    }
-    try {
-      const response = await listSessionFiles(session);
-      if (!response.ok) {
-        throw new Error(response.detail || response.error || "Failed to read session files.");
-      }
-      setSessionFiles(response.items || []);
-    } catch (error) {
-      addEvent("error", `Could not load session files: ${(error as Error).message}`);
-    } finally {
-      setSessionFilesLoading(false);
-    }
-  }, [addEvent]);
-
   const refreshSessionNotes = useCallback(async (session: string) => {
     if (!session) {
       setSessionNotes("");
@@ -1302,21 +1225,6 @@ export default function App() {
       setSessionNotesLoading(false);
     }
   }, [addEvent]);
-
-  const refreshBrowser = useCallback(async (root: string, path = "") => {
-    try {
-      const response = await listBrowseEntries(root, path);
-      if (!response.ok) {
-        throw new Error(response.detail || response.error || "Failed to read files.");
-      }
-      setBrowserState(response);
-      setBrowserRoot(response.root?.id || root);
-    } catch (error) {
-      setError(`Could not browse files: ${(error as Error).message}`);
-    } finally {
-      setBrowserLoading(false);
-    }
-  }, [setError]);
 
   const refreshTelegramStatus = useCallback(async () => {
     try {
@@ -1925,28 +1833,17 @@ export default function App() {
   useEffect(() => {
     if (!selectedSession) {
       setSessionTranscriptChunks([]);
-      setSessionFiles([]);
       setSessionNotes("");
       setSessionNotesInfo(null);
-      setSessionFilesLoading(false);
       setSessionNotesLoading(false);
       return;
     }
     setSessionAutoFollow(true);
     setSessionUnreadCount(0);
     void refreshScreen(selectedSession);
-    setSessionFilesLoading(true);
-    void refreshSessionFiles(selectedSession);
     setSessionNotesLoading(true);
     void refreshSessionNotes(selectedSession);
-  }, [refreshScreen, refreshSessionFiles, refreshSessionNotes, selectedSession]);
-
-  useEffect(() => {
-    setBrowserLoading(true);
-    setBrowserSelectedPath("");
-    setLastCopiedSessionPath("");
-    void refreshBrowser(browserRoot, "");
-  }, [browserRoot, refreshBrowser]);
+  }, [refreshScreen, refreshSessionNotes, selectedSession]);
 
   useEffect(() => {
     if (!selectedTmuxPane) {
@@ -2177,25 +2074,8 @@ export default function App() {
   }, [sessionProjectFilter]);
 
   useEffect(() => {
-    safeStorageSet(IMAGE_DELIVERY_MODE_STORAGE, sessionImageDeliveryMode);
-  }, [sessionImageDeliveryMode]);
-
-  useEffect(() => {
     safeStorageSet(SESSION_VIEW_STORAGE, sessionViewMode);
   }, [sessionViewMode]);
-
-  useEffect(() => {
-    safeStorageSet(SESSION_WORKSPACE_PANE_STORAGE, sessionWorkspacePane);
-  }, [sessionWorkspacePane]);
-
-  useEffect(() => {
-    setSelectedSessionFileId((current) => {
-      if (current && sessionFiles.some((item) => item.id === current)) {
-        return current;
-      }
-      return sessionFiles[0]?.id || "";
-    });
-  }, [sessionFiles]);
 
   useEffect(() => {
     safeStorageSet(STREAM_PROFILE_STORAGE, streamProfile);
@@ -2270,28 +2150,6 @@ export default function App() {
   }, [filteredSessions]);
 
   const selectedSessionInfo = sessions.find((session) => session.session === selectedSession) || null;
-  const selectedBrowserEntry = useMemo(
-    () => (browserState?.items || []).find((item) => item.wsl_path === browserSelectedPath) || null,
-    [browserSelectedPath, browserState],
-  );
-  const selectedSessionFile = useMemo(
-    () => sessionFiles.find((item) => item.id === selectedSessionFileId) || null,
-    [selectedSessionFileId, sessionFiles],
-  );
-  const newestSessionFile = useMemo(() => {
-    if (sessionFiles.length === 0) {
-      return null;
-    }
-    return [...sessionFiles].sort((left, right) => {
-      const createdDelta = (right.created_at || 0) - (left.created_at || 0);
-      if (createdDelta !== 0) {
-        return createdDelta;
-      }
-      return String(right.id || "").localeCompare(String(left.id || ""));
-    })[0] || null;
-  }, [sessionFiles]);
-  const browserRoots = browserState?.roots || [];
-  const sessionFileCountLabel = `${sessionFiles.length} file${sessionFiles.length === 1 ? "" : "s"}`;
   const authSummary = authLoading
     ? "Checking auth..."
     : auth?.auth_required
@@ -2313,17 +2171,9 @@ export default function App() {
   const sessionCountValue = sessionsMeta?.total_sessions || sessions.length;
   const sessionCountLabel = `${sessionCountValue} session${sessionCountValue === 1 ? "" : "s"}`;
   const visibleSessionCountLabel = `${filteredSessions.length} visible / ${sessionCountValue} total`;
-  const sessionWorkspaceTabs: Array<{ key: SessionWorkspacePane; label: string; detail: string }> = [
-    { key: "notes", label: "Notes", detail: "Plans, checkpoints, and captured Codex replies." },
-    { key: "files", label: "Files", detail: "Session attachments, browse, and share paths." },
-    { key: "setup", label: "Setup", detail: "Image delivery and reasoning profile for the active session." },
-  ];
-  const activeSessionWorkspaceTab =
-    sessionWorkspaceTabs.find((tab) => tab.key === sessionWorkspacePane) || sessionWorkspaceTabs[0];
   const runningRuns = debugRuns.filter((run) => run.status === "running").length;
   const totalEvents = eventLog.length;
   const errorEvents = eventLog.filter((evt) => evt.level === "error").length;
-  const controlProfileSummary = `Reasoning ${selectedReasoningEffort} | Image ${sessionImageDeliveryMode}`;
   const resolvedTheme = themeMode === "system" ? (prefersDarkTheme ? "dark" : "light") : themeMode;
   const controllerRouteKind = classifyControllerRoute(controllerBase, netInfo);
   const controllerRouteSummary =
@@ -2360,24 +2210,14 @@ export default function App() {
         ? "Ready"
       : statusMessage;
   const canSendPrompt = promptText.trim().length > 0;
-  const composerTelegramTarget = selectedSessionFile && selectedSessionFile.item_kind !== "directory"
-    ? selectedSessionFile
-    : newestSessionFile && newestSessionFile.item_kind !== "directory"
-      ? newestSessionFile
-      : null;
   const composerTelegramDisabledReason = !telegramConfigured
     ? "Telegram is not configured."
     : !selectedSession
       ? "Select a session first."
-      : !composerTelegramTarget
-        ? "No session file is available to send to Telegram yet."
       : "";
   const desktopFocusSummary = desktopFocusPoint
     ? `Focused target: ${desktopFocusPoint.x}, ${desktopFocusPoint.y}`
     : "No desktop target focused yet. Tap the remote desktop once first.";
-  const stopSessionFileSelection = (event: { stopPropagation: () => void }) => {
-    event.stopPropagation();
-  };
   const installButtonLabel =
     installState === "installed"
       ? "Installed"
@@ -2682,6 +2522,27 @@ export default function App() {
     }
   }, [refreshScreen, refreshSessions, selectedSession, setError, setStatus]);
 
+  const onSendBackspace = useCallback(async () => {
+    if (!selectedSession) {
+      setError("Select a session first.");
+      return;
+    }
+    setSessionBusy(true);
+    try {
+      const response = await sendSessionKey(selectedSession, "backspace");
+      if (!response.ok) {
+        throw new Error(response.detail || response.error || "Backspace failed.");
+      }
+      setStatus(`Sent Backspace to ${selectedSession}.`);
+      await refreshScreen(selectedSession);
+      await refreshSessions();
+    } catch (error) {
+      setError(`Backspace failed: ${(error as Error).message}`);
+    } finally {
+      setSessionBusy(false);
+    }
+  }, [refreshScreen, refreshSessions, selectedSession, setError, setStatus]);
+
   const onSendArrowKey = useCallback(async (key: "up" | "down" | "left" | "right") => {
     if (!selectedSession) {
       setError("Select a session first.");
@@ -2786,7 +2647,6 @@ export default function App() {
       setStatus(`Closed ${selectedSession}.`);
       await refreshSessions();
       setSessionTranscriptChunks([]);
-      setSessionFiles([]);
       delete sessionStreamSeqRef.current[selectedSession];
     } catch (error) {
       setError(`Close session failed: ${(error as Error).message}`);
@@ -2822,7 +2682,6 @@ export default function App() {
         setStatus(`Image sent to ${selectedSession}.`);
       }
       await refreshScreen(selectedSession);
-      await refreshSessionFiles(selectedSession);
     } catch (error) {
       setError(`Send image failed: ${(error as Error).message}`);
     } finally {
@@ -2836,107 +2695,7 @@ export default function App() {
     sessionImagePrompt,
     setError,
     setStatus,
-    refreshSessionFiles,
   ]);
-
-  const onUploadSessionFile = useCallback(async () => {
-    if (!selectedSession) {
-      setError("Select a session first.");
-      return;
-    }
-    if (!sessionUploadFile) {
-      setError("Choose a file first.");
-      return;
-    }
-    setSessionFilesBusy(true);
-    try {
-      const response = await uploadSessionFile(selectedSession, sessionUploadFile, sessionUploadTitle);
-      if (!response.ok || !response.item) {
-        throw new Error(response.detail || response.error || "Upload failed.");
-      }
-      setSessionUploadFile(null);
-      setSessionUploadTitle("");
-      setStatus(`Attached ${response.item.file_name} to ${selectedSession}.`);
-      await refreshSessionFiles(selectedSession);
-    } catch (error) {
-      setError(`Upload failed: ${(error as Error).message}`);
-    } finally {
-      setSessionFilesBusy(false);
-    }
-  }, [refreshSessionFiles, selectedSession, sessionUploadFile, sessionUploadTitle, setError, setStatus]);
-
-  const onBrowseOpen = useCallback(async (entry: BrowserEntryInfo) => {
-    if (entry.kind !== "directory") {
-      setBrowserSelectedPath(entry.wsl_path);
-      return;
-    }
-    setBrowserLoading(true);
-    setBrowserSelectedPath(entry.wsl_path);
-    await refreshBrowser(browserRoot, entry.wsl_path);
-  }, [browserRoot, refreshBrowser]);
-
-  const onBrowseUp = useCallback(async () => {
-    if (!browserState?.root?.path || !browserState.current_path) {
-      return;
-    }
-    const current = browserState.current_path;
-    const rootPath = browserState.root.path;
-    if (current === rootPath) {
-      return;
-    }
-    const trimmed = current.replace(/\/+$/, "");
-    const parent = trimmed.slice(0, trimmed.lastIndexOf("/")) || rootPath;
-    setBrowserLoading(true);
-    await refreshBrowser(browserRoot, parent);
-  }, [browserRoot, browserState, refreshBrowser]);
-
-  const onRegisterBrowserItem = useCallback(async (entry: BrowserEntryInfo) => {
-    if (!selectedSession) {
-      setError("Select a session first.");
-      return;
-    }
-    setSessionFilesBusy(true);
-    try {
-      const response = await registerSessionFile(selectedSession, {
-        path: entry.wsl_path,
-        title: entry.name,
-        allow_directory: entry.kind === "directory",
-      });
-      if (!response.ok || !response.item) {
-        throw new Error(response.detail || response.error || "Attach failed.");
-      }
-      setBrowserSelectedPath(entry.wsl_path);
-      setStatus(`Attached ${entry.name} to ${selectedSession}.`);
-      await refreshSessionFiles(selectedSession);
-    } catch (error) {
-      setError(`Attach failed: ${(error as Error).message}`);
-    } finally {
-      setSessionFilesBusy(false);
-    }
-  }, [refreshSessionFiles, selectedSession, setError, setStatus]);
-
-  const onCopySessionPath = useCallback(async (item: { wsl_path: string }) => {
-    const path = item.wsl_path || "";
-    if (!path) {
-      return;
-    }
-    try {
-      await copyTextWithFallback(path);
-      setLastCopiedSessionPath(path);
-      setStatus(`Copied path: ${path}`);
-    } catch (error) {
-      setError(`Could not copy path: ${(error as Error).message}`);
-    }
-  }, [setError, setStatus]);
-
-  const onUseSessionPath = useCallback((item: { wsl_path: string }) => {
-    const path = item.wsl_path || "";
-    if (!path) {
-      return;
-    }
-    setPromptText((current) => (current.trim() ? `${current.trim()} ${path}` : path));
-    setStatus(`Path inserted into composer: ${path}`);
-  }, [setStatus]);
 
   const onSaveSessionNotes = useCallback(async () => {
     if (!selectedSession) {
@@ -2983,7 +2742,14 @@ export default function App() {
     }
   }, [selectedSession, setError, setStatus]);
 
-  const submitPromptText = useCallback(async (userPrompt: string, successMessage?: string) => {
+  const submitPromptText = useCallback(async (
+    userPrompt: string,
+    successMessage?: string,
+    options?: {
+      preserveComposer?: boolean;
+    },
+  ) => {
+    const preserveComposer = options?.preserveComposer ?? false;
     if (!selectedSession) {
       setError("Select a session first.");
       return false;
@@ -3001,13 +2767,16 @@ export default function App() {
         throw new Error(response.detail || response.error || "Prompt send failed.");
       }
       if (response.shared_file || response.session_file) {
-        setPromptText("");
+        if (!preserveComposer) {
+          setPromptText("");
+        }
         setStatus(response.detail || `Attached ${(response.session_file || response.shared_file)?.file_name || "item"} to session files.`);
-        await refreshSessionFiles(selectedSession);
         await refreshSessions();
         return true;
       }
-      setPromptText("");
+      if (!preserveComposer) {
+        setPromptText("");
+      }
       const threadId = await ensureThreadForSession(selectedSession, normalizedPrompt);
       if (threadId) {
         const message = addThreadMessage(threadId, "user", normalizedPrompt);
@@ -3017,7 +2786,6 @@ export default function App() {
       }
       setStatus(successMessage || `Sent prompt to ${selectedSession}.`);
       await refreshScreen(selectedSession);
-      await refreshSessionFiles(selectedSession);
       await refreshSessions();
       window.setTimeout(async () => {
         try {
@@ -3039,7 +2807,6 @@ export default function App() {
     captureAssistantSnapshot,
     ensureThreadForSession,
     refreshScreen,
-    refreshSessionFiles,
     refreshSessions,
     selectedSession,
     setError,
@@ -3074,27 +2841,32 @@ export default function App() {
       setError("Telegram is not configured yet.");
       return;
     }
-    if (!composerTelegramTarget || composerTelegramTarget.item_kind === "directory" || !composerTelegramTarget.wsl_path) {
-      setError("No session file is available to send through Codex yet.");
-      return;
-    }
-    const command = buildTelegramSessionPrompt(composerTelegramTarget);
+    const command = buildTelegramSessionPrompt();
+    const existingDraft = promptText.trim();
+    const combinedPrompt = existingDraft ? `${existingDraft}\n\n${command}` : command;
+    flushSync(() => {
+      setPromptText(combinedPrompt);
+    });
+    setStatus("Prepared Telegram instruction for the current task output.");
     setComposerTelegramBusy(true);
     try {
+      await waitForNextPaint();
       const sent = await submitPromptText(
-        command,
-        `Asked Codex to send ${composerTelegramTarget.title || composerTelegramTarget.file_name} via Telegram.`,
+        combinedPrompt,
+        "Asked Codex to send the relevant generated output files via Telegram.",
+        { preserveComposer: true },
       );
       if (!sent) {
-        setPromptText(command);
+        setPromptText(combinedPrompt);
       }
     } catch (error) {
       setError(`Telegram send request failed: ${(error as Error).message}`);
+      setPromptText(combinedPrompt);
     } finally {
       setComposerTelegramBusy(false);
     }
   }, [
-    composerTelegramTarget,
+    promptText,
     selectedSession,
     setError,
     setPromptText,
@@ -3132,80 +2904,6 @@ export default function App() {
       setSessionUnreadCount(0);
     }
   }, []);
-
-  const onDeleteSessionFileRow = useCallback(async (item: SharedFileInfo) => {
-    if (!selectedSession) {
-      return;
-    }
-    setSessionFilesBusy(true);
-    try {
-      const response = await deleteSessionFile(selectedSession, item.id);
-      if (!response.ok) {
-        throw new Error(response.detail || response.error || "Remove failed.");
-      }
-      setStatus(
-        response.deleted_source
-          ? `Removed ${item.file_name} and deleted uploaded source.`
-          : `Detached ${item.file_name} from ${selectedSession}.`,
-      );
-      await refreshSessionFiles(selectedSession);
-    } catch (error) {
-      setError(`Remove failed: ${(error as Error).message}`);
-    } finally {
-      setSessionFilesBusy(false);
-    }
-  }, [refreshSessionFiles, selectedSession, setError, setStatus]);
-
-  const onSendSessionFileRowToTelegram = useCallback(async (item: SharedFileInfo) => {
-    if (!selectedSession) {
-      return;
-    }
-    setSessionFilesBusy(true);
-    try {
-      const response = await sendSessionFileToTelegram(selectedSession, item.id, item.title || item.file_name);
-      if (!response.ok) {
-        throw new Error(response.detail || response.error || "Telegram send failed.");
-      }
-      setStatus(response.detail || `Sent ${item.file_name} to Telegram.`);
-    } catch (error) {
-      setError(`Telegram send failed: ${(error as Error).message}`);
-    } finally {
-      setSessionFilesBusy(false);
-    }
-  }, [selectedSession, setError, setStatus]);
-
-  const onApplySessionProfile = useCallback(async () => {
-    if (!selectedSession) {
-      setError("Select a session first.");
-      return;
-    }
-    setSessionBusy(true);
-    try {
-      const nextReasoningEffort = clampReasoningForModel(selectedModel, selectedReasoningEffort, reasoningEffortOptions);
-      const response = await applySessionProfile(selectedSession, {
-        reasoning_effort: nextReasoningEffort,
-      });
-      if (!response.ok) {
-        throw new Error(response.detail || response.error || "Profile apply failed.");
-      }
-      setStatus(`Applied reasoning ${response.reasoning_effort || nextReasoningEffort} to ${selectedSession}.`);
-      await refreshScreen(selectedSession);
-      await refreshSessions();
-    } catch (error) {
-      setError(`Profile apply failed: ${(error as Error).message}`);
-    } finally {
-      setSessionBusy(false);
-    }
-  }, [
-    refreshScreen,
-    refreshSessions,
-    reasoningEffortOptions,
-    selectedModel,
-    selectedReasoningEffort,
-    selectedSession,
-    setError,
-    setStatus,
-  ]);
 
   const onCreateThread = useCallback(async () => {
     const sessionName = (threadSessionInput || selectedSession).trim();
@@ -4029,7 +3727,6 @@ export default function App() {
                       await refreshSessions();
                       if (selectedSession === session.session) {
                         setSessionTranscriptChunks([]);
-                        setSessionFiles([]);
                         setSessionNotes("");
                         setSessionNotesInfo(null);
                       }
@@ -4265,7 +3962,7 @@ export default function App() {
           </div>
           <div className="meta-chip">
             <span>Controls</span>
-            <strong>{controlProfileSummary}</strong>
+            <strong>Image insert path</strong>
           </div>
           <div className="meta-chip">
             <span>Output</span>
@@ -4446,10 +4143,6 @@ export default function App() {
                           State: {selectedSessionInfo.state} | Command: {selectedSessionInfo.current_command || "(none)"}
                         </p>
                         <p className="small">
-                          Model: <strong>{selectedSessionInfo.model || "controller default"}</strong> | Reasoning:{" "}
-                          <strong>{selectedSessionInfo.reasoning_effort || selectedReasoningEffort}</strong>
-                        </p>
-                        <p className="small">
                           Refresh updates pane output. Interrupt sends Esc (soft stop), Ctrl+C sends terminal interrupt,
                           and Close ends the tmux session.
                         </p>
@@ -4485,69 +4178,6 @@ export default function App() {
 
                     <div className="session-workspace">
                       <section className="session-live-shell">
-                        <div className="quick-open-card session-composer-shell">
-                          <div className="session-pane-head">
-                            <div>
-                              <h3>Prompt Composer</h3>
-                              <p className="small">Draft on the left, then keep one tap to send while the transcript stays visible.</p>
-                            </div>
-                            <span className={`mode-pill ${canSendPrompt ? "mode-ready" : "mode-muted"}`}>
-                              {canSendPrompt ? "ready to send" : "composer idle"}
-                            </span>
-                          </div>
-                          <div className="prompt-composer">
-                            <label className="field">
-                              <span>Prompt Composer</span>
-                                <div className="composer-input-wrap">
-                                  <textarea
-                                    value={promptText}
-                                    onChange={(event) => setPromptText(event.target.value)}
-                                    rows={5}
-                                  placeholder="Type your prompt. Codrex will send Enter + Enter to submit."
-                                />
-                                <div className="composer-action-stack">
-                                  <button
-                                    type="button"
-                                    className="composer-telegram-btn"
-                                    data-testid="composer-send-telegram"
-                                    aria-label="Ask Codex to send via Telegram"
-                                    title={
-                                      composerTelegramDisabledReason
-                                      || `Ask ${selectedSession || "the active session"} to send ${composerTelegramTarget?.file_name || "the selected session file"} via the existing Telegram helper.`
-                                    }
-                                    onClick={() => {
-                                      if (composerTelegramDisabledReason) {
-                                        setError(composerTelegramDisabledReason);
-                                        return;
-                                      }
-                                      void onSendComposerToTelegram();
-                                    }}
-                                    disabled={composerTelegramBusy || !!composerTelegramDisabledReason}
-                                  >
-                                    <span className="composer-telegram-glyph" aria-hidden="true">✈</span>
-                                    <span className="composer-telegram-label">{composerTelegramBusy ? "Asking..." : "Telegram"}</span>
-                                  </button>
-                                </div>
-                                <button
-                                  type="button"
-                                  className="composer-send-btn"
-                                  data-testid="composer-send-prompt"
-                                  aria-label={sessionBusy ? "Sending prompt" : "Send prompt"}
-                                  onClick={() => void onSendPrompt()}
-                                  disabled={sessionBusy || !canSendPrompt}
-                                >
-                                  <svg viewBox="0 0 24 24" aria-hidden="true">
-                                    <path
-                                      d="M3 11.8 20.6 4.3a1 1 0 0 1 1.3 1.3L14.4 23.2a1 1 0 0 1-1.9-.3l-1-6-6-1a1 1 0 0 1-.3-1.9Z"
-                                      fill="currentColor"
-                                    />
-                                  </svg>
-                                </button>
-                              </div>
-                            </label>
-                          </div>
-                        </div>
-
                         <div className="session-console-card session-console-primary">
                           <div className="session-console-head">
                             <div>
@@ -4589,6 +4219,108 @@ export default function App() {
                           </pre>
                         </div>
 
+                        <div className="quick-open-card session-composer-shell">
+                          <div className="session-pane-head">
+                            <div>
+                              <h3>Prompt Composer</h3>
+                              <p className="small">Draft on the left, then keep one tap to send while the transcript stays visible.</p>
+                            </div>
+                            <span className={`mode-pill ${canSendPrompt ? "mode-ready" : "mode-muted"}`}>
+                              {canSendPrompt ? "ready to send" : "composer idle"}
+                            </span>
+                          </div>
+                          <div className="prompt-composer">
+                            <label className="field">
+                              <span>Prompt Composer</span>
+                              <div className="composer-input-wrap">
+                                <textarea
+                                  value={promptText}
+                                  onChange={(event) => setPromptText(event.target.value)}
+                                  rows={5}
+                                  placeholder="Type your prompt. Codrex will send Enter + Enter to submit."
+                                />
+                                <div className="composer-action-stack">
+                                  <div className="composer-action-row">
+                                    <input
+                                      ref={sessionImageInputRef}
+                                      type="file"
+                                      accept="image/*"
+                                      data-testid="session-image-input"
+                                      className="sr-only"
+                                      onChange={(event) => setSessionImageFile(event.target.files?.[0] || null)}
+                                    />
+                                    <button
+                                      type="button"
+                                      className={`composer-icon-btn ${sessionImageFile ? "is-active" : ""}`}
+                                      data-testid="composer-image-picker"
+                                      aria-label={sessionImageFile ? `Selected image ${sessionImageFile.name}` : "Choose image"}
+                                      title={sessionImageFile ? `Selected image: ${sessionImageFile.name}` : "Choose an image to insert into the composer"}
+                                      onClick={() => sessionImageInputRef.current?.click()}
+                                    >
+                                      <span className="composer-telegram-glyph" aria-hidden="true">🖼</span>
+                                    </button>
+                                    <button
+                                      type="button"
+                                      className="composer-telegram-btn"
+                                      data-testid="composer-send-telegram"
+                                      aria-label="Ask Codex to send via Telegram"
+                                      title={
+                                        composerTelegramDisabledReason
+                                        || `Append a Telegram send instruction for the current task output and send it through ${selectedSession || "the active session"}.`
+                                      }
+                                      onClick={() => {
+                                        if (composerTelegramDisabledReason) {
+                                          setError(composerTelegramDisabledReason);
+                                          return;
+                                        }
+                                        void onSendComposerToTelegram();
+                                      }}
+                                      disabled={composerTelegramBusy || !!composerTelegramDisabledReason}
+                                    >
+                                      <span className="composer-telegram-glyph" aria-hidden="true">✈</span>
+                                      <span className="composer-telegram-label">{composerTelegramBusy ? "Asking..." : "Telegram"}</span>
+                                    </button>
+                                  </div>
+                                </div>
+                                <button
+                                  type="button"
+                                  className="composer-send-btn"
+                                  data-testid="composer-send-prompt"
+                                  aria-label={sessionBusy ? "Sending prompt" : "Send prompt"}
+                                  onClick={() => void onSendPrompt()}
+                                  disabled={sessionBusy || !canSendPrompt}
+                                >
+                                  <svg viewBox="0 0 24 24" aria-hidden="true">
+                                    <path
+                                      d="M3 11.8 20.6 4.3a1 1 0 0 1 1.3 1.3L14.4 23.2a1 1 0 0 1-1.9-.3l-1-6-6-1a1 1 0 0 1-.3-1.9Z"
+                                      fill="currentColor"
+                                    />
+                                  </svg>
+                                </button>
+                              </div>
+                            </label>
+                          </div>
+                          {sessionImageFile ? (
+                            <div className="composer-media-inline" data-testid="composer-image-panel">
+                              <span className="mode-pill mode-ready">{sessionImageFile.name}</span>
+                              <input
+                                type="text"
+                                value={sessionImagePrompt}
+                                onChange={(event) => setSessionImagePrompt(event.target.value)}
+                                placeholder="Optional image instruction"
+                              />
+                              <button
+                                type="button"
+                                className="button soft compact button-light is-active"
+                                onClick={() => void onSendSessionImage()}
+                                disabled={sessionBusy || !sessionImageFile}
+                              >
+                                Send Image
+                              </button>
+                            </div>
+                          ) : null}
+                        </div>
+
                         <div className="session-action-dock" data-testid="session-action-dock">
                           <div className="session-action-group session-action-group-wide" role="group" aria-label="Session utility controls">
                             <button
@@ -4603,6 +4335,10 @@ export default function App() {
                             <button type="button" className="button soft compact action-chip button-light is-active" data-short="ENT" onClick={() => void onSendEnter()} disabled={sessionBusy}>
                               <span className="btn-glyph" aria-hidden="true">↵</span>
                               <span className="btn-text">Enter</span>
+                            </button>
+                            <button type="button" className="button soft compact action-chip button-light" data-short="⌫" onClick={() => void onSendBackspace()} disabled={sessionBusy}>
+                              <span className="btn-glyph" aria-hidden="true">⌫</span>
+                              <span className="btn-text">Backspace</span>
                             </button>
                           </div>
                           <div className="arrow-cluster" role="group" aria-label="Session arrow keys">
@@ -4635,45 +4371,18 @@ export default function App() {
                         </div>
                       </section>
 
-                      <aside className="session-secondary-shell">
+                      <section className="session-secondary-shell">
                         <div className="session-secondary-card">
-                            <div className="session-pane-head">
-                              <div>
-                                <h3>{activeSessionWorkspaceTab.label}</h3>
-                                <p className="small">{activeSessionWorkspaceTab.detail}</p>
-                              </div>
-                            <span className="mode-pill mode-muted">workspace tabs</span>
-                          </div>
-                          <div className="segmented session-pane-tabs" role="tablist" aria-label="Session workspace sections">
-                            {sessionWorkspaceTabs.map((tab) => (
-                              <button
-                                key={tab.key}
-                                type="button"
-                                role="tab"
-                                data-testid={`session-pane-tab-${tab.key}`}
-                                aria-selected={sessionWorkspacePane === tab.key}
-                                className={`seg-item session-pane-tab ${sessionWorkspacePane === tab.key ? "active" : ""}`}
-                                onClick={() => setSessionWorkspacePane(tab.key)}
-                              >
-                                {tab.label}
-                              </button>
-                            ))}
-                          </div>
-
-                          <div
-                            className={`session-pane-card ${sessionWorkspacePane === "notes" ? "active" : "inactive"}`}
-                            data-testid="session-notes-panel"
-                            hidden={sessionWorkspacePane !== "notes"}
-                          >
-                            <div className="session-files-subhead">
-                              <div>
-                                <h3>Session Notes</h3>
-                                <p className="small">Keep planning notes and save the latest Codex response directly into this session.</p>
-                              </div>
-                              <span className={`mode-pill ${sessionNotesInfo?.updated_at ? "mode-ready" : "mode-muted"}`}>
-                                {sessionNotesInfo?.updated_at ? `Saved ${formatClock(sessionNotesInfo.updated_at)}` : "Not saved yet"}
-                              </span>
+                          <div className="session-pane-head">
+                            <div>
+                              <h3>Notes</h3>
+                              <p className="small">Keep plans, checkpoints, and captured Codex replies attached to this session.</p>
                             </div>
+                            <span className={`mode-pill ${sessionNotesInfo?.updated_at ? "mode-ready" : "mode-muted"}`}>
+                              {sessionNotesInfo?.updated_at ? `Saved ${formatClock(sessionNotesInfo.updated_at)}` : "Not saved yet"}
+                            </span>
+                          </div>
+                          <div className="session-pane-card" data-testid="session-notes-panel">
                             <div className="row">
                               <button
                                 type="button"
@@ -4739,324 +4448,8 @@ export default function App() {
                               </p>
                             </div>
                           </div>
-
-                          <div
-                            className={`session-pane-card session-files-pane ${sessionWorkspacePane === "files" ? "active" : "inactive"}`}
-                            data-testid="session-files-panel"
-                            hidden={sessionWorkspacePane !== "files"}
-                          >
-                            <div className="session-files-head">
-                              <div>
-                                <h3>Session Files</h3>
-                                <p className="small">Each Codex session keeps its own attachments and registered paths.</p>
-                              </div>
-                              <span className={`mode-pill ${sessionFiles.length > 0 ? "mode-ready" : "mode-muted"}`}>{sessionFileCountLabel}</span>
-                            </div>
-                            <div className="session-pane-scroll session-files-stack">
-                              <div className="quick-open-card compact-card">
-                                <h3>Upload</h3>
-                                <div className="row">
-                                  <input
-                                    type="file"
-                                    data-testid="session-file-upload-input"
-                                    onChange={(event) => setSessionUploadFile(event.target.files?.[0] || null)}
-                                  />
-                                  <input
-                                    type="text"
-                                    value={sessionUploadTitle}
-                                    onChange={(event) => setSessionUploadTitle(event.target.value)}
-                                    placeholder="Optional title"
-                                  />
-                                  <button
-                                    type="button"
-                                    className="button soft compact button-light is-active"
-                                    onClick={() => void onUploadSessionFile()}
-                                    disabled={sessionFilesBusy || !sessionUploadFile}
-                                  >
-                                    Attach
-                                  </button>
-                                </div>
-                              </div>
-
-                              <div className="quick-open-card compact-card">
-                                <div className="session-files-subhead">
-                                  <h3>Browse</h3>
-                                  <div className="row">
-                                    <label className="field inline">
-                                      <span>Root</span>
-                                      <select
-                                        data-testid="browser-root-select"
-                                        value={browserRoot}
-                                        onChange={(event) => setBrowserRoot(event.target.value)}
-                                      >
-                                        {browserRoots.map((root) => (
-                                          <option key={root.id} value={root.id}>
-                                            {root.label}
-                                          </option>
-                                        ))}
-                                      </select>
-                                    </label>
-                                    <button type="button" className="button soft compact button-light" onClick={() => void onBrowseUp()}>
-                                      Up
-                                    </button>
-                                    <button type="button" className="button soft compact button-light" onClick={() => void refreshBrowser(browserRoot, browserState?.current_path || "")}>
-                                      Refresh
-                                    </button>
-                                  </div>
-                                </div>
-                                <p className="small">
-                                  {browserState?.display_path || "Loading browser..."}
-                                </p>
-                                {selectedBrowserEntry ? (
-                                  <div className="session-path-pill">
-                                    <strong>{selectedBrowserEntry.name}</strong>
-                                    <span>{selectedBrowserEntry.wsl_path}</span>
-                                  </div>
-                                ) : null}
-                                {lastCopiedSessionPath ? <p className="small">Copied path: <code>{lastCopiedSessionPath}</code></p> : null}
-                                {browserLoading ? <p className="small">Loading browser...</p> : null}
-                                {!browserLoading && (!browserState?.items || browserState.items.length === 0) ? (
-                                  <div className="empty-state panel-empty">
-                                    <h3>No items here</h3>
-                                    <p>Select another root or move up a directory.</p>
-                                  </div>
-                                ) : null}
-                                {!browserLoading && browserState?.items?.length ? (
-                                  <div className="session-scroll-window" data-testid="session-browser-window">
-                                    <div className="session-file-list" role="list" aria-label="Browser entries">
-                                      {browserState.items.map((item) => {
-                                        const selected = item.wsl_path === browserSelectedPath;
-                                        return (
-                                          <div
-                                            key={item.wsl_path}
-                                            className={`session-file-item ${selected ? "selected" : ""}`}
-                                            role="button"
-                                            tabIndex={0}
-                                            onClick={() => setBrowserSelectedPath(item.wsl_path)}
-                                            onKeyDown={(event) => {
-                                              if (event.key === "Enter" || event.key === " ") {
-                                                event.preventDefault();
-                                                setBrowserSelectedPath(item.wsl_path);
-                                              }
-                                            }}
-                                          >
-                                            <div className="session-row">
-                                              <strong>{item.name}</strong>
-                                              <span className="badge muted">{item.kind}</span>
-                                            </div>
-                                            <p>{item.display_path}</p>
-                                            <small>{item.kind === "directory" ? "Folder path available to Codex" : formatFileSize(item.size_bytes)}</small>
-                                            <div className="row">
-                                              {item.kind === "directory" ? (
-                                                <button type="button" className="button soft compact button-light" onClick={() => void onBrowseOpen(item)}>
-                                                  Open
-                                                </button>
-                                              ) : null}
-                                              <button type="button" className="button soft compact button-light" onClick={() => void onCopySessionPath(item)}>
-                                                Copy Path
-                                              </button>
-                                              <button type="button" className="button soft compact button-light" onClick={() => onUseSessionPath(item)}>
-                                                Use Path
-                                              </button>
-                                              <button type="button" className="button soft compact button-light is-active" onClick={() => void onRegisterBrowserItem(item)} disabled={sessionFilesBusy}>
-                                                Attach
-                                              </button>
-                                            </div>
-                                          </div>
-                                        );
-                                      })}
-                                    </div>
-                                  </div>
-                                ) : null}
-                              </div>
-
-                              <div className="quick-open-card compact-card">
-                                <div className="session-files-subhead">
-                                  <h3>Attached to {selectedSessionInfo.session}</h3>
-                                  <button type="button" className="button soft compact button-light" onClick={() => void refreshSessionFiles(selectedSessionInfo.session)}>
-                                    Refresh
-                                  </button>
-                                </div>
-                                {!telegramConfigured ? (
-                                  <p className="small">Telegram is not configured yet. You can still attach and copy paths now.</p>
-                                ) : null}
-                                {selectedSessionFile ? (
-                                  <p className="small">
-                                    Selected file: <strong>{selectedSessionFile.title || selectedSessionFile.file_name}</strong>
-                                  </p>
-                                ) : null}
-                                {sessionFilesLoading ? <p className="small">Loading session files...</p> : null}
-                                {!sessionFilesLoading && sessionFiles.length === 0 ? (
-                                  <div className="empty-state panel-empty">
-                                    <h3>No files attached</h3>
-                                    <p>Upload a file or attach a path from the browser above.</p>
-                                  </div>
-                                ) : null}
-                                {!sessionFilesLoading && sessionFiles.length > 0 ? (
-                                  <div className="session-scroll-window" data-testid="session-attached-files-window">
-                                    <div className="session-file-list" role="list" aria-label="Session files">
-                                      {sessionFiles.map((item) => (
-                                        <div
-                                          key={item.id}
-                                          className={`session-file-item ${item.id === selectedSessionFileId ? "selected" : ""}`}
-                                          role="button"
-                                          tabIndex={0}
-                                          onClick={() => setSelectedSessionFileId(item.id)}
-                                          onKeyDown={(event) => {
-                                            if (event.key === "Enter" || event.key === " ") {
-                                              event.preventDefault();
-                                              setSelectedSessionFileId(item.id);
-                                            }
-                                          }}
-                                        >
-                                          <div className="session-row">
-                                            <strong>{item.title || item.file_name}</strong>
-                                            <span className="badge muted">{item.item_kind || "file"}</span>
-                                          </div>
-                                          <p>{item.display_path || item.wsl_path}</p>
-                                          <small>
-                                            {item.source_kind || "registered"} | {item.item_kind === "directory" ? "folder" : formatFileSize(item.size_bytes)}
-                                          </small>
-                                          <div className="row">
-                                            <button type="button" className="button soft compact button-light" onClick={(event) => { stopSessionFileSelection(event); void onCopySessionPath(item); }}>
-                                              Copy Path
-                                            </button>
-                                            <button type="button" className="button soft compact button-light" onClick={(event) => { stopSessionFileSelection(event); onUseSessionPath(item); }}>
-                                              Use Path
-                                            </button>
-                                            {item.item_kind !== "directory" && item.download_url ? (
-                                              <button
-                                                type="button"
-                                                className="button soft compact button-light"
-                                                onClick={(event) => {
-                                                  stopSessionFileSelection(event);
-                                                  window.open(item.download_url, "_blank", "noopener,noreferrer");
-                                                }}
-                                              >
-                                                Open
-                                              </button>
-                                            ) : null}
-                                            <button
-                                              type="button"
-                                              className="button soft compact button-light is-active"
-                                              onClick={(event) => {
-                                                stopSessionFileSelection(event);
-                                                void onSendSessionFileRowToTelegram(item);
-                                              }}
-                                              disabled={sessionFilesBusy || !telegramConfigured || item.item_kind === "directory"}
-                                            >
-                                              Send via Telegram
-                                            </button>
-                                            <button
-                                              type="button"
-                                              className="button danger compact button-light is-danger"
-                                              onClick={(event) => {
-                                                stopSessionFileSelection(event);
-                                                void onDeleteSessionFileRow(item);
-                                              }}
-                                              disabled={sessionFilesBusy}
-                                            >
-                                              {item.source_kind === "upload" ? "Delete" : "Detach"}
-                                            </button>
-                                          </div>
-                                        </div>
-                                      ))}
-                                    </div>
-                                  </div>
-                                ) : null}
-                              </div>
-                            </div>
-                          </div>
-
-                          <div
-                            className={`session-pane-card session-setup-pane ${sessionWorkspacePane === "setup" ? "active" : "inactive"}`}
-                            data-testid="session-setup-panel"
-                            hidden={sessionWorkspacePane !== "setup"}
-                          >
-                            <div className="session-pane-scroll">
-                              <div className="quick-open-card session-image-card compact-card">
-                                <div className="session-pane-head">
-                                  <div>
-                                    <h3>Image Upload</h3>
-                                    <p className="small">Upload an image, then choose how to deliver it into your active Codex workflow.</p>
-                                  </div>
-                                  <span className={`mode-pill ${sessionImageFile ? "mode-ready" : "mode-muted"}`}>
-                                    {sessionImageFile ? "image ready" : "no image yet"}
-                                  </span>
-                                </div>
-                                <div className="row">
-                                  <input
-                                    type="file"
-                                    accept="image/*"
-                                    onChange={(event) => setSessionImageFile(event.target.files?.[0] || null)}
-                                  />
-                                  <input
-                                    type="text"
-                                    value={sessionImagePrompt}
-                                    onChange={(event) => setSessionImagePrompt(event.target.value)}
-                                    placeholder="Optional instruction for this image"
-                                  />
-                                  <label className="field inline">
-                                    <span>Mode</span>
-                                    <select
-                                      value={sessionImageDeliveryMode}
-                                      onChange={(event) => setSessionImageDeliveryMode(parseSessionImageDeliveryMode(event.target.value))}
-                                    >
-                                      <option value="insert_path">Insert path in composer</option>
-                                      <option value="desktop_clipboard">Paste image (Ctrl+V)</option>
-                                      <option value="session_path">Send path as message</option>
-                                    </select>
-                                  </label>
-                                  <button type="button" className="button soft compact button-light is-active" onClick={() => void onSendSessionImage()} disabled={sessionBusy || !sessionImageFile}>
-                                    Send Image
-                                  </button>
-                                </div>
-                                <p className="small">
-                                  {sessionImageDeliveryMode === "insert_path"
-                                    ? "Inserts the local image path into Codex composer without submitting; continue typing and press Send."
-                                    : sessionImageDeliveryMode === "desktop_clipboard"
-                                      ? "Requires Codex input focused on laptop; copies image to clipboard and sends Ctrl+V."
-                                      : "Sends a path message directly to session transcript and submits immediately."}
-                                </p>
-                              </div>
-
-                              <div className="quick-open-card session-model-card compact-card">
-                                <div className="session-pane-head">
-                                  <div>
-                                    <h3>Session Reasoning</h3>
-                                    <p className="small">The controller default model stays fixed. You can still adjust reasoning for the active session.</p>
-                                  </div>
-                                  <span className="mode-pill mode-ready">{selectedReasoningEffort}</span>
-                                </div>
-                                <div className="row">
-                                  <label className="field inline">
-                                    <span>Reasoning</span>
-                                    <select
-                                      data-testid="session-reasoning-select"
-                                      value={selectedReasoningEffort}
-                                      onChange={(event) => setSelectedReasoningEffort(parseReasoningEffort(event.target.value))}
-                                    >
-                                      {sessionAllowedReasoningOptions.map((effort) => (
-                                        <option key={effort} value={effort}>
-                                          {effort}
-                                        </option>
-                                      ))}
-                                    </select>
-                                  </label>
-                                  <button
-                                    type="button"
-                                    className="button soft compact button-light is-active"
-                                    onClick={() => void onApplySessionProfile()}
-                                    disabled={sessionBusy || !selectedSession}
-                                  >
-                                    Apply to Current Session
-                                  </button>
-                                </div>
-                              </div>
-                            </div>
-                          </div>
                         </div>
-                      </aside>
+                      </section>
                     </div>
                   </>
                 )}

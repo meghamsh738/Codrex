@@ -985,11 +985,13 @@ button:active,
 }
 
 .session-item {
+  position: relative;
   text-align: left;
   border: 1px solid var(--border);
   border-radius: var(--radius-m);
   background: linear-gradient(175deg, color-mix(in srgb, var(--surface) 98%, transparent), color-mix(in srgb, var(--surface-soft) 94%, transparent));
   padding: 18px;
+  padding-right: 56px;
   min-height: 148px;
   cursor: pointer;
   transition: border-color 120ms ease, transform 120ms ease, box-shadow 120ms ease;
@@ -1073,25 +1075,30 @@ button:active,
 }
 
 .session-close-chip {
+  position: absolute;
+  top: 14px;
+  right: 14px;
+  z-index: 1;
   border: 1px solid color-mix(in srgb, var(--danger) 55%, var(--border) 45%);
-  background: linear-gradient(180deg, color-mix(in srgb, var(--danger) 22%, var(--surface) 78%), color-mix(in srgb, var(--surface-soft) 92%, transparent));
-  color: color-mix(in srgb, var(--danger) 78%, #ffffff 22%);
+  background: linear-gradient(180deg, color-mix(in srgb, var(--danger) 34%, var(--surface) 66%), color-mix(in srgb, var(--danger) 18%, var(--surface-soft) 82%));
+  color: color-mix(in srgb, var(--danger) 84%, #ffffff 16%);
   border-radius: 999px;
-  min-width: 30px;
-  height: 30px;
+  min-width: 34px;
+  height: 34px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  font-size: 1rem;
+  font-size: 1.1rem;
   font-weight: 700;
   line-height: 1;
   padding: 0;
-  box-shadow: 0 0 0 1px rgba(239, 68, 68, 0.08);
+  box-shadow: 0 0 0 1px rgba(239, 68, 68, 0.12), 0 10px 18px rgba(127, 29, 29, 0.22);
 }
 
 .session-close-chip:hover:not(:disabled) {
   border-color: color-mix(in srgb, var(--danger) 70%, var(--border) 30%);
-  box-shadow: 0 8px 14px rgba(239, 68, 68, 0.18);
+  box-shadow: 0 0 0 1px rgba(248, 113, 113, 0.22), 0 12px 18px rgba(239, 68, 68, 0.24);
+  transform: translateY(-1px);
 }
 
 .state {
@@ -1381,7 +1388,7 @@ button:active,
 }
 
 .composer-input-wrap textarea {
-  padding-right: 174px;
+  padding-right: 156px;
   min-height: 142px;
 }
 
@@ -1390,8 +1397,40 @@ button:active,
   right: 10px;
   bottom: 10px;
   display: inline-flex;
-  align-items: flex-end;
+  align-items: center;
   gap: 8px;
+}
+
+.composer-action-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.composer-icon-btn {
+  width: 40px;
+  height: 40px;
+  border-radius: 999px;
+  border: 1px solid color-mix(in srgb, var(--border-strong) 56%, var(--brand-accent) 44%);
+  background: linear-gradient(
+    165deg,
+    color-mix(in srgb, var(--surface-soft) 94%, var(--brand-accent) 6%),
+    color-mix(in srgb, var(--surface) 98%, transparent)
+  );
+  color: var(--text);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  box-shadow: 0 8px 14px rgba(14, 155, 255, 0.12);
+  transition: transform 120ms ease, box-shadow 120ms ease, border-color 120ms ease;
+}
+
+.composer-icon-btn:hover,
+.composer-icon-btn.is-active {
+  transform: translateY(-1px);
+  border-color: color-mix(in srgb, var(--brand-accent) 74%, var(--border) 26%);
+  box-shadow: 0 10px 18px rgba(14, 155, 255, 0.2);
 }
 
 .composer-telegram-btn {
@@ -1445,6 +1484,21 @@ button:active,
 .composer-telegram-label {
   font-size: 0.78rem;
   line-height: 1;
+}
+
+.composer-media-inline {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: center;
+  padding: 10px 12px;
+  border: 1px solid color-mix(in srgb, var(--border) 72%, var(--brand-accent) 28%);
+  border-radius: 16px;
+  background: linear-gradient(
+    176deg,
+    color-mix(in srgb, var(--surface-soft) 94%, transparent),
+    color-mix(in srgb, var(--surface) 98%, transparent)
+  );
 }
 
 .composer-telegram-menu {
@@ -1726,7 +1780,7 @@ button:active,
 }
 
 .session-action-group-wide {
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: repeat(3, minmax(0, 1fr));
 }
 
 .action-chip {
@@ -2068,6 +2122,14 @@ button:active,
   .session-action-group-wide,
   .remote-quickkeys {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .composer-media-actions {
+    grid-template-columns: 1fr;
+  }
+
+  .composer-media-inline {
+    grid-template-columns: 1fr;
   }
 
   .remote-shortcut-grid {

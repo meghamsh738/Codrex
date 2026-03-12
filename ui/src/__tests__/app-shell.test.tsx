@@ -994,7 +994,7 @@ describe("app shell tabs", () => {
     });
   });
 
-  it("switches between notes, files, and setup panes inside the sessions workspace", async () => {
+  it("shows a notes-only lower pane for sessions", async () => {
     getSessionsMock.mockResolvedValue({
       ok: true,
       sessions: [
@@ -1013,12 +1013,8 @@ describe("app shell tabs", () => {
     render(<App />);
 
     expect(await screen.findByTestId("session-notes-panel")).toBeVisible();
-
-    fireEvent.click(screen.getByTestId("session-pane-tab-files"));
-    expect(await screen.findByTestId("session-files-panel")).toBeVisible();
-
-    fireEvent.click(screen.getByTestId("session-pane-tab-setup"));
-    expect(await screen.findByTestId("session-setup-panel")).toBeVisible();
+    expect(screen.queryByTestId("session-files-panel")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("session-setup-panel")).not.toBeInTheDocument();
   });
 
   it("sends arrow key to session from action dock", async () => {
@@ -1046,7 +1042,7 @@ describe("app shell tabs", () => {
     });
   });
 
-  it("attaches a browser path to the selected session", async () => {
+  it("sends backspace to session from action dock", async () => {
     getSessionsMock.mockResolvedValue({
       ok: true,
       sessions: [
@@ -1061,105 +1057,17 @@ describe("app shell tabs", () => {
         },
       ],
     });
-    listBrowseEntriesMock.mockResolvedValue({
-      ok: true,
-      root: {
-        id: "workspace",
-        label: "Workspace",
-        path: "/home/megha/codrex-work",
-      },
-      roots: [
-        {
-          id: "workspace",
-          label: "Workspace",
-          path: "/home/megha/codrex-work",
-        },
-      ],
-      current_path: "/home/megha/codrex-work",
-      current_relative_path: "",
-      display_path: "/home/megha/codrex-work",
-      windows_path: "",
-      items: [
-        {
-          name: "result.png",
-          kind: "file",
-          display_path: "/home/megha/codrex-work/output/result.png",
-          wsl_path: "/home/megha/codrex-work/output/result.png",
-          windows_path: "",
-          size_bytes: 1024,
-          mtime: Date.now(),
-        },
-      ],
-    });
 
     render(<App />);
-    fireEvent.click(await screen.findByTestId("session-pane-tab-files"));
-    const panel = await screen.findByTestId("session-files-panel");
-    const itemCard = within(panel).getByText("/home/megha/codrex-work/output/result.png").closest(".session-file-item");
-    expect(itemCard).not.toBeNull();
-
-    fireEvent.click(within(itemCard as HTMLElement).getByRole("button", { name: "Attach" }));
+    const actionDock = await screen.findByTestId("session-action-dock");
+    fireEvent.click(within(actionDock).getByRole("button", { name: "Backspace" }));
 
     await waitFor(() => {
-      expect(registerSessionFileMock).toHaveBeenCalledWith("codex_demo", {
-        path: "/home/megha/codrex-work/output/result.png",
-        title: "result.png",
-        allow_directory: false,
-      });
+      expect(sendSessionKeyMock).toHaveBeenCalledWith("codex_demo", "backspace");
     });
   });
 
-  it("sends a session file to telegram from the session files panel", async () => {
-    getSessionsMock.mockResolvedValue({
-      ok: true,
-      sessions: [
-        {
-          session: "codex_demo",
-          pane_id: "%1",
-          current_command: "codex",
-          cwd: "/home/megha/work",
-          state: "idle",
-          updated_at: Date.now(),
-          snippet: "",
-        },
-      ],
-    });
-    getTelegramStatusMock.mockResolvedValueOnce({
-      ok: true,
-      configured: true,
-    });
-    listSessionFilesMock.mockResolvedValue({
-      ok: true,
-      items: [
-        {
-          id: "sf_abc",
-          title: "Result Plot",
-          file_name: "result.png",
-          mime_type: "image/png",
-          size_bytes: 2048,
-          created_at: Date.now(),
-          expires_at: Date.now() + 24 * 3600 * 1000,
-          created_by: "session:codex_demo",
-          is_image: true,
-          wsl_path: "/home/megha/codrex-work/output/result.png",
-          download_url: "/codex/session/codex_demo/files/sf_abc/download",
-        },
-      ],
-    });
-
-    render(<App />);
-    fireEvent.click(await screen.findByTestId("session-pane-tab-files"));
-    const panel = await screen.findByTestId("session-files-panel");
-    await within(panel).findAllByText("Result Plot");
-
-    fireEvent.click(within(panel).getByRole("button", { name: "Send via Telegram" }));
-
-    await waitFor(() => {
-      expect(sendSessionFileToTelegramMock).toHaveBeenCalledWith("codex_demo", "sf_abc", "Result Plot");
-    });
-  });
-
-  it("asks Codex to send the selected session file via Telegram from the composer action", async () => {
+  it("asks Codex to send the relevant generated output files via Telegram from the composer action", async () => {
     getAuthStatusMock.mockResolvedValue({
       ok: true,
       auth_required: true,
@@ -1183,33 +1091,12 @@ describe("app shell tabs", () => {
       ok: true,
       configured: true,
     });
-    listSessionFilesMock.mockResolvedValue({
-      ok: true,
-      items: [
-        {
-          id: "sf_abc",
-          title: "Result Plot",
-          file_name: "result.png",
-          mime_type: "image/png",
-          size_bytes: 2048,
-          created_at: Date.now(),
-          expires_at: Date.now() + 24 * 3600 * 1000,
-          created_by: "session:codex_demo",
-          is_image: true,
-          item_kind: "file",
-          wsl_path: "/home/megha/codrex-work/output/result.png",
-          download_url: "/codex/session/codex_demo/files/sf_abc/download",
-        },
-      ],
-    });
 
     render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: /open codex_demo/i }));
 
-    fireEvent.click(await screen.findByTestId("session-pane-tab-files"));
-    const panel = await screen.findByTestId("session-files-panel");
-    const itemCard = (await within(panel).findByText("/home/megha/codrex-work/output/result.png")).closest(".session-file-item");
-    expect(itemCard).not.toBeNull();
-    fireEvent.click(itemCard as HTMLElement);
+    const composer = screen.getByRole("textbox", { name: /Prompt Composer/i });
+    fireEvent.change(composer, { target: { value: "Please review the plot first." } });
 
     const telegramButton = await screen.findByTestId("composer-send-telegram");
     fireEvent.click(telegramButton);
@@ -1217,13 +1104,46 @@ describe("app shell tabs", () => {
     await waitFor(() => {
       expect(sendToSessionMock).toHaveBeenCalledTimes(1);
     });
-    expect(sendSessionFileToTelegramMock).not.toHaveBeenCalled();
     const [sessionName, prompt] = sendToSessionMock.mock.calls[0] || [];
     expect(sessionName).toBe("codex_demo");
-    expect(prompt).toContain("Send Result Plot to me via Telegram");
-    expect(prompt).toContain('"/home/megha/codrex-work/output/result.png"');
+    expect(prompt).toContain("Please review the plot first.");
+    expect(prompt).toContain("Send the relevant generated output files for the current task to me via Telegram");
     expect(prompt).toContain("Do not search for Telegram bot keys or secret files.");
-    expect(prompt).toContain("tell me exactly which path you sent");
+    expect(prompt).toContain("tell me exactly which paths you sent");
+    expect(composer).toHaveValue(prompt);
+  });
+
+  it("keeps the Telegram action available without showing the old helper bubble", async () => {
+    getAuthStatusMock.mockResolvedValue({
+      ok: true,
+      auth_required: true,
+      authenticated: true,
+    });
+    getSessionsMock.mockResolvedValue({
+      ok: true,
+      sessions: [
+        {
+          session: "codex_demo",
+          pane_id: "%1",
+          current_command: "codex",
+          cwd: "/home/megha/work",
+          state: "idle",
+          updated_at: Date.now(),
+          snippet: "Assistant ready",
+        },
+      ],
+    });
+    getTelegramStatusMock.mockResolvedValue({
+      ok: true,
+      configured: true,
+    });
+
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: /open codex_demo/i }));
+
+    const telegramButton = await screen.findByTestId("composer-send-telegram");
+    expect(telegramButton).not.toBeDisabled();
+    expect(screen.queryByTestId("composer-telegram-hint")).not.toBeInTheDocument();
   });
 
   it("copies notes and latest response with the shared clipboard helper", async () => {
@@ -1261,31 +1181,7 @@ describe("app shell tabs", () => {
     });
   });
 
-  it("shows setup controls without a model selector", async () => {
-    getSessionsMock.mockResolvedValue({
-      ok: true,
-      sessions: [
-        {
-          session: "codex_demo",
-          pane_id: "%1",
-          current_command: "codex",
-          cwd: "/home/megha/work",
-          state: "idle",
-          updated_at: Date.now(),
-          snippet: "Assistant ready",
-        },
-      ],
-    });
-
-    render(<App />);
-    fireEvent.click(await screen.findByTestId("session-pane-tab-setup"));
-
-    expect(await screen.findByTestId("session-setup-panel")).toBeVisible();
-    expect(screen.queryByTestId("session-model-select")).not.toBeInTheDocument();
-    expect(screen.getByTestId("session-reasoning-select")).toBeInTheDocument();
-  });
-
-  it("keeps session files panel visible when telegram is configured", async () => {
+  it("shows a compact image picker in the composer area", async () => {
     getSessionsMock.mockResolvedValue({
       ok: true,
       sessions: [
@@ -1306,8 +1202,9 @@ describe("app shell tabs", () => {
     });
 
     render(<App />);
-    fireEvent.click(await screen.findByTestId("session-pane-tab-files"));
-    expect(await screen.findByTestId("session-files-panel")).toBeVisible();
+    expect(await screen.findByTestId("composer-image-picker")).toBeVisible();
+    expect(screen.getByTestId("session-image-input")).toBeInTheDocument();
+    expect(screen.queryByTestId("session-image-mode-select")).not.toBeInTheDocument();
   });
 
   it("enables live output automatically when creating a session", async () => {

@@ -393,7 +393,7 @@ export function enterSession(session: string): Promise<BasicResult> {
   });
 }
 
-export function sendSessionKey(session: string, key: "up" | "down" | "left" | "right"): Promise<BasicResult> {
+export function sendSessionKey(session: string, key: "up" | "down" | "left" | "right" | "backspace"): Promise<BasicResult> {
   return requestJson<BasicResult>(`/codex/session/${encodeURIComponent(session)}/key`, {
     method: "POST",
     headers: JSON_HEADERS,

@@ -78,11 +78,14 @@ test.describe("mobile Sessions flow", () => {
     await expect.poll(() => mock.promptRequests[0]?.session ?? "").toBe("codex_demo");
     await expect.poll(() => mock.promptRequests[0]?.prompt ?? "").toBe("Summarize the latest build status.");
 
+    await composer.fill("Summarize the latest build status.");
     await page.getByTestId("composer-send-telegram").click();
     await expect.poll(() => mock.promptRequests.length).toBe(2);
     await expect.poll(() => mock.promptRequests[1]?.session ?? "").toBe("codex_demo");
-    await expect.poll(() => mock.promptRequests[1]?.prompt ?? "").toContain("Send Release Plot to me via Telegram");
-    await expect.poll(() => mock.promptRequests[1]?.prompt ?? "").toContain("/home/megha/codrex-work/output/release-plot.png");
+    await expect.poll(() => mock.promptRequests[1]?.prompt ?? "").toContain("Summarize the latest build status.");
+    await expect.poll(() => mock.promptRequests[1]?.prompt ?? "").toContain("Send the relevant generated output files for the current task to me via Telegram");
+    await expect.poll(() => mock.promptRequests[1]?.prompt ?? "").toContain("Do not search for Telegram bot keys or secret files.");
+    await expect(composer).toHaveValue(mock.promptRequests[1]?.prompt ?? "");
 
     const notesInput = page.getByTestId("session-notes-input");
     await notesInput.fill("Release checklist");
@@ -142,12 +145,8 @@ test.describe("mobile Sessions flow", () => {
     await dismissSwipeHint(page);
 
     await page.getByRole("button", { name: /open codex_demo/i }).click();
-    await page.getByTestId("session-pane-tab-files").click();
-    await expect(page.getByTestId("session-files-panel")).toBeVisible();
-    await page.getByTestId("session-pane-tab-setup").click();
-    await expect(page.getByTestId("session-reasoning-select")).toBeVisible();
-    await expect(page.getByTestId("session-setup-panel")).not.toContainText("Model Selection");
-    await page.getByTestId("session-pane-tab-notes").click();
+    await expect(page.getByTestId("session-notes-panel")).toBeVisible();
+    await expect(page.getByTestId("composer-image-picker")).toBeVisible();
 
     const overflow = await page.getByTestId("session-detail").evaluate((node) => ({
       clientWidth: node.clientWidth,
