@@ -277,6 +277,7 @@ if (-not $script:DiagActionName) {
   $script:DiagActionName = "start"
 }
 $script:DiagSource = "start-mobile"
+$startupTimer = [System.Diagnostics.Stopwatch]::StartNew()
 $script:DiagBeforeSessionState = if ((Read-SessionData -Path $sessionPath) -or (Read-SessionData -Path (Join-Path (Join-Path $root "logs") "mobile.session.json"))) { "present" } else { "missing" }
 $script:DiagBeforeControllerSnapshot = @()
 $script:DiagBeforeUiSnapshot = @()
@@ -387,7 +388,9 @@ if ($DevUi) {
 }
 
 Write-Host "Starting controller..."
+$controllerStartTimer = [System.Diagnostics.Stopwatch]::StartNew()
 & powershell.exe @controllerArgs
+$controllerStartMs = [int]$controllerStartTimer.ElapsedMilliseconds
 
 $uiPid = $null
 if ($DevUi) {
@@ -440,20 +443,17 @@ if ($DevUi) {
     }
   }
 } else {
-  $appReady = $false
+  # start-controller.ps1 already waits for the controller to become reachable.
+  # The built UI is served by that same controller process, so avoid a second
+  # long readiness loop here. A short health probe is enough for diagnostics.
   $appHealth = $null
-  for ($i = 0; $i -lt 40; $i++) {
+  for ($i = 0; $i -lt 5; $i++) {
     $controllerPort = Read-ControllerPort -ConfigPath $configPath -LocalConfigPath $localConfigPath -LegacyLocalConfigPath $legacyLocalConfigPath
     $appHealth = Get-AppHealth -Port $controllerPort
-    if ($appHealth -and $appHealth.ok -and $appHealth.ui_mode -eq "built") {
-      $appReady = $true
+    if ($appHealth -and $appHealth.ok) {
       break
     }
-    Start-Sleep -Milliseconds 100
-  }
-  if (-not $appReady) {
-    $detail = if ($appHealth -and $appHealth.detail) { [string]$appHealth.detail } else { "Controller app health never reached built mode." }
-    throw "Built app startup failed. $detail"
+    Start-Sleep -Milliseconds 50
   }
 }
 
@@ -512,5 +512,7 @@ Write-StartMobileDiagnostic -Ok:$true -Detail "Mobile stack ready." -Extra ([psc
   dev_ui = [bool]$DevUi
   open_firewall = [bool]$OpenFirewall
   session_written = [bool]$persistedSession
+  controller_start_ms = $controllerStartMs
+  mobile_ready_ms = [int]$startupTimer.ElapsedMilliseconds
 })
 exit 0

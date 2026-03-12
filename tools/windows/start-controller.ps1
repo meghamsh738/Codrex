@@ -259,6 +259,7 @@ if (-not $script:DiagActionName) {
 }
 $script:DiagSource = "start-controller"
 $script:DiagBeforeControllerSnapshot = @()
+$startupTimer = [System.Diagnostics.Stopwatch]::StartNew()
 
 function Write-StartControllerDiagnostic {
   param(
@@ -506,5 +507,6 @@ Write-StartControllerDiagnostic -Ok:$true -Detail "Controller started." -Extra (
   open_firewall = [bool]$OpenFirewall
   log_stdout = $outLog
   log_stderr = $errLog
+  controller_ready_ms = [int]$startupTimer.ElapsedMilliseconds
 })
 exit 0
