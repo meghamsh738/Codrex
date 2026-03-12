@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { flushSync } from "react-dom";
 import {
   addThreadRecordMessage,
@@ -77,6 +77,9 @@ import type {
   TmuxPaneInfo,
 } from "./types";
 import type { IpcEvent } from "./api";
+const PairTab = lazy(() => import("./tabs/PairTab"));
+const SettingsTab = lazy(() => import("./tabs/SettingsTab"));
+const DebugTab = lazy(() => import("./tabs/DebugTab"));
 
 type RouteHint = "lan" | "tailscale" | "current";
 type MainTab = "sessions" | "threads" | "remote" | "pair" | "settings" | "debug";
@@ -5277,431 +5280,92 @@ export default function App() {
         ) : null}
 
         {activeTab === "pair" ? (
-          <section className={screenCardClassName} data-testid="tab-panel-pair">
-            <div className="card-head">
-              <h2>Pair Device</h2>
-              <div className="row">
-                <span className="badge">QR Flow</span>
-                <span className="badge muted">{prettyRouteLabel(routeHint)}</span>
-              </div>
-            </div>
-
-            <div className="pair-layout">
-              <div className="stack">
-                <p className="small">
-                  Keep using Tailscale + token auth. QR exchange only grants this device the existing backend token context.
-                </p>
-
-                <div className="step-card">
-                  <div className="step-head">
-                    <span className="step-index">1</span>
-                    <h3>Choose Route</h3>
-                  </div>
-                  <label className="field">
-                    <span>Route Hint</span>
-                    <select
-                      data-testid="pair-route-hint-select"
-                      value={routeHint}
-                      onChange={(event) => onRouteHintChange(event.target.value as RouteHint)}
-                    >
-                      <option value="tailscale">{prettyRouteLabel("tailscale")} (default)</option>
-                      <option value="lan" disabled={!isLocalBrowser}>
-                        {prettyRouteLabel("lan")}{!isLocalBrowser ? " (localhost only)" : ""}
-                      </option>
-                      <option value="current" disabled={!isLocalBrowser}>
-                        {prettyRouteLabel("current")}{!isLocalBrowser ? " (localhost only)" : ""}
-                      </option>
-                    </select>
-                  </label>
-                  {!isLocalBrowser ? (
-                    <p className="small warn">
-                      For safety, LAN/current pairing routes are disabled outside localhost browser sessions.
-                    </p>
-                  ) : null}
-                  <label className="field">
-                    <span>Controller Base URL</span>
-                    <input
-                      type="text"
-                      value={controllerBase}
-                      onChange={(event) => setControllerBase(event.target.value)}
-                      placeholder="http://192.168.x.x:<codrex-port>"
-                    />
-                  </label>
-                  <p className="small">
-                    LAN: <strong>{netInfo?.lan_ip || "n/a"}</strong> | Tailscale: <strong>{netInfo?.tailscale_ip || "n/a"}</strong>
-                  </p>
-                  {tailscaleRouteUnavailable ? (
-                    <p className="small warn">
-                      Tailscale route is selected but no Tailscale IP is detected.
-                    </p>
-                  ) : null}
-                </div>
-
-                <div className="step-card">
-                  <div className="step-head">
-                    <span className="step-index">2</span>
-                    <h3>Generate and Exchange</h3>
-                  </div>
-                  <div className="row">
-                    <button type="button" className="button" onClick={() => void onGeneratePairing()} disabled={pairBusy}>
-                      {pairBusy ? "Generating..." : "Generate QR"}
-                    </button>
-                    <button type="button" className="button soft compact" onClick={() => void refreshNet()}>
-                      Refresh Routes
-                    </button>
-                    <button
-                      type="button"
-                      className="button soft compact"
-                      onClick={() => void onPairExchange()}
-                      disabled={pairBusy || !pairCode}
-                    >
-                      Exchange Here
-                    </button>
-                  </div>
-                  <p className="small">Generate QR first, then use Exchange Here on this device if needed.</p>
-                </div>
-              </div>
-
-              <div className="pair-preview">
-                {pairCode ? (
-                  <>
-                    <div className="step-head">
-                      <span className="step-index">3</span>
-                      <h3>Scan or Share</h3>
-                    </div>
-                    <p className="small">
-                      Code: <code>{pairCode}</code>
-                      {pairExpiry ? ` (expires in ${pairExpiry}s)` : ""}
-                    </p>
-                    <textarea data-testid="pair-link-text" readOnly value={pairLink} rows={3} />
-                    <div className="row">
-                      <button type="button" className="button soft compact" onClick={() => void onCopyPairLink()}>
-                        Copy Link
-                      </button>
-                      <button type="button" className="button soft compact" onClick={onOpenPairLink}>
-                        Open Link
-                      </button>
-                    </div>
-                    {pairQrUrl ? (
-                      <div className="pair-qr-wrap">
-                        <img className="qr" src={pairQrUrl} alt="Pairing QR" />
-                      </div>
-                    ) : null}
-                  </>
-                ) : (
-                  <div className="empty-state panel-empty">
-                    <h3>No code generated</h3>
-                    <p>Generate a pairing code to show a QR image for phone/tablet sign-in.</p>
-                  </div>
-                )}
-              </div>
-            </div>
-          </section>
+          <Suspense fallback={<section className={screenCardClassName} data-testid="tab-panel-pair"><p className="small">Loading pair tab...</p></section>}>
+            <PairTab
+              screenCardClassName={screenCardClassName}
+              routeHint={routeHint}
+              prettyRouteLabel={prettyRouteLabel}
+              isLocalBrowser={isLocalBrowser}
+              controllerBase={controllerBase}
+              setControllerBase={setControllerBase}
+              onRouteHintChange={onRouteHintChange}
+              netInfo={netInfo}
+              tailscaleRouteUnavailable={tailscaleRouteUnavailable}
+              pairBusy={pairBusy}
+              onGeneratePairing={() => void onGeneratePairing()}
+              refreshNet={() => void refreshNet()}
+              onPairExchange={() => void onPairExchange()}
+              pairCode={pairCode}
+              pairExpiry={pairExpiry}
+              pairLink={pairLink}
+              onCopyPairLink={() => void onCopyPairLink()}
+              onOpenPairLink={onOpenPairLink}
+              pairQrUrl={pairQrUrl}
+            />
+          </Suspense>
         ) : null}
 
         {activeTab === "settings" ? (
-          <section className={screenCardClassName} data-testid="tab-panel-settings">
-            <div className="card-head">
-              <h2>Security & Settings</h2>
-              {authLoading ? <span className="badge">Checking...</span> : <span className="badge">Auth</span>}
-            </div>
-
-            {!auth ? (
-              <p className="small">Loading auth state...</p>
-            ) : (
-              <div className="settings-layout">
-                <div className="stack">
-                  <p className="small">
-                    Required: <strong>{auth.auth_required ? "Yes" : "No"}</strong> | Authenticated:{" "}
-                    <strong>{auth.authenticated ? "Yes" : "No"}</strong>
-                  </p>
-
-                  {auth.auth_required && !auth.authenticated ? (
-                    <>
-                      <div className="quick-open-card">
-                        <h3>Laptop Quick Auth</h3>
-                        <p className="small">If this page is opened on localhost from your laptop, use one-tap local auth.</p>
-                        <button type="button" className="button" onClick={() => void onBootstrapLocalAuth()} disabled={authBusy}>
-                          {authBusy ? "Authorizing..." : "Use Local Laptop Auth"}
-                        </button>
-                      </div>
-                      <label className="field">
-                        <span>Access Token</span>
-                        <input
-                          type="password"
-                          value={tokenInput}
-                          onChange={(event) => setTokenInput(event.target.value)}
-                          placeholder="Paste CODEX_AUTH_TOKEN"
-                        />
-                      </label>
-                      <button type="button" className="button" onClick={() => void onLogin()} disabled={authBusy}>
-                        {authBusy ? "Logging in..." : "Login"}
-                      </button>
-                      <p className="small">Use token login when local quick auth is unavailable.</p>
-                    </>
-                  ) : (
-                    <div className="row">
-                      <button type="button" className="button" onClick={() => void refreshAuth()}>
-                        Recheck
-                      </button>
-                      <button type="button" className="button danger compact" onClick={() => void onLogout()} disabled={authBusy}>
-                        Logout
-                      </button>
-                    </div>
-                  )}
-
-                  <div className="quick-open-card">
-                    <h3>Android Usability</h3>
-                    <p className="small">Tune touch targets and transcript density for phone/tablet usage.</p>
-                    <div className="row">
-                      <button
-                        type="button"
-                        className="button soft compact"
-                        data-testid="toggle-touch-comfort"
-                        onClick={() => setTouchComfortMode((current) => !current)}
-                      >
-                        Touch Comfort: {touchComfortMode ? "On" : "Off"}
-                      </button>
-                      <button
-                        type="button"
-                        className="button soft compact"
-                        data-testid="toggle-compact-transcript"
-                        onClick={() => setCompactTranscript((current) => !current)}
-                      >
-                        Compact Transcript: {compactTranscript ? "On" : "Off"}
-                      </button>
-                    </div>
-                  </div>
-
-                  <div className="quick-open-card">
-                    <h3>Theme</h3>
-                    <p className="small">Choose visual theme for laptop, Android, and tablet.</p>
-                    <label className="field">
-                      <span>Theme Mode</span>
-                      <select data-testid="theme-select" value={themeMode} onChange={(event) => setThemeMode(parseThemeMode(event.target.value))}>
-                        <option value="dark">Dark</option>
-                        <option value="light">Light</option>
-                      </select>
-                    </label>
-                    <p className="small">Active theme: <strong>{resolvedTheme}</strong></p>
-                  </div>
-                </div>
-
-                <div className="stack">
-                  <div className="quick-open-card settings-note">
-                    <h3>Network Diagnostics</h3>
-                    <p className="small">
-                      Current route: <strong>{controllerRouteSummary}</strong>
-                    </p>
-                    <p className={`small severity ${controllerRouteSeverity}`}>{controllerRouteAdvice}</p>
-                    <p className="small">Controller base: <code>{controllerBase || "(not set)"}</code></p>
-                    <p className="small">Route hint: <strong>{prettyRouteLabel(routeHint)}</strong></p>
-                    <p className="small">LAN: <strong>{netInfo?.lan_ip || "n/a"}</strong></p>
-                    <p className="small">Tailscale: <strong>{netInfo?.tailscale_ip || "n/a"}</strong></p>
-                    <p className="small">Browser origin: <code>{typeof window !== "undefined" ? window.location.origin : "n/a"}</code></p>
-                    <div className="row">
-                      <button type="button" className="button soft compact" onClick={() => void refreshNet()}>
-                        Refresh Network
-                      </button>
-                      <button type="button" className="button soft compact" onClick={() => void refreshAuth()}>
-                        Refresh Auth
-                      </button>
-                    </div>
-                  </div>
-
-                  <div className="empty-state settings-note">
-                    <h3>Remote safety checklist</h3>
-                    <p>Use Tailscale/private network and keep token auth enabled on backend.</p>
-                    <ul className="safety-list">
-                      <li>Avoid exposing backend ports directly to public internet.</li>
-                      <li>Use QR pairing for mobile sign-in instead of sharing raw token.</li>
-                      <li>Rotate token if devices are lost or shared.</li>
-                    </ul>
-                  </div>
-                </div>
-              </div>
-            )}
-          </section>
+          <Suspense fallback={<section className={screenCardClassName} data-testid="tab-panel-settings"><p className="small">Loading settings...</p></section>}>
+            <SettingsTab
+              screenCardClassName={screenCardClassName}
+              authLoading={authLoading}
+              auth={auth}
+              authBusy={authBusy}
+              onBootstrapLocalAuth={() => void onBootstrapLocalAuth()}
+              tokenInput={tokenInput}
+              setTokenInput={setTokenInput}
+              onLogin={() => void onLogin()}
+              refreshAuth={() => void refreshAuth()}
+              onLogout={() => void onLogout()}
+              touchComfortMode={touchComfortMode}
+              setTouchComfortMode={setTouchComfortMode}
+              compactTranscript={compactTranscript}
+              setCompactTranscript={setCompactTranscript}
+              themeMode={themeMode}
+              setThemeMode={setThemeMode}
+              parseThemeMode={parseThemeMode}
+              resolvedTheme={resolvedTheme}
+              controllerRouteSummary={controllerRouteSummary}
+              controllerRouteSeverity={controllerRouteSeverity}
+              controllerRouteAdvice={controllerRouteAdvice}
+              controllerBase={controllerBase}
+              routeHint={routeHint}
+              prettyRouteLabel={prettyRouteLabel}
+              netInfo={netInfo}
+              refreshNet={() => void refreshNet()}
+            />
+          </Suspense>
         ) : null}
 
         {activeTab === "debug" ? (
-          <section className={screenCardClassName} data-testid="tab-panel-debug">
-            <div className="card-head">
-              <h2>Debug Timeline</h2>
-              <div className="row">
-                <span className="badge">Events {totalEvents}</span>
-                <span className={`badge ${errorEvents > 0 ? "warn" : "muted"}`}>Errors {errorEvents}</span>
-                <span className="badge muted">Runs {debugRuns.length}</span>
-                <button type="button" className="button soft compact" onClick={() => void refreshDebugRuns()}>
-                  Refresh Runs
-                </button>
-              </div>
-            </div>
-
-            <div className="debug-layout">
-              <div className="debug-column">
-                <div className="debug-block">
-                  <h3>Controller Runs</h3>
-                  {debugLoading ? <p className="small">Loading run history...</p> : null}
-                  {!debugLoading && debugRuns.length === 0 ? (
-                    <div className="empty-state panel-empty">
-                      <h3>No runs yet</h3>
-                      <p>Run history appears here when `/codex/exec` jobs are used.</p>
-                    </div>
-                  ) : null}
-                  <div className="run-list" role="list" aria-label="Codex exec runs">
-                    {debugRuns.map((run) => {
-                      const selected = run.id === selectedRunId;
-                      return (
-                        <button
-                          key={run.id}
-                          type="button"
-                          className={`run-item ${selected ? "selected" : ""}`}
-                          onClick={() => setSelectedRunId(run.id)}
-                        >
-                          <div className="session-row">
-                            <strong>{run.id}</strong>
-                            <span className={`state state-${run.status}`}>{run.status}</span>
-                          </div>
-                          <p>{run.prompt || "(no prompt)"}</p>
-                          <small>Duration: {run.duration_s ?? "-"}</small>
-                        </button>
-                      );
-                    })}
-                  </div>
-                </div>
-
-                <div className="debug-block">
-                  <h3>App Event Timeline</h3>
-                  {eventLog.length === 0 ? (
-                    <p className="small">No events yet.</p>
-                  ) : (
-                    <div className="event-list" role="list" aria-label="Application events">
-                      {eventLog.map((evt) => (
-                        <div key={evt.id} className={`event-item ${evt.level === "error" ? "error" : ""}`}>
-                          <div className="session-row">
-                            <strong>{formatClock(evt.at)}</strong>
-                            <span className={`badge ${evt.level === "error" ? "" : "muted"}`}>
-                              {evt.level === "error" ? "Error" : "Info"}
-                            </span>
-                          </div>
-                          <p>{evt.message}</p>
-                        </div>
-                      ))}
-                    </div>
-                  )}
-                </div>
-
-                <div className="debug-block">
-                  <div className="card-head">
-                    <h3>IPC History</h3>
-                    <div className="row">
-                      <select value={ipcFilter} onChange={(event) => setIpcFilter(event.target.value as "all" | "http" | "sse" | "error")}>
-                        <option value="all">All</option>
-                        <option value="http">HTTP</option>
-                        <option value="sse">SSE</option>
-                        <option value="error">Errors</option>
-                      </select>
-                      <span className="badge muted">{filteredIpcHistory.length}</span>
-                    </div>
-                  </div>
-                  <div className="row">
-                    <input
-                      type="text"
-                      value={ipcSearch}
-                      onChange={(event) => setIpcSearch(event.target.value)}
-                      placeholder="Search path, detail, payload..."
-                    />
-                    <button type="button" className="button soft compact" onClick={onExportIpcHistory} disabled={ipcHistory.length === 0}>
-                      Export JSON
-                    </button>
-                    <button type="button" className="button soft compact" onClick={onClearIpcHistory} disabled={ipcHistory.length === 0}>
-                      Clear
-                    </button>
-                  </div>
-                  {filteredIpcHistory.length === 0 ? (
-                    <p className="small">No IPC events for this filter.</p>
-                  ) : (
-                    <div className="event-list" role="list" aria-label="IPC history">
-                      {filteredIpcHistory.slice(0, 240).map((evt) => (
-                        <button
-                          key={evt.id}
-                          type="button"
-                          className={`event-item ${evt.direction === "error" ? "error" : ""} ${selectedIpcEvent?.id === evt.id ? "selected" : ""}`}
-                          onClick={() => setSelectedIpcId(evt.id)}
-                        >
-                          <div className="session-row">
-                            <strong>{formatClock(evt.at)}</strong>
-                            <span className={`badge ${evt.direction === "error" ? "" : "muted"}`}>
-                              #{evt.seq} {evt.channel.toUpperCase()} {evt.direction.toUpperCase()}
-                            </span>
-                          </div>
-                          <p>
-                            [{evt.method || "GET"}] {evt.path}
-                            {typeof evt.status === "number" ? ` | status ${evt.status}` : ""}
-                            {typeof evt.durationMs === "number" ? ` | ${evt.durationMs}ms` : ""}
-                          </p>
-                          {evt.detail ? <p>{evt.detail}</p> : null}
-                        </button>
-                      ))}
-                    </div>
-                  )}
-                  {selectedIpcEvent ? (
-                    <div className="quick-open-card">
-                      <div className="detail-head">
-                        <h3>Selected IPC Event</h3>
-                        <button type="button" className="button soft compact" onClick={() => void onCopySelectedIpc()}>
-                          Copy
-                        </button>
-                      </div>
-                      <p className="small">
-                        #{selectedIpcEvent.seq} | {selectedIpcEvent.channel.toUpperCase()} {selectedIpcEvent.direction.toUpperCase()} | {formatClock(selectedIpcEvent.at)}
-                      </p>
-                      <label className="field">
-                        <span>Request Body</span>
-                        <pre className="console">{selectedIpcEvent.requestBody || "(none)"}</pre>
-                      </label>
-                      <label className="field">
-                        <span>Response Body</span>
-                        <pre className="console">{selectedIpcEvent.responseBody || "(none)"}</pre>
-                      </label>
-                    </div>
-                  ) : null}
-                </div>
-              </div>
-
-              <div className="debug-column">
-                <div className="debug-block">
-                  <h3>Selected Run Detail</h3>
-                  {!selectedRunId ? (
-                    <div className="empty-state panel-empty">
-                      <h3>Select a run</h3>
-                      <p>Choose a run from the list to inspect full output and exit code.</p>
-                    </div>
-                  ) : selectedRunLoading ? (
-                    <p className="small">Loading run detail...</p>
-                  ) : !selectedRun ? (
-                    <p className="small">Run details unavailable.</p>
-                  ) : (
-                    <div className="stack">
-                      <p className="small">
-                        Status: <strong>{selectedRun.status}</strong> | Exit: <strong>{selectedRun.exit_code ?? "-"}</strong> | Duration:{" "}
-                        <strong>{selectedRun.duration_s ?? "-"}</strong>
-                      </p>
-                      <label className="field">
-                        <span>Prompt</span>
-                        <textarea readOnly rows={4} value={selectedRun.prompt || ""} />
-                      </label>
-                      <label className="field">
-                        <span>Output</span>
-                        <pre className="console">{selectedRun.output || "(no output captured)"}</pre>
-                      </label>
-                    </div>
-                  )}
-                </div>
-              </div>
-            </div>
-          </section>
+          <Suspense fallback={<section className={screenCardClassName} data-testid="tab-panel-debug"><p className="small">Loading debug timeline...</p></section>}>
+            <DebugTab
+              screenCardClassName={screenCardClassName}
+              totalEvents={totalEvents}
+              errorEvents={errorEvents}
+              debugRuns={debugRuns}
+              debugLoading={debugLoading}
+              refreshDebugRuns={() => void refreshDebugRuns()}
+              selectedRunId={selectedRunId}
+              setSelectedRunId={setSelectedRunId}
+              eventLog={eventLog}
+              ipcFilter={ipcFilter}
+              setIpcFilter={setIpcFilter}
+              filteredIpcHistory={filteredIpcHistory}
+              ipcSearch={ipcSearch}
+              setIpcSearch={setIpcSearch}
+              onExportIpcHistory={onExportIpcHistory}
+              ipcHistoryCount={ipcHistory.length}
+              onClearIpcHistory={onClearIpcHistory}
+              selectedIpcEvent={selectedIpcEvent}
+              setSelectedIpcId={setSelectedIpcId}
+              onCopySelectedIpc={() => void onCopySelectedIpc()}
+              selectedRunLoading={selectedRunLoading}
+              selectedRun={selectedRun}
+              formatClock={formatClock}
+            />
+          </Suspense>
         ) : null}
       </main>
 
