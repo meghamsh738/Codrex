@@ -186,6 +186,9 @@ const REASONING_EFFORT_STORAGE = "codrex.ui.reasoning_effort.v1";
 const THEME_MODE_STORAGE = "codrex.ui.theme_mode.v1";
 const SESSION_VIEW_STORAGE = "codrex.ui.session_view_mode.v1";
 const SESSION_WORKSPACE_PANE_STORAGE = "codrex.ui.session_workspace_pane.v1";
+const SESSION_SELECTED_STORAGE = "codrex.ui.selected_session.v1";
+const SESSION_QUERY_STORAGE = "codrex.ui.session_query.v1";
+const SESSION_PROJECT_FILTER_STORAGE = "codrex.ui.session_project_filter.v1";
 const STREAM_PROFILE_STORAGE = "codrex.ui.stream_profile.v1";
 const STREAM_ENABLED_STORAGE = "codrex.ui.stream_enabled.v1";
 const SWIPE_HINT_SEEN_STORAGE = "codrex.ui.swipe_hint_seen.v1";
@@ -202,6 +205,7 @@ const DESKTOP_PROFILE_STREAM: Record<DesktopStreamProfile, { fps: number; level:
   ultra: { fps: 3, level: 2, scale: 3, bw: true },
   extreme: { fps: 2, level: 3, scale: 4, bw: true },
 };
+const SESSION_SUMMARY_POLL_MS = 3000;
 const POWER_ACTION_LABELS: Record<"lock" | "sleep" | "hibernate" | "restart" | "shutdown", string> = {
   lock: "Lock",
   sleep: "Sleep",
@@ -643,11 +647,6 @@ function compactAssistantSnapshot(text: string): string {
 }
 
 const TRANSCRIPT_CHUNK_SIZE = 4096;
-const SESSION_STREAM_POLL_FALLBACK_MS: Record<StreamProfile, number> = {
-  fast: 900,
-  balanced: 1400,
-  battery: 2200,
-};
 
 function chunkTranscript(text: string): TranscriptChunk[] {
   if (!text) {
@@ -732,12 +731,13 @@ export default function App() {
   const [pairBusy, setPairBusy] = useState(false);
 
   const [sessions, setSessions] = useState<SessionInfo[]>([]);
+  const [sessionsMeta, setSessionsMeta] = useState<{ total_sessions?: number; background_mode?: string } | null>(null);
   const [sessionsLoading, setSessionsLoading] = useState(true);
-  const [selectedSession, setSelectedSession] = useState("");
+  const [selectedSession, setSelectedSession] = useState(() => safeStorageGet(SESSION_SELECTED_STORAGE));
   const [newSessionName, setNewSessionName] = useState("");
   const [newSessionCwd, setNewSessionCwd] = useState("");
-  const [sessionQuery, setSessionQuery] = useState("");
-  const [sessionProjectFilter, setSessionProjectFilter] = useState("all");
+  const [sessionQuery, setSessionQuery] = useState(() => safeStorageGet(SESSION_QUERY_STORAGE));
+  const [sessionProjectFilter, setSessionProjectFilter] = useState(() => safeStorageGet(SESSION_PROJECT_FILTER_STORAGE) || "all");
   const [sessionViewMode, setSessionViewMode] = useState<SessionViewMode>(() =>
     parseSessionViewMode(safeStorageGet(SESSION_VIEW_STORAGE)),
   );
@@ -1226,10 +1226,15 @@ export default function App() {
         throw new Error(response.detail || response.error || "Failed to read sessions.");
       }
       const nextSessions = response.sessions || [];
+      setSessionsMeta(response.meta || null);
       setSessions(nextSessions);
       setSelectedSession((current) => {
         if (current && nextSessions.some((s) => s.session === current)) {
           return current;
+        }
+        const stored = safeStorageGet(SESSION_SELECTED_STORAGE);
+        if (stored && nextSessions.some((s) => s.session === stored)) {
+          return stored;
         }
         return nextSessions[0]?.session || "";
       });
@@ -1854,10 +1859,10 @@ export default function App() {
       activeTab === "remote"
         ? 3500
         : activeTab === "sessions"
-          ? SESSION_STREAM_POLL_FALLBACK_MS[streamProfile]
+          ? SESSION_SUMMARY_POLL_MS
           : 2500;
     const interval = window.setInterval(() => {
-      const shouldPollSessions = activeTab === "sessions" || activeTab === "threads" || activeTab === "pair";
+      const shouldPollSessions = activeTab === "sessions";
       if (shouldPollSessions) {
         void refreshSessions();
       }
@@ -1869,9 +1874,6 @@ export default function App() {
           (outputFeedState === "connecting" || outputFeedState === "live");
         if (selectedSession && !liveStreamActive) {
           void refreshScreen(selectedSession);
-        }
-        if (selectedSession) {
-          void refreshSessionFiles(selectedSession);
         }
       }
 
@@ -1901,7 +1903,6 @@ export default function App() {
     refreshRunDetail,
     refreshScreen,
     refreshSessions,
-    refreshSessionFiles,
     refreshThreads,
     refreshTmuxScreen,
     refreshTmuxState,
@@ -2155,6 +2156,18 @@ export default function App() {
   }, [selectedReasoningEffort]);
 
   useEffect(() => {
+    safeStorageSet(SESSION_SELECTED_STORAGE, selectedSession);
+  }, [selectedSession]);
+
+  useEffect(() => {
+    safeStorageSet(SESSION_QUERY_STORAGE, sessionQuery);
+  }, [sessionQuery]);
+
+  useEffect(() => {
+    safeStorageSet(SESSION_PROJECT_FILTER_STORAGE, sessionProjectFilter);
+  }, [sessionProjectFilter]);
+
+  useEffect(() => {
     safeStorageSet(IMAGE_DELIVERY_MODE_STORAGE, sessionImageDeliveryMode);
   }, [sessionImageDeliveryMode]);
 
@@ -2198,6 +2211,9 @@ export default function App() {
 
   useEffect(() => {
     if (sessionProjectFilter === "all") {
+      return;
+    }
+    if (projectOptions.length === 0) {
       return;
     }
     if (!projectOptions.includes(sessionProjectFilter)) {
@@ -2285,8 +2301,9 @@ export default function App() {
   const powerWakeBadge = `wake: ${powerWakeReadiness}`;
   const powerWakeTransport = powerStatus?.wake_transport_hint || "unknown";
   const powerWakeWarning = (powerStatus?.wake_warning || "").trim();
-  const sessionCountLabel = `${sessions.length} session${sessions.length === 1 ? "" : "s"}`;
-  const visibleSessionCountLabel = `${filteredSessions.length} visible`;
+  const sessionCountValue = sessionsMeta?.total_sessions || sessions.length;
+  const sessionCountLabel = `${sessionCountValue} session${sessionCountValue === 1 ? "" : "s"}`;
+  const visibleSessionCountLabel = `${filteredSessions.length} visible / ${sessionCountValue} total`;
   const sessionWorkspaceTabs: Array<{ key: SessionWorkspacePane; label: string; detail: string }> = [
     { key: "notes", label: "Notes", detail: "Plans, checkpoints, and captured Codex replies." },
     { key: "files", label: "Files", detail: "Session attachments, browse, and share paths." },
@@ -2581,7 +2598,6 @@ export default function App() {
       setStreamEnabled(true);
       setOutputFeedState("polling");
       await refreshSessions();
-      await refreshScreen(response.session);
       setActiveTab("sessions");
       setStatus(`Created ${response.session} (${response.reasoning_effort || createReasoningEffort}).`);
     } catch (error) {
@@ -2592,7 +2608,6 @@ export default function App() {
   }, [
     newSessionCwd,
     newSessionName,
-    refreshScreen,
     refreshSessions,
     reasoningEffortOptions,
     selectedModel,
@@ -2619,7 +2634,6 @@ export default function App() {
       setStreamEnabled(true);
       setOutputFeedState("polling");
       await refreshSessions();
-      await refreshScreen(response.session);
       setActiveTab("sessions");
       setStatus(`Started ${response.session} in resume-last mode.`);
     } catch (error) {
@@ -2631,7 +2645,6 @@ export default function App() {
     newSessionCwd,
     newSessionName,
     reasoningEffortOptions,
-    refreshScreen,
     refreshSessions,
     selectedModel,
     selectedReasoningEffort,
@@ -4358,7 +4371,14 @@ export default function App() {
                   </div>
                 </div>
 
-                <p className="small">{visibleSessionCountLabel}</p>
+                <div className="session-summary-strip">
+                  <p className="small">{visibleSessionCountLabel}</p>
+                  <p className="small">
+                    {sessionsMeta?.background_mode === "selected_only"
+                      ? "Only the selected session stays live; background sessions use cached summaries."
+                      : sessionCountLabel}
+                  </p>
+                </div>
 
                 {sessionsLoading ? <p className="small">Loading sessions...</p> : null}
                 {!sessionsLoading && sessions.length === 0 ? (

@@ -787,6 +787,9 @@ LEGACY_APP_RUNTIME_SESSION_FILE = os.path.abspath(os.path.join(LEGACY_RUNTIME_DI
 SESSION_STREAM_LOCK = threading.Lock()
 SESSION_STREAM_REPLAY_MAX = int(os.environ.get("CODEX_SESSION_STREAM_REPLAY_MAX", "240") or "240")
 SESSION_STREAM_STATES: Dict[str, Dict[str, Any]] = {}
+SESSION_RECOVERING_AFTER_S = float(os.environ.get("CODEX_SESSION_RECOVERING_AFTER_S", "20") or "20")
+SESSION_STALE_TTL_S = float(os.environ.get("CODEX_SESSION_STALE_TTL_S", "180") or "180")
+SESSION_BACKGROUND_MODE = "selected_only"
 
 # -------------------------
 # Telegram delivery (optional)
@@ -3314,6 +3317,27 @@ def _capture_snippet(pane_id: str, lines: int = 60) -> str:
         return ""
     lines_arr = out.splitlines()
     return "\n".join(lines_arr[-12:])
+
+
+def _session_cached_snippet(prev: Optional[Dict[str, Any]]) -> str:
+    last_text = str((prev or {}).get("last_text") or "").strip()
+    if last_text:
+        return last_text.splitlines()[-1][:240]
+    cached = str((prev or {}).get("snippet") or "").strip()
+    if cached:
+        return cached[:240]
+    return ""
+
+
+def _session_summary_state(prev: Optional[Dict[str, Any]], current_command: str) -> str:
+    cached_text = str((prev or {}).get("last_text") or (prev or {}).get("snippet") or "")
+    cached_state = str((prev or {}).get("state") or "").strip().lower()
+    inferred = _infer_progress_state(cached_text, current_command)
+    if cached_state in {"running", "waiting", "done", "error", "recovering", "starting", "idle"}:
+        if cached_state == "starting" and inferred not in {"idle", "starting"}:
+            return inferred
+        return cached_state
+    return inferred
 
 def _capture_pane_full(pane_id: str, max_chars: int = 20000) -> str:
     pane_id = _validate_pane_id(pane_id)
@@ -7174,7 +7198,10 @@ def codex_session_create(payload: Optional[Dict[str, Any]] = Body(default=None))
             "session": name,
             "cwd": cwd,
             "created_at": time.time(),
+            "updated_at": time.time(),
+            "last_seen_at": time.time(),
             "state": "starting",
+            "snippet": "",
             "last_text": "",
             "model": model,
             "reasoning_effort": reasoning_effort,
@@ -7678,10 +7705,15 @@ def codex_session_screen(session: str):
     session = _validate_session_name(session)
     pane = _session_pane(session)
     if not pane:
-        # Session exists in metadata but has no pane (terminated or failed to start).
-        # Prune stale entry to avoid sticky "no panes" UX loops in client polling.
         with SESSIONS_LOCK:
-            SESSIONS.pop(session, None)
+            prev = dict(SESSIONS.get(session) or {})
+            if prev:
+                SESSIONS[session] = {
+                    **prev,
+                    "session": session,
+                    "state": "recovering",
+                    "updated_at": time.time(),
+                }
         return {"ok": False, "error": "not_found", "detail": f"Session '{session}' has no panes."}
     # Full pane capture is needed for Codex because it renders in the alternate screen.
     text = _capture_pane_full(pane["pane_id"], max_chars=25000)
@@ -7695,7 +7727,9 @@ def codex_session_screen(session: str):
             "state": state,
             "last_text": text or snippet,
             "updated_at": time.time(),
+            "last_seen_at": time.time(),
             "current_command": pane.get("current_command", ""),
+            "snippet": (text or snippet).splitlines()[-1][:240] if (text or snippet) else "",
             "model": prev.get("model") or CODEX_DEFAULT_MODEL,
             "reasoning_effort": prev.get("reasoning_effort") or CODEX_DEFAULT_REASONING_EFFORT,
         }
@@ -7838,6 +7872,7 @@ async def codex_session_stream(websocket: WebSocket, session: str):
                     "cwd": pane.get("current_path", ""),
                     "state": current_state,
                     "updated_at": time.time(),
+                    "last_seen_at": time.time(),
                     "snippet": text.splitlines()[-1][:240] if text else "",
                     "last_text": text,
                     "model": prev.get("model") or CODEX_DEFAULT_MODEL,
@@ -7884,18 +7919,19 @@ def codex_sessions_live():
     live: List[Dict[str, Any]] = []
     now = time.time()
     seen_sessions = set()
+    with SESSIONS_LOCK:
+        known_items = dict(SESSIONS)
     for p in panes:
         session = p.get("session", "")
         cc = (p.get("current_command") or "").lower()
-        known = session in SESSIONS
+        known = session in known_items
         codex_like = session.startswith("codex_") or cc == "codex"
         if not (known or codex_like):
             continue
         seen_sessions.add(session)
-        with SESSIONS_LOCK:
-            prev = SESSIONS.get(session, {})
-        snippet = _capture_snippet(p["pane_id"], lines=60)
-        state = _infer_progress_state(snippet, p.get("current_command", ""))
+        prev = known_items.get(session, {})
+        snippet = _session_cached_snippet(prev)
+        state = _session_summary_state(prev, p.get("current_command", ""))
         item = {
             "session": session,
             "pane_id": p["pane_id"],
@@ -7903,49 +7939,57 @@ def codex_sessions_live():
             "cwd": p.get("current_path", ""),
             "state": state,
             "updated_at": now,
-            "snippet": snippet.splitlines()[-1] if snippet else "",
+            "last_seen_at": now,
+            "snippet": snippet,
             "model": prev.get("model") or CODEX_DEFAULT_MODEL,
             "reasoning_effort": prev.get("reasoning_effort") or CODEX_DEFAULT_REASONING_EFFORT,
         }
         live.append(item)
         with SESSIONS_LOCK:
-            SESSIONS[session] = {**prev, **item, "last_text": snippet}
+            SESSIONS[session] = {**prev, **item}
 
-    # Include very recent known sessions even when tmux pane discovery has a short startup race.
-    with SESSIONS_LOCK:
-        known_items = dict(SESSIONS)
+    # Keep known sessions visible during transient pane discovery gaps.
     for session, prev in known_items.items():
         if session in seen_sessions:
             continue
         if not str(session or "").startswith("codex_"):
             continue
-        updated_at = float(prev.get("updated_at") or prev.get("created_at") or now)
-        age_s = max(0.0, now - updated_at)
-        if age_s > 20:
-            # Stale in-memory records without panes are dropped after grace window.
+        last_seen_at = float(prev.get("last_seen_at") or prev.get("updated_at") or prev.get("created_at") or now)
+        age_s = max(0.0, now - last_seen_at)
+        if age_s > SESSION_STALE_TTL_S:
             with SESSIONS_LOCK:
                 if session in SESSIONS and session not in seen_sessions:
                     SESSIONS.pop(session, None)
             continue
-        last_text = str(prev.get("last_text") or "")
-        fallback_snippet = ""
-        if last_text.strip():
-            fallback_snippet = last_text.splitlines()[-1][:240]
+        fallback_snippet = _session_cached_snippet(prev)
+        fallback_state = str(prev.get("state") or "").strip().lower()
+        if age_s > SESSION_RECOVERING_AFTER_S and fallback_state not in {"done", "error"}:
+            fallback_state = "recovering"
+        elif not fallback_state:
+            fallback_state = "starting"
         live.append(
             {
                 "session": session,
                 "pane_id": str(prev.get("pane_id") or ""),
                 "current_command": str(prev.get("current_command") or ""),
                 "cwd": str(prev.get("cwd") or ""),
-                "state": str(prev.get("state") or "starting"),
+                "state": fallback_state or "starting",
                 "updated_at": now,
+                "last_seen_at": last_seen_at,
                 "snippet": fallback_snippet,
                 "model": prev.get("model") or CODEX_DEFAULT_MODEL,
                 "reasoning_effort": prev.get("reasoning_effort") or CODEX_DEFAULT_REASONING_EFFORT,
             }
         )
     live.sort(key=lambda x: x["session"])
-    return {"ok": True, "sessions": live}
+    return {
+        "ok": True,
+        "sessions": live,
+        "meta": {
+            "total_sessions": len(live),
+            "background_mode": SESSION_BACKGROUND_MODE,
+        },
+    }
 
 @app.post("/codex/session/{session}/image")
 async def codex_session_image(

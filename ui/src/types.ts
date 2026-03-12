@@ -1,4 +1,4 @@
-export type SessionState = "starting" | "idle" | "busy";
+export type SessionState = "starting" | "idle" | "busy" | "running" | "waiting" | "done" | "error" | "recovering";
 
 export interface AuthStatus {
   ok: boolean;
@@ -95,13 +95,20 @@ export interface SessionInfo {
   cwd: string;
   state: SessionState;
   updated_at: number;
+  last_seen_at?: number;
   snippet: string;
   model?: string;
   reasoning_effort?: string;
 }
 
+export interface SessionsMeta {
+  total_sessions?: number;
+  background_mode?: string;
+}
+
 export interface SessionsResult extends BasicResult {
   sessions?: SessionInfo[];
+  meta?: SessionsMeta;
 }
 
 export interface SessionCreateResult extends BasicResult {

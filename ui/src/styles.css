@@ -929,7 +929,7 @@ button:active,
 }
 
 .session-list {
-  max-height: min(50vh, 640px);
+  max-height: min(62vh, 760px);
   overflow: auto;
   padding: 8px;
   padding-right: 6px;
@@ -949,8 +949,17 @@ button:active,
 
 .session-card-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
   gap: 16px;
+  align-items: stretch;
+}
+
+.session-summary-strip {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 8px 16px;
+  align-items: center;
 }
 
 .list-tools {
@@ -981,6 +990,7 @@ button:active,
   border-radius: var(--radius-m);
   background: linear-gradient(175deg, color-mix(in srgb, var(--surface) 98%, transparent), color-mix(in srgb, var(--surface-soft) 94%, transparent));
   padding: 18px;
+  min-height: 148px;
   cursor: pointer;
   transition: border-color 120ms ease, transform 120ms ease, box-shadow 120ms ease;
 }
@@ -2651,7 +2661,7 @@ button.event-item:hover {
   }
 
   .session-list {
-    max-height: min(54vh, 700px);
+    max-height: min(64vh, 820px);
   }
 
   .run-list,

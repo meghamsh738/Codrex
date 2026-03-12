@@ -41,8 +41,14 @@ export interface PromptRequest {
   prompt: string;
 }
 
+export interface TelegramSendRequest {
+  session: string;
+  fileId: string;
+}
+
 export interface MockControllerHandle {
   promptRequests: PromptRequest[];
+  telegramSendRequests: TelegramSendRequest[];
 }
 
 function json(route: Route, payload: unknown, status = 200): Promise<void> {
@@ -79,6 +85,7 @@ export async function installMockController(
 ): Promise<MockControllerHandle> {
   const sessions = options.sessions ?? [];
   const promptRequests: PromptRequest[] = [];
+  const telegramSendRequests: TelegramSendRequest[] = [];
   const notesBySession = new Map<string, string>();
   const sessionFilesBySession = new Map(
     Object.entries(options.sessionFiles ?? {}),
@@ -264,12 +271,18 @@ export async function installMockController(
     }),
   );
 
-  await page.route(/\/codex\/session\/[^/]+\/files\/[^/]+\/telegram(?:\?.*)?$/, async (route) =>
-    json(route, {
+  await page.route(/\/codex\/session\/[^/]+\/files\/[^/]+\/telegram(?:\?.*)?$/, async (route) => {
+    const url = new URL(route.request().url());
+    const match = url.pathname.match(/\/codex\/session\/([^/]+)\/files\/([^/]+)\/telegram$/);
+    telegramSendRequests.push({
+      session: decodeURIComponent(match?.[1] ?? ""),
+      fileId: decodeURIComponent(match?.[2] ?? ""),
+    });
+    await json(route, {
       ok: true,
       detail: "Sent to Telegram.",
-    }),
-  );
+    });
+  });
 
   await page.route(/\/codex\/session\/[^/]+\/notes\/append-latest(?:\?.*)?$/, async (route) => {
     const sessionName = decodeSessionName(route.request().url());
@@ -347,7 +360,7 @@ export async function installMockController(
     });
   });
 
-  return { promptRequests };
+  return { promptRequests, telegramSendRequests };
 }
 
 export async function dismissSwipeHint(page: Page): Promise<void> {

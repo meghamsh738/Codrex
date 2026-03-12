@@ -849,15 +849,39 @@ class CodexSessionConfigTests(unittest.TestCase):
         self.assertEqual(out["sessions"][0]["session"], "codex_demo")
         self.assertEqual(out["sessions"][0]["state"], "starting")
 
-    def test_codex_sessions_live_drops_stale_known_session_without_pane(self):
-        old = server_mod.time.time() - 600
+    def test_codex_sessions_live_marks_missing_session_as_recovering_before_ttl(self):
+        old = server_mod.time.time() - 45
         fake_sessions = {
             "codex_stale": {
                 "session": "codex_stale",
                 "cwd": "/home/megha/work",
-                "state": "starting",
+                "state": "running",
                 "created_at": old,
                 "updated_at": old,
+                "last_seen_at": old,
+                "model": "gpt-5-codex",
+                "reasoning_effort": "high",
+            }
+        }
+        with mock.patch.object(server_mod, "_tmux_list_panes", return_value=[]), \
+             mock.patch.object(server_mod, "SESSIONS", fake_sessions):
+            out = server_mod.codex_sessions_live()
+
+        self.assertTrue(out["ok"])
+        self.assertEqual(len(out["sessions"]), 1)
+        self.assertEqual(out["sessions"][0]["state"], "recovering")
+        self.assertIn("codex_stale", fake_sessions)
+
+    def test_codex_sessions_live_drops_stale_known_session_without_pane_after_ttl(self):
+        old = server_mod.time.time() - (server_mod.SESSION_STALE_TTL_S + 60)
+        fake_sessions = {
+            "codex_stale": {
+                "session": "codex_stale",
+                "cwd": "/home/megha/work",
+                "state": "running",
+                "created_at": old,
+                "updated_at": old,
+                "last_seen_at": old,
                 "model": "gpt-5-codex",
                 "reasoning_effort": "high",
             }
@@ -870,7 +894,33 @@ class CodexSessionConfigTests(unittest.TestCase):
         self.assertEqual(out["sessions"], [])
         self.assertNotIn("codex_stale", fake_sessions)
 
-    def test_codex_session_screen_prunes_session_without_pane(self):
+    def test_codex_sessions_live_uses_cached_summary_without_capture(self):
+        fake_sessions = {
+            "codex_demo": {
+                "session": "codex_demo",
+                "cwd": "/home/megha/work",
+                "state": "running",
+                "last_text": "line 1\nline 2\nlatest cached line",
+                "model": "gpt-5-codex",
+                "reasoning_effort": "high",
+            }
+        }
+        panes = [{
+            "session": "codex_demo",
+            "pane_id": "%7",
+            "current_command": "node",
+            "current_path": "/home/megha/work",
+        }]
+        with mock.patch.object(server_mod, "_tmux_list_panes", return_value=panes), \
+             mock.patch.object(server_mod, "_capture_snippet", side_effect=AssertionError("should not capture snippets")), \
+             mock.patch.object(server_mod, "SESSIONS", fake_sessions):
+            out = server_mod.codex_sessions_live()
+
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["sessions"][0]["snippet"], "latest cached line")
+        self.assertEqual(out["meta"]["background_mode"], "selected_only")
+
+    def test_codex_session_screen_marks_session_recovering_without_pane(self):
         fake_sessions = {"codex_demo": {"session": "codex_demo", "state": "starting"}}
         with mock.patch.object(server_mod, "_session_pane", return_value=None), \
              mock.patch.object(server_mod, "SESSIONS", fake_sessions):
@@ -878,7 +928,7 @@ class CodexSessionConfigTests(unittest.TestCase):
 
         self.assertFalse(out["ok"])
         self.assertEqual(out["error"], "not_found")
-        self.assertNotIn("codex_demo", fake_sessions)
+        self.assertEqual(fake_sessions["codex_demo"]["state"], "recovering")
 
     def test_auth_bootstrap_local_rejects_non_localhost(self):
         req = SimpleNamespace(

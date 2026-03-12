@@ -134,6 +134,9 @@ const clipboardWriteTextMock = vi.fn();
 function setupDefaultMocks(): void {
   window.localStorage.removeItem("codrex.ui.controller_base.v1");
   window.localStorage.removeItem("codrex.ui.stream_enabled.v1");
+  window.localStorage.removeItem("codrex.ui.selected_session.v1");
+  window.localStorage.removeItem("codrex.ui.session_query.v1");
+  window.localStorage.removeItem("codrex.ui.session_project_filter.v1");
   window.localStorage.removeItem("codrex.ui.session_workspace_pane.v1");
   window.localStorage.removeItem("codrex.ui.threads.v2");
   window.localStorage.removeItem("codrex.ui.thread_messages.v2");
@@ -806,6 +809,51 @@ describe("app shell tabs", () => {
     const sessionList = screen.getByRole("list", { name: "Codex sessions" });
     expect(await within(sessionList).findByRole("button", { name: /codex_alpha/i })).toBeInTheDocument();
     expect(within(sessionList).queryByRole("button", { name: /codex_beta/i })).not.toBeInTheDocument();
+  });
+
+  it("restores selected session and filter state after reload", async () => {
+    window.localStorage.setItem("codrex.ui.selected_session.v1", "codex_beta");
+    window.localStorage.setItem("codrex.ui.session_project_filter.v1", "project-beta");
+    window.localStorage.setItem("codrex.ui.session_query.v1", "beta");
+
+    getSessionsMock.mockResolvedValue({
+      ok: true,
+      sessions: [
+        {
+          session: "codex_alpha",
+          pane_id: "%1",
+          current_command: "node",
+          cwd: "/home/megha/project-alpha",
+          state: "idle",
+          updated_at: Date.now(),
+          snippet: "",
+        },
+        {
+          session: "codex_beta",
+          pane_id: "%2",
+          current_command: "node",
+          cwd: "/home/megha/project-beta",
+          state: "running",
+          updated_at: Date.now(),
+          snippet: "Latest cached line",
+        },
+      ],
+      meta: {
+        total_sessions: 2,
+        background_mode: "selected_only",
+      },
+    });
+
+    render(<App />);
+
+    const projectFilter = await screen.findByTestId("session-project-filter");
+    expect((projectFilter as HTMLSelectElement).value).toBe("project-beta");
+    expect((screen.getByTestId("session-search-input") as HTMLInputElement).value).toBe("beta");
+
+    const sessionList = screen.getByRole("list", { name: "Codex sessions" });
+    const betaCard = await within(sessionList).findByRole("button", { name: /codex_beta/i });
+    expect(betaCard.className).toContain("selected");
+    expect(screen.getByText("1 visible / 2 total")).toBeInTheDocument();
   });
 
   it("sends prompt text directly to session", async () => {

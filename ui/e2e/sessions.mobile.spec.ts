@@ -79,9 +79,9 @@ test.describe("mobile Sessions flow", () => {
     await expect.poll(() => mock.promptRequests[0]?.prompt ?? "").toBe("Summarize the latest build status.");
 
     await page.getByTestId("composer-send-telegram").click();
-    await expect.poll(() => mock.promptRequests.length).toBe(2);
-    await expect.poll(() => mock.promptRequests[1]?.prompt ?? "").toContain("Use `tgsend` if it is available. If it is not on PATH, use `/home/megha/.local/bin/codrex-send --telegram` directly.");
-    await expect.poll(() => mock.promptRequests[1]?.prompt ?? "").toContain("/home/megha/codrex-work/output/release-plot.png");
+    await expect.poll(() => mock.telegramSendRequests.length).toBe(1);
+    await expect.poll(() => mock.telegramSendRequests[0]?.session ?? "").toBe("codex_demo");
+    await expect.poll(() => mock.telegramSendRequests[0]?.fileId ?? "").toBe("sf_plot");
 
     const notesInput = page.getByTestId("session-notes-input");
     await notesInput.fill("Release checklist");
