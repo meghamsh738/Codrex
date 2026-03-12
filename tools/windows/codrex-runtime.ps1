@@ -539,6 +539,51 @@ function Get-StatusSnapshot {
   }
 }
 
+function Wait-ForStableStartSnapshot {
+  param(
+    [object]$Paths,
+    [int]$ExpectedPort,
+    [int]$Attempts = 10,
+    [int]$DelayMs = 120
+  )
+  $latest = Get-StatusSnapshot -Paths $Paths
+  for ($attempt = 0; $attempt -lt $Attempts; $attempt++) {
+    $controllerListening = Test-PortListening -Port $ExpectedPort
+    $session = Read-MobileSession -Paths $Paths
+    $sessionMatches = $false
+    if ($session -and $session.controller_port) {
+      try {
+        $sessionMatches = ([int]$session.controller_port -eq $ExpectedPort)
+      } catch {}
+    }
+    if ($latest.status -eq "running") {
+      return $latest
+    }
+    if ($latest.status -eq "checking" -and $controllerListening -and $sessionMatches) {
+      return $latest
+    }
+    if ($attempt -lt ($Attempts - 1)) {
+      Start-Sleep -Milliseconds $DelayMs
+      $latest = Get-StatusSnapshot -Paths $Paths
+    }
+  }
+  return $latest
+}
+
+function Test-ChildReportedReady {
+  param(
+    [object]$ScriptResult
+  )
+  if (-not $ScriptResult) {
+    return $false
+  }
+  $text = [string]$ScriptResult.text
+  if (-not $text) {
+    return $false
+  }
+  return $text -match 'Mobile stack ready\.'
+}
+
 function Repair-Runtime {
   param(
     [object]$Paths
@@ -769,14 +814,32 @@ function Start-Runtime {
       Remove-Item Env:CODEX_ACTION_SOURCE -ErrorAction SilentlyContinue
     }
   }
-  $fresh = Get-StatusSnapshot -Paths $Paths
+  $fresh = if ($result.exit_code -eq 0) {
+    Wait-ForStableStartSnapshot -Paths $Paths -ExpectedPort $beforeControllerPort
+  } else {
+    Get-StatusSnapshot -Paths $Paths
+  }
+  $childReportedReady = Test-ChildReportedReady -ScriptResult $result
+  $sessionAfterStart = Read-MobileSession -Paths $Paths
+  $sessionMatchesPort = $false
+  if ($sessionAfterStart -and $sessionAfterStart.controller_port) {
+    try {
+      $sessionMatchesPort = ([int]$sessionAfterStart.controller_port -eq $beforeControllerPort)
+    } catch {}
+  }
+  $controllerListeningAfterStart = Test-PortListening -Port $beforeControllerPort
+  $treatAsStarted = ($result.exit_code -eq 0) -and (
+    $fresh.status -eq "running" -or
+    ($fresh.status -eq "checking" -and $controllerListeningAfterStart -and $sessionMatchesPort) -or
+    ($childReportedReady -and $sessionMatchesPort)
+  )
   $afterSummary = Get-StatusSummaryRecord -Snapshot $fresh
   $detail = $fresh.detail
   if ($result.text) {
     $detail = if ($detail) { "$detail Output: $($result.text)" } else { $result.text }
   }
   $resultPayload = $null
-  if ($result.exit_code -ne 0 -or $fresh.status -ne "running") {
+  if (-not $treatAsStarted) {
     $resultPayload = [pscustomobject]@{
       ok = $false
       action = "start"
@@ -800,13 +863,17 @@ function Start-Runtime {
     $resultPayload = [pscustomobject]@{
       ok = $true
       action = "start"
-      status = $fresh.status
-      detail = "Codrex app stack started."
-      controller_port = $fresh.controller_port
+      status = if ($fresh.status) { $fresh.status } else { "checking" }
+      detail = if ($childReportedReady -and $fresh.status -ne "running") {
+        "Codrex app stack started and is finalizing readiness."
+      } else {
+        "Codrex app stack started."
+      }
+      controller_port = if ($fresh.controller_port) { $fresh.controller_port } else { $beforeControllerPort }
       controller_pid = $fresh.controller_pid
-      local_url = $fresh.local_url
+      local_url = if ($fresh.local_url) { $fresh.local_url } else { "http://127.0.0.1:$beforeControllerPort/" }
       network_url = $fresh.network_url
-      session_present = $fresh.session_present
+      session_present = if ($sessionAfterStart) { $true } else { $fresh.session_present }
       app_ready = $fresh.app_ready
       app_version = $fresh.app_version
       repo_rev = $fresh.repo_rev
