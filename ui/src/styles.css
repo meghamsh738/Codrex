@@ -708,6 +708,12 @@ a:focus-visible {
   color: color-mix(in srgb, var(--warn) 72%, #ffffff 28%);
 }
 
+.badge.active {
+  background: color-mix(in srgb, var(--brand-accent) 18%, var(--surface) 82%);
+  border-color: color-mix(in srgb, var(--brand-accent) 42%, var(--border) 58%);
+  color: color-mix(in srgb, var(--brand-accent) 76%, #ffffff 24%);
+}
+
 .stack {
   display: flex;
   flex-direction: column;
@@ -904,6 +910,13 @@ button:active,
   color: var(--text);
   border-color: var(--border);
   box-shadow: 0 6px 12px rgba(15, 23, 42, 0.08);
+}
+
+.button.active {
+  background: linear-gradient(180deg, color-mix(in srgb, var(--brand-accent) 22%, var(--surface) 78%), color-mix(in srgb, var(--brand-accent) 14%, var(--surface-soft) 86%));
+  border-color: color-mix(in srgb, var(--brand-accent) 44%, var(--border) 56%);
+  color: color-mix(in srgb, var(--brand-accent) 86%, #ffffff 14%);
+  box-shadow: 0 6px 12px rgba(14, 155, 255, 0.16);
 }
 
 .button.warn {
@@ -1382,28 +1395,31 @@ button:active,
   gap: 10px;
 }
 
+.composer-chat-shell {
+  display: grid;
+  gap: 12px;
+  padding: 14px;
+  border: 1px solid color-mix(in srgb, var(--border-strong) 58%, var(--brand-accent) 42%);
+  border-radius: 22px;
+  background: linear-gradient(
+    180deg,
+    color-mix(in srgb, var(--surface-panel) 96%, var(--brand-accent) 4%),
+    color-mix(in srgb, var(--surface) 99%, transparent)
+  );
+}
+
 .composer-input-wrap {
   position: relative;
 }
 
 .composer-input-wrap textarea {
-  padding-right: 156px;
-  min-height: 142px;
-}
-
-.composer-action-stack {
-  position: absolute;
-  right: 10px;
-  bottom: 10px;
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-}
-
-.composer-action-row {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
+  width: 100%;
+  min-height: 132px;
+  resize: vertical;
+  padding: 16px 18px;
+  border-radius: 18px;
+  border: 1px solid color-mix(in srgb, var(--border) 70%, var(--brand-accent) 30%);
+  background: color-mix(in srgb, var(--surface-soft) 94%, transparent);
 }
 
 .composer-icon-btn {
@@ -1498,6 +1514,37 @@ button:active,
     color-mix(in srgb, var(--surface-soft) 94%, transparent),
     color-mix(in srgb, var(--surface) 98%, transparent)
   );
+}
+
+.composer-chat-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+}
+
+.composer-chat-left,
+.composer-chat-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.composer-chat-left {
+  flex: 1 1 auto;
+}
+
+.composer-chat-actions {
+  flex: 0 0 auto;
+}
+
+.composer-chat-meta {
+  color: var(--text-muted);
+  font-size: 0.84rem;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .composer-telegram-menu {
@@ -1903,6 +1950,16 @@ button:active,
   color: var(--muted);
 }
 
+.remote-group-head {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.remote-group-head .small {
+  margin: 0;
+}
+
 .remote-key-controls select {
   flex: 2 1 280px;
   min-width: 220px;
@@ -1914,7 +1971,7 @@ button:active,
 
 .remote-workspace {
   display: grid;
-  grid-template-columns: minmax(0, 1.5fr) minmax(320px, 1fr);
+  grid-template-columns: minmax(0, 1fr);
   gap: 14px;
   align-items: start;
 }
@@ -1925,6 +1982,12 @@ button:active,
   flex-direction: column;
   gap: 12px;
   min-width: 0;
+}
+
+.remote-control-stack {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  align-items: start;
 }
 
 .remote-view-stack .remote-stage {
@@ -1940,6 +2003,81 @@ button:active,
 
 .remote-quickkeys {
   grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.remote-path-browser-head,
+.remote-path-browser-copy,
+.remote-path-entry {
+  display: grid;
+  gap: 8px;
+  align-items: center;
+}
+
+.remote-path-browser-head {
+  grid-template-columns: minmax(0, 1fr) auto;
+}
+
+.remote-path-browser-folder {
+  margin: 0;
+}
+
+.remote-path-browser-copy {
+  grid-template-columns: minmax(0, 1fr) auto;
+}
+
+.remote-path-browser-copy input,
+.remote-path-browser-head select {
+  min-width: 0;
+}
+
+.remote-path-browser-list {
+  display: grid;
+  gap: 8px;
+  max-height: 240px;
+  overflow: auto;
+  padding-right: 4px;
+}
+
+.remote-path-entry {
+  grid-template-columns: minmax(0, 1fr) auto;
+  padding: 6px;
+  border: 1px solid color-mix(in srgb, var(--border) 78%, var(--brand-accent) 22%);
+  border-radius: var(--radius-s);
+  background: color-mix(in srgb, var(--surface) 96%, transparent);
+}
+
+.remote-path-entry.selected {
+  border-color: color-mix(in srgb, var(--brand-accent) 62%, var(--border) 38%);
+  background: color-mix(in srgb, var(--brand-accent) 10%, var(--surface) 90%);
+}
+
+.remote-path-entry-main {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  min-width: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  padding: 0;
+  text-align: left;
+  cursor: pointer;
+}
+
+.remote-path-entry-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.remote-path-entry-text strong,
+.remote-path-entry-text span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .remote-power-grid {
@@ -2125,6 +2263,20 @@ button:active,
 
   .composer-media-actions {
     grid-template-columns: 1fr;
+  }
+
+  .composer-chat-toolbar {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .composer-chat-left,
+  .composer-chat-actions {
+    justify-content: space-between;
+  }
+
+  .composer-chat-actions {
+    width: 100%;
   }
 
   .composer-media-inline {

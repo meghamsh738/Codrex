@@ -1,17 +1,17 @@
 @echo off
 setlocal
 cd /d "%~dp0"
-set "LAUNCHER_PUBLISH=%~dp0launcher\Codrex.Launcher\bin\Release\net8.0-windows\win-x64\publish\Codrex.Launcher.exe"
 set "LAUNCHER_RELEASE=%~dp0launcher\Codrex.Launcher\bin\Release\net8.0-windows\Codrex.Launcher.exe"
+set "LAUNCHER_PUBLISH=%~dp0launcher\Codrex.Launcher\bin\Release\net8.0-windows\win-x64\publish\Codrex.Launcher.exe"
 set "LAUNCHER_DEBUG=%~dp0launcher\Codrex.Launcher\bin\Debug\net8.0-windows\Codrex.Launcher.exe"
-
-if exist "%LAUNCHER_PUBLISH%" (
-  start "" "%LAUNCHER_PUBLISH%"
-  exit /b 0
-)
 
 if exist "%LAUNCHER_RELEASE%" (
   start "" "%LAUNCHER_RELEASE%"
+  exit /b 0
+)
+
+if exist "%LAUNCHER_PUBLISH%" (
+  start "" "%LAUNCHER_PUBLISH%"
   exit /b 0
 )
 

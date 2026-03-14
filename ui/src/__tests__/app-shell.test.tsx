@@ -26,6 +26,7 @@ vi.mock("../api", async (importOriginal) => {
     ctrlcSession: vi.fn(),
     deleteSessionFile: vi.fn(),
     desktopClick: vi.fn(),
+    desktopGetSelectedPath: vi.fn(),
     desktopMove: vi.fn(),
     desktopScroll: vi.fn(),
     desktopSendKey: vi.fn(),
@@ -67,6 +68,7 @@ vi.mock("../api", async (importOriginal) => {
     sendToPane: vi.fn(),
     sendToSession: vi.fn(),
     setDesktopMode: vi.fn(),
+    setDesktopPerfMode: vi.fn(),
     setIpcObserver: vi.fn(),
     startCodexExec: vi.fn(),
     updateThreadRecord: vi.fn(),
@@ -110,7 +112,9 @@ const getTmuxPaneScreenMock = vi.mocked(api.getTmuxPaneScreen);
 const getDesktopInfoMock = vi.mocked(api.getDesktopInfo);
 const getPowerStatusMock = vi.mocked(api.getPowerStatus);
 const setDesktopModeMock = vi.mocked(api.setDesktopMode);
+const setDesktopPerfModeMock = vi.mocked(api.setDesktopPerfMode);
 const desktopClickMock = vi.mocked(api.desktopClick);
+const desktopGetSelectedPathMock = vi.mocked(api.desktopGetSelectedPath);
 const desktopMoveMock = vi.mocked(api.desktopMove);
 const desktopScrollMock = vi.mocked(api.desktopScroll);
 const desktopSendTextMock = vi.mocked(api.desktopSendText);
@@ -329,7 +333,14 @@ function setupDefaultMocks(): void {
   sendSessionKeyMock.mockResolvedValue({ ok: true });
   sendToSessionMock.mockResolvedValue({ ok: true });
   setDesktopModeMock.mockResolvedValue({ ok: true, enabled: false });
+  setDesktopPerfModeMock.mockResolvedValue({ ok: true, enabled: false, perf_mode_enabled: false, perf_mode_active: false, alt_held: false });
   desktopClickMock.mockResolvedValue({ ok: true });
+  desktopGetSelectedPathMock.mockResolvedValue({
+    ok: true,
+    path: "D:\\Reports\\result.png",
+    paths: ["D:\\Reports\\result.png"],
+    count: 1,
+  });
   desktopMoveMock.mockResolvedValue({ ok: true, x: 100, y: 80 });
   desktopScrollMock.mockResolvedValue({ ok: true });
   desktopSendTextMock.mockResolvedValue({ ok: true });
@@ -533,6 +544,26 @@ describe("app shell tabs", () => {
     expect(desktopClickMock).not.toHaveBeenCalled();
   });
 
+  it("copies the selected Explorer path from the remote controls", async () => {
+    getDesktopInfoMock.mockResolvedValue({
+      ok: true,
+      enabled: true,
+      width: 1920,
+      height: 1080,
+    });
+
+    render(<App />);
+
+    fireEvent.click(await screen.findByTestId("tab-remote"));
+    const remotePathPanel = await screen.findByTestId("remote-selected-path");
+    fireEvent.click(within(remotePathPanel).getByRole("button", { name: "Copy Focused Path" }));
+
+    await waitFor(() => {
+      expect(desktopGetSelectedPathMock).toHaveBeenCalled();
+      expect(clipboardWriteTextMock).toHaveBeenCalledWith("D:\\Reports\\result.png");
+    });
+  });
+
   it("sends remote arrow quick keys from the tablet control cluster", async () => {
     getDesktopInfoMock.mockResolvedValue({
       ok: true,
@@ -546,7 +577,8 @@ describe("app shell tabs", () => {
     const remotePanel = await screen.findByTestId("tab-panel-remote");
     await within(remotePanel).findByRole("button", { name: "Disable Control" });
 
-    fireEvent.click(within(remotePanel).getByRole("button", { name: "Up" }));
+    const arrowCluster = within(remotePanel).getByRole("group", { name: "Remote arrow keys" });
+    fireEvent.click(within(arrowCluster).getByRole("button", { name: "Up" }));
 
     await waitFor(() => {
       expect(desktopSendKeyMock).toHaveBeenCalledWith("up");
@@ -567,11 +599,15 @@ describe("app shell tabs", () => {
     await within(remotePanel).findByRole("button", { name: "Disable Control" });
 
     fireEvent.click(within(remotePanel).getByRole("button", { name: "All Tabs" }));
+    fireEvent.click(within(remotePanel).getByRole("button", { name: "Hold Alt+Tab" }));
     fireEvent.click(within(remotePanel).getByRole("button", { name: "Switch Tab" }));
+    fireEvent.click(within(remotePanel).getByRole("button", { name: "Release Alt" }));
 
     await waitFor(() => {
       expect(desktopSendKeyMock).toHaveBeenCalledWith("win+tab");
+      expect(desktopSendKeyMock).toHaveBeenCalledWith("alt+tab-hold");
       expect(desktopSendKeyMock).toHaveBeenCalledWith("alt+tab");
+      expect(desktopSendKeyMock).toHaveBeenCalledWith("alt+release");
     });
   });
 

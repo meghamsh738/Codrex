@@ -24,10 +24,14 @@ public partial class MainWindow : Window
     private bool _webReady;
     private bool _actionBusy;
     private long _actionGeneration;
+    private long _lastActionEventId;
     private string _pendingAction = "";
     private string _statusDetail = "Launcher ready.";
     private string _errorDetail = "";
     private string _lastPublishedStateJson = "";
+    private string _lastActionMessage = "launcher ready";
+    private string _lastActionKind = "launcher";
+    private string _lastActionAt = DateTime.Now.ToString("HH:mm:ss");
     private DateTime _lastNetInfoRefreshUtc = DateTime.MinValue;
 
     public MainWindow()
@@ -89,6 +93,7 @@ public partial class MainWindow : Window
             switch (type)
             {
                 case "ready":
+                    RecordActionEvent("launcher", "launcher ready");
                     await PublishStateAsync();
                     break;
                 case "start":
@@ -105,12 +110,19 @@ public partial class MainWindow : Window
                         _stateStore.SavePreferences(_preferences);
                         _currentPairing = null;
                         _statusDetail = $"Selected {route} route.";
+                        var routeHost = route == "tailscale"
+                            ? (_lastNetInfo?.TailscaleIp?.Trim() ?? "")
+                            : (_lastNetInfo?.LanIp?.Trim() ?? "");
+                        RecordActionEvent("route", string.IsNullOrWhiteSpace(routeHost)
+                            ? $"{route} selected"
+                            : $"{route} selected -> {routeHost}");
                         await PublishStateAsync();
                     }
                     break;
                 case "toggleAdvanced":
                     _preferences.AdvancedVisible = !_preferences.AdvancedVisible;
                     _stateStore.SavePreferences(_preferences);
+                    RecordActionEvent("ui", _preferences.AdvancedVisible ? "advanced opened" : "advanced closed");
                     await PublishStateAsync();
                     break;
                 case "showQr":
@@ -122,6 +134,7 @@ public partial class MainWindow : Window
                         OpenUrl(runtime.LocalUrl);
                         _statusDetail = $"Opened app: {runtime.LocalUrl}";
                         _errorDetail = "";
+                        RecordActionEvent("open", $"opened local ui -> {runtime.LocalUrl}");
                         await PublishStateAsync();
                     }
                     break;
@@ -132,6 +145,7 @@ public partial class MainWindow : Window
                         OpenUrl(networkUrl);
                         _statusDetail = $"Opened network app: {networkUrl}";
                         _errorDetail = "";
+                        RecordActionEvent("open", $"opened network ui -> {networkUrl}");
                         await PublishStateAsync();
                     }
                     break;
@@ -142,6 +156,7 @@ public partial class MainWindow : Window
                         OpenUrl(fallbackUrl);
                         _statusDetail = $"Opened fallback: {fallbackUrl}";
                         _errorDetail = "";
+                        RecordActionEvent("open", $"opened fallback -> {fallbackUrl}");
                         await PublishStateAsync();
                     }
                     break;
@@ -151,6 +166,7 @@ public partial class MainWindow : Window
                         Clipboard.SetText(_currentPairing.PairLink);
                         _statusDetail = "Copied pairing link.";
                         _errorDetail = "";
+                        RecordActionEvent("copy", "copied pairing link");
                         await PublishStateAsync();
                     }
                     break;
@@ -158,6 +174,7 @@ public partial class MainWindow : Window
                     Clipboard.SetText(_stateStore.LogsDir);
                     _statusDetail = "Copied logs path.";
                     _errorDetail = "";
+                    RecordActionEvent("copy", "copied logs path");
                     await PublishStateAsync();
                     break;
                 case "copyLastError":
@@ -166,6 +183,7 @@ public partial class MainWindow : Window
                         Clipboard.SetText(_stateStore.LastErrorPath);
                         _statusDetail = "Copied last error path.";
                         _errorDetail = "";
+                        RecordActionEvent("copy", "copied last error path");
                         await PublishStateAsync();
                     }
                     break;
@@ -173,6 +191,7 @@ public partial class MainWindow : Window
                     OpenDirectory(_stateStore.LogsDir);
                     _statusDetail = "Opened Codrex logs.";
                     _errorDetail = "";
+                    RecordActionEvent("open", "opened logs directory");
                     await PublishStateAsync();
                     break;
             }
@@ -180,6 +199,7 @@ public partial class MainWindow : Window
         catch (Exception ex)
         {
             _errorDetail = ex.Message;
+            RecordActionEvent("error", $"launcher error -> {ex.Message}");
             await PublishStateAsync();
         }
     }
@@ -207,6 +227,7 @@ public partial class MainWindow : Window
         _errorDetail = "";
         _currentPairing = action == "stop" ? null : _currentPairing;
         _statusDetail = action == "start" ? "Starting Codrex runtime..." : action == "stop" ? "Stopping Codrex runtime..." : "Running Codrex action...";
+        RecordActionEvent(action, action == "start" ? "starting codrex runtime" : action == "stop" ? "stopping codrex runtime" : $"running {action}");
         UpdateRefreshInterval();
         await PublishStateAsync();
 
@@ -229,10 +250,12 @@ public partial class MainWindow : Window
             if (!result.Ok)
             {
                 _errorDetail = string.IsNullOrWhiteSpace(result.Detail) ? $"Codrex {action} failed." : result.Detail;
+                RecordActionEvent("error", $"{action} failed -> {_errorDetail}");
             }
             else
             {
                 _statusDetail = string.IsNullOrWhiteSpace(result.Detail) ? $"Codrex {action} complete." : result.Detail;
+                RecordActionEvent(action, $"{action} complete");
                 if (action == "stop")
                 {
                     _currentPairing = null;
@@ -246,6 +269,7 @@ public partial class MainWindow : Window
                 return;
             }
             _errorDetail = ex.Message;
+            RecordActionEvent("error", $"{action} exception -> {ex.Message}");
         }
         finally
         {
@@ -276,15 +300,23 @@ public partial class MainWindow : Window
             {
                 _statusDetail = _currentPairing.Detail;
                 _errorDetail = "";
+                var host = GetSelectedRouteHost();
+                RecordActionEvent(
+                    "qr",
+                    string.IsNullOrWhiteSpace(host)
+                        ? $"qr generated for {_preferences.PreferredPairRoute}"
+                        : $"qr generated for {_preferences.PreferredPairRoute} -> {host}");
             }
             else
             {
                 _errorDetail = _currentPairing.Detail;
+                RecordActionEvent("error", $"qr failed -> {_errorDetail}");
             }
         }
         catch (Exception ex)
         {
             _errorDetail = ex.Message;
+            RecordActionEvent("error", $"qr exception -> {ex.Message}");
         }
 
         await PublishStateAsync();
@@ -381,7 +413,7 @@ public partial class MainWindow : Window
             statusTone = ResolveStatusTone(runtime.Status, _actionBusy, _errorDetail),
             detail = string.IsNullOrWhiteSpace(_errorDetail) ? _statusDetailOrRuntime(runtime.Detail) : _errorDetail,
             actionBusy = _actionBusy,
-            actionLabel = _actionBusy ? "Working..." : "",
+            actionLabel = _actionBusy ? (_pendingAction == "showQr" ? "QR..." : "Working...") : "",
             appVersion = runtime.AppVersion,
             repoRev = runtime.RepoRev,
             controllerPort = runtime.ControllerPort,
@@ -402,6 +434,10 @@ public partial class MainWindow : Window
             showQrEnabled = !_actionBusy && runtime.Status.Equals("running", StringComparison.OrdinalIgnoreCase),
             openAppEnabled = !_actionBusy && runtime.Status.Equals("running", StringComparison.OrdinalIgnoreCase),
             openNetworkEnabled = !_actionBusy && runtime.Status.Equals("running", StringComparison.OrdinalIgnoreCase) && !string.IsNullOrWhiteSpace(selectedNetworkUrl),
+            actionEventId = _lastActionEventId,
+            actionEventMessage = _lastActionMessage,
+            actionEventKind = _lastActionKind,
+            actionEventAt = _lastActionAt,
         };
 
         var stateJson = JsonSerializer.Serialize(state);
@@ -478,6 +514,14 @@ public partial class MainWindow : Window
     {
         var value = (raw ?? string.Empty).Trim().ToLowerInvariant();
         return value == "tailscale" ? "tailscale" : "lan";
+    }
+
+    private void RecordActionEvent(string kind, string message)
+    {
+        _lastActionEventId += 1;
+        _lastActionKind = string.IsNullOrWhiteSpace(kind) ? "launcher" : kind.Trim().ToLowerInvariant();
+        _lastActionMessage = string.IsNullOrWhiteSpace(message) ? "ok" : message.Trim();
+        _lastActionAt = DateTime.Now.ToString("HH:mm:ss");
     }
 
     private static void OpenUrl(string url)

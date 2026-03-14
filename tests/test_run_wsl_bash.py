@@ -397,6 +397,45 @@ class TmuxCloseSessionTests(unittest.TestCase):
         self.assertEqual(result["error"], "tmux_server_not_running")
 
 
+class TmuxSendTextTests(unittest.TestCase):
+    def test_large_plain_text_is_sent_in_chunks(self):
+        text = "A" * 900
+        with mock.patch.object(server_mod, "_pane_is_codex_like", return_value=False), \
+             mock.patch.object(server_mod, "run_wsl_bash", return_value={
+                 "exit_code": 0,
+                 "stdout": "",
+                 "stderr": "",
+             }) as run_mock:
+            result = server_mod._tmux_send_text("%7", text, codex_mode=None, timeout_s=30)
+
+        self.assertEqual(result["exit_code"], 0)
+        self.assertEqual(run_mock.call_count, 4)
+        expected_chunks = [text[:400], text[400:800], text[800:]]
+        for index, expected_chunk in enumerate(expected_chunks):
+            command = run_mock.call_args_list[index].args[0]
+            self.assertEqual(
+                command,
+                f"tmux send-keys -t %7 -l " + server_mod._bash_quote(expected_chunk),
+            )
+        self.assertEqual(run_mock.call_args_list[-1].args[0], "tmux send-keys -t %7 Enter")
+
+    def test_large_codex_text_keeps_double_enter_submission(self):
+        text = "B" * 850
+        with mock.patch.object(server_mod, "run_wsl_bash", return_value={
+                 "exit_code": 0,
+                 "stdout": "",
+                 "stderr": "",
+             }) as run_mock:
+            result = server_mod._tmux_send_text("%9", text, codex_mode=True, timeout_s=20)
+
+        self.assertEqual(result["exit_code"], 0)
+        self.assertEqual(run_mock.call_count, 4)
+        self.assertEqual(
+            run_mock.call_args_list[-1].args[0],
+            "tmux send-keys -t %9 Enter ; sleep 0.2 ; tmux send-keys -t %9 Enter",
+        )
+
+
 class WslExecutableTests(unittest.TestCase):
     def test_prefers_explicit_wsl_exe(self):
         with mock.patch.object(server_mod.os, "name", "nt"), \
@@ -742,6 +781,10 @@ class CodexSessionConfigTests(unittest.TestCase):
         self.assertTrue(out["ok"])
         self.assertTrue(out["send_telegram"])
 
+    def test_parse_share_command_ignores_regular_text_with_quotes(self):
+        out = server_mod._parse_share_command('Please send this big prompt with an unmatched " quote and keep going')
+        self.assertFalse(out["is_command"])
+
     def test_parse_share_command_respects_default_send_toggle(self):
         with mock.patch.object(server_mod, "CODEX_TELEGRAM_DEFAULT_SEND", True):
             out = server_mod._parse_share_command(
@@ -1061,6 +1104,19 @@ class DesktopModeTests(unittest.TestCase):
              mock.patch.object(server_mod, "_require_desktop_enabled", side_effect=RuntimeError("should-not-be-called")):
             out = server_mod.desktop_shot(req)
         self.assertIsNotNone(out)
+
+    def test_desktop_input_text_sends_large_text_in_chunks(self):
+        req = SimpleNamespace(query_params={}, cookies={server_mod.CODEX_DESKTOP_MODE_COOKIE: "1"})
+        payload = {"text": "x" * 1200}
+        with mock.patch.object(server_mod, "_ensure_windows_host"), \
+             mock.patch.object(server_mod, "_require_desktop_enabled"), \
+             mock.patch.object(server_mod, "_desktop_release_alt_if_held"), \
+             mock.patch.object(server_mod, "_send_unicode_text_chunked", return_value=1200) as send_mock:
+            out = server_mod.desktop_input_text(req, payload)
+
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["sent"], 1200)
+        send_mock.assert_called_once_with(payload["text"], chunk_size=240)
 
     def test_desktop_mode_endpoint_sets_global_flag(self):
         req = SimpleNamespace(url=SimpleNamespace(scheme="http"), headers={})

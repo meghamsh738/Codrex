@@ -191,10 +191,16 @@ export interface DesktopInfoResult extends BasicResult {
   top?: number;
   width?: number;
   height?: number;
+  alt_held?: boolean;
+  perf_mode_enabled?: boolean;
+  perf_mode_active?: boolean;
 }
 
 export interface DesktopModeResult extends BasicResult {
   enabled?: boolean;
+  alt_held?: boolean;
+  perf_mode_enabled?: boolean;
+  perf_mode_active?: boolean;
 }
 
 export interface DesktopInputResult extends BasicResult {
@@ -203,6 +209,12 @@ export interface DesktopInputResult extends BasicResult {
   sent?: number;
   key?: string;
   delta?: number;
+  path?: string;
+  paths?: string[];
+  count?: number;
+  alt_held?: boolean;
+  perf_mode_enabled?: boolean;
+  perf_mode_active?: boolean;
 }
 
 export interface PowerStatusResult extends BasicResult {

@@ -23,6 +23,8 @@ from typing import List, Dict, Any, Optional, Tuple
 from urllib.parse import quote, urlparse
 import urllib.request
 import urllib.error
+import atexit
+import base64
 
 from mss import mss
 from mss.tools import to_png
@@ -145,6 +147,76 @@ def _default_runtime_dir() -> str:
         or os.path.join(os.path.expanduser("~"), ".local", "state")
     )
     return os.path.abspath(os.path.join(base, "codrex-remote-ui"))
+
+
+def _desktop_perf_wallpaper_path() -> str:
+    return os.path.join(_default_runtime_dir(), "state", "desktop-perf-wallpaper.bmp")
+
+
+def _desktop_perf_restore_wallpaper_path() -> str:
+    return os.path.join(_default_runtime_dir(), "state", "desktop-perf-restore.bmp")
+
+
+def _ps_single_quote(value: str) -> str:
+    return str(value or "").replace("'", "''")
+
+
+def _desktop_perf_powershell_helpers() -> str:
+    return r"""
+Add-Type -AssemblyName System.Drawing
+$ProgressPreference = 'SilentlyContinue'
+if (-not ('CodrexDesktopPerfNative' -as [type])) {
+  Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public static class CodrexDesktopPerfNative {
+  public const int SPI_SETDESKWALLPAPER = 20;
+  public const int SPIF_UPDATEINIFILE = 0x01;
+  public const int SPIF_SENDWININICHANGE = 0x02;
+  public static readonly IntPtr HWND_BROADCAST = new IntPtr(0xffff);
+  public const uint WM_SETTINGCHANGE = 0x001A;
+  public const uint SMTO_ABORTIFHUNG = 0x0002;
+
+  [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+  public static extern bool SystemParametersInfo(int uiAction, int uiParam, string pvParam, int fWinIni);
+
+  [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+  public static extern IntPtr SendMessageTimeout(IntPtr hWnd, uint Msg, IntPtr wParam, string lParam, uint fuFlags, uint uTimeout, out IntPtr lpdwResult);
+}
+"@
+}
+
+function Invoke-CodrexDesktopRefresh {
+  param([string]$WallpaperPath)
+  $resolvedWallpaper = ''
+  if ($WallpaperPath) {
+    try {
+      $resolvedWallpaper = (Resolve-Path -LiteralPath $WallpaperPath -ErrorAction Stop).Path
+    } catch {
+      $resolvedWallpaper = $WallpaperPath
+    }
+  }
+  [CodrexDesktopPerfNative]::SystemParametersInfo(
+    [CodrexDesktopPerfNative]::SPI_SETDESKWALLPAPER,
+    0,
+    $resolvedWallpaper,
+    [CodrexDesktopPerfNative]::SPIF_UPDATEINIFILE -bor [CodrexDesktopPerfNative]::SPIF_SENDWININICHANGE
+  ) | Out-Null
+  foreach ($area in @('Control Panel\Desktop', 'WindowsThemeElement', 'ImmersiveColorSet', 'TraySettings')) {
+    $msgResult = [IntPtr]::Zero
+    [CodrexDesktopPerfNative]::SendMessageTimeout(
+      [CodrexDesktopPerfNative]::HWND_BROADCAST,
+      [CodrexDesktopPerfNative]::WM_SETTINGCHANGE,
+      [IntPtr]::Zero,
+      $area,
+      [CodrexDesktopPerfNative]::SMTO_ABORTIFHUNG,
+      5000,
+      [ref]$msgResult
+    ) | Out-Null
+  }
+  & "$env:WINDIR\System32\cmd.exe" /c 'RUNDLL32.EXE user32.dll,UpdatePerUserSystemParameters 1, True' | Out-Null
+}
+"""
 
 
 def _parse_csv_config(raw: str, fallback: List[str]) -> List[str]:
@@ -686,6 +758,12 @@ DESKTOP_STREAM_FPS_DEFAULT = float(os.environ.get("CODEX_DESKTOP_STREAM_FPS", "3
 DESKTOP_STREAM_PNG_LEVEL_DEFAULT = int(os.environ.get("CODEX_DESKTOP_STREAM_PNG_LEVEL", "3") or "3")
 DESKTOP_MODE_LOCK = threading.Lock()
 DESKTOP_MODE_ENABLED = str(os.environ.get("CODEX_DESKTOP_MODE_DEFAULT", "1") or "1").strip().lower() not in {"0", "false", "no", "off"}
+DESKTOP_ALT_LOCK = threading.Lock()
+DESKTOP_ALT_HELD = False
+DESKTOP_PERF_LOCK = threading.Lock()
+DESKTOP_PERF_ENABLED = str(os.environ.get("CODEX_DESKTOP_PERF_DEFAULT", "1") or "1").strip().lower() not in {"0", "false", "no", "off"}
+DESKTOP_PERF_ACTIVE = False
+DESKTOP_PERF_SNAPSHOT: Optional[Dict[str, Any]] = None
 _cookie_secure_raw = str(os.environ.get("CODEX_COOKIE_SECURE", "auto") or "auto").strip().lower()
 if _cookie_secure_raw in {"auto", "always", "never", "on", "off", "true", "false", "1", "0", "yes", "no"}:
     CODEX_COOKIE_SECURE_MODE = _cookie_secure_raw
@@ -2264,6 +2342,16 @@ def _send_vk(vk: int, extended: bool = False) -> None:
     up = INPUT(type=INPUT_KEYBOARD, union=INPUT_UNION(ki=KEYBDINPUT(wVk=vk, wScan=0, dwFlags=flags | KEYEVENTF_KEYUP, time=0, dwExtraInfo=0)))
     _send_inputs([down, up])
 
+def _send_vk_down(vk: int, extended: bool = False) -> None:
+    flags = KEYEVENTF_EXTENDEDKEY if extended else 0
+    down = INPUT(type=INPUT_KEYBOARD, union=INPUT_UNION(ki=KEYBDINPUT(wVk=vk, wScan=0, dwFlags=flags, time=0, dwExtraInfo=0)))
+    _send_inputs([down])
+
+def _send_vk_up(vk: int, extended: bool = False) -> None:
+    flags = (KEYEVENTF_EXTENDEDKEY if extended else 0) | KEYEVENTF_KEYUP
+    up = INPUT(type=INPUT_KEYBOARD, union=INPUT_UNION(ki=KEYBDINPUT(wVk=vk, wScan=0, dwFlags=flags, time=0, dwExtraInfo=0)))
+    _send_inputs([up])
+
 def _send_vk_repeat(vk: int, count: int, extended: bool = False) -> None:
     n = int(count)
     if n <= 0:
@@ -2309,6 +2397,20 @@ def _send_unicode_text(text: str) -> None:
         inputs.append(down)
         inputs.append(up)
     _send_inputs(inputs)
+
+
+def _iter_text_chunks(text: str, chunk_size: int):
+    size = max(1, int(chunk_size or 1))
+    for start in range(0, len(text), size):
+        yield text[start:start + size]
+
+
+def _send_unicode_text_chunked(text: str, chunk_size: int = 240) -> int:
+    sent = 0
+    for chunk in _iter_text_chunks(text, chunk_size):
+        _send_unicode_text(chunk)
+        sent += len(chunk)
+    return sent
 
 # -------------------------
 # Live codex session state
@@ -2705,11 +2807,262 @@ def _desktop_global_enabled() -> bool:
         return bool(DESKTOP_MODE_ENABLED)
 
 
+def _desktop_alt_held() -> bool:
+    with DESKTOP_ALT_LOCK:
+        return bool(DESKTOP_ALT_HELD)
+
+
+def _set_desktop_alt_held(value: bool) -> bool:
+    global DESKTOP_ALT_HELD
+    with DESKTOP_ALT_LOCK:
+        DESKTOP_ALT_HELD = bool(value)
+        return DESKTOP_ALT_HELD
+
+
+def _desktop_release_alt_if_held() -> bool:
+    if not _desktop_alt_held():
+        return False
+    try:
+        _send_vk_up(VK_MENU)
+    except Exception:
+        pass
+    _set_desktop_alt_held(False)
+    return True
+
+
+def _desktop_perf_snapshot() -> Dict[str, Any]:
+    with DESKTOP_PERF_LOCK:
+        return {
+            "enabled": bool(DESKTOP_PERF_ENABLED),
+            "active": bool(DESKTOP_PERF_ACTIVE),
+            "snapshot_present": bool(DESKTOP_PERF_SNAPSHOT),
+        }
+
+
+def _apply_desktop_perf_mode() -> Dict[str, Any]:
+    global DESKTOP_PERF_ACTIVE, DESKTOP_PERF_SNAPSHOT
+    if os.name != "nt":
+        return _desktop_perf_snapshot()
+    with DESKTOP_PERF_LOCK:
+        if not DESKTOP_PERF_ENABLED:
+            return {
+                "enabled": False,
+                "active": False,
+                "snapshot_present": bool(DESKTOP_PERF_SNAPSHOT),
+            }
+        if DESKTOP_PERF_ACTIVE and isinstance(DESKTOP_PERF_SNAPSHOT, dict):
+            return {
+                "enabled": True,
+                "active": True,
+                "snapshot_present": True,
+            }
+    wallpaper_path = _desktop_perf_wallpaper_path()
+    restore_wallpaper_path = _desktop_perf_restore_wallpaper_path()
+    script = _desktop_perf_powershell_helpers() + r"""
+$ErrorActionPreference = 'Stop'
+$desktop = Get-ItemProperty 'HKCU:\Control Panel\Desktop'
+$metrics = Get-ItemProperty 'HKCU:\Control Panel\Desktop\WindowMetrics' -ErrorAction SilentlyContinue
+$personalize = Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize' -ErrorAction SilentlyContinue
+$colors = Get-ItemProperty 'HKCU:\Control Panel\Colors' -ErrorAction SilentlyContinue
+$restoreWallpaperPath = '__RESTORE_WALLPAPER_PATH__'
+$restoreWallpaperDir = Split-Path -Parent $restoreWallpaperPath
+if ($restoreWallpaperDir -and -not (Test-Path $restoreWallpaperDir)) {
+  New-Item -Path $restoreWallpaperDir -ItemType Directory -Force | Out-Null
+}
+$wallpaperCandidates = New-Object System.Collections.Generic.List[string]
+if ($desktop.Wallpaper) {
+  $wallpaperCandidates.Add([string]$desktop.Wallpaper) | Out-Null
+}
+$themesRoot = Join-Path $env:APPDATA 'Microsoft\Windows\Themes'
+$transcodedWallpaper = Join-Path $themesRoot 'TranscodedWallpaper'
+if (Test-Path $transcodedWallpaper) {
+  $wallpaperCandidates.Add($transcodedWallpaper) | Out-Null
+}
+$cachedWallpaperDir = Join-Path $themesRoot 'CachedFiles'
+if (Test-Path $cachedWallpaperDir) {
+  $cachedWallpaper = Get-ChildItem -LiteralPath $cachedWallpaperDir -Filter 'CachedImage_*' -File -ErrorAction SilentlyContinue |
+    Sort-Object LastWriteTime -Descending |
+    Select-Object -First 1
+  if ($cachedWallpaper) {
+    $wallpaperCandidates.Add([string]$cachedWallpaper.FullName) | Out-Null
+  }
+}
+$resolvedWallpaperSource = ''
+foreach ($candidate in $wallpaperCandidates) {
+  if (-not $candidate) { continue }
+  try {
+    $resolvedWallpaperSource = (Resolve-Path -LiteralPath $candidate -ErrorAction Stop).Path
+    if ($resolvedWallpaperSource) { break }
+  } catch {}
+}
+if ($resolvedWallpaperSource) {
+  $img = $null
+  try {
+    $img = [System.Drawing.Image]::FromFile($resolvedWallpaperSource)
+    $img.Save($restoreWallpaperPath, [System.Drawing.Imaging.ImageFormat]::Bmp)
+  } finally {
+    if ($img) { $img.Dispose() }
+  }
+}
+$snapshot = [pscustomobject]@{
+  wallpaper = [string]$desktop.Wallpaper
+  wallpaper_restore_path = if (Test-Path $restoreWallpaperPath) { $restoreWallpaperPath } else { '' }
+  wallpaper_source = [string]$resolvedWallpaperSource
+  wallpaper_style = [string]$desktop.WallpaperStyle
+  tile_wallpaper = [string]$desktop.TileWallpaper
+  background = if ($colors) { [string]$colors.Background } else { '' }
+  min_animate = if ($metrics) { [string]$metrics.MinAnimate } else { '' }
+  enable_transparency = if ($personalize) { [string]$personalize.EnableTransparency } else { '' }
+}
+$wallpaperPath = '__WALLPAPER_PATH__'
+$wallpaperDir = Split-Path -Parent $wallpaperPath
+if ($wallpaperDir -and -not (Test-Path $wallpaperDir)) {
+  New-Item -Path $wallpaperDir -ItemType Directory -Force | Out-Null
+}
+$bmp = New-Object System.Drawing.Bitmap 64, 64
+$gfx = [System.Drawing.Graphics]::FromImage($bmp)
+try {
+  $gfx.Clear([System.Drawing.Color]::Black)
+  $bmp.Save($wallpaperPath, [System.Drawing.Imaging.ImageFormat]::Bmp)
+} finally {
+  if ($gfx) { $gfx.Dispose() }
+  if ($bmp) { $bmp.Dispose() }
+}
+Set-ItemProperty 'HKCU:\Control Panel\Desktop' -Name Wallpaper -Value $wallpaperPath
+Set-ItemProperty 'HKCU:\Control Panel\Desktop' -Name WallpaperStyle -Value '0'
+Set-ItemProperty 'HKCU:\Control Panel\Desktop' -Name TileWallpaper -Value '0'
+if ($colors) {
+  Set-ItemProperty 'HKCU:\Control Panel\Colors' -Name Background -Value '0 0 0'
+}
+if ($metrics) {
+  Set-ItemProperty 'HKCU:\Control Panel\Desktop\WindowMetrics' -Name MinAnimate -Value '0'
+}
+if ($personalize) {
+  Set-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize' -Name EnableTransparency -Value 0
+}
+Invoke-CodrexDesktopRefresh -WallpaperPath $wallpaperPath
+$snapshot | ConvertTo-Json -Compress -Depth 4
+"""
+    script = script.replace("__WALLPAPER_PATH__", _ps_single_quote(wallpaper_path))
+    script = script.replace("__RESTORE_WALLPAPER_PATH__", _ps_single_quote(restore_wallpaper_path))
+    result = _run_powershell(script, timeout_s=12)
+    if result.get("exit_code") != 0:
+        return {
+            "enabled": _desktop_perf_snapshot().get("enabled", False),
+            "active": False,
+            "snapshot_present": bool(DESKTOP_PERF_SNAPSHOT),
+            "error": (result.get("stderr") or result.get("stdout") or "desktop_perf_apply_failed").strip(),
+        }
+    try:
+        snapshot = json.loads(str(result.get("stdout") or "{}"))
+    except Exception:
+        snapshot = {}
+    if not isinstance(snapshot, dict):
+        snapshot = {}
+    with DESKTOP_PERF_LOCK:
+        DESKTOP_PERF_SNAPSHOT = snapshot
+        DESKTOP_PERF_ACTIVE = True
+        return {
+            "enabled": bool(DESKTOP_PERF_ENABLED),
+            "active": True,
+            "snapshot_present": True,
+        }
+
+
+def _restore_desktop_perf_mode() -> Dict[str, Any]:
+    global DESKTOP_PERF_ACTIVE, DESKTOP_PERF_SNAPSHOT
+    if os.name != "nt":
+        return _desktop_perf_snapshot()
+    with DESKTOP_PERF_LOCK:
+        snapshot = dict(DESKTOP_PERF_SNAPSHOT or {})
+        active = bool(DESKTOP_PERF_ACTIVE)
+    if not active:
+        return {
+            "enabled": _desktop_perf_snapshot().get("enabled", False),
+            "active": False,
+            "snapshot_present": bool(snapshot),
+        }
+    snapshot_json = json.dumps(snapshot).encode("utf-8")
+    snapshot_b64 = base64.b64encode(snapshot_json).decode("ascii")
+    script = _desktop_perf_powershell_helpers() + (
+        "$ErrorActionPreference = 'Stop'; "
+        "$snapshotJson = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('" + snapshot_b64 + "')); "
+        "$snapshot = $snapshotJson | ConvertFrom-Json; "
+        "$wallpaper = [string]$snapshot.wallpaper; "
+        "if ($snapshot.wallpaper_restore_path -and (Test-Path ([string]$snapshot.wallpaper_restore_path))) { "
+        "  $wallpaper = [string]$snapshot.wallpaper_restore_path "
+        "}; "
+        "Set-ItemProperty 'HKCU:\\Control Panel\\Desktop' -Name Wallpaper -Value $wallpaper; "
+        "Set-ItemProperty 'HKCU:\\Control Panel\\Desktop' -Name WallpaperStyle -Value ([string]$snapshot.wallpaper_style); "
+        "Set-ItemProperty 'HKCU:\\Control Panel\\Desktop' -Name TileWallpaper -Value ([string]$snapshot.tile_wallpaper); "
+        "if ($snapshot.background -ne $null) { Set-ItemProperty 'HKCU:\\Control Panel\\Colors' -Name Background -Value ([string]$snapshot.background) }; "
+        "if ($snapshot.min_animate -ne $null) { Set-ItemProperty 'HKCU:\\Control Panel\\Desktop\\WindowMetrics' -Name MinAnimate -Value ([string]$snapshot.min_animate) }; "
+        "if ($snapshot.enable_transparency -ne $null -and [string]$snapshot.enable_transparency -ne '') { "
+        "  Set-ItemProperty 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize' -Name EnableTransparency -Value ([int]$snapshot.enable_transparency) "
+        "}; "
+        "Invoke-CodrexDesktopRefresh -WallpaperPath $wallpaper"
+    )
+    result = _run_powershell(script, timeout_s=12)
+    if result.get("exit_code") != 0:
+        return {
+            "enabled": _desktop_perf_snapshot().get("enabled", False),
+            "active": True,
+            "snapshot_present": bool(snapshot),
+            "error": (result.get("stderr") or result.get("stdout") or "desktop_perf_restore_failed").strip(),
+        }
+    with DESKTOP_PERF_LOCK:
+        DESKTOP_PERF_ACTIVE = False
+        DESKTOP_PERF_SNAPSHOT = None
+        try:
+            os.remove(_desktop_perf_wallpaper_path())
+        except FileNotFoundError:
+            pass
+        except Exception:
+            pass
+        return {
+            "enabled": bool(DESKTOP_PERF_ENABLED),
+            "active": False,
+            "snapshot_present": False,
+        }
+
+
+def _set_desktop_perf_enabled(enabled: bool) -> Dict[str, Any]:
+    global DESKTOP_PERF_ENABLED
+    value = bool(enabled)
+    with DESKTOP_PERF_LOCK:
+        DESKTOP_PERF_ENABLED = value
+    if not value:
+        restored = _restore_desktop_perf_mode()
+        restored["enabled"] = False
+        return restored
+    if _desktop_global_enabled():
+        return _apply_desktop_perf_mode()
+    return {
+        "enabled": True,
+        "active": False,
+        "snapshot_present": bool(_desktop_perf_snapshot().get("snapshot_present")),
+    }
+
+
+def _sync_desktop_perf_mode(enabled: bool) -> Dict[str, Any]:
+    if not _desktop_perf_snapshot().get("enabled", False):
+        return _restore_desktop_perf_mode()
+    if enabled:
+        return _apply_desktop_perf_mode()
+    return _restore_desktop_perf_mode()
+
+
+atexit.register(_restore_desktop_perf_mode)
+
+
 def _set_desktop_global_enabled(enabled: bool) -> bool:
     global DESKTOP_MODE_ENABLED
     value = bool(enabled)
     with DESKTOP_MODE_LOCK:
         DESKTOP_MODE_ENABLED = value
+    if not value:
+        _desktop_release_alt_if_held()
+    _sync_desktop_perf_mode(value)
     return value
 
 
@@ -3061,7 +3414,7 @@ def _run_powershell(script: str, timeout_s: int = 10, sta: bool = False) -> Dict
         return {"exit_code": 125, "stdout": "", "stderr": f"exception: {type(e).__name__}: {e}"}
 
 
-def _spawn_windows_background_process(args: List[str]) -> Dict[str, Any]:
+def _spawn_windows_background_process(args: List[str], *, detached: bool = True) -> Dict[str, Any]:
     _ensure_windows_host()
     kwargs: Dict[str, Any] = {
         "stdin": subprocess.DEVNULL,
@@ -3070,8 +3423,9 @@ def _spawn_windows_background_process(args: List[str]) -> Dict[str, Any]:
     }
     if os.name == "nt":
         creationflags = 0
-        creationflags |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-        creationflags |= getattr(subprocess, "DETACHED_PROCESS", 0)
+        if detached:
+            creationflags |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            creationflags |= getattr(subprocess, "DETACHED_PROCESS", 0)
         creationflags |= getattr(subprocess, "CREATE_NO_WINDOW", 0)
         if creationflags:
             kwargs["creationflags"] = creationflags
@@ -3132,7 +3486,10 @@ def _schedule_power_action(action: str) -> Dict[str, Any]:
         raise HTTPException(status_code=400, detail="Unsupported power action.")
     delay_ms = int(max(0.5, CODEX_POWER_ACTION_DELAY_SECONDS) * 1000)
     if action_name == "lock":
-        script = "rundll32.exe user32.dll,LockWorkStation"
+        script = (
+            f"Start-Sleep -Milliseconds {delay_ms}; "
+            "rundll32.exe user32.dll,LockWorkStation"
+        )
         args = ["powershell", "-NoProfile", "-Command", script]
     elif action_name == "sleep":
         script = (
@@ -3150,7 +3507,10 @@ def _schedule_power_action(action: str) -> Dict[str, Any]:
     else:
         script = f"Start-Sleep -Milliseconds {delay_ms}; shutdown.exe /s /t 0 /f"
         args = ["powershell", "-NoProfile", "-Command", script]
-    started = _spawn_windows_background_process(args)
+    # Desktop-facing power actions need to stay in the current interactive
+    # Windows session. Detached background flags work for backend helpers, but
+    # they are unreliable for LockWorkStation / suspend style actions.
+    started = _spawn_windows_background_process(args, detached=False)
     if not started.get("ok"):
         raise HTTPException(status_code=500, detail=str(started.get("detail") or "power_action_failed"))
     return {
@@ -3194,6 +3554,17 @@ def _desktop_paste_image_file(path_for_windows: str) -> Dict[str, Any]:
 
 def _desktop_send_key(key: str) -> Dict[str, Any]:
     k = (key or "").strip().lower()
+    if k == "alt+release":
+        try:
+            _send_vk_up(VK_MENU)
+        except Exception:
+            pass
+        _set_desktop_alt_held(False)
+        return {"exit_code": 0, "stdout": "", "stderr": "", "mode": "native_release", "key": k, "alt_held": False}
+
+    if k != "alt+tab-hold":
+        _desktop_release_alt_if_held()
+
     native_vk = {
         "enter": VK_RETURN,
         "esc": VK_ESCAPE,
@@ -3227,7 +3598,14 @@ def _desktop_send_key(key: str) -> Dict[str, Any]:
     if k in native_combos:
         mods, vk = native_combos[k]
         _send_vk_combo(mods, vk, extended=(k in {"alt+tab", "win+tab"}))
-        return {"exit_code": 0, "stdout": "", "stderr": "", "mode": "native_combo", "key": k}
+        return {"exit_code": 0, "stdout": "", "stderr": "", "mode": "native_combo", "key": k, "alt_held": False}
+
+    if k == "alt+tab-hold":
+        if not _desktop_alt_held():
+            _send_vk_down(VK_MENU)
+            _set_desktop_alt_held(True)
+        _send_vk(VK_TAB, extended=True)
+        return {"exit_code": 0, "stdout": "", "stderr": "", "mode": "native_hold", "key": k, "alt_held": True}
 
     # Fallback to SendKeys for uncommon special-key specs.
     ps_key_map = {
@@ -3235,12 +3613,248 @@ def _desktop_send_key(key: str) -> Dict[str, Any]:
     }
     spec = ps_key_map.get(k)
     if not spec:
-        raise HTTPException(status_code=400, detail="Unsupported key. Try: enter, esc, tab, arrows, win+tab, ctrl+c.")
+        raise HTTPException(status_code=400, detail="Unsupported key. Try: enter, esc, tab, arrows, alt+tab, alt+tab-hold, alt+release, win+tab, ctrl+c.")
     script = "Add-Type -AssemblyName System.Windows.Forms; " + f"[System.Windows.Forms.SendKeys]::SendWait('{spec}')"
     r = _run_powershell(script, timeout_s=8)
     r["mode"] = "powershell_sendkeys"
     r["key"] = k
+    r["alt_held"] = _desktop_alt_held()
     return r
+
+
+def _desktop_selected_paths() -> Dict[str, Any]:
+    script = r"""
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+public static class CodrexWin32 {
+  [DllImport("user32.dll")]
+  public static extern IntPtr GetForegroundWindow();
+  [DllImport("user32.dll")]
+  public static extern IntPtr GetAncestor(IntPtr hWnd, uint gaFlags);
+  [DllImport("user32.dll")]
+  [return: MarshalAs(UnmanagedType.Bool)]
+  public static extern bool IsWindowVisible(IntPtr hWnd);
+  [DllImport("user32.dll")]
+  [return: MarshalAs(UnmanagedType.Bool)]
+  public static extern bool IsIconic(IntPtr hWnd);
+  [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+  public static extern int GetClassName(IntPtr hWnd, StringBuilder lpClassName, int nMaxCount);
+  [DllImport("user32.dll")]
+  public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
+}
+"@;
+$ErrorActionPreference = 'Stop'
+$shell = New-Object -ComObject Shell.Application
+$GA_ROOT = [uint32]2
+$foregroundHandle = [CodrexWin32]::GetForegroundWindow()
+$foregroundRootHandle = [CodrexWin32]::GetAncestor($foregroundHandle, $GA_ROOT)
+$foreground = [int64]$foregroundHandle
+$foregroundRoot = [int64]$foregroundRootHandle
+$windows = @()
+foreach ($candidate in $shell.Windows()) {
+  try {
+    if ($candidate -and $candidate.Document) {
+      $windows += $candidate
+    }
+  } catch {}
+}
+
+if ($windows.Count -eq 0) {
+  $windows = @()
+}
+
+$focusedPid = [uint32]0
+[void][CodrexWin32]::GetWindowThreadProcessId([intptr]$foregroundHandle, [ref]$focusedPid)
+$focusedProcess = ''
+try {
+  if ([int]$focusedPid -gt 0) {
+    $focusedProcess = (Get-Process -Id ([int]$focusedPid) -ErrorAction Stop).ProcessName
+  }
+} catch {}
+$classNameBuilder = New-Object System.Text.StringBuilder 260
+try {
+  [void][CodrexWin32]::GetClassName([intptr]$foregroundHandle, $classNameBuilder, $classNameBuilder.Capacity)
+} catch {}
+$focusedClass = $classNameBuilder.ToString()
+
+$diag = @{
+  windows_count = $windows.Count
+  focused_process = $focusedProcess
+  focused_class = $focusedClass
+  focused_hwnd = $foreground
+  focused_root_hwnd = $foregroundRoot
+}
+$allowedDesktopClasses = @('Progman', 'WorkerW')
+$focusedExplorer = ($focusedProcess -eq 'explorer')
+$focusedDesktop = $allowedDesktopClasses -contains $focusedClass
+$focusedShellSurface = $focusedExplorer -or $focusedDesktop
+$diag.focused_shell_surface = $focusedShellSurface
+$diag.foreground_visible = if ($foregroundHandle -ne [IntPtr]::Zero) { [CodrexWin32]::IsWindowVisible($foregroundHandle) } else { $false }
+$diag.foreground_root_visible = if ($foregroundRootHandle -ne [IntPtr]::Zero) { [CodrexWin32]::IsWindowVisible($foregroundRootHandle) } else { $false }
+$diag.foreground_root_minimized = if ($foregroundRootHandle -ne [IntPtr]::Zero) { [CodrexWin32]::IsIconic($foregroundRootHandle) } else { $false }
+
+function Normalize-Paths($rawPaths) {
+  $paths = @()
+  foreach ($raw in @($rawPaths)) {
+    try {
+      $value = [string]$raw
+      if (-not [string]::IsNullOrWhiteSpace($value)) {
+        $paths += $value.Trim()
+      }
+    } catch {}
+  }
+  return @($paths | Select-Object -Unique)
+}
+
+function Get-WindowPaths($window) {
+  $paths = @()
+  try {
+    foreach ($item in @($window.Document.SelectedItems())) {
+      try {
+        if ($item.Path) {
+          $paths += [string]$item.Path
+        }
+      } catch {}
+    }
+  } catch {}
+  $normalized = Normalize-Paths $paths
+  if ($normalized.Count -gt 0) {
+    return @{
+      mode = 'selected_items'
+      paths = $normalized
+    }
+  }
+  try {
+    $focused = $window.Document.FocusedItem()
+    if ($focused -and $focused.Path) {
+      return @{
+        mode = 'focused_item'
+        paths = Normalize-Paths @([string]$focused.Path)
+      }
+    }
+  } catch {}
+  return $null
+}
+
+$foregroundWindow = $null
+foreach ($candidate in $windows) {
+  try {
+    $candidateHandle = [intptr]([int64]$candidate.HWND)
+    if ([int64]$candidate.HWND -eq $foregroundRoot -and [CodrexWin32]::IsWindowVisible($candidateHandle) -and -not [CodrexWin32]::IsIconic($candidateHandle)) {
+      $foregroundWindow = $candidate
+      break
+    }
+  } catch {}
+}
+$diag.matched_foreground_window = [bool]$foregroundWindow
+
+$result = $null
+if ($foregroundWindow) {
+  $result = Get-WindowPaths $foregroundWindow
+}
+
+if ((-not $result -or ($result.paths | Measure-Object).Count -eq 0) -and ($foregroundWindow -or ($focusedDesktop -and $diag.foreground_root_visible -and -not $diag.foreground_root_minimized))) {
+  Add-Type -AssemblyName System.Windows.Forms
+  try {
+    [System.Windows.Forms.SendKeys]::SendWait('^c')
+    Start-Sleep -Milliseconds 250
+  } catch {}
+
+  $clipboardPaths = @()
+  try {
+    foreach ($entry in [System.Windows.Forms.Clipboard]::GetFileDropList()) {
+      if ($entry) {
+        $clipboardPaths += [string]$entry
+      }
+    }
+  } catch {}
+
+  $normalizedClipboardPaths = Normalize-Paths $clipboardPaths
+  if ($normalizedClipboardPaths.Count -gt 0) {
+    $result = @{
+      mode = 'clipboard_file_drop'
+      paths = $normalizedClipboardPaths
+    }
+  } else {
+    $clipboardTextPaths = @()
+    try {
+      $clipboardText = [System.Windows.Forms.Clipboard]::GetText()
+      foreach ($line in @($clipboardText -split "`r?`n")) {
+        $candidate = [string]$line
+        if ([string]::IsNullOrWhiteSpace($candidate)) {
+          continue
+        }
+        $candidate = $candidate.Trim().Trim('"')
+        if (-not [string]::IsNullOrWhiteSpace($candidate) -and (Test-Path -LiteralPath $candidate)) {
+          $clipboardTextPaths += $candidate
+        }
+      }
+    } catch {}
+
+    $normalizedClipboardTextPaths = Normalize-Paths $clipboardTextPaths
+    if ($normalizedClipboardTextPaths.Count -gt 0) {
+      $result = @{
+        mode = 'clipboard_text'
+        paths = $normalizedClipboardTextPaths
+      }
+    }
+  }
+
+  $diag.clipboard_file_drop_count = $normalizedClipboardPaths.Count
+  $diag.clipboard_text_count = if ($normalizedClipboardTextPaths) { $normalizedClipboardTextPaths.Count } else { 0 }
+}
+
+if (-not $result -or ($result.paths | Measure-Object).Count -eq 0) {
+  @{
+    ok = $false
+    detail = if (-not $focusedShellSurface) { 'focused_window_is_not_explorer_or_desktop' } elseif ($focusedExplorer -and -not $foregroundWindow) { 'focused_explorer_window_not_resolved' } elseif ($windows.Count -eq 0 -and -not $focusedDesktop) { 'file_explorer_not_focused' } else { 'no_selection' }
+    diagnostics = $diag
+  } | ConvertTo-Json -Compress -Depth 4
+  exit 3
+}
+
+$resultPaths = Normalize-Paths @($result.paths)
+$firstResultPath = $null
+if ($resultPaths.Count -gt 0) {
+  $firstResultPath = ($resultPaths | Select-Object -First 1)
+}
+@{
+  ok = $true
+  path = if ($firstResultPath) { [string]$firstResultPath } else { '' }
+  paths = @($resultPaths)
+  count = $resultPaths.Count
+  mode = $result.mode
+  diagnostics = $diag
+} | ConvertTo-Json -Compress -Depth 4
+"""
+    result = _run_powershell(script, timeout_s=8, sta=True)
+    raw = str(result.get("stdout") or "").strip()
+    try:
+        payload = json.loads(raw)
+    except Exception:
+        detail = (result.get("stderr") or result.get("stdout") or "selected_path_parse_failed").strip()
+        raise HTTPException(status_code=500, detail=detail)
+    if not payload.get("ok", False):
+        detail = str(payload.get("detail") or result.get("stderr") or result.get("stdout") or "selected_path_failed").strip()
+        diagnostics = payload.get("diagnostics")
+        if isinstance(diagnostics, dict) and diagnostics:
+            detail = f"{detail} | diagnostics={json.dumps(diagnostics, separators=(',', ':'))}"
+        raise HTTPException(status_code=400, detail=detail)
+    raw_paths = payload.get("paths") or []
+    if isinstance(raw_paths, str):
+        raw_paths = [raw_paths]
+    paths = [str(p).strip() for p in raw_paths if str(p).strip()]
+    if not paths:
+        raise HTTPException(status_code=400, detail="no_selection")
+    return {
+        "ok": True,
+        "path": paths[0],
+        "paths": paths,
+        "count": len(paths),
+        "mode": str(payload.get("mode") or ""),
+    }
 
 # -------------------------
 # Codex session helpers
@@ -6789,7 +7403,14 @@ def auth_pair_qr_png(data: str = ""):
 def desktop_info(request: Request):
     _ensure_windows_host()
     mon = _desktop_monitor()
-    return {"ok": True, "enabled": _desktop_enabled_from_request(request), **mon}
+    return {
+        "ok": True,
+        "enabled": _desktop_enabled_from_request(request),
+        "alt_held": _desktop_alt_held(),
+        "perf_mode_enabled": _desktop_perf_snapshot().get("enabled", False),
+        "perf_mode_active": _desktop_perf_snapshot().get("active", False),
+        **mon,
+    }
 
 @app.get("/desktop/shot")
 def desktop_shot(request: Request, level: Optional[int] = None, scale: Optional[int] = None, bw: Optional[str] = None):
@@ -6890,7 +7511,14 @@ async def desktop_stream(
 @app.post("/desktop/mode")
 def desktop_mode(request: Request, payload: Dict[str, Any] = Body(...)):
     enabled = _set_desktop_global_enabled(_truthy_flag(payload.get("enabled")))
-    resp = JSONResponse({"ok": True, "enabled": enabled})
+    perf = _desktop_perf_snapshot()
+    resp = JSONResponse({
+        "ok": True,
+        "enabled": enabled,
+        "alt_held": _desktop_alt_held(),
+        "perf_mode_enabled": perf.get("enabled", False),
+        "perf_mode_active": perf.get("active", False),
+    })
     resp.set_cookie(
         key=CODEX_DESKTOP_MODE_COOKIE,
         value="1" if enabled else "0",
@@ -6901,6 +7529,13 @@ def desktop_mode(request: Request, payload: Dict[str, Any] = Body(...)):
     )
     return resp
 
+
+@app.post("/desktop/perf")
+def desktop_perf_mode(payload: Dict[str, Any] = Body(...)):
+    _ensure_windows_host()
+    perf = _set_desktop_perf_enabled(_truthy_flag(payload.get("enabled")))
+    return {"ok": True, **perf, "alt_held": _desktop_alt_held()}
+
 @app.post("/desktop/input/move")
 def desktop_input_move(request: Request, payload: Dict[str, Any] = Body(...)):
     _ensure_windows_host()
@@ -6909,12 +7544,13 @@ def desktop_input_move(request: Request, payload: Dict[str, Any] = Body(...)):
     y = int(payload.get("y", 0))
     p = _desktop_point(x, y)
     _desktop_move_abs(p["x"], p["y"])
-    return {"ok": True, "x": p["rel_x"], "y": p["rel_y"]}
+    return {"ok": True, "x": p["rel_x"], "y": p["rel_y"], "alt_held": _desktop_alt_held()}
 
 @app.post("/desktop/input/click")
 def desktop_input_click(request: Request, payload: Dict[str, Any] = Body(...)):
     _ensure_windows_host()
     _require_desktop_enabled(request)
+    alt_held_before_click = _desktop_alt_held()
     x = payload.get("x")
     y = payload.get("y")
     button = (payload.get("button") or "left").strip().lower()
@@ -6923,29 +7559,33 @@ def desktop_input_click(request: Request, payload: Dict[str, Any] = Body(...)):
         p = _desktop_point(int(x), int(y))
         _desktop_move_abs(p["x"], p["y"])
     _desktop_click(button=button, double=double)
-    return {"ok": True, "button": button, "double": double}
+    if alt_held_before_click:
+        _desktop_release_alt_if_held()
+    return {"ok": True, "button": button, "double": double, "alt_held": _desktop_alt_held()}
 
 @app.post("/desktop/input/scroll")
 def desktop_input_scroll(request: Request, payload: Dict[str, Any] = Body(...)):
     _ensure_windows_host()
     _require_desktop_enabled(request)
+    _desktop_release_alt_if_held()
     delta = int(payload.get("delta", 0))
     if delta == 0:
         raise HTTPException(status_code=400, detail="delta is required.")
     _desktop_scroll(delta)
-    return {"ok": True, "delta": delta}
+    return {"ok": True, "delta": delta, "alt_held": _desktop_alt_held()}
 
 @app.post("/desktop/input/type")
 def desktop_input_type(request: Request, payload: Dict[str, Any] = Body(...)):
     _ensure_windows_host()
     _require_desktop_enabled(request)
+    _desktop_release_alt_if_held()
     text = (payload.get("text") or "")
     if not text:
         raise HTTPException(status_code=400, detail="text is required.")
     r = _desktop_send_text(text)
     if r.get("exit_code") != 0:
         return {"ok": False, "error": "type_failed", "raw": r}
-    return {"ok": True}
+    return {"ok": True, "alt_held": _desktop_alt_held()}
 
 @app.post("/desktop/input/text")
 def desktop_input_text(request: Request, payload: Dict[str, Any] = Body(...)):
@@ -6954,15 +7594,16 @@ def desktop_input_text(request: Request, payload: Dict[str, Any] = Body(...)):
     """
     _ensure_windows_host()
     _require_desktop_enabled(request)
+    _desktop_release_alt_if_held()
     text = payload.get("text")
     if not isinstance(text, str):
         raise HTTPException(status_code=400, detail="text must be a string.")
     if not text:
-        return {"ok": True, "sent": 0}
-    if len(text) > 500:
-        raise HTTPException(status_code=400, detail="text too long (max 500).")
-    _send_unicode_text(text)
-    return {"ok": True, "sent": len(text)}
+        return {"ok": True, "sent": 0, "alt_held": _desktop_alt_held()}
+    if len(text) > 20000:
+        raise HTTPException(status_code=400, detail="text too long (max 20000).")
+    sent = _send_unicode_text_chunked(text, chunk_size=240)
+    return {"ok": True, "sent": sent, "alt_held": _desktop_alt_held()}
 
 @app.post("/desktop/input/edit")
 def desktop_input_edit(request: Request, payload: Dict[str, Any] = Body(...)):
@@ -6973,6 +7614,7 @@ def desktop_input_edit(request: Request, payload: Dict[str, Any] = Body(...)):
     """
     _ensure_windows_host()
     _require_desktop_enabled(request)
+    _desktop_release_alt_if_held()
     backspace = int(payload.get("backspace", 0) or 0)
     text = payload.get("text") or ""
     if not isinstance(text, str):
@@ -6988,7 +7630,7 @@ def desktop_input_edit(request: Request, payload: Dict[str, Any] = Body(...)):
         _send_vk_repeat(VK_BACK, backspace)
     if text:
         _send_unicode_text(text)
-    return {"ok": True, "backspace": backspace, "sent": len(text)}
+    return {"ok": True, "backspace": backspace, "sent": len(text), "alt_held": _desktop_alt_held()}
 
 @app.post("/desktop/input/key")
 def desktop_input_key(request: Request, payload: Dict[str, Any] = Body(...)):
@@ -7000,7 +7642,22 @@ def desktop_input_key(request: Request, payload: Dict[str, Any] = Body(...)):
     r = _desktop_send_key(key)
     if r.get("exit_code") != 0:
         return {"ok": False, "error": "key_failed", "raw": r}
-    return {"ok": True, "key": key}
+    return {"ok": True, "key": key, "alt_held": bool(r.get("alt_held", _desktop_alt_held()))}
+
+
+@app.post("/desktop/selection/path")
+def desktop_selection_path(request: Request):
+    _ensure_windows_host()
+    _require_desktop_enabled(request)
+    _desktop_release_alt_if_held()
+    try:
+        payload = _desktop_selected_paths()
+        payload["alt_held"] = _desktop_alt_held()
+        return payload
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"selected_path_internal_error: {type(exc).__name__}: {exc}")
 
 
 @app.get("/power/status")
@@ -7420,28 +8077,35 @@ def _maybe_repair_codex_session_reasoning(session: str, pane_id: str) -> Dict[st
 
 def _tmux_send_text(pane_id: str, text: str, *, codex_mode: Optional[bool] = None, timeout_s: int = 30) -> Dict[str, Any]:
     pane_id = _validate_pane_id(pane_id)
-    if len(text) > 8000:
-        raise HTTPException(status_code=400, detail="Text too long (max 8000 chars).")
+    if len(text) > 20000:
+        raise HTTPException(status_code=400, detail="Text too long (max 20000 chars).")
 
     use_codex = _pane_is_codex_like(pane_id) if codex_mode is None else bool(codex_mode)
+    for chunk in _iter_text_chunks(text, 400):
+        send_cmd = f"tmux send-keys -t {pane_id} -l " + _bash_quote(chunk)
+        send_result = run_wsl_bash(send_cmd, timeout_s=timeout_s)
+        if send_result.get("exit_code") != 0:
+            return send_result
+
     if use_codex:
-        cmd = (
-            f"tmux send-keys -t {pane_id} -l " + _bash_quote(text) + " ; "
+        enter_cmd = (
             f"tmux send-keys -t {pane_id} Enter ; "
             f"sleep 0.2 ; "
             f"tmux send-keys -t {pane_id} Enter"
         )
     else:
-        cmd = (
-            f"tmux send-keys -t {pane_id} -l " + _bash_quote(text) + " \\; "
-            f"send-keys -t {pane_id} Enter"
-        )
-    return run_wsl_bash(cmd, timeout_s=timeout_s)
+        enter_cmd = f"tmux send-keys -t {pane_id} Enter"
+    return run_wsl_bash(enter_cmd, timeout_s=timeout_s)
 
 
 def _parse_share_command(raw_text: str) -> Dict[str, Any]:
     text = str(raw_text or "").strip()
     if not text:
+        return {"is_command": False}
+    aliases_default = {"codrex-send", "/codrex-send", "/send-file", "/share-file"}
+    aliases_telegram = {"tgsend", "/tgsend", "telegram-send", "/telegram-send"}
+    first_token = text.split(None, 1)[0].strip().lower() if text else ""
+    if first_token not in aliases_default and first_token not in aliases_telegram:
         return {"is_command": False}
     try:
         parts = shlex.split(text, posix=True)
@@ -7451,8 +8115,6 @@ def _parse_share_command(raw_text: str) -> Dict[str, Any]:
         return {"is_command": False}
 
     cmd = parts[0].strip().lower()
-    aliases_default = {"codrex-send", "/codrex-send", "/send-file", "/share-file"}
-    aliases_telegram = {"tgsend", "/tgsend", "telegram-send", "/telegram-send"}
     if cmd in aliases_telegram:
         default_send_telegram = True
     elif cmd in aliases_default:

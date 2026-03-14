@@ -256,6 +256,7 @@ $configPath = Join-Path $root "controller.config.json"
 $localConfigPath = Join-Path $stateDir "controller.config.local.json"
 $legacyLocalConfigPath = Join-Path $root "controller.config.local.json"
 $sessionPath = Join-Path $stateDir "mobile.session.json"
+$desktopPerfSnapshotPath = Join-Path $stateDir "desktop-perf.json"
 $uiOutLog = Join-Path $logsDir "ui.out.log"
 $uiErrLog = Join-Path $logsDir "ui.err.log"
 
@@ -286,6 +287,174 @@ $script:DiagLinkedLogs = [ordered]@{
   controller_stderr = Join-Path $logsDir "controller.err.log"
   ui_stdout = $uiOutLog
   ui_stderr = $uiErrLog
+}
+
+function Enable-CodrexDesktopPerfMode {
+  param([string]$SnapshotPath)
+  try {
+    $parent = Split-Path -Parent $SnapshotPath
+    if ($parent -and -not (Test-Path $parent)) {
+      New-Item -Path $parent -ItemType Directory -Force | Out-Null
+    }
+    if (Test-Path $SnapshotPath) {
+      return $true
+    }
+    $perfWallpaperPath = Join-Path $parent "desktop-perf-wallpaper.bmp"
+    $restoreWallpaperPath = Join-Path $parent "desktop-perf-restore.bmp"
+    $scriptTemplate = @'
+$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.Drawing
+$desktop = Get-ItemProperty 'HKCU:\Control Panel\Desktop'
+$metrics = Get-ItemProperty 'HKCU:\Control Panel\Desktop\WindowMetrics' -ErrorAction SilentlyContinue
+$personalize = Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize' -ErrorAction SilentlyContinue
+$colors = Get-ItemProperty 'HKCU:\Control Panel\Colors' -ErrorAction SilentlyContinue
+$restoreWallpaperPath = '__RESTORE_WALLPAPER__'
+$restoreWallpaperDir = Split-Path -Parent $restoreWallpaperPath
+if ($restoreWallpaperDir -and -not (Test-Path $restoreWallpaperDir)) {
+  New-Item -Path $restoreWallpaperDir -ItemType Directory -Force | Out-Null
+}
+$wallpaperCandidates = New-Object System.Collections.Generic.List[string]
+if ($desktop.Wallpaper) {
+  $wallpaperCandidates.Add([string]$desktop.Wallpaper) | Out-Null
+}
+$themesRoot = Join-Path $env:APPDATA 'Microsoft\Windows\Themes'
+$transcodedWallpaper = Join-Path $themesRoot 'TranscodedWallpaper'
+if (Test-Path $transcodedWallpaper) {
+  $wallpaperCandidates.Add($transcodedWallpaper) | Out-Null
+}
+$cachedWallpaperDir = Join-Path $themesRoot 'CachedFiles'
+if (Test-Path $cachedWallpaperDir) {
+  $cachedWallpaper = Get-ChildItem -LiteralPath $cachedWallpaperDir -Filter 'CachedImage_*' -File -ErrorAction SilentlyContinue |
+    Sort-Object LastWriteTime -Descending |
+    Select-Object -First 1
+  if ($cachedWallpaper) {
+    $wallpaperCandidates.Add([string]$cachedWallpaper.FullName) | Out-Null
+  }
+}
+$resolvedWallpaperSource = ''
+foreach ($candidate in $wallpaperCandidates) {
+  if (-not $candidate) { continue }
+  try {
+    $resolvedWallpaperSource = (Resolve-Path -LiteralPath $candidate -ErrorAction Stop).Path
+    if ($resolvedWallpaperSource) { break }
+  } catch {}
+}
+if ($resolvedWallpaperSource) {
+  $img = $null
+  try {
+    $img = [System.Drawing.Image]::FromFile($resolvedWallpaperSource)
+    $img.Save($restoreWallpaperPath, [System.Drawing.Imaging.ImageFormat]::Bmp)
+  } catch {} finally {
+    if ($img) { $img.Dispose() }
+  }
+}
+$snapshot = [pscustomobject]@{
+  wallpaper = [string]$desktop.Wallpaper
+  wallpaper_restore_path = if (Test-Path $restoreWallpaperPath) { $restoreWallpaperPath } else { '' }
+  wallpaper_source = [string]$resolvedWallpaperSource
+  wallpaper_style = [string]$desktop.WallpaperStyle
+  tile_wallpaper = [string]$desktop.TileWallpaper
+  background = if ($colors) { [string]$colors.Background } else { '' }
+  min_animate = if ($metrics) { [string]$metrics.MinAnimate } else { '' }
+  enable_transparency = if ($personalize) { [string]$personalize.EnableTransparency } else { '' }
+}
+$snapshot | ConvertTo-Json -Compress -Depth 4
+'@
+    $quotedRestoreWallpaperPath = [string]$restoreWallpaperPath -replace "'", "''"
+    $snapshotScript = $scriptTemplate.Replace('__RESTORE_WALLPAPER__', $quotedRestoreWallpaperPath)
+    $snapshotJson = & powershell.exe -NoProfile -Command $snapshotScript
+    if (-not $snapshotJson) {
+      return $false
+    }
+    Set-Content -Path $SnapshotPath -Value $snapshotJson -Encoding UTF8
+$applyScriptTemplate = @'
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+Add-Type -AssemblyName System.Drawing
+if (-not ('CodrexDesktopPerfNative' -as [type])) {
+  Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public static class CodrexDesktopPerfNative {
+  public const int SPI_SETDESKWALLPAPER = 20;
+  public const int SPIF_UPDATEINIFILE = 0x01;
+  public const int SPIF_SENDWININICHANGE = 0x02;
+  public static readonly IntPtr HWND_BROADCAST = new IntPtr(0xffff);
+  public const uint WM_SETTINGCHANGE = 0x001A;
+  public const uint SMTO_ABORTIFHUNG = 0x0002;
+
+  [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+  public static extern bool SystemParametersInfo(int uiAction, int uiParam, string pvParam, int fWinIni);
+
+  [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+  public static extern IntPtr SendMessageTimeout(IntPtr hWnd, uint Msg, IntPtr wParam, string lParam, uint fuFlags, uint uTimeout, out IntPtr lpdwResult);
+}
+"@
+}
+
+function Invoke-CodrexDesktopRefresh {
+  param([string]$WallpaperPath)
+  $resolvedWallpaper = ''
+  if ($WallpaperPath) {
+    try {
+      $resolvedWallpaper = (Resolve-Path -LiteralPath $WallpaperPath -ErrorAction Stop).Path
+    } catch {
+      $resolvedWallpaper = $WallpaperPath
+    }
+  }
+  [CodrexDesktopPerfNative]::SystemParametersInfo(
+    [CodrexDesktopPerfNative]::SPI_SETDESKWALLPAPER,
+    0,
+    $resolvedWallpaper,
+    [CodrexDesktopPerfNative]::SPIF_UPDATEINIFILE -bor [CodrexDesktopPerfNative]::SPIF_SENDWININICHANGE
+  ) | Out-Null
+  foreach ($area in @('Control Panel\Desktop', 'WindowsThemeElement', 'ImmersiveColorSet', 'TraySettings')) {
+    $msgResult = [IntPtr]::Zero
+    [CodrexDesktopPerfNative]::SendMessageTimeout(
+      [CodrexDesktopPerfNative]::HWND_BROADCAST,
+      [CodrexDesktopPerfNative]::WM_SETTINGCHANGE,
+      [IntPtr]::Zero,
+      $area,
+      [CodrexDesktopPerfNative]::SMTO_ABORTIFHUNG,
+      5000,
+      [ref]$msgResult
+    ) | Out-Null
+  }
+  & "$env:WINDIR\System32\cmd.exe" /c 'RUNDLL32.EXE user32.dll,UpdatePerUserSystemParameters 1, True' | Out-Null
+}
+
+$wallpaperPath = '__PERF_WALLPAPER__'
+$wallpaperDir = Split-Path -Parent $wallpaperPath
+if ($wallpaperDir -and -not (Test-Path $wallpaperDir)) {
+  New-Item -Path $wallpaperDir -ItemType Directory -Force | Out-Null
+}
+$bmp = New-Object System.Drawing.Bitmap 64, 64
+$gfx = [System.Drawing.Graphics]::FromImage($bmp)
+try {
+  $gfx.Clear([System.Drawing.Color]::Black)
+  $bmp.Save($wallpaperPath, [System.Drawing.Imaging.ImageFormat]::Bmp)
+} finally {
+  if ($gfx) { $gfx.Dispose() }
+  if ($bmp) { $bmp.Dispose() }
+}
+
+Set-ItemProperty 'HKCU:\Control Panel\Desktop' -Name Wallpaper -Value $wallpaperPath
+Set-ItemProperty 'HKCU:\Control Panel\Desktop' -Name WallpaperStyle -Value '0'
+Set-ItemProperty 'HKCU:\Control Panel\Desktop' -Name TileWallpaper -Value '0'
+try { Set-ItemProperty 'HKCU:\Control Panel\Colors' -Name Background -Value '0 0 0' } catch {}
+try { Set-ItemProperty 'HKCU:\Control Panel\Desktop\WindowMetrics' -Name MinAnimate -Value '0' } catch {}
+try { Set-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize' -Name EnableTransparency -Value 0 } catch {}
+Invoke-CodrexDesktopRefresh -WallpaperPath $wallpaperPath
+'@
+    $quotedWallpaperPath = [string]$perfWallpaperPath -replace "'", "''"
+    $applyScript = $applyScriptTemplate.Replace('__PERF_WALLPAPER__', $quotedWallpaperPath)
+    $applyScriptEncoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($applyScript))
+    & powershell.exe -NoProfile -EncodedCommand $applyScriptEncoded | Out-Null
+    return $true
+  } catch {
+    Write-Host ("Warning: desktop performance mode was not enabled ({0})." -f $_.Exception.Message)
+    return $false
+  }
 }
 
 function Write-StartMobileDiagnostic {
@@ -488,6 +657,7 @@ $persistedSession = Read-SessionData -Path $sessionPath
 if (-not $persistedSession -or [int]$persistedSession.controller_port -ne $controllerPort) {
   throw "Codrex runtime session file was not written correctly at $sessionPath"
 }
+$perfModeApplied = Enable-CodrexDesktopPerfMode -SnapshotPath $desktopPerfSnapshotPath
 
 Write-Host ""
 Write-Host "Mobile stack ready."
@@ -512,6 +682,7 @@ Write-StartMobileDiagnostic -Ok:$true -Detail "Mobile stack ready." -Extra ([psc
   dev_ui = [bool]$DevUi
   open_firewall = [bool]$OpenFirewall
   session_written = [bool]$persistedSession
+  perf_mode_applied = [bool]$perfModeApplied
   controller_start_ms = $controllerStartMs
   mobile_ready_ms = [int]$startupTimer.ElapsedMilliseconds
 })

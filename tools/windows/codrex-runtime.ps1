@@ -219,6 +219,22 @@ function Get-CodrexControllerProcessesByPort {
   return @($owners | ForEach-Object { $_ })
 }
 
+function Get-CodrexControllerProcessById {
+  param(
+    [int]$ProcessId
+  )
+  if ($ProcessId -le 0) {
+    return $null
+  }
+  try {
+    $proc = Get-CimInstance Win32_Process -Filter ("ProcessId = {0}" -f $ProcessId) -ErrorAction SilentlyContinue
+    if ($proc -and $proc.CommandLine -and $proc.CommandLine -match "app\.server:app") {
+      return $proc
+    }
+  } catch {}
+  return $null
+}
+
 function Test-PortListening {
   param(
     [int]$Port
@@ -481,10 +497,19 @@ function Get-StatusSnapshot {
   $session = Read-MobileSession -Paths $Paths
   $port = Get-ControllerPortFromState -Paths $Paths -Config $cfg -Session $session
   $owners = @(Get-CodrexControllerProcessesByPort -Port $port | Sort-Object ProcessId -Descending)
-  $controllerOn = ($owners.Count -gt 0)
+  $sessionReportedPid = 0
+  if ($session -and $session.controller_pid) {
+    try {
+      $sessionReportedPid = [int]$session.controller_pid
+    } catch {}
+  }
+  $sessionProcess = if ($sessionReportedPid -gt 0) { Get-CodrexControllerProcessById -ProcessId $sessionReportedPid } else { $null }
+  $sessionProcessAlive = [bool]$sessionProcess
+  $controllerOn = ($owners.Count -gt 0) -or $sessionProcessAlive
   $duplicateOwners = ($owners.Count -gt 1)
-  $appRuntime = if ($controllerOn) { Get-AppRuntime -Port $port } else { $null }
-  $appHealth = if ($appRuntime) { $appRuntime } elseif ($controllerOn) { Get-AppHealth -Port $port } else { $null }
+  $portListening = if ($controllerOn) { Test-PortListening -Port $port } else { $false }
+  $appRuntime = if ($portListening) { Get-AppRuntime -Port $port } else { $null }
+  $appHealth = if ($appRuntime) { $appRuntime } elseif ($portListening) { Get-AppHealth -Port $port } else { $null }
   $appBuilt = [bool]($appHealth -and $appHealth.ok -and $appHealth.ui_mode -eq "built")
   $sessionPresent = [bool]$session
   $sessionValid = $false
@@ -504,6 +529,9 @@ function Get-StatusSnapshot {
   } elseif ($controllerOn -and $appBuilt -and -not $sessionValid) {
     $status = "recovering"
     $detail = "Controller is healthy but runtime session state is missing or stale."
+  } elseif ($controllerOn -and $sessionValid) {
+    $status = "checking"
+    $detail = "Controller process is active and runtime session is present. Readiness is still settling."
   } elseif ($controllerOn) {
     $status = "checking"
     $detail = "Controller is running but app readiness is not confirmed yet."
@@ -525,8 +553,8 @@ function Get-StatusSnapshot {
     runtime_dir = $Paths.runtime_dir
     logs_dir = $Paths.logs_dir
     controller_port = $port
-    controller_pid = if ($owners.Count -gt 0) { [int]$owners[0].ProcessId } else { $null }
-    controller_pids = @($owners | ForEach-Object { [int]$_.ProcessId })
+    controller_pid = if ($owners.Count -gt 0) { [int]$owners[0].ProcessId } elseif ($sessionProcessAlive) { [int]$sessionReportedPid } else { $null }
+    controller_pids = if ($owners.Count -gt 0) { @($owners | ForEach-Object { [int]$_.ProcessId }) } elseif ($sessionProcessAlive) { @([int]$sessionReportedPid) } else { @() }
     duplicate_controllers = $duplicateOwners
     session_present = $sessionPresent
     session_file = $Paths.session_path

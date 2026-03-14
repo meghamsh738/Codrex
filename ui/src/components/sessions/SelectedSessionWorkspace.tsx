@@ -170,15 +170,36 @@ const SessionComposerPanel = memo(function SessionComposerPanel({
       <div className="prompt-composer">
         <label className="field">
           <span>Prompt Composer</span>
-          <div className="composer-input-wrap">
-            <textarea
-              value={promptText}
-              onChange={(event) => onPromptTextChange(event.target.value)}
-              rows={5}
-              placeholder="Type your prompt. Codrex will send Enter + Enter to submit."
-            />
-            <div className="composer-action-stack">
-              <div className="composer-action-row">
+          <div className="composer-chat-shell">
+            <div className="composer-input-wrap">
+              <textarea
+                value={promptText}
+                onChange={(event) => onPromptTextChange(event.target.value)}
+                rows={5}
+                placeholder="Type your prompt. Codrex will send Enter + Enter to submit."
+              />
+            </div>
+            {sessionImageFile ? (
+              <div className="composer-media-inline" data-testid="composer-image-panel">
+                <span className="mode-pill mode-ready">{sessionImageFile.name}</span>
+                <input
+                  type="text"
+                  value={sessionImagePrompt}
+                  onChange={(event) => onSessionImagePromptChange(event.target.value)}
+                  placeholder="Optional image instruction"
+                />
+                <button
+                  type="button"
+                  className="button soft compact button-light is-active"
+                  onClick={onSendSessionImage}
+                  disabled={sessionBusy || !sessionImageFile}
+                >
+                  Send Image
+                </button>
+              </div>
+            ) : null}
+            <div className="composer-chat-toolbar">
+              <div className="composer-chat-left">
                 <input
                   ref={sessionImageInputRef}
                   type="file"
@@ -197,60 +218,43 @@ const SessionComposerPanel = memo(function SessionComposerPanel({
                 >
                   <span className="composer-telegram-glyph" aria-hidden="true">🖼</span>
                 </button>
+                <span className="composer-chat-meta">
+                  {sessionImageFile ? sessionImageFile.name : "Attach image"}
+                </span>
+              </div>
+              <div className="composer-chat-actions">
                 <button
                   type="button"
                   className="composer-telegram-btn"
                   data-testid="composer-send-telegram"
-                  aria-label="Ask Codex to send via Telegram"
-                  title={
-                    composerTelegramDisabledReason
-                    || "Append a Telegram send instruction for the current task output and send it through the active session."
-                  }
+                  aria-label="Send Telegram instruction"
+                  title={composerTelegramDisabledReason || "Send Telegram instruction"}
                   onClick={onSendComposerToTelegram}
                   disabled={composerTelegramBusy || !!composerTelegramDisabledReason}
                 >
                   <span className="composer-telegram-glyph" aria-hidden="true">✈</span>
-                  <span className="composer-telegram-label">{composerTelegramBusy ? "Asking..." : "Telegram"}</span>
+                  <span className="composer-telegram-label">{composerTelegramBusy ? "Sending..." : "Telegram"}</span>
+                </button>
+                <button
+                  type="button"
+                  className="composer-send-btn"
+                  data-testid="composer-send-prompt"
+                  aria-label={sessionBusy ? "Sending prompt" : "Send prompt"}
+                  onClick={onSendPrompt}
+                  disabled={sessionBusy || !canSendPrompt}
+                >
+                  <svg viewBox="0 0 24 24" aria-hidden="true">
+                    <path
+                      d="M3 11.8 20.6 4.3a1 1 0 0 1 1.3 1.3L14.4 23.2a1 1 0 0 1-1.9-.3l-1-6-6-1a1 1 0 0 1-.3-1.9Z"
+                      fill="currentColor"
+                    />
+                  </svg>
                 </button>
               </div>
             </div>
-            <button
-              type="button"
-              className="composer-send-btn"
-              data-testid="composer-send-prompt"
-              aria-label={sessionBusy ? "Sending prompt" : "Send prompt"}
-              onClick={onSendPrompt}
-              disabled={sessionBusy || !canSendPrompt}
-            >
-              <svg viewBox="0 0 24 24" aria-hidden="true">
-                <path
-                  d="M3 11.8 20.6 4.3a1 1 0 0 1 1.3 1.3L14.4 23.2a1 1 0 0 1-1.9-.3l-1-6-6-1a1 1 0 0 1-.3-1.9Z"
-                  fill="currentColor"
-                />
-              </svg>
-            </button>
           </div>
         </label>
       </div>
-      {sessionImageFile ? (
-        <div className="composer-media-inline" data-testid="composer-image-panel">
-          <span className="mode-pill mode-ready">{sessionImageFile.name}</span>
-          <input
-            type="text"
-            value={sessionImagePrompt}
-            onChange={(event) => onSessionImagePromptChange(event.target.value)}
-            placeholder="Optional image instruction"
-          />
-          <button
-            type="button"
-            className="button soft compact button-light is-active"
-            onClick={onSendSessionImage}
-            disabled={sessionBusy || !sessionImageFile}
-          >
-            Send Image
-          </button>
-        </div>
-      ) : null}
     </div>
   );
 });

@@ -124,12 +124,16 @@ function normalizeBaseUrl(raw: string): string {
   return `http://${trimmed}`.replace(/\/$/, "");
 }
 
-async function parseJson<T>(res: Response): Promise<T> {
+async function parseJson<T>(res: Response): Promise<T | string> {
   const text = await res.text();
   if (!text) {
     return {} as T;
   }
-  return JSON.parse(text) as T;
+  try {
+    return JSON.parse(text) as T;
+  } catch {
+    return text;
+  }
 }
 
 async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
@@ -169,12 +173,14 @@ async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
     });
 
     if (!response.ok) {
-      const detail = (payload as { detail?: string; error?: string } | undefined)?.detail
-        || (payload as { detail?: string; error?: string } | undefined)?.error;
+      const detail = typeof payload === "string"
+        ? payload.trim()
+        : (payload as { detail?: string; error?: string } | undefined)?.detail
+          || (payload as { detail?: string; error?: string } | undefined)?.error;
       throw new Error(detail || `Request failed (${response.status})`);
     }
 
-    return payload;
+    return payload as T;
   } catch (error) {
     if (!didReceiveResponse) {
       emitIpcEvent({
@@ -715,6 +721,14 @@ export function setDesktopMode(enabled: boolean): Promise<DesktopModeResult> {
   });
 }
 
+export function setDesktopPerfMode(enabled: boolean): Promise<DesktopModeResult> {
+  return requestJson<DesktopModeResult>("/desktop/perf", {
+    method: "POST",
+    headers: JSON_HEADERS,
+    body: JSON.stringify({ enabled }),
+  });
+}
+
 export function desktopClick(params: { button?: "left" | "right"; double?: boolean; x?: number; y?: number }): Promise<DesktopInputResult> {
   return requestJson<DesktopInputResult>("/desktop/input/click", {
     method: "POST",
@@ -758,6 +772,14 @@ export function desktopSendKey(key: string): Promise<DesktopInputResult> {
     method: "POST",
     headers: JSON_HEADERS,
     body: JSON.stringify({ key }),
+  });
+}
+
+export function desktopGetSelectedPath(): Promise<DesktopInputResult> {
+  return requestJson<DesktopInputResult>("/desktop/selection/path", {
+    method: "POST",
+    headers: JSON_HEADERS,
+    body: JSON.stringify({}),
   });
 }
 

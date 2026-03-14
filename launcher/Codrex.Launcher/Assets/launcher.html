@@ -7,18 +7,19 @@
     <style>
       :root {
         color-scheme: dark;
-        --bg: #07101d;
-        --panel: #0d1a2b;
-        --panel-2: #102036;
-        --border: #234066;
-        --text: #e7eef9;
-        --muted: #96a8c5;
-        --blue: #48a7ff;
-        --green: #39d98a;
-        --amber: #ffb84d;
-        --red: #ff7d7d;
-        --shadow: 0 12px 32px rgba(0, 0, 0, 0.26);
-        --radius: 20px;
+        --bg: #050b14;
+        --bg-2: #08111d;
+        --panel: #091523;
+        --panel-2: #0d1c2f;
+        --border: #183453;
+        --border-strong: #2565a8;
+        --text: #e6eef8;
+        --muted: #8ea2bd;
+        --blue: #49a8ff;
+        --green: #37d889;
+        --amber: #ffb44e;
+        --red: #ff7c8b;
+        --radius: 14px;
       }
 
       * { box-sizing: border-box; }
@@ -27,51 +28,52 @@
         min-height: 100vh;
         font-family: "Segoe UI Variable", "Segoe UI", system-ui, sans-serif;
         background:
-          radial-gradient(circle at top right, rgba(72, 167, 255, 0.1), transparent 30%),
-          linear-gradient(180deg, #07101d 0%, #09162a 100%);
+          linear-gradient(180deg, rgba(73, 168, 255, 0.05), transparent 18%),
+          linear-gradient(180deg, var(--bg) 0%, var(--bg-2) 100%);
         color: var(--text);
       }
 
       .shell {
         display: grid;
         grid-template-columns: minmax(0, 1.35fr) 360px;
-        gap: 20px;
+        gap: 14px;
         min-height: 100vh;
-        padding: 24px;
+        padding: 16px;
       }
 
       .panel {
-        background: linear-gradient(180deg, rgba(13, 26, 43, 0.96), rgba(10, 20, 35, 0.96));
-        border: 1px solid rgba(35, 64, 102, 0.85);
+        background: linear-gradient(180deg, rgba(9, 21, 35, 0.98), rgba(7, 16, 28, 0.98));
+        border: 1px solid rgba(24, 52, 83, 0.92);
         border-radius: var(--radius);
-        box-shadow: var(--shadow);
         min-width: 0;
       }
 
       .main {
         display: grid;
-        gap: 18px;
-        padding: 22px;
+        gap: 12px;
+        padding: 16px;
       }
 
       .hero {
         display: flex;
         justify-content: space-between;
-        gap: 16px;
+        gap: 12px;
         align-items: flex-start;
       }
 
       .hero h1 {
         margin: 0;
-        font-size: 1.8rem;
+        font-size: 1.65rem;
         font-weight: 700;
+        letter-spacing: -0.02em;
       }
 
       .hero p {
-        margin: 8px 0 0;
+        margin: 6px 0 0;
         color: var(--muted);
-        max-width: 48rem;
-        line-height: 1.45;
+        max-width: 44rem;
+        line-height: 1.4;
+        font-size: 0.96rem;
       }
 
       .status-strip {
@@ -82,11 +84,11 @@
       }
 
       .light {
-        width: 12px;
-        height: 12px;
+        width: 10px;
+        height: 10px;
         border-radius: 999px;
         display: inline-block;
-        box-shadow: 0 0 0 1px rgba(255,255,255,0.08), 0 0 14px currentColor;
+        box-shadow: 0 0 0 1px rgba(255,255,255,0.06), 0 0 10px currentColor;
       }
       .light.ok { color: var(--green); background: var(--green); }
       .light.busy { color: var(--amber); background: var(--amber); }
@@ -98,17 +100,17 @@
         align-items: center;
         gap: 8px;
         border-radius: 999px;
-        border: 1px solid rgba(72, 167, 255, 0.2);
-        background: rgba(18, 34, 58, 0.72);
-        padding: 8px 12px;
-        font-size: 0.92rem;
+        border: 1px solid rgba(73, 168, 255, 0.16);
+        background: rgba(12, 26, 43, 0.9);
+        padding: 7px 11px;
+        font-size: 0.88rem;
         color: var(--muted);
         font-family: "Cascadia Mono", "Consolas", ui-monospace, monospace;
       }
 
       .grid {
         display: grid;
-        gap: 14px;
+        gap: 10px;
       }
 
       .controls {
@@ -121,23 +123,26 @@
 
       button {
         appearance: none;
-        border: 1px solid rgba(72, 167, 255, 0.14);
-        background: linear-gradient(180deg, #102846, #0c1f36);
+        border: 1px solid rgba(73, 168, 255, 0.12);
+        background: linear-gradient(180deg, #0d2138, #0a1829);
         color: var(--text);
-        border-radius: 16px;
-        padding: 15px 16px;
-        font-size: 0.98rem;
+        border-radius: 12px;
+        padding: 13px 14px;
+        font-size: 0.95rem;
         font-weight: 600;
         cursor: pointer;
         transition: transform 120ms ease, border-color 120ms ease, background 120ms ease, box-shadow 120ms ease;
+        text-transform: uppercase;
+        letter-spacing: 0.03em;
+        font-family: "Cascadia Mono", "Consolas", ui-monospace, monospace;
       }
 
       button:hover:not(:disabled),
       button:focus-visible:not(:disabled) {
         outline: none;
         transform: translateY(-1px);
-        border-color: rgba(72, 167, 255, 0.44);
-        box-shadow: 0 0 0 3px rgba(72, 167, 255, 0.16);
+        border-color: rgba(73, 168, 255, 0.44);
+        box-shadow: 0 0 0 2px rgba(73, 168, 255, 0.16);
       }
 
       button:disabled {
@@ -146,48 +151,51 @@
       }
 
       .button-accent {
-        background: linear-gradient(180deg, rgba(72, 167, 255, 0.2), rgba(13, 37, 64, 0.88));
+        background: linear-gradient(180deg, rgba(73, 168, 255, 0.18), rgba(11, 28, 46, 0.94));
       }
 
       .button-warn {
-        background: linear-gradient(180deg, rgba(255, 112, 112, 0.16), rgba(54, 15, 24, 0.86));
+        background: linear-gradient(180deg, rgba(255, 124, 139, 0.16), rgba(52, 12, 22, 0.92));
         border-color: rgba(255, 125, 125, 0.2);
       }
 
       .button-active {
-        border-color: rgba(72, 167, 255, 0.7);
-        box-shadow: 0 0 0 2px rgba(72, 167, 255, 0.18), 0 0 18px rgba(72, 167, 255, 0.2);
+        border-color: rgba(73, 168, 255, 0.7);
+        box-shadow: inset 0 0 0 1px rgba(73, 168, 255, 0.35), 0 0 0 1px rgba(73, 168, 255, 0.12);
       }
 
       .summary-card,
       .route-card,
       .detail-card {
-        padding: 18px;
+        padding: 14px;
       }
 
       .section-title {
-        margin: 0 0 10px;
-        font-size: 1rem;
+        margin: 0 0 8px;
+        font-size: 0.92rem;
         font-weight: 700;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        font-family: "Cascadia Mono", "Consolas", ui-monospace, monospace;
       }
 
       .subtle {
         color: var(--muted);
         line-height: 1.45;
-        font-size: 0.95rem;
+        font-size: 0.9rem;
       }
 
       .status-card {
         display: flex;
         justify-content: space-between;
-        gap: 14px;
-        padding: 18px;
+        gap: 12px;
+        padding: 14px;
         align-items: center;
       }
 
       .status-card strong {
         display: block;
-        font-size: 1.04rem;
+        font-size: 1rem;
       }
 
       .status-card p {
@@ -198,20 +206,23 @@
       .meta-grid {
         display: grid;
         grid-template-columns: repeat(4, minmax(0, 1fr));
-        gap: 12px;
+        gap: 10px;
       }
 
       .meta-tile {
-        padding: 14px;
-        border-radius: 14px;
-        border: 1px solid rgba(35, 64, 102, 0.75);
-        background: rgba(8, 16, 28, 0.55);
+        padding: 12px;
+        border-radius: 12px;
+        border: 1px solid rgba(24, 52, 83, 0.8);
+        background: rgba(7, 15, 26, 0.65);
       }
 
       .meta-tile span {
         display: block;
-        font-size: 0.84rem;
+        font-size: 0.78rem;
         color: var(--muted);
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        font-family: "Cascadia Mono", "Consolas", ui-monospace, monospace;
       }
 
       .meta-tile strong {
@@ -222,18 +233,18 @@
 
       .side {
         display: grid;
-        gap: 18px;
-        padding: 18px;
+        gap: 12px;
+        padding: 16px;
         align-content: start;
       }
 
       .qr-box {
-        min-height: 320px;
+        min-height: 290px;
         display: grid;
         place-items: center;
-        border: 1px dashed rgba(72, 167, 255, 0.22);
-        border-radius: 20px;
-        background: rgba(4, 10, 18, 0.36);
+        border: 1px dashed rgba(73, 168, 255, 0.18);
+        border-radius: 14px;
+        background: rgba(4, 10, 18, 0.5);
         overflow: hidden;
       }
 
@@ -245,10 +256,80 @@
 
       .pair-link {
         width: 100%;
+        padding: 11px 12px;
+        border-radius: 12px;
+        border: 1px solid rgba(24, 52, 83, 0.9);
+        background: rgba(6, 12, 20, 0.96);
+        color: var(--text);
+        font-family: "Cascadia Mono", "Consolas", ui-monospace, monospace;
+      }
+
+      .console {
+        padding: 0;
+        overflow: hidden;
+      }
+
+      .console-header {
+        display: flex;
+        justify-content: space-between;
+        gap: 12px;
+        align-items: center;
         padding: 12px 14px;
-        border-radius: 14px;
-        border: 1px solid rgba(35, 64, 102, 0.8);
-        background: rgba(6, 12, 20, 0.92);
+        border-bottom: 1px solid rgba(24, 52, 83, 0.8);
+        background: rgba(5, 11, 20, 0.92);
+      }
+
+      .console-header .subtle {
+        font-size: 0.84rem;
+      }
+
+      .console-log {
+        list-style: none;
+        margin: 0;
+        padding: 12px 14px;
+        display: grid;
+        gap: 8px;
+        min-height: 154px;
+        max-height: 196px;
+        overflow: auto;
+        background: rgba(4, 10, 18, 0.72);
+        font-family: "Cascadia Mono", "Consolas", ui-monospace, monospace;
+        font-size: 0.88rem;
+      }
+
+      .console-entry {
+        display: grid;
+        grid-template-columns: 72px 82px minmax(0, 1fr);
+        gap: 10px;
+        align-items: start;
+        color: var(--muted);
+      }
+
+      .console-entry.is-ok .console-kind { color: var(--green); }
+      .console-entry.is-busy .console-kind { color: var(--amber); }
+      .console-entry.is-error .console-kind { color: var(--red); }
+      .console-entry.is-info .console-kind { color: var(--blue); }
+
+      .console-time,
+      .console-kind {
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+        white-space: nowrap;
+      }
+
+      .console-message {
+        color: var(--text);
+        word-break: break-word;
+      }
+
+      .route-inline {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+      }
+
+      .route-host {
+        font-family: "Cascadia Mono", "Consolas", ui-monospace, monospace;
         color: var(--text);
       }
 
@@ -279,7 +360,7 @@
         <header class="hero">
           <div>
             <h1>Codrex Launcher</h1>
-            <p>Use this desktop launcher to start and stop Codrex, pick the pairing route, generate QR codes on demand, and open the local web UI only when you want it.</p>
+            <p>Start and stop Codrex, choose the pairing route, generate QR on demand, and launch the web UI only when you ask for it.</p>
           </div>
           <div class="status-strip">
             <span class="badge"><span id="statusLight" class="light idle"></span><strong id="statusLabel">Checking</strong></span>
@@ -321,6 +402,20 @@
           <p class="subtle" id="routeSummary">LAN route is selected.</p>
         </section>
 
+        <section class="panel console">
+          <div class="console-header">
+            <h2 class="section-title">Launcher Console</h2>
+            <span class="subtle">Immediate action feedback</span>
+          </div>
+          <ol class="console-log" id="consoleLog">
+            <li class="console-entry is-info">
+              <span class="console-time">--:--:--</span>
+              <span class="console-kind">launcher</span>
+              <span class="console-message">Launcher ready.</span>
+            </li>
+          </ol>
+        </section>
+
         <section id="advancedPanel" class="panel detail-card advanced">
           <h2 class="section-title">Advanced</h2>
           <div class="grid controls">
@@ -352,6 +447,7 @@
         pairLink: "",
         qrImageUrl: "",
       };
+      const consoleEntries = [];
       const rendered = {
         tone: "",
         busyTone: "",
@@ -375,6 +471,7 @@
         logsDir: "",
         pairStatus: "",
         pairLink: "",
+        actionEventId: null,
       };
       let renderedQrUrl = "";
       let renderedQrVisible = false;
@@ -410,6 +507,7 @@
         pairStatus: document.getElementById("pairStatus"),
         qrBox: document.getElementById("qrBox"),
         pairLink: document.getElementById("pairLink"),
+        consoleLog: document.getElementById("consoleLog"),
       };
 
       function post(type, extra = {}) {
@@ -436,6 +534,28 @@
         if (rendered[key] === value) return;
         rendered[key] = value;
         el.classList.toggle(className, value);
+      }
+
+      function renderConsoleEntry(entry) {
+        const li = document.createElement("li");
+        li.className = `console-entry is-${entry.tone}`;
+        li.innerHTML = `
+          <span class="console-time"></span>
+          <span class="console-kind"></span>
+          <span class="console-message"></span>
+        `;
+        li.querySelector(".console-time").textContent = entry.at;
+        li.querySelector(".console-kind").textContent = entry.kind;
+        li.querySelector(".console-message").textContent = entry.message;
+        return li;
+      }
+
+      function pushConsoleEntry(entry) {
+        consoleEntries.unshift(entry);
+        if (consoleEntries.length > 16) {
+          consoleEntries.length = 16;
+        }
+        els.consoleLog.replaceChildren(...consoleEntries.map(renderConsoleEntry));
       }
 
       function render(next) {
@@ -474,10 +594,34 @@
         setClassToggle(els.tailscaleRouteButton, "button-active", state.route === "tailscale", "tailscaleActive");
         setClassToggle(els.advancedPanel, "visible", !!state.advancedVisible, "advancedVisible");
         setText(els.logPathLine, state.logsDir ? `Logs: ${state.logsDir}` : "Logs: n/a", "logsDir");
-        setText(els.pairStatus, state.pairDetail || (state.qrVisible ? "Pairing QR ready." : "Press Show Pair QR after Codrex is running."), "pairStatus");
+        const pairStatus = state.pairDetail
+          || (state.qrVisible
+            ? `Pairing QR ready for ${state.route}. ${state.routeHost || "Waiting for route host."}`
+            : "Press Show Pair QR after Codrex is running.");
+        setText(els.pairStatus, pairStatus, "pairStatus");
         if (rendered.pairLink !== (state.pairLink || "")) {
           rendered.pairLink = state.pairLink || "";
           els.pairLink.value = rendered.pairLink;
+        }
+        if (rendered.actionEventId !== state.actionEventId && state.actionEventId) {
+          rendered.actionEventId = state.actionEventId;
+          const toneMap = {
+            error: "error",
+            start: "busy",
+            stop: "busy",
+            qr: "ok",
+            route: "info",
+            open: "info",
+            copy: "info",
+            launcher: "info",
+            ui: "info",
+          };
+          pushConsoleEntry({
+            at: state.actionEventAt || "--:--:--",
+            kind: state.actionEventKind || "launcher",
+            message: state.actionEventMessage || "ok",
+            tone: toneMap[state.actionEventKind] || (state.actionBusy ? "busy" : "info"),
+          });
         }
 
         const nextQrVisible = !!(state.qrVisible && state.qrImageUrl);

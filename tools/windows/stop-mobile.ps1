@@ -111,6 +111,7 @@ function Get-CodrexRuntimeDir {
 $runtimeDir = Get-CodrexRuntimeDir -RepoRoot $root
 $stateDir = Join-Path $runtimeDir "state"
 $sessionPath = Join-Path $stateDir "mobile.session.json"
+$desktopPerfSnapshotPath = Join-Path $stateDir "desktop-perf.json"
 $legacySessionPath = Join-Path (Join-Path $root "logs") "mobile.session.json"
 $configPath = Join-Path $root "controller.config.json"
 $localConfigPath = Join-Path $stateDir "controller.config.local.json"
@@ -211,6 +212,100 @@ $null = Write-CodrexEventLog -RuntimeDir $runtimeDir -Source $script:DiagSource 
   session_state_before = $script:DiagBeforeSessionState
 }
 
+function Disable-CodrexDesktopPerfMode {
+  param([string]$SnapshotPath)
+  if (-not (Test-Path $SnapshotPath)) {
+    return $false
+  }
+  try {
+    $perfWallpaperPath = Join-Path (Split-Path -Parent $SnapshotPath) "desktop-perf-wallpaper.bmp"
+    $snapshotJson = Get-Content -Path $SnapshotPath -Raw -ErrorAction Stop
+    if (-not $snapshotJson) {
+      Remove-Item $SnapshotPath -Force -ErrorAction SilentlyContinue
+      return $false
+    }
+    $snapshotB64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($snapshotJson))
+$restoreScriptTemplate = @'
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+if (-not ('CodrexDesktopPerfNative' -as [type])) {
+  Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public static class CodrexDesktopPerfNative {
+  public const int SPI_SETDESKWALLPAPER = 20;
+  public const int SPIF_UPDATEINIFILE = 0x01;
+  public const int SPIF_SENDWININICHANGE = 0x02;
+  public static readonly IntPtr HWND_BROADCAST = new IntPtr(0xffff);
+  public const uint WM_SETTINGCHANGE = 0x001A;
+  public const uint SMTO_ABORTIFHUNG = 0x0002;
+
+  [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+  public static extern bool SystemParametersInfo(int uiAction, int uiParam, string pvParam, int fWinIni);
+
+  [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+  public static extern IntPtr SendMessageTimeout(IntPtr hWnd, uint Msg, IntPtr wParam, string lParam, uint fuFlags, uint uTimeout, out IntPtr lpdwResult);
+}
+"@
+}
+
+function Invoke-CodrexDesktopRefresh {
+  param([string]$WallpaperPath)
+  $resolvedWallpaper = ''
+  if ($WallpaperPath) {
+    try {
+      $resolvedWallpaper = (Resolve-Path -LiteralPath $WallpaperPath -ErrorAction Stop).Path
+    } catch {
+      $resolvedWallpaper = $WallpaperPath
+    }
+  }
+  [CodrexDesktopPerfNative]::SystemParametersInfo(
+    [CodrexDesktopPerfNative]::SPI_SETDESKWALLPAPER,
+    0,
+    $resolvedWallpaper,
+    [CodrexDesktopPerfNative]::SPIF_UPDATEINIFILE -bor [CodrexDesktopPerfNative]::SPIF_SENDWININICHANGE
+  ) | Out-Null
+  foreach ($area in @('Control Panel\Desktop', 'WindowsThemeElement', 'ImmersiveColorSet', 'TraySettings')) {
+    $msgResult = [IntPtr]::Zero
+    [CodrexDesktopPerfNative]::SendMessageTimeout(
+      [CodrexDesktopPerfNative]::HWND_BROADCAST,
+      [CodrexDesktopPerfNative]::WM_SETTINGCHANGE,
+      [IntPtr]::Zero,
+      $area,
+      [CodrexDesktopPerfNative]::SMTO_ABORTIFHUNG,
+      5000,
+      [ref]$msgResult
+    ) | Out-Null
+  }
+  & "$env:WINDIR\System32\cmd.exe" /c 'RUNDLL32.EXE user32.dll,UpdatePerUserSystemParameters 1, True' | Out-Null
+}
+
+$snapshotJson = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__SNAPSHOT_B64__'))
+$snapshot = $snapshotJson | ConvertFrom-Json
+$restoreWallpaper = [string]$snapshot.wallpaper
+if ($snapshot.wallpaper_restore_path -and (Test-Path ([string]$snapshot.wallpaper_restore_path))) {
+  $restoreWallpaper = [string]$snapshot.wallpaper_restore_path
+}
+Set-ItemProperty 'HKCU:\Control Panel\Desktop' -Name Wallpaper -Value $restoreWallpaper
+Set-ItemProperty 'HKCU:\Control Panel\Desktop' -Name WallpaperStyle -Value ([string]$snapshot.wallpaper_style)
+Set-ItemProperty 'HKCU:\Control Panel\Desktop' -Name TileWallpaper -Value ([string]$snapshot.tile_wallpaper)
+if ($snapshot.background -ne $null) { try { Set-ItemProperty 'HKCU:\Control Panel\Colors' -Name Background -Value ([string]$snapshot.background) } catch {} }
+if ($snapshot.min_animate -ne $null) { try { Set-ItemProperty 'HKCU:\Control Panel\Desktop\WindowMetrics' -Name MinAnimate -Value ([string]$snapshot.min_animate) } catch {} }
+if ($snapshot.enable_transparency -ne $null -and [string]$snapshot.enable_transparency -ne '') { try { Set-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize' -Name EnableTransparency -Value ([int]$snapshot.enable_transparency) } catch {} }
+Invoke-CodrexDesktopRefresh -WallpaperPath $restoreWallpaper
+'@
+    $restoreScript = $restoreScriptTemplate.Replace('__SNAPSHOT_B64__', $snapshotB64)
+    $restoreScriptEncoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($restoreScript))
+    & powershell.exe -NoProfile -EncodedCommand $restoreScriptEncoded | Out-Null
+    Remove-Item $SnapshotPath -Force -ErrorAction SilentlyContinue
+    Remove-Item $perfWallpaperPath -Force -ErrorAction SilentlyContinue
+    return $true
+  } catch {
+    Write-Host ("Warning: desktop performance mode was not restored ({0})." -f $_.Exception.Message)
+    return $false
+  }
+}
+
 $uiStoppedBySession = $false
 $uiStoppedByPort = $false
 if ($UiPort -gt 0 -or ($session -and $session.ui_pid)) {
@@ -249,6 +344,7 @@ if (Test-Path $sessionPath) {
 if (Test-Path $legacySessionPath) {
   Remove-Item $legacySessionPath -Force -ErrorAction SilentlyContinue
 }
+$perfModeRestored = Disable-CodrexDesktopPerfMode -SnapshotPath $desktopPerfSnapshotPath
 
 $controllerListening = Test-PortListening -Port $controllerPort
 $uiListening = if ($UiPort -gt 0) { Test-PortListening -Port $UiPort } else { $false }
@@ -264,6 +360,7 @@ Write-StopMobileDiagnostic -Ok:([bool]$result.ok) -Detail $(if ($result.ok) { "M
   controller_status = $result.controller_status
   ui_stopped = [bool]$result.ui_stopped
   stale_session_file_removed = [bool]$result.stale_session_file_removed
+  perf_mode_restored = [bool]$perfModeRestored
   stop_complete_ms = [int]$stopTimer.ElapsedMilliseconds
 })
 $result | ConvertTo-Json -Compress | Write-Output

@@ -21,6 +21,7 @@ import {
   detectControllerPort,
   deleteThreadRecord,
   desktopClick,
+  desktopGetSelectedPath,
   desktopScroll,
   desktopSendKey,
   desktopSendText,
@@ -56,6 +57,7 @@ import {
   sendToPane,
   sendToSession,
   setDesktopMode,
+  setDesktopPerfMode,
   setIpcObserver,
   startCodexExec,
   updateThreadRecord,
@@ -779,11 +781,15 @@ export default function App() {
 
   const [desktopInfo, setDesktopInfo] = useState<DesktopInfoResult | null>(null);
   const [desktopEnabled, setDesktopEnabled] = useState(false);
-  const [desktopProfile, setDesktopProfile] = useState<DesktopStreamProfile>("balanced");
+  const [desktopProfile, setDesktopProfile] = useState<DesktopStreamProfile>("responsive");
   const [desktopKeyInput, setDesktopKeyInput] = useState("enter");
   const [desktopTextInput, setDesktopTextInput] = useState("");
   const [desktopStatus, setDesktopStatus] = useState("");
   const [desktopFocusPoint, setDesktopFocusPoint] = useState<{ x: number; y: number } | null>(null);
+  const [desktopSelectedPath, setDesktopSelectedPath] = useState("");
+  const [desktopAltHeld, setDesktopAltHeld] = useState(false);
+  const [desktopPerfEnabled, setDesktopPerfEnabled] = useState(true);
+  const [desktopPerfActive, setDesktopPerfActive] = useState(false);
   const [desktopFullscreen, setDesktopFullscreen] = useState(false);
   const [desktopTrackpadMode, setDesktopTrackpadMode] = useState(true);
   const [powerStatus, setPowerStatus] = useState<PowerStatusResult | null>(null);
@@ -859,6 +865,7 @@ export default function App() {
     y: 0,
     moved: false,
   });
+  const desktopIgnoreNextClickRef = useRef(false);
   const threadLastAssistantAtRef = useRef<Record<string, number>>({});
   const localThreadsRef = useRef<ChatThread[]>([]);
   const localThreadMessagesRef = useRef<Record<string, ThreadMessage[]>>({});
@@ -1397,6 +1404,13 @@ export default function App() {
         if (!response.enabled) {
           setDesktopFocusPoint(null);
         }
+      }
+      setDesktopAltHeld(Boolean(response.alt_held));
+      if (typeof response.perf_mode_enabled === "boolean") {
+        setDesktopPerfEnabled(response.perf_mode_enabled);
+      }
+      if (typeof response.perf_mode_active === "boolean") {
+        setDesktopPerfActive(response.perf_mode_active);
       }
     } catch (error) {
       setDesktopInfo(null);
@@ -2275,6 +2289,29 @@ export default function App() {
   }, [filteredSessions]);
 
   const selectedSessionInfo = sessions.find((session) => session.session === selectedSession) || null;
+  useEffect(() => {
+    if (
+      activeTab !== "sessions" ||
+      !pageVisible ||
+      !selectedSession ||
+      !streamEnabled
+    ) {
+      return;
+    }
+    const selectedState = String(selectedSessionInfo?.state || "").toLowerCase();
+    const shouldRecover =
+      outputFeedState !== "live" || selectedState === "waiting" || selectedState === "recovering";
+    if (!shouldRecover) {
+      return;
+    }
+    void refreshScreen(selectedSession);
+    void refreshSessions();
+    const interval = window.setInterval(() => {
+      void refreshScreen(selectedSession);
+      void refreshSessions();
+    }, 500);
+    return () => window.clearInterval(interval);
+  }, [activeTab, outputFeedState, pageVisible, refreshScreen, refreshSessions, selectedSession, selectedSessionInfo?.state, streamEnabled]);
   const authSummary = authLoading
     ? "Checking auth..."
     : auth?.auth_required
@@ -2347,6 +2384,14 @@ export default function App() {
   const desktopFocusSummary = desktopFocusPoint
     ? `Focused target: ${desktopFocusPoint.x}, ${desktopFocusPoint.y}`
     : "No desktop target focused yet. Tap the remote desktop once first.";
+  const desktopPerfSummary = desktopPerfEnabled
+    ? desktopPerfActive
+      ? "Boost host: active"
+      : "Boost host: armed"
+    : "Boost host: off";
+  const desktopPathSummary = desktopSelectedPath
+    ? `Copied: ${desktopSelectedPath}`
+    : "Works for the currently focused File Explorer window or desktop selection on the host.";
   const installButtonLabel =
     installState === "installed"
       ? "Installed"
@@ -2978,13 +3023,12 @@ export default function App() {
     flushSync(() => {
       setPromptText(combinedPrompt);
     });
-    setStatus("Prepared Telegram instruction for the current task output.");
     setComposerTelegramBusy(true);
     try {
       await waitForNextPaint();
       const sent = await submitPromptText(
         combinedPrompt,
-        "Asked Codex to send the relevant generated output files via Telegram.",
+        "Sent Telegram instruction to Codex for the current task output.",
         { preserveComposer: true },
       );
       if (!sent) {
@@ -3068,6 +3112,25 @@ export default function App() {
   const onSessionNotesChange = useCallback((value: string) => {
     setSessionNotes(value);
   }, []);
+
+  const onCopyRemoteSelectedPath = useCallback(async () => {
+    if (!desktopEnabled) {
+      setError("Enable remote control first.");
+      return;
+    }
+    try {
+      const response = await desktopGetSelectedPath();
+      if (!response.ok || !response.path) {
+        throw new Error(response.detail || response.error || "No selected Explorer path.");
+      }
+      setDesktopSelectedPath(response.path);
+      await copyTextWithFallback(response.path);
+      const count = Number(response.count || 0);
+      setStatus(count > 1 ? `Copied first of ${count} selected paths: ${response.path}` : `Copied selected path: ${response.path}`);
+    } catch (error) {
+      setError(`Copy selected path failed: ${(error as Error).message}`);
+    }
+  }, [desktopEnabled, setError, setStatus]);
 
   const onRefreshSelectedSession = useCallback(() => {
     if (!selectedSession) {
@@ -3396,6 +3459,13 @@ export default function App() {
       }
       const enabled = !!response.enabled;
       setDesktopEnabled(enabled);
+      setDesktopAltHeld(Boolean(response.alt_held));
+      if (typeof response.perf_mode_enabled === "boolean") {
+        setDesktopPerfEnabled(response.perf_mode_enabled);
+      }
+      if (typeof response.perf_mode_active === "boolean") {
+        setDesktopPerfActive(response.perf_mode_active);
+      }
       setDesktopStatus(
         enabled
           ? "Desktop control enabled. Stream remains live."
@@ -3412,6 +3482,27 @@ export default function App() {
     }
   }, [desktopEnabled, refreshDesktopState, setError]);
 
+  const onToggleDesktopPerfMode = useCallback(async () => {
+    try {
+      const response = await setDesktopPerfMode(!desktopPerfEnabled);
+      if (!response.ok) {
+        throw new Error(response.detail || response.error || "Desktop performance mode request failed.");
+      }
+      setDesktopPerfEnabled(Boolean(response.perf_mode_enabled));
+      setDesktopPerfActive(Boolean(response.perf_mode_active));
+      setDesktopAltHeld(Boolean(response.alt_held));
+      setDesktopStatus(
+        response.perf_mode_enabled
+          ? response.perf_mode_active
+            ? "Boost host performance enabled."
+            : "Boost host performance armed for the next desktop-control session."
+          : "Boost host performance disabled.",
+      );
+    } catch (error) {
+      setError(`Boost host performance failed: ${(error as Error).message}`);
+    }
+  }, [desktopPerfEnabled, setError]);
+
   const onDesktopClick = useCallback(async (button: "left" | "right", double = false) => {
     if (!desktopEnabled) {
       setError("Desktop control is disabled. Enable Desktop first.");
@@ -3422,6 +3513,7 @@ export default function App() {
       if (!response.ok) {
         throw new Error(response.detail || response.error || "Desktop click failed.");
       }
+      setDesktopAltHeld(Boolean(response.alt_held));
       setDesktopStatus(`${double ? "Double " : ""}${button} click sent.`);
     } catch (error) {
       setError(`Desktop click failed: ${(error as Error).message}`);
@@ -3438,6 +3530,7 @@ export default function App() {
       if (!response.ok) {
         throw new Error(response.detail || response.error || "Desktop scroll failed.");
       }
+      setDesktopAltHeld(Boolean(response.alt_held));
       setDesktopStatus(`Scroll ${delta < 0 ? "up" : "down"} sent.`);
     } catch (error) {
       setError(`Desktop scroll failed: ${(error as Error).message}`);
@@ -3463,6 +3556,7 @@ export default function App() {
       if (!response.ok) {
         throw new Error(response.detail || response.error || "Desktop text failed.");
       }
+      setDesktopAltHeld(Boolean(response.alt_held));
       setDesktopTextInput("");
       setDesktopStatus(`Typed text into focused app at ${desktopFocusPoint.x}, ${desktopFocusPoint.y}.`);
     } catch (error) {
@@ -3537,6 +3631,7 @@ export default function App() {
       if (!response.ok) {
         throw new Error(response.detail || response.error || "Desktop move failed.");
       }
+      setDesktopAltHeld(Boolean(response.alt_held));
       setDesktopStatus(`Pointer moved to ${target.x}, ${target.y}.`);
     } catch (error) {
       setError(`Desktop move failed: ${(error as Error).message}`);
@@ -3591,6 +3686,9 @@ export default function App() {
     if (!desktopEnabled) {
       return;
     }
+    if (!state.active) {
+      return;
+    }
     const target = mapDesktopPointFromClient(event.clientX, event.clientY);
     if (!target) {
       return;
@@ -3605,6 +3703,8 @@ export default function App() {
       if (!response.ok) {
         throw new Error(response.detail || response.error || "Desktop tap failed.");
       }
+      desktopIgnoreNextClickRef.current = true;
+      setDesktopAltHeld(Boolean(response.alt_held));
       setDesktopStatus(`Focused desktop at ${target.x}, ${target.y}.`);
     } catch (error) {
       setError(`Desktop tap failed: ${(error as Error).message}`);
@@ -3626,6 +3726,7 @@ export default function App() {
       if (!response.ok) {
         throw new Error(response.detail || response.error || "Desktop right click failed.");
       }
+      setDesktopAltHeld(Boolean(response.alt_held));
       setDesktopStatus(`Right click sent at ${target.x}, ${target.y}.`);
     } catch (error) {
       setError(`Desktop right click failed: ${(error as Error).message}`);
@@ -3635,6 +3736,11 @@ export default function App() {
   const onDesktopFrameTap = useCallback(async (event: React.MouseEvent<HTMLImageElement>) => {
     if (!desktopEnabled) {
       setDesktopStatus("Desktop control is disabled. Enable Desktop first.");
+      return;
+    }
+    if (desktopIgnoreNextClickRef.current) {
+      desktopIgnoreNextClickRef.current = false;
+      event.preventDefault();
       return;
     }
     if (desktopTrackpadMode) {
@@ -3650,6 +3756,7 @@ export default function App() {
       if (!response.ok) {
         throw new Error(response.detail || response.error || "Desktop tap failed.");
       }
+      setDesktopAltHeld(Boolean(response.alt_held));
       setDesktopStatus(`Focused desktop at ${target.x}, ${target.y}.`);
     } catch (error) {
       setError(`Desktop tap failed: ${(error as Error).message}`);
@@ -3678,6 +3785,7 @@ export default function App() {
       if (!response.ok) {
         throw new Error(response.detail || response.error || "Desktop key failed.");
       }
+      setDesktopAltHeld(Boolean(response.alt_held));
       setDesktopStatus(`Key sent: ${desktopKeyInput}`);
     } catch (error) {
       setError(`Desktop key failed: ${(error as Error).message}`);
@@ -3694,12 +3802,32 @@ export default function App() {
       if (!response.ok) {
         throw new Error(response.detail || response.error || "Desktop key failed.");
       }
+      setDesktopAltHeld(Boolean(response.alt_held));
       setDesktopKeyInput(key);
-      setDesktopStatus(`Key sent: ${key}`);
+      setDesktopStatus(key === "alt+tab-hold" ? "Alt held for window switching." : `Key sent: ${key}`);
     } catch (error) {
       setError(`Desktop key failed: ${(error as Error).message}`);
     }
   }, [desktopEnabled, setError]);
+
+  useEffect(() => {
+    if (!desktopAltHeld) {
+      return;
+    }
+    if (activeTab === "remote" && desktopEnabled) {
+      return;
+    }
+    void desktopSendKey("alt+release")
+      .then((response) => {
+        if (response.ok) {
+          setDesktopAltHeld(Boolean(response.alt_held));
+          setDesktopStatus("Released held Alt.");
+        }
+      })
+      .catch(() => {
+        setDesktopAltHeld(false);
+      });
+  }, [activeTab, desktopAltHeld, desktopEnabled]);
 
   const onRequestPowerAction = useCallback(async (action: PowerActionName, confirmToken = "") => {
     setPowerBusy(true);
@@ -4714,6 +4842,15 @@ export default function App() {
                     >
                       Trackpad: {desktopTrackpadMode ? "On" : "Direct"}
                     </button>
+                    <button
+                      type="button"
+                      className={`button soft compact ${desktopPerfEnabled ? "active" : ""}`}
+                      onClick={() => void onToggleDesktopPerfMode()}
+                    >
+                      Boost Host: {desktopPerfEnabled ? "On" : "Off"}
+                    </button>
+                    {desktopAltHeld ? <span className="badge warn">Alt held</span> : null}
+                    {desktopPerfActive ? <span className="badge active">Boost active</span> : null}
                     <span className="small">
                       {desktopInfo?.width && desktopInfo?.height
                         ? `${desktopInfo.width}x${desktopInfo.height}`
@@ -4740,7 +4877,7 @@ export default function App() {
                       {DESKTOP_PROFILE_STREAM[desktopProfile].bw ? " / grayscale" : ""}
                     </strong>
                   </p>
-                  <p className="small">{desktopStatus || "Desktop controls are available only on Windows host."}</p>
+                  <p className="small">{desktopStatus || desktopPerfSummary || "Desktop controls are available only on Windows host."}</p>
                   <div className="remote-workspace">
                     <div className="remote-view-stack">
                       <div
@@ -4878,8 +5015,14 @@ export default function App() {
                             <button type="button" className="button soft compact action-chip" onClick={() => void onDesktopSendQuickKey("win+tab")} disabled={desktopInteractionDisabled}>
                               <span className="btn-text">All Tabs</span>
                             </button>
+                            <button type="button" className={`button soft compact action-chip${desktopAltHeld ? " warn" : ""}`} onClick={() => void onDesktopSendQuickKey("alt+tab-hold")} disabled={desktopInteractionDisabled}>
+                              <span className="btn-text">{desktopAltHeld ? "Alt Held" : "Hold Alt+Tab"}</span>
+                            </button>
                             <button type="button" className="button soft compact action-chip" onClick={() => void onDesktopSendQuickKey("alt+tab")} disabled={desktopInteractionDisabled}>
                               <span className="btn-text">Switch Tab</span>
+                            </button>
+                            <button type="button" className="button soft compact action-chip" onClick={() => void onDesktopSendQuickKey("alt+release")} disabled={desktopInteractionDisabled}>
+                              <span className="btn-text">Release Alt</span>
                             </button>
                             <button type="button" className="button soft compact action-chip" onClick={() => void onDesktopSendQuickKey("ctrl+c")} disabled={desktopInteractionDisabled}>
                               <span className="btn-text">Ctrl+C</span>
@@ -4889,6 +5032,32 @@ export default function App() {
                             </button>
                           </div>
                         </div>
+                      </div>
+                      <div className="remote-control-group" data-testid="remote-selected-path">
+                        <div className="remote-group-head">
+                          <h4>Focused Explorer Path</h4>
+                          <span className="small">Select a file or folder in the currently focused File Explorer window or on the host desktop, then copy its path.</span>
+                        </div>
+                        <div className="remote-path-browser-copy">
+                          <input
+                            type="text"
+                            readOnly
+                            value={desktopSelectedPath || ""}
+                            placeholder="No Explorer selection copied yet"
+                            aria-label="Remote selected path"
+                          />
+                          <button
+                            type="button"
+                            className="button soft compact action-chip"
+                            onClick={() => void onCopyRemoteSelectedPath()}
+                            disabled={desktopInteractionDisabled}
+                          >
+                            <span className="btn-text">Copy Focused Path</span>
+                          </button>
+                        </div>
+                        <p className="small remote-path-browser-folder">
+                          {desktopPathSummary}
+                        </p>
                       </div>
                     </div>
                   </div>

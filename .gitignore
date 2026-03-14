@@ -15,6 +15,7 @@ logs/
 backup/
 output/
 tmp/
+tmp-desktop-*.png
 .runtime/
 test-results/
 ui/test-results/
