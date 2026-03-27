@@ -216,6 +216,7 @@ const REMOTE_POLL_MS = 3500;
 const REMOTE_HIDDEN_POLL_MS = 7000;
 const DEFAULT_BACKGROUND_POLL_MS = 5000;
 const SESSION_MUTATION_REVALIDATE_MS = 900;
+const DESKTOP_REMOTE_CLIPBOARD_GRACE_MS = 15000;
 const POWER_ACTION_LABELS: Record<"lock" | "sleep" | "hibernate" | "restart" | "shutdown", string> = {
   lock: "Lock",
   sleep: "Sleep",
@@ -858,6 +859,10 @@ export default function App() {
   const sessionScreenRefreshInFlightRef = useRef<Set<string>>(new Set());
   const scheduledSessionsRefreshRef = useRef<number | null>(null);
   const remoteStageRef = useRef<HTMLDivElement | null>(null);
+  const desktopPrimedPasteTextRef = useRef("");
+  const desktopRecentRemoteCopyAtRef = useRef(0);
+  const desktopAutoPerfRef = useRef(false);
+  const desktopAutoPerfBusyRef = useRef(false);
   const desktopFrameRef = useRef<HTMLImageElement | null>(null);
   const desktopPointerRef = useRef<{
     active: boolean;
@@ -867,6 +872,7 @@ export default function App() {
     y: number;
     moved: boolean;
     scrolling: boolean;
+    dragging: boolean;
     pointerType: string;
   }>({
     active: false,
@@ -876,8 +882,10 @@ export default function App() {
     y: 0,
     moved: false,
     scrolling: false,
+    dragging: false,
     pointerType: "",
   });
+  const desktopDragHoldTimerRef = useRef<number | null>(null);
   const desktopIgnoreNextClickRef = useRef(false);
   const threadLastAssistantAtRef = useRef<Record<string, number>>({});
   const localThreadsRef = useRef<ChatThread[]>([]);
@@ -2008,6 +2016,9 @@ export default function App() {
   useEffect(() => {
     const onFullscreenChange = () => {
       setDesktopFullscreen(Boolean(document.fullscreenElement));
+      if (document.fullscreenElement) {
+        remoteStageRef.current?.focus({ preventScroll: true });
+      }
     };
     document.addEventListener("fullscreenchange", onFullscreenChange);
     return () => document.removeEventListener("fullscreenchange", onFullscreenChange);
@@ -3137,6 +3148,7 @@ export default function App() {
       }
       setDesktopSelectedPath(response.path);
       setDesktopTextInput(response.path);
+      desktopPrimedPasteTextRef.current = response.path;
       await copyTextWithFallback(response.path);
       const count = Number(response.count || 0);
       remoteStageRef.current?.focus({ preventScroll: true });
@@ -3627,13 +3639,89 @@ export default function App() {
     if (rect.width <= 0 || rect.height <= 0) {
       return null;
     }
-    const normX = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
-    const normY = Math.max(0, Math.min(1, (clientY - rect.top) / rect.height));
+    const sourceWidth = img.naturalWidth > 0 ? img.naturalWidth : desktopInfo.width;
+    const sourceHeight = img.naturalHeight > 0 ? img.naturalHeight : desktopInfo.height;
+    if (sourceWidth <= 0 || sourceHeight <= 0) {
+      return null;
+    }
+
+    let renderedWidth = rect.width;
+    let renderedHeight = rect.height;
+    let offsetLeft = 0;
+    let offsetTop = 0;
+    const sourceAspect = sourceWidth / sourceHeight;
+    const boxAspect = rect.width / rect.height;
+
+    if (boxAspect > sourceAspect) {
+      renderedHeight = rect.height;
+      renderedWidth = renderedHeight * sourceAspect;
+      offsetLeft = (rect.width - renderedWidth) / 2;
+    } else if (boxAspect < sourceAspect) {
+      renderedWidth = rect.width;
+      renderedHeight = renderedWidth / sourceAspect;
+      offsetTop = (rect.height - renderedHeight) / 2;
+    }
+
+    if (renderedWidth <= 0 || renderedHeight <= 0) {
+      return null;
+    }
+
+    const localX = clientX - rect.left - offsetLeft;
+    const localY = clientY - rect.top - offsetTop;
+    const normX = Math.max(0, Math.min(1, localX / renderedWidth));
+    const normY = Math.max(0, Math.min(1, localY / renderedHeight));
     return {
       x: Math.round(normX * desktopInfo.width),
       y: Math.round(normY * desktopInfo.height),
     };
   }, [desktopInfo?.height, desktopInfo?.width]);
+
+  const clearDesktopDragHoldTimer = useCallback(() => {
+    if (desktopDragHoldTimerRef.current != null && typeof window !== "undefined") {
+      window.clearTimeout(desktopDragHoldTimerRef.current);
+      desktopDragHoldTimerRef.current = null;
+    }
+  }, []);
+
+  const normalizeDesktopPointerType = useCallback((pointerType: string | null | undefined) => {
+    const normalized = typeof pointerType === "string" ? pointerType.trim().toLowerCase() : "";
+    if (normalized === "mouse" || normalized === "touch" || normalized === "pen") {
+      return normalized;
+    }
+    return desktopFullscreen ? "touch" : "mouse";
+  }, [desktopFullscreen]);
+
+  const beginDesktopTouchDrag = useCallback(async () => {
+    const state = desktopPointerRef.current;
+    if (!desktopEnabled || !desktopFullscreen || !state.active || state.scrolling || state.dragging || state.pointerType !== "touch") {
+      return;
+    }
+    const drift = Math.abs(state.x - state.startX) + Math.abs(state.y - state.startY);
+    if (drift > 18) {
+      return;
+    }
+    const target = mapDesktopPointFromClient(state.x, state.y);
+    if (!target) {
+      return;
+    }
+    try {
+      const response = await desktopClick({ x: target.x, y: target.y, button: "left", action: "down" });
+      if (!response.ok) {
+        throw new Error(response.detail || response.error || "Desktop drag start failed.");
+      }
+      desktopPointerRef.current = {
+        ...desktopPointerRef.current,
+        dragging: true,
+        moved: true,
+        scrolling: false,
+      };
+      setDesktopFocusPoint(target);
+      setDesktopAltHeld(Boolean(response.alt_held));
+      setDesktopStatus(`Dragging from ${target.x}, ${target.y}.`);
+    } catch (error) {
+      setError(`Desktop drag failed: ${(error as Error).message}`);
+    }
+  }, [desktopEnabled, desktopFullscreen, mapDesktopPointFromClient, setError]);
 
   const onDesktopMovePointer = useCallback(async (clientX: number, clientY: number) => {
     if (!desktopEnabled) {
@@ -3668,7 +3756,8 @@ export default function App() {
     if (!desktopEnabled) {
       return;
     }
-    if (event.pointerType === "mouse" && !desktopTrackpadMode) {
+    const pointerType = normalizeDesktopPointerType(event.pointerType);
+    if (pointerType === "mouse" && !desktopTrackpadMode) {
       return;
     }
     remoteStageRef.current?.focus({ preventScroll: true });
@@ -3680,16 +3769,33 @@ export default function App() {
       y: event.clientY,
       moved: false,
       scrolling: false,
-      pointerType: event.pointerType,
+      dragging: false,
+      pointerType,
     };
+    clearDesktopDragHoldTimer();
+    if (desktopFullscreen && pointerType === "touch" && typeof window !== "undefined") {
+      desktopDragHoldTimerRef.current = window.setTimeout(() => {
+        void beginDesktopTouchDrag();
+      }, 220);
+    }
     event.currentTarget.setPointerCapture(event.pointerId);
-  }, [desktopEnabled, desktopTrackpadMode]);
+  }, [beginDesktopTouchDrag, clearDesktopDragHoldTimer, desktopEnabled, desktopFullscreen, desktopTrackpadMode, normalizeDesktopPointerType]);
 
   const onDesktopPointerMove = useCallback(async (event: React.PointerEvent<HTMLImageElement>) => {
     if (!desktopEnabled || !desktopPointerRef.current.active) {
       return;
     }
     const state = desktopPointerRef.current;
+    if (state.dragging) {
+      desktopPointerRef.current = {
+        ...state,
+        x: event.clientX,
+        y: event.clientY,
+        moved: true,
+      };
+      await onDesktopMovePointer(event.clientX, event.clientY);
+      return;
+    }
     const allowFullscreenTouchGesture = desktopFullscreen && state.pointerType === "touch";
     if (!desktopTrackpadMode && !allowFullscreenTouchGesture) {
       return;
@@ -3702,6 +3808,7 @@ export default function App() {
       state.pointerType === "touch" &&
       (state.scrolling || (Math.abs(totalDeltaY) > 24 && Math.abs(totalDeltaY) > Math.abs(totalDeltaX) * 1.25));
     if (canScrollByTouch) {
+      clearDesktopDragHoldTimer();
       desktopPointerRef.current = {
         ...state,
         x: event.clientX,
@@ -3717,6 +3824,9 @@ export default function App() {
     if (allowFullscreenTouchGesture && !desktopTrackpadMode) {
       return;
     }
+    if (state.pointerType === "touch" && (Math.abs(totalDeltaX) + Math.abs(totalDeltaY)) > 14) {
+      clearDesktopDragHoldTimer();
+    }
     const delta = Math.abs(event.clientX - state.x) + Math.abs(event.clientY - state.y);
     if (delta < 8) {
       return;
@@ -3729,10 +3839,11 @@ export default function App() {
       scrolling: false,
     };
     await onDesktopMovePointer(event.clientX, event.clientY);
-  }, [desktopEnabled, desktopFullscreen, desktopTrackpadMode, onDesktopMovePointer, onDesktopScroll]);
+  }, [clearDesktopDragHoldTimer, desktopEnabled, desktopFullscreen, desktopTrackpadMode, onDesktopMovePointer, onDesktopScroll]);
 
   const onDesktopPointerUp = useCallback(async (event: React.PointerEvent<HTMLImageElement>) => {
     const state = desktopPointerRef.current;
+    clearDesktopDragHoldTimer();
     desktopPointerRef.current = {
       active: false,
       startX: 0,
@@ -3741,6 +3852,7 @@ export default function App() {
       y: 0,
       moved: false,
       scrolling: false,
+      dragging: false,
       pointerType: "",
     };
     if (!desktopEnabled) {
@@ -3750,14 +3862,38 @@ export default function App() {
       return;
     }
     const target = mapDesktopPointFromClient(event.clientX, event.clientY);
-    if (!target) {
-      return;
-    }
-    setDesktopFocusPoint(target);
     if (state.scrolling) {
       setDesktopStatus("Touch scroll gesture sent.");
       return;
     }
+    if (state.dragging) {
+      try {
+        const response = await desktopClick({
+          x: target?.x,
+          y: target?.y,
+          button: "left",
+          action: "up",
+        });
+        if (!response.ok) {
+          throw new Error(response.detail || response.error || "Desktop drag release failed.");
+        }
+        desktopIgnoreNextClickRef.current = true;
+        setDesktopAltHeld(Boolean(response.alt_held));
+        if (target) {
+          setDesktopFocusPoint(target);
+          setDesktopStatus(`Drag completed at ${target.x}, ${target.y}.`);
+        } else {
+          setDesktopStatus("Drag completed.");
+        }
+      } catch (error) {
+        setError(`Desktop drag failed: ${(error as Error).message}`);
+      }
+      return;
+    }
+    if (!target) {
+      return;
+    }
+    setDesktopFocusPoint(target);
     if (desktopTrackpadMode && state.moved) {
       setDesktopStatus(`Pointer focused at ${target.x}, ${target.y}.`);
       return;
@@ -3773,7 +3909,35 @@ export default function App() {
     } catch (error) {
       setError(`Desktop tap failed: ${(error as Error).message}`);
     }
-  }, [desktopEnabled, desktopTrackpadMode, mapDesktopPointFromClient, setError]);
+  }, [clearDesktopDragHoldTimer, desktopEnabled, desktopTrackpadMode, mapDesktopPointFromClient, setError]);
+
+  const onDesktopPointerCancel = useCallback(() => {
+    const state = desktopPointerRef.current;
+    clearDesktopDragHoldTimer();
+    desktopPointerRef.current = {
+      active: false,
+      startX: 0,
+      startY: 0,
+      x: 0,
+      y: 0,
+      moved: false,
+      scrolling: false,
+      dragging: false,
+      pointerType: "",
+    };
+    if (!desktopEnabled || !state.dragging) {
+      return;
+    }
+    const target = mapDesktopPointFromClient(state.x, state.y);
+    void desktopClick({
+      x: target?.x,
+      y: target?.y,
+      button: "left",
+      action: "up",
+    }).catch((error: Error) => {
+      setError(`Desktop drag failed: ${error.message}`);
+    });
+  }, [clearDesktopDragHoldTimer, desktopEnabled, mapDesktopPointFromClient, setError]);
 
   const onDesktopContextMenu = useCallback(async (event: React.MouseEvent<HTMLImageElement>) => {
     if (!desktopEnabled) {
@@ -3868,9 +4032,57 @@ export default function App() {
       return;
     }
     try {
+      if (key === "ctrl+v" && desktopPrimedPasteTextRef.current) {
+        const primedText = desktopPrimedPasteTextRef.current;
+        desktopPrimedPasteTextRef.current = "";
+        desktopRecentRemoteCopyAtRef.current = 0;
+        const response = await desktopSendText(primedText);
+        if (!response.ok) {
+          throw new Error(response.detail || response.error || "Desktop paste failed.");
+        }
+        setDesktopAltHeld(Boolean(response.alt_held));
+        setDesktopKeyInput(key);
+        setDesktopStatus("Primed text pasted into the focused desktop app.");
+        return;
+      }
+      if (key === "ctrl+v") {
+        const remoteClipboardLikelyFresh =
+          Date.now() - desktopRecentRemoteCopyAtRef.current < DESKTOP_REMOTE_CLIPBOARD_GRACE_MS;
+        if (!remoteClipboardLikelyFresh) {
+          let localClipboardText = "";
+          try {
+            if (typeof navigator !== "undefined" && navigator.clipboard?.readText) {
+              localClipboardText = await navigator.clipboard.readText();
+            }
+          } catch {
+            localClipboardText = "";
+          }
+          if (localClipboardText) {
+            const response = await desktopSendText(localClipboardText);
+            if (!response.ok) {
+              throw new Error(response.detail || response.error || "Desktop paste failed.");
+            }
+            desktopRecentRemoteCopyAtRef.current = 0;
+            setDesktopAltHeld(Boolean(response.alt_held));
+            setDesktopTextInput(localClipboardText);
+            setDesktopKeyInput(key);
+            setDesktopStatus(
+              desktopFocusPoint
+                ? `Pasted local clipboard into focused app at ${desktopFocusPoint.x}, ${desktopFocusPoint.y}.`
+                : "Pasted local clipboard into the focused desktop app.",
+            );
+            return;
+          }
+        }
+      }
       const response = await desktopSendKey(key);
       if (!response.ok) {
         throw new Error(response.detail || response.error || "Desktop key failed.");
+      }
+      if (key === "ctrl+c" || key === "ctrl+x") {
+        desktopRecentRemoteCopyAtRef.current = Date.now();
+      } else if (key === "ctrl+v") {
+        desktopRecentRemoteCopyAtRef.current = 0;
       }
       setDesktopAltHeld(Boolean(response.alt_held));
       setDesktopKeyInput(key);
@@ -3878,15 +4090,29 @@ export default function App() {
     } catch (error) {
       setError(`Desktop key failed: ${(error as Error).message}`);
     }
+  }, [desktopEnabled, desktopFocusPoint, setError]);
+
+  const onDesktopTypeInlineText = useCallback(async (text: string) => {
+    if (!desktopEnabled) {
+      return;
+    }
+    try {
+      const response = await desktopSendText(text);
+      if (!response.ok) {
+        throw new Error(response.detail || response.error || "Desktop text failed.");
+      }
+      setDesktopAltHeld(Boolean(response.alt_held));
+      if (text.trim()) {
+        setDesktopStatus(`Typed "${text}" into the focused desktop app.`);
+      }
+    } catch (error) {
+      setError(`Desktop text failed: ${(error as Error).message}`);
+    }
   }, [desktopEnabled, setError]);
 
   const onDesktopPasteLocalClipboard = useCallback(async (fallbackText = "") => {
     if (!desktopEnabled) {
       setError("Desktop control is disabled. Enable Desktop first.");
-      return;
-    }
-    if (!desktopFocusPoint) {
-      setError("Tap the remote desktop once to focus the target app/window first.");
       return;
     }
 
@@ -3899,6 +4125,11 @@ export default function App() {
       text = "";
     }
 
+    let usedPrimedText = false;
+    if (!text && desktopPrimedPasteTextRef.current) {
+      text = desktopPrimedPasteTextRef.current;
+      usedPrimedText = true;
+    }
     if (!text) {
       text = fallbackText || desktopTextInput;
     }
@@ -3912,9 +4143,17 @@ export default function App() {
       if (!response.ok) {
         throw new Error(response.detail || response.error || "Desktop paste failed.");
       }
+      desktopRecentRemoteCopyAtRef.current = 0;
       setDesktopAltHeld(Boolean(response.alt_held));
       setDesktopTextInput(text);
-      setDesktopStatus(`Pasted local clipboard into focused app at ${desktopFocusPoint.x}, ${desktopFocusPoint.y}.`);
+      if (usedPrimedText) {
+        desktopPrimedPasteTextRef.current = "";
+      }
+      setDesktopStatus(
+        desktopFocusPoint
+          ? `Pasted local clipboard into focused app at ${desktopFocusPoint.x}, ${desktopFocusPoint.y}.`
+          : "Pasted local clipboard into the focused desktop app.",
+      );
     } catch (error) {
       setError(`Desktop paste failed: ${(error as Error).message}`);
     }
@@ -3940,115 +4179,174 @@ export default function App() {
   }, [activeTab, desktopAltHeld, desktopEnabled]);
 
   useEffect(() => {
+    if (!desktopFullscreen || activeTab !== "remote" || !desktopEnabled) {
+      return;
+    }
+
+    const onRemoteFullscreenKeyDown = (event: KeyboardEvent) => {
+      if (event.defaultPrevented || event.repeat) {
+        return;
+      }
+
+      const ctrlOrMeta = event.ctrlKey || event.metaKey;
+      const alt = event.altKey;
+      const shift = event.shiftKey;
+      const normalizedKey = (event.key || "").toLowerCase();
+
+      let quickKey = "";
+      let textToType = "";
+
+      if (ctrlOrMeta && normalizedKey === "a") {
+        quickKey = "ctrl+a";
+      } else if (ctrlOrMeta && normalizedKey === "c") {
+        quickKey = "ctrl+c";
+      } else if (ctrlOrMeta && normalizedKey === "x") {
+        quickKey = "ctrl+x";
+      } else if (ctrlOrMeta && normalizedKey === "v") {
+        quickKey = "ctrl+v";
+      } else if (ctrlOrMeta && normalizedKey === "z" && shift) {
+        quickKey = "ctrl+shift+z";
+      } else if (ctrlOrMeta && normalizedKey === "z") {
+        quickKey = "ctrl+z";
+      } else if (ctrlOrMeta && normalizedKey === "y") {
+        quickKey = "ctrl+y";
+      } else if (ctrlOrMeta && normalizedKey === "tab" && shift) {
+        quickKey = "ctrl+shift+tab";
+      } else if (ctrlOrMeta && normalizedKey === "tab") {
+        quickKey = "ctrl+tab";
+      } else if (alt && normalizedKey === "tab" && shift) {
+        quickKey = "alt+shift+tab";
+      } else if (alt && normalizedKey === "tab") {
+        quickKey = "alt+tab";
+      } else if (!ctrlOrMeta && !alt && normalizedKey === "enter") {
+        quickKey = "enter";
+      } else if (!ctrlOrMeta && !alt && normalizedKey === "escape") {
+        quickKey = "esc";
+      } else if (!ctrlOrMeta && !alt && normalizedKey === "tab") {
+        quickKey = "tab";
+      } else if (!ctrlOrMeta && !alt && normalizedKey === "backspace") {
+        quickKey = "backspace";
+      } else if (!ctrlOrMeta && !alt && normalizedKey === "delete") {
+        quickKey = "delete";
+      } else if (!ctrlOrMeta && !alt && normalizedKey === "arrowup") {
+        quickKey = "up";
+      } else if (!ctrlOrMeta && !alt && normalizedKey === "arrowdown") {
+        quickKey = "down";
+      } else if (!ctrlOrMeta && !alt && normalizedKey === "arrowleft") {
+        quickKey = "left";
+      } else if (!ctrlOrMeta && !alt && normalizedKey === "arrowright") {
+        quickKey = "right";
+      } else if (!ctrlOrMeta && !alt && event.key.length === 1) {
+        textToType = event.key;
+      } else {
+        return;
+      }
+
+      event.preventDefault();
+      event.stopPropagation();
+
+      if (textToType) {
+        void onDesktopTypeInlineText(textToType);
+      } else if (quickKey) {
+        void onDesktopSendQuickKey(quickKey);
+      }
+    };
+
+    window.addEventListener("keydown", onRemoteFullscreenKeyDown, true);
+    return () => {
+      window.removeEventListener("keydown", onRemoteFullscreenKeyDown, true);
+    };
+  }, [activeTab, desktopEnabled, desktopFullscreen, onDesktopSendQuickKey, onDesktopTypeInlineText]);
+
+  useEffect(() => {
     if (!desktopEnabled || !desktopFullscreen) {
       return;
     }
 
-    const toDesktopShortcut = (event: KeyboardEvent): string | null => {
-      const baseKeyMap: Record<string, string> = {
-        a: "a",
-        c: "c",
-        x: "x",
-        y: "y",
-        z: "z",
-        Enter: "enter",
-        Backspace: "backspace",
-        Delete: "delete",
-        Escape: "esc",
-        Tab: "tab",
-        ArrowUp: "up",
-        ArrowDown: "down",
-        ArrowLeft: "left",
-        ArrowRight: "right",
-      };
-      const baseKey = baseKeyMap[event.key] || (event.key.length === 1 ? event.key.toLowerCase() : "");
-      if (!baseKey) {
-        return null;
-      }
-      const parts: string[] = [];
-      if (event.ctrlKey || event.metaKey) {
-        parts.push("ctrl");
-      }
-      if (event.altKey) {
-        parts.push("alt");
-      }
-      if (event.shiftKey) {
-        parts.push("shift");
-      }
-      parts.push(baseKey);
-      return parts.join("+");
+    const isEditableTarget = (target: EventTarget | null): boolean => {
+      const node = target as HTMLElement | null;
+      const tag = node?.tagName?.toLowerCase() || "";
+      return tag === "input" || tag === "textarea" || tag === "select" || !!node?.isContentEditable;
     };
 
-    const onKeyDown = (event: KeyboardEvent) => {
-      const target = event.target as HTMLElement | null;
-      const tag = target?.tagName?.toLowerCase() || "";
-      if (tag === "input" || tag === "textarea" || tag === "select" || target?.isContentEditable) {
+    const onPaste = (event: ClipboardEvent) => {
+      if (isEditableTarget(event.target)) {
         return;
       }
-      const shortcut = toDesktopShortcut(event);
-      if (shortcut) {
-        const passthroughShortcuts = new Set([
-          "ctrl+a",
-          "ctrl+c",
-          "ctrl+x",
-          "ctrl+z",
-          "ctrl+y",
-          "ctrl+shift+z",
-          "ctrl+tab",
-          "ctrl+shift+tab",
-          "alt+tab",
-          "alt+shift+tab",
-        ]);
-        if (shortcut === "ctrl+v") {
-          event.preventDefault();
-          event.stopPropagation();
-          void onDesktopPasteLocalClipboard(desktopSelectedPath || desktopTextInput);
-          return;
-        }
-        if (passthroughShortcuts.has(shortcut)) {
-          event.preventDefault();
-          event.stopPropagation();
-          void onDesktopSendQuickKey(shortcut);
-          return;
-        }
-      }
-
-      const specialKeys: Record<string, string> = {
-        Enter: "enter",
-        Backspace: "backspace",
-        Delete: "delete",
-        Escape: "esc",
-        Tab: "tab",
-        ArrowUp: "up",
-        ArrowDown: "down",
-        ArrowLeft: "left",
-        ArrowRight: "right",
-      };
-      const mappedKey = specialKeys[event.key];
-      if (mappedKey) {
-        event.preventDefault();
-        void onDesktopSendQuickKey(mappedKey);
+      const text = event.clipboardData?.getData("text/plain") || "";
+      event.preventDefault();
+      event.stopPropagation();
+      if (text || desktopPrimedPasteTextRef.current || desktopSelectedPath || desktopTextInput) {
+        void onDesktopPasteLocalClipboard(text);
         return;
       }
-      if (event.key === " " || event.key.length === 1) {
-        event.preventDefault();
-        void desktopSendText(event.key)
-          .then((response) => {
-            if (!response.ok) {
-              throw new Error(response.detail || response.error || "Desktop text failed.");
-            }
-            setDesktopAltHeld(Boolean(response.alt_held));
-            setDesktopStatus(`Typed "${event.key}" from fullscreen keyboard.`);
-          })
-          .catch((error: Error) => {
-            setError(`Desktop keyboard failed: ${error.message}`);
-          });
-      }
+      void onDesktopSendQuickKey("ctrl+v");
     };
 
-    document.addEventListener("keydown", onKeyDown, { capture: true });
-    return () => document.removeEventListener("keydown", onKeyDown, { capture: true });
-  }, [desktopEnabled, desktopFullscreen, desktopSelectedPath, desktopTextInput, onDesktopPasteLocalClipboard, onDesktopSendQuickKey, setError]);
+    const onCopyOrCut = (event: ClipboardEvent) => {
+      if (isEditableTarget(event.target)) {
+        return;
+      }
+      event.preventDefault();
+      event.stopPropagation();
+      void onDesktopSendQuickKey(event.type === "cut" ? "ctrl+x" : "ctrl+c");
+    };
+
+    document.addEventListener("paste", onPaste, { capture: true });
+    document.addEventListener("copy", onCopyOrCut, { capture: true });
+    document.addEventListener("cut", onCopyOrCut, { capture: true });
+    return () => {
+      document.removeEventListener("paste", onPaste, { capture: true });
+      document.removeEventListener("copy", onCopyOrCut, { capture: true });
+      document.removeEventListener("cut", onCopyOrCut, { capture: true });
+    };
+  }, [desktopEnabled, desktopFullscreen, desktopSelectedPath, desktopTextInput, onDesktopPasteLocalClipboard, onDesktopSendQuickKey]);
+
+  useEffect(() => {
+    const wantsAutoPerf = activeTab === "remote" && desktopFullscreen && desktopEnabled;
+    if (wantsAutoPerf && !desktopPerfActive && !desktopAutoPerfBusyRef.current) {
+      const autoEnabledFromDisabledState = !desktopPerfEnabled;
+      desktopAutoPerfBusyRef.current = true;
+      void setDesktopPerfMode(true)
+        .then((response) => {
+          if (!response.ok) {
+            throw new Error(response.detail || response.error || "Desktop performance mode request failed.");
+          }
+          setDesktopPerfEnabled(Boolean(response.perf_mode_enabled));
+          setDesktopPerfActive(Boolean(response.perf_mode_active));
+          setDesktopAltHeld(Boolean(response.alt_held));
+          if (autoEnabledFromDisabledState && response.perf_mode_enabled) {
+            desktopAutoPerfRef.current = true;
+          }
+        })
+        .catch((error: Error) => {
+          setError(`Boost host performance failed: ${error.message}`);
+        })
+        .finally(() => {
+          desktopAutoPerfBusyRef.current = false;
+        });
+      return;
+    }
+    if (!wantsAutoPerf && desktopAutoPerfRef.current && (desktopPerfEnabled || desktopPerfActive) && !desktopAutoPerfBusyRef.current) {
+      desktopAutoPerfBusyRef.current = true;
+      void setDesktopPerfMode(false)
+        .then((response) => {
+          if (!response.ok) {
+            throw new Error(response.detail || response.error || "Desktop performance mode request failed.");
+          }
+          setDesktopPerfEnabled(Boolean(response.perf_mode_enabled));
+          setDesktopPerfActive(Boolean(response.perf_mode_active));
+          setDesktopAltHeld(Boolean(response.alt_held));
+          desktopAutoPerfRef.current = false;
+        })
+        .catch((error: Error) => {
+          setError(`Boost host performance failed: ${error.message}`);
+        })
+        .finally(() => {
+          desktopAutoPerfBusyRef.current = false;
+        });
+    }
+  }, [activeTab, desktopEnabled, desktopFullscreen, desktopPerfActive, desktopPerfEnabled, setError]);
 
   const onRequestPowerAction = useCallback(async (action: PowerActionName, confirmToken = "") => {
     setPowerBusy(true);
@@ -5169,6 +5467,7 @@ export default function App() {
                           onPointerDown={(event) => void onDesktopPointerDown(event)}
                           onPointerMove={(event) => void onDesktopPointerMove(event)}
                           onPointerUp={(event) => void onDesktopPointerUp(event)}
+                          onPointerCancel={onDesktopPointerCancel}
                         />
                       </div>
                       <p className="small">

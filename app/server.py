@@ -3363,9 +3363,10 @@ def _desktop_move_abs(x: int, y: int) -> None:
     user32 = _win_user32()
     user32.SetCursorPos(int(x), int(y))
 
-def _desktop_click(button: str = "left", double: bool = False) -> None:
+def _desktop_click(button: str = "left", double: bool = False, action: str = "click") -> None:
     user32 = _win_user32()
     btn = (button or "left").strip().lower()
+    click_action = (action or "click").strip().lower()
     mapping = {
         "left": (0x0002, 0x0004),
         "right": (0x0008, 0x0010),
@@ -3373,7 +3374,15 @@ def _desktop_click(button: str = "left", double: bool = False) -> None:
     }
     if btn not in mapping:
         raise HTTPException(status_code=400, detail="Unsupported mouse button.")
+    if click_action not in {"click", "down", "up"}:
+        raise HTTPException(status_code=400, detail="Unsupported mouse action.")
     down, up = mapping[btn]
+    if click_action == "down":
+        user32.mouse_event(down, 0, 0, 0, 0)
+        return
+    if click_action == "up":
+        user32.mouse_event(up, 0, 0, 0, 0)
+        return
     times = 2 if double else 1
     for _ in range(times):
         user32.mouse_event(down, 0, 0, 0, 0)
@@ -7555,13 +7564,14 @@ def desktop_input_click(request: Request, payload: Dict[str, Any] = Body(...)):
     y = payload.get("y")
     button = (payload.get("button") or "left").strip().lower()
     double = bool(payload.get("double", False))
+    action = (payload.get("action") or "click").strip().lower()
     if x is not None and y is not None:
         p = _desktop_point(int(x), int(y))
         _desktop_move_abs(p["x"], p["y"])
-    _desktop_click(button=button, double=double)
+    _desktop_click(button=button, double=double, action=action)
     if alt_held_before_click:
         _desktop_release_alt_if_held()
-    return {"ok": True, "button": button, "double": double, "alt_held": _desktop_alt_held()}
+    return {"ok": True, "button": button, "double": double, "action": action, "alt_held": _desktop_alt_held()}
 
 @app.post("/desktop/input/scroll")
 def desktop_input_scroll(request: Request, payload: Dict[str, Any] = Body(...)):

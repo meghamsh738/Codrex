@@ -4,6 +4,64 @@ import App from "../App";
 import * as api from "../api";
 import type { SessionInfo } from "../types";
 
+function mockRect(width: number, height: number, left = 0, top = 0) {
+  return {
+    left,
+    top,
+    width,
+    height,
+    right: left + width,
+    bottom: top + height,
+    x: left,
+    y: top,
+    toJSON: () => ({}),
+  };
+}
+
+function firePointer(
+  node: Element,
+  type: "pointerdown" | "pointermove" | "pointerup" | "pointercancel",
+  init: {
+    clientX: number;
+    clientY: number;
+    pointerId?: number;
+    pointerType?: string;
+    buttons?: number;
+  },
+) {
+  const event = new Event(type, {
+    bubbles: true,
+    cancelable: true,
+  });
+  Object.defineProperties(event, {
+    clientX: {
+      configurable: true,
+      value: init.clientX,
+    },
+    clientY: {
+      configurable: true,
+      value: init.clientY,
+    },
+    button: {
+      configurable: true,
+      value: 0,
+    },
+    buttons: {
+      configurable: true,
+      value: init.buttons ?? (type === "pointerup" || type === "pointercancel" ? 0 : 1),
+    },
+    pointerId: {
+      configurable: true,
+      value: init.pointerId ?? 1,
+    },
+    pointerType: {
+      configurable: true,
+      value: init.pointerType ?? "touch",
+    },
+  });
+  fireEvent(node, event);
+}
+
 vi.mock("../api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../api")>();
   return {
@@ -135,6 +193,7 @@ const startCodexExecMock = vi.mocked(api.startCodexExec);
 const setIpcObserverMock = vi.mocked(api.setIpcObserver);
 const uploadWslFileMock = vi.mocked(api.uploadWslFile);
 const clipboardWriteTextMock = vi.fn();
+const clipboardReadTextMock = vi.fn();
 
 function setupDefaultMocks(): void {
   window.localStorage.removeItem("codrex.ui.controller_base.v1");
@@ -395,11 +454,13 @@ describe("app shell tabs", () => {
     });
     clipboardWriteTextMock.mockReset();
     clipboardWriteTextMock.mockResolvedValue(undefined);
+    clipboardReadTextMock.mockReset();
+    clipboardReadTextMock.mockResolvedValue("");
     Object.defineProperty(navigator, "clipboard", {
       configurable: true,
       value: {
         writeText: clipboardWriteTextMock,
-        readText: vi.fn().mockResolvedValue(""),
+        readText: clipboardReadTextMock,
       },
     });
     setupDefaultMocks();
@@ -489,17 +550,7 @@ describe("app shell tabs", () => {
     const streamImage = screen.getByAltText("Desktop stream");
     Object.defineProperty(streamImage, "getBoundingClientRect", {
       configurable: true,
-      value: () => ({
-        left: 0,
-        top: 0,
-        width: 960,
-        height: 540,
-        right: 960,
-        bottom: 540,
-        x: 0,
-        y: 0,
-        toJSON: () => ({}),
-      }),
+      value: () => mockRect(960, 540),
     });
     fireEvent.click(streamImage, { clientX: 120, clientY: 80 });
 
@@ -539,17 +590,7 @@ describe("app shell tabs", () => {
     const streamImage = screen.getByAltText("Desktop stream");
     Object.defineProperty(streamImage, "getBoundingClientRect", {
       configurable: true,
-      value: () => ({
-        left: 0,
-        top: 0,
-        width: 960,
-        height: 540,
-        right: 960,
-        bottom: 540,
-        x: 0,
-        y: 0,
-        toJSON: () => ({}),
-      }),
+      value: () => mockRect(960, 540),
     });
     fireEvent.click(streamImage, { clientX: 140, clientY: 100 });
     desktopClickMock.mockClear();
@@ -561,6 +602,111 @@ describe("app shell tabs", () => {
     });
     expect(desktopSendTextMock).not.toHaveBeenCalled();
     expect(desktopClickMock).not.toHaveBeenCalled();
+  });
+
+  it("maps fullscreen direct taps against the contained image instead of the letterboxed frame", async () => {
+    getDesktopInfoMock.mockResolvedValue({
+      ok: true,
+      enabled: true,
+      width: 2000,
+      height: 1000,
+    });
+
+    render(<App />);
+
+    fireEvent.click(await screen.findByTestId("tab-remote"));
+    await screen.findByRole("button", { name: "Disable Control" });
+    fireEvent.click(screen.getByRole("button", { name: "Trackpad: On" }));
+    fireEvent.click(screen.getByTestId("remote-fullscreen-toggle"));
+    await screen.findByTestId("remote-overlay-copy-path");
+
+    const streamImage = screen.getByAltText("Desktop stream");
+    Object.defineProperty(streamImage, "getBoundingClientRect", {
+      configurable: true,
+      value: () => mockRect(1000, 1000),
+    });
+
+    fireEvent.click(streamImage, { clientX: 500, clientY: 250 });
+
+    await waitFor(() => {
+      expect(desktopClickMock).toHaveBeenCalledWith(expect.objectContaining({ x: 1000, y: 0, button: "left" }));
+    });
+  });
+
+  it("sends fullscreen touch scroll gestures to the desktop", async () => {
+    getDesktopInfoMock.mockResolvedValue({
+      ok: true,
+      enabled: true,
+      width: 1920,
+      height: 1080,
+    });
+
+    render(<App />);
+
+    fireEvent.click(await screen.findByTestId("tab-remote"));
+    await screen.findByRole("button", { name: "Disable Control" });
+    fireEvent.click(screen.getByTestId("remote-fullscreen-toggle"));
+    await screen.findByTestId("remote-overlay-copy-path");
+
+    const streamImage = screen.getByAltText("Desktop stream");
+    Object.defineProperty(streamImage, "getBoundingClientRect", {
+      configurable: true,
+      value: () => mockRect(960, 540),
+    });
+    Object.defineProperty(streamImage, "setPointerCapture", {
+      configurable: true,
+      value: vi.fn(),
+    });
+
+    firePointer(streamImage, "pointerdown", { pointerId: 1, pointerType: "touch", clientX: 200, clientY: 140 });
+    firePointer(streamImage, "pointermove", { pointerId: 1, pointerType: "touch", clientX: 206, clientY: 188 });
+
+    await waitFor(() => {
+      expect(desktopScrollMock).toHaveBeenCalledWith(240);
+    });
+  });
+
+  it("starts and releases a fullscreen touch drag after a short hold", async () => {
+    getDesktopInfoMock.mockResolvedValue({
+      ok: true,
+      enabled: true,
+      width: 1920,
+      height: 1080,
+    });
+
+    render(<App />);
+
+    fireEvent.click(await screen.findByTestId("tab-remote"));
+    await screen.findByRole("button", { name: "Disable Control" });
+    fireEvent.click(screen.getByTestId("remote-fullscreen-toggle"));
+    await screen.findByTestId("remote-overlay-copy-path");
+
+    const streamImage = screen.getByAltText("Desktop stream");
+    Object.defineProperty(streamImage, "getBoundingClientRect", {
+      configurable: true,
+      value: () => mockRect(960, 540),
+    });
+    Object.defineProperty(streamImage, "setPointerCapture", {
+      configurable: true,
+      value: vi.fn(),
+    });
+
+    firePointer(streamImage, "pointerdown", { pointerId: 1, pointerType: "touch", clientX: 120, clientY: 120 });
+    await new Promise((resolve) => setTimeout(resolve, 260));
+
+    await waitFor(() => {
+      expect(desktopClickMock).toHaveBeenCalledWith(expect.objectContaining({ x: 240, y: 240, button: "left", action: "down" }));
+    });
+
+    firePointer(streamImage, "pointermove", { pointerId: 1, pointerType: "touch", clientX: 240, clientY: 180 });
+    await waitFor(() => {
+      expect(desktopMoveMock).toHaveBeenCalledWith(480, 360);
+    });
+
+    firePointer(streamImage, "pointerup", { pointerId: 1, pointerType: "touch", clientX: 300, clientY: 210 });
+    await waitFor(() => {
+      expect(desktopClickMock).toHaveBeenCalledWith(expect.objectContaining({ x: 600, y: 420, button: "left", action: "up" }));
+    });
   });
 
   it("copies the selected Explorer path from the remote controls", async () => {
@@ -1286,6 +1432,183 @@ describe("app shell tabs", () => {
 
     await waitFor(() => {
       expect(desktopSendTextMock).toHaveBeenCalledWith("a");
+    });
+  });
+
+  it("pastes the primed focused path on the next fullscreen Ctrl+V", async () => {
+    getDesktopInfoMock.mockResolvedValue({
+      ok: true,
+      enabled: true,
+      width: 1920,
+      height: 1080,
+    });
+
+    render(<App />);
+
+    fireEvent.click(await screen.findByTestId("tab-remote"));
+    await screen.findByRole("button", { name: "Disable Control" });
+    fireEvent.click(screen.getByTestId("remote-fullscreen-toggle"));
+
+    fireEvent.click(await screen.findByTestId("remote-overlay-copy-path"));
+
+    await waitFor(() => {
+      expect(desktopGetSelectedPathMock).toHaveBeenCalled();
+      expect(clipboardWriteTextMock).toHaveBeenCalledWith("D:\\Reports\\result.png");
+    });
+
+    desktopSendTextMock.mockClear();
+    desktopSendKeyMock.mockClear();
+
+    fireEvent.keyDown(document, { key: "v", ctrlKey: true });
+
+    await waitFor(() => {
+      expect(desktopSendTextMock).toHaveBeenCalledWith("D:\\Reports\\result.png");
+    });
+    expect(desktopSendKeyMock).not.toHaveBeenCalledWith("ctrl+v");
+  });
+
+  it("keeps Ctrl+C and Ctrl+V as real remote shortcuts when no local paste is armed", async () => {
+    getDesktopInfoMock.mockResolvedValue({
+      ok: true,
+      enabled: true,
+      width: 1920,
+      height: 1080,
+    });
+
+    render(<App />);
+
+    fireEvent.click(await screen.findByTestId("tab-remote"));
+    await screen.findByRole("button", { name: "Disable Control" });
+    fireEvent.click(screen.getByTestId("remote-fullscreen-toggle"));
+    await screen.findByTestId("remote-overlay-copy-path");
+
+    desktopSendTextMock.mockClear();
+    desktopSendKeyMock.mockClear();
+
+    fireEvent.keyDown(document, { key: "c", ctrlKey: true });
+    fireEvent.keyDown(document, { key: "v", ctrlKey: true });
+
+    await waitFor(() => {
+      expect(desktopSendKeyMock).toHaveBeenCalledWith("ctrl+c");
+      expect(desktopSendKeyMock).toHaveBeenCalledWith("ctrl+v");
+    });
+    expect(desktopSendTextMock).not.toHaveBeenCalled();
+  });
+
+  it("uses local clipboard text for fullscreen Ctrl+V when no recent remote copy is armed", async () => {
+    getDesktopInfoMock.mockResolvedValue({
+      ok: true,
+      enabled: true,
+      width: 1920,
+      height: 1080,
+    });
+    clipboardReadTextMock.mockResolvedValue("tablet clipboard payload");
+
+    render(<App />);
+
+    fireEvent.click(await screen.findByTestId("tab-remote"));
+    await screen.findByRole("button", { name: "Disable Control" });
+    fireEvent.click(screen.getByTestId("remote-fullscreen-toggle"));
+    await screen.findByTestId("remote-overlay-copy-path");
+
+    desktopSendTextMock.mockClear();
+    desktopSendKeyMock.mockClear();
+
+    fireEvent.keyDown(document, { key: "v", ctrlKey: true });
+
+    await waitFor(() => {
+      expect(desktopSendTextMock).toHaveBeenCalledWith("tablet clipboard payload");
+    });
+    expect(desktopSendKeyMock).not.toHaveBeenCalledWith("ctrl+v");
+  });
+
+  it("handles tablet paste events in fullscreen by sending clipboard text to the desktop", async () => {
+    getDesktopInfoMock.mockResolvedValue({
+      ok: true,
+      enabled: true,
+      width: 1920,
+      height: 1080,
+    });
+
+    render(<App />);
+
+    fireEvent.click(await screen.findByTestId("tab-remote"));
+    await screen.findByRole("button", { name: "Disable Control" });
+    fireEvent.click(screen.getByTestId("remote-fullscreen-toggle"));
+    await screen.findByTestId("remote-overlay-copy-path");
+
+    desktopSendTextMock.mockClear();
+    desktopSendKeyMock.mockClear();
+
+    fireEvent.paste(document, {
+      clipboardData: {
+        getData: (format: string) => (format === "text/plain" ? "tablet clipboard text" : ""),
+      },
+    });
+
+    await waitFor(() => {
+      expect(desktopSendTextMock).toHaveBeenCalledWith("tablet clipboard text");
+    });
+    expect(desktopSendKeyMock).not.toHaveBeenCalledWith("ctrl+v");
+  });
+
+  it("handles tablet copy and empty paste events in fullscreen as remote shortcuts", async () => {
+    getDesktopInfoMock.mockResolvedValue({
+      ok: true,
+      enabled: true,
+      width: 1920,
+      height: 1080,
+    });
+
+    render(<App />);
+
+    fireEvent.click(await screen.findByTestId("tab-remote"));
+    await screen.findByRole("button", { name: "Disable Control" });
+    fireEvent.click(screen.getByTestId("remote-fullscreen-toggle"));
+    await screen.findByTestId("remote-overlay-copy-path");
+
+    desktopSendTextMock.mockClear();
+    desktopSendKeyMock.mockClear();
+
+    fireEvent.copy(document);
+    fireEvent.paste(document, {
+      clipboardData: {
+        getData: () => "",
+      },
+    });
+
+    await waitFor(() => {
+      expect(desktopSendKeyMock).toHaveBeenCalledWith("ctrl+c");
+      expect(desktopSendKeyMock).toHaveBeenCalledWith("ctrl+v");
+    });
+    expect(desktopSendTextMock).not.toHaveBeenCalled();
+  });
+
+  it("auto-enables host boost when fullscreen remote mode opens", async () => {
+    getDesktopInfoMock.mockResolvedValue({
+      ok: true,
+      enabled: true,
+      perf_mode_enabled: false,
+      perf_mode_active: false,
+      width: 1920,
+      height: 1080,
+    });
+    setDesktopPerfModeMock.mockResolvedValue({
+      ok: true,
+      enabled: true,
+      perf_mode_enabled: true,
+      perf_mode_active: true,
+      alt_held: false,
+    });
+
+    render(<App />);
+
+    fireEvent.click(await screen.findByTestId("tab-remote"));
+    await screen.findByRole("button", { name: "Disable Control" });
+    fireEvent.click(screen.getByTestId("remote-fullscreen-toggle"));
+
+    await waitFor(() => {
+      expect(setDesktopPerfModeMock).toHaveBeenCalledWith(true);
     });
   });
 

@@ -729,7 +729,13 @@ export function setDesktopPerfMode(enabled: boolean): Promise<DesktopModeResult>
   });
 }
 
-export function desktopClick(params: { button?: "left" | "right"; double?: boolean; x?: number; y?: number }): Promise<DesktopInputResult> {
+export function desktopClick(params: {
+  button?: "left" | "right";
+  double?: boolean;
+  x?: number;
+  y?: number;
+  action?: "click" | "down" | "up";
+}): Promise<DesktopInputResult> {
   return requestJson<DesktopInputResult>("/desktop/input/click", {
     method: "POST",
     headers: JSON_HEADERS,
@@ -738,6 +744,7 @@ export function desktopClick(params: { button?: "left" | "right"; double?: boole
       double: !!params.double,
       x: params.x,
       y: params.y,
+      action: params.action || "click",
     }),
   });
 }
