@@ -248,6 +248,28 @@ function Get-CodrexRuntimeDir {
   return (Join-Path $RepoRoot ".runtime")
 }
 
+function Test-CodrexStackPerfModeEnabled {
+  $raw = [string]$env:CODEX_RUNTIME_STACK_PERF
+  if (-not $raw) {
+    return $false
+  }
+  $normalized = $raw.Trim().ToLowerInvariant()
+  return $normalized -in @("1", "true", "yes", "on")
+}
+
+function Clear-CodrexDesktopPerfArtifacts {
+  param([string]$SnapshotPath)
+  foreach ($path in @(
+    $SnapshotPath,
+    (Join-Path (Split-Path -Parent $SnapshotPath) "desktop-perf-wallpaper.bmp"),
+    (Join-Path (Split-Path -Parent $SnapshotPath) "desktop-perf-restore.bmp")
+  )) {
+    if ($path -and (Test-Path $path)) {
+      Remove-Item $path -Force -ErrorAction SilentlyContinue
+    }
+  }
+}
+
 $uiRoot = Join-Path $root "ui"
 $runtimeDir = Get-CodrexRuntimeDir -RepoRoot $root
 $stateDir = Join-Path $runtimeDir "state"
@@ -259,6 +281,7 @@ $sessionPath = Join-Path $stateDir "mobile.session.json"
 $desktopPerfSnapshotPath = Join-Path $stateDir "desktop-perf.json"
 $uiOutLog = Join-Path $logsDir "ui.out.log"
 $uiErrLog = Join-Path $logsDir "ui.err.log"
+$stackPerfModeEnabled = Test-CodrexStackPerfModeEnabled
 
 if (-not (Test-Path $uiRoot)) {
   throw "UI folder not found at $uiRoot"
@@ -657,7 +680,12 @@ $persistedSession = Read-SessionData -Path $sessionPath
 if (-not $persistedSession -or [int]$persistedSession.controller_port -ne $controllerPort) {
   throw "Codrex runtime session file was not written correctly at $sessionPath"
 }
-$perfModeApplied = Enable-CodrexDesktopPerfMode -SnapshotPath $desktopPerfSnapshotPath
+$perfModeApplied = $false
+if ($stackPerfModeEnabled) {
+  $perfModeApplied = Enable-CodrexDesktopPerfMode -SnapshotPath $desktopPerfSnapshotPath
+} else {
+  Clear-CodrexDesktopPerfArtifacts -SnapshotPath $desktopPerfSnapshotPath
+}
 
 Write-Host ""
 Write-Host "Mobile stack ready."
@@ -682,6 +710,7 @@ Write-StartMobileDiagnostic -Ok:$true -Detail "Mobile stack ready." -Extra ([psc
   dev_ui = [bool]$DevUi
   open_firewall = [bool]$OpenFirewall
   session_written = [bool]$persistedSession
+  perf_mode_script_enabled = [bool]$stackPerfModeEnabled
   perf_mode_applied = [bool]$perfModeApplied
   controller_start_ms = $controllerStartMs
   mobile_ready_ms = [int]$startupTimer.ElapsedMilliseconds

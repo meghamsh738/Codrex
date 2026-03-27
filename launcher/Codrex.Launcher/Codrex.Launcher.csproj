@@ -8,6 +8,7 @@
     <AssemblyName>Codrex.Launcher</AssemblyName>
     <RootNamespace>Codrex.Launcher</RootNamespace>
     <Platforms>x64</Platforms>
+    <ApplicationIcon>Assets\codrex-icon.ico</ApplicationIcon>
   </PropertyGroup>
 
   <ItemGroup>
@@ -16,5 +17,6 @@
 
   <ItemGroup>
     <EmbeddedResource Include="Assets\launcher.html" />
+    <Resource Include="Assets\codrex-icon.ico" />
   </ItemGroup>
 </Project>

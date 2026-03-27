@@ -108,6 +108,28 @@ function Get-CodrexRuntimeDir {
   return (Join-Path $RepoRoot ".runtime")
 }
 
+function Test-CodrexStackPerfModeEnabled {
+  $raw = [string]$env:CODEX_RUNTIME_STACK_PERF
+  if (-not $raw) {
+    return $false
+  }
+  $normalized = $raw.Trim().ToLowerInvariant()
+  return $normalized -in @("1", "true", "yes", "on")
+}
+
+function Clear-CodrexDesktopPerfArtifacts {
+  param([string]$SnapshotPath)
+  foreach ($path in @(
+    $SnapshotPath,
+    (Join-Path (Split-Path -Parent $SnapshotPath) "desktop-perf-wallpaper.bmp"),
+    (Join-Path (Split-Path -Parent $SnapshotPath) "desktop-perf-restore.bmp")
+  )) {
+    if ($path -and (Test-Path $path)) {
+      Remove-Item $path -Force -ErrorAction SilentlyContinue
+    }
+  }
+}
+
 $runtimeDir = Get-CodrexRuntimeDir -RepoRoot $root
 $stateDir = Join-Path $runtimeDir "state"
 $sessionPath = Join-Path $stateDir "mobile.session.json"
@@ -128,6 +150,7 @@ if (-not $script:DiagActionName) {
 }
 $script:DiagSource = "stop-mobile"
 $stopTimer = [System.Diagnostics.Stopwatch]::StartNew()
+$stackPerfModeEnabled = Test-CodrexStackPerfModeEnabled
 
 function Write-StopMobileDiagnostic {
   param(
@@ -344,7 +367,12 @@ if (Test-Path $sessionPath) {
 if (Test-Path $legacySessionPath) {
   Remove-Item $legacySessionPath -Force -ErrorAction SilentlyContinue
 }
-$perfModeRestored = Disable-CodrexDesktopPerfMode -SnapshotPath $desktopPerfSnapshotPath
+$perfModeRestored = $false
+if ($stackPerfModeEnabled) {
+  $perfModeRestored = Disable-CodrexDesktopPerfMode -SnapshotPath $desktopPerfSnapshotPath
+} else {
+  Clear-CodrexDesktopPerfArtifacts -SnapshotPath $desktopPerfSnapshotPath
+}
 
 $controllerListening = Test-PortListening -Port $controllerPort
 $uiListening = if ($UiPort -gt 0) { Test-PortListening -Port $UiPort } else { $false }
@@ -360,6 +388,7 @@ Write-StopMobileDiagnostic -Ok:([bool]$result.ok) -Detail $(if ($result.ok) { "M
   controller_status = $result.controller_status
   ui_stopped = [bool]$result.ui_stopped
   stale_session_file_removed = [bool]$result.stale_session_file_removed
+  perf_mode_script_enabled = [bool]$stackPerfModeEnabled
   perf_mode_restored = [bool]$perfModeRestored
   stop_complete_ms = [int]$stopTimer.ElapsedMilliseconds
 })

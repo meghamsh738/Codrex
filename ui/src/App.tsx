@@ -859,11 +859,24 @@ export default function App() {
   const scheduledSessionsRefreshRef = useRef<number | null>(null);
   const remoteStageRef = useRef<HTMLDivElement | null>(null);
   const desktopFrameRef = useRef<HTMLImageElement | null>(null);
-  const desktopPointerRef = useRef<{ active: boolean; x: number; y: number; moved: boolean }>({
+  const desktopPointerRef = useRef<{
+    active: boolean;
+    startX: number;
+    startY: number;
+    x: number;
+    y: number;
+    moved: boolean;
+    scrolling: boolean;
+    pointerType: string;
+  }>({
     active: false,
+    startX: 0,
+    startY: 0,
     x: 0,
     y: 0,
     moved: false,
+    scrolling: false,
+    pointerType: "",
   });
   const desktopIgnoreNextClickRef = useRef(false);
   const threadLastAssistantAtRef = useRef<Record<string, number>>({});
@@ -2372,11 +2385,9 @@ export default function App() {
         ? "Ready"
       : statusMessage;
   const canSendPrompt = promptText.trim().length > 0;
-  const composerTelegramDisabledReason = !telegramConfigured
-    ? "Telegram is not configured."
-    : !selectedSession
-      ? "Select a session first."
-      : "";
+  const composerTelegramDisabledReason = !selectedSession
+    ? "Select a session first."
+    : "";
   const sessionNotesSavedLabel = sessionNotesInfo?.updated_at ? `Saved ${formatClock(sessionNotesInfo.updated_at)}` : "Not saved yet";
   const hasLatestSessionResponse = Boolean(
     latestSessionResponseSnapshot.trim() || (sessionNotesInfo?.last_response_snapshot || "").trim(),
@@ -2444,10 +2455,16 @@ export default function App() {
         throw new Error(response.detail || response.error || "Invalid token.");
       }
       setTokenInput("");
-      await refreshAuth();
-      await refreshSessions();
-      await refreshTelegramStatus();
-      await refreshThreads();
+      await Promise.all([
+        refreshAuth(),
+        refreshSessions(),
+        refreshTelegramStatus(),
+        refreshThreads(),
+        refreshDebugRuns(),
+        refreshTmuxState(),
+        refreshDesktopState(),
+        refreshPowerStatus(),
+      ]);
       setStatus("Logged in.");
       setActiveTab("sessions");
     } catch (error) {
@@ -2455,7 +2472,7 @@ export default function App() {
     } finally {
       setAuthBusy(false);
     }
-  }, [refreshAuth, refreshSessions, refreshTelegramStatus, refreshThreads, setError, setStatus, tokenInput]);
+  }, [refreshAuth, refreshDebugRuns, refreshDesktopState, refreshPowerStatus, refreshSessions, refreshTelegramStatus, refreshThreads, refreshTmuxState, setError, setStatus, tokenInput]);
 
   const onBootstrapLocalAuth = useCallback(async () => {
     setAuthBusy(true);
@@ -2464,10 +2481,16 @@ export default function App() {
       if (!response.ok) {
         throw new Error(response.detail || response.error || "Local laptop auth is unavailable.");
       }
-      await refreshAuth();
-      await refreshSessions();
-      await refreshTelegramStatus();
-      await refreshThreads();
+      await Promise.all([
+        refreshAuth(),
+        refreshSessions(),
+        refreshTelegramStatus(),
+        refreshThreads(),
+        refreshDebugRuns(),
+        refreshTmuxState(),
+        refreshDesktopState(),
+        refreshPowerStatus(),
+      ]);
       setStatus("Local laptop authentication is active.");
       setActiveTab("sessions");
     } catch (error) {
@@ -2475,7 +2498,7 @@ export default function App() {
     } finally {
       setAuthBusy(false);
     }
-  }, [refreshAuth, refreshSessions, refreshTelegramStatus, refreshThreads, setError, setStatus]);
+  }, [refreshAuth, refreshDebugRuns, refreshDesktopState, refreshPowerStatus, refreshSessions, refreshTelegramStatus, refreshThreads, refreshTmuxState, setError, setStatus]);
 
   const onLogout = useCallback(async () => {
     setAuthBusy(true);
@@ -3013,10 +3036,6 @@ export default function App() {
       setError("Select a session first.");
       return;
     }
-    if (!telegramConfigured) {
-      setError("Telegram is not configured yet.");
-      return;
-    }
     const command = buildTelegramSessionPrompt();
     const existingDraft = promptText.trim();
     const combinedPrompt = existingDraft ? `${existingDraft}\n\n${command}` : command;
@@ -3040,14 +3059,7 @@ export default function App() {
     } finally {
       setComposerTelegramBusy(false);
     }
-  }, [
-    promptText,
-    selectedSession,
-    setError,
-    setPromptText,
-    submitPromptText,
-    telegramConfigured,
-  ]);
+  }, [promptText, selectedSession, setError, setPromptText, submitPromptText]);
 
   const onCopySessionNotes = useCallback(async () => {
     const text = sessionNotes.trim();
@@ -3124,9 +3136,15 @@ export default function App() {
         throw new Error(response.detail || response.error || "No selected Explorer path.");
       }
       setDesktopSelectedPath(response.path);
+      setDesktopTextInput(response.path);
       await copyTextWithFallback(response.path);
       const count = Number(response.count || 0);
-      setStatus(count > 1 ? `Copied first of ${count} selected paths: ${response.path}` : `Copied selected path: ${response.path}`);
+      remoteStageRef.current?.focus({ preventScroll: true });
+      setStatus(
+        count > 1
+          ? `Copied first of ${count} selected paths: ${response.path}. Press Ctrl+V in fullscreen to send it to the desktop.`
+          : `Copied selected path: ${response.path}. Press Ctrl+V in fullscreen to send it to the desktop.`,
+      );
     } catch (error) {
       setError(`Copy selected path failed: ${(error as Error).message}`);
     }
@@ -3653,36 +3671,78 @@ export default function App() {
     if (event.pointerType === "mouse" && !desktopTrackpadMode) {
       return;
     }
+    remoteStageRef.current?.focus({ preventScroll: true });
     desktopPointerRef.current = {
       active: true,
+      startX: event.clientX,
+      startY: event.clientY,
       x: event.clientX,
       y: event.clientY,
       moved: false,
+      scrolling: false,
+      pointerType: event.pointerType,
     };
     event.currentTarget.setPointerCapture(event.pointerId);
   }, [desktopEnabled, desktopTrackpadMode]);
 
   const onDesktopPointerMove = useCallback(async (event: React.PointerEvent<HTMLImageElement>) => {
-    if (!desktopEnabled || !desktopTrackpadMode || !desktopPointerRef.current.active) {
+    if (!desktopEnabled || !desktopPointerRef.current.active) {
       return;
     }
     const state = desktopPointerRef.current;
+    const allowFullscreenTouchGesture = desktopFullscreen && state.pointerType === "touch";
+    if (!desktopTrackpadMode && !allowFullscreenTouchGesture) {
+      return;
+    }
+    const totalDeltaX = event.clientX - state.startX;
+    const totalDeltaY = event.clientY - state.startY;
+    const stepDeltaY = event.clientY - state.y;
+    const canScrollByTouch =
+      desktopFullscreen &&
+      state.pointerType === "touch" &&
+      (state.scrolling || (Math.abs(totalDeltaY) > 24 && Math.abs(totalDeltaY) > Math.abs(totalDeltaX) * 1.25));
+    if (canScrollByTouch) {
+      desktopPointerRef.current = {
+        ...state,
+        x: event.clientX,
+        y: event.clientY,
+        moved: true,
+        scrolling: true,
+      };
+      if (Math.abs(stepDeltaY) >= 18) {
+        await onDesktopScroll(stepDeltaY >= 0 ? 240 : -240);
+      }
+      return;
+    }
+    if (allowFullscreenTouchGesture && !desktopTrackpadMode) {
+      return;
+    }
     const delta = Math.abs(event.clientX - state.x) + Math.abs(event.clientY - state.y);
     if (delta < 8) {
       return;
     }
     desktopPointerRef.current = {
-      active: true,
+      ...state,
       x: event.clientX,
       y: event.clientY,
       moved: true,
+      scrolling: false,
     };
     await onDesktopMovePointer(event.clientX, event.clientY);
-  }, [desktopEnabled, desktopTrackpadMode, onDesktopMovePointer]);
+  }, [desktopEnabled, desktopFullscreen, desktopTrackpadMode, onDesktopMovePointer, onDesktopScroll]);
 
   const onDesktopPointerUp = useCallback(async (event: React.PointerEvent<HTMLImageElement>) => {
     const state = desktopPointerRef.current;
-    desktopPointerRef.current = { active: false, x: 0, y: 0, moved: false };
+    desktopPointerRef.current = {
+      active: false,
+      startX: 0,
+      startY: 0,
+      x: 0,
+      y: 0,
+      moved: false,
+      scrolling: false,
+      pointerType: "",
+    };
     if (!desktopEnabled) {
       return;
     }
@@ -3694,6 +3754,10 @@ export default function App() {
       return;
     }
     setDesktopFocusPoint(target);
+    if (state.scrolling) {
+      setDesktopStatus("Touch scroll gesture sent.");
+      return;
+    }
     if (desktopTrackpadMode && state.moved) {
       setDesktopStatus(`Pointer focused at ${target.x}, ${target.y}.`);
       return;
@@ -3738,6 +3802,7 @@ export default function App() {
       setDesktopStatus("Desktop control is disabled. Enable Desktop first.");
       return;
     }
+    remoteStageRef.current?.focus({ preventScroll: true });
     if (desktopIgnoreNextClickRef.current) {
       desktopIgnoreNextClickRef.current = false;
       event.preventDefault();
@@ -3767,6 +3832,7 @@ export default function App() {
     try {
       if (!document.fullscreenElement) {
         await remoteStageRef.current?.requestFullscreen();
+        remoteStageRef.current?.focus({ preventScroll: true });
       } else {
         await document.exitFullscreen();
       }
@@ -3774,6 +3840,10 @@ export default function App() {
       setError(`Fullscreen failed: ${(error as Error).message}`);
     }
   }, [setError]);
+
+  const onRemoteStageFocus = useCallback(() => {
+    remoteStageRef.current?.focus({ preventScroll: true });
+  }, []);
 
   const onDesktopSendKey = useCallback(async () => {
     if (!desktopEnabled) {
@@ -3810,6 +3880,46 @@ export default function App() {
     }
   }, [desktopEnabled, setError]);
 
+  const onDesktopPasteLocalClipboard = useCallback(async (fallbackText = "") => {
+    if (!desktopEnabled) {
+      setError("Desktop control is disabled. Enable Desktop first.");
+      return;
+    }
+    if (!desktopFocusPoint) {
+      setError("Tap the remote desktop once to focus the target app/window first.");
+      return;
+    }
+
+    let text = "";
+    try {
+      if (typeof navigator !== "undefined" && navigator.clipboard?.readText) {
+        text = await navigator.clipboard.readText();
+      }
+    } catch {
+      text = "";
+    }
+
+    if (!text) {
+      text = fallbackText || desktopTextInput;
+    }
+    if (!text) {
+      setError("Clipboard is empty/unavailable. Copy a path or load text first.");
+      return;
+    }
+
+    try {
+      const response = await desktopSendText(text);
+      if (!response.ok) {
+        throw new Error(response.detail || response.error || "Desktop paste failed.");
+      }
+      setDesktopAltHeld(Boolean(response.alt_held));
+      setDesktopTextInput(text);
+      setDesktopStatus(`Pasted local clipboard into focused app at ${desktopFocusPoint.x}, ${desktopFocusPoint.y}.`);
+    } catch (error) {
+      setError(`Desktop paste failed: ${(error as Error).message}`);
+    }
+  }, [desktopEnabled, desktopFocusPoint, desktopTextInput, setError]);
+
   useEffect(() => {
     if (!desktopAltHeld) {
       return;
@@ -3828,6 +3938,117 @@ export default function App() {
         setDesktopAltHeld(false);
       });
   }, [activeTab, desktopAltHeld, desktopEnabled]);
+
+  useEffect(() => {
+    if (!desktopEnabled || !desktopFullscreen) {
+      return;
+    }
+
+    const toDesktopShortcut = (event: KeyboardEvent): string | null => {
+      const baseKeyMap: Record<string, string> = {
+        a: "a",
+        c: "c",
+        x: "x",
+        y: "y",
+        z: "z",
+        Enter: "enter",
+        Backspace: "backspace",
+        Delete: "delete",
+        Escape: "esc",
+        Tab: "tab",
+        ArrowUp: "up",
+        ArrowDown: "down",
+        ArrowLeft: "left",
+        ArrowRight: "right",
+      };
+      const baseKey = baseKeyMap[event.key] || (event.key.length === 1 ? event.key.toLowerCase() : "");
+      if (!baseKey) {
+        return null;
+      }
+      const parts: string[] = [];
+      if (event.ctrlKey || event.metaKey) {
+        parts.push("ctrl");
+      }
+      if (event.altKey) {
+        parts.push("alt");
+      }
+      if (event.shiftKey) {
+        parts.push("shift");
+      }
+      parts.push(baseKey);
+      return parts.join("+");
+    };
+
+    const onKeyDown = (event: KeyboardEvent) => {
+      const target = event.target as HTMLElement | null;
+      const tag = target?.tagName?.toLowerCase() || "";
+      if (tag === "input" || tag === "textarea" || tag === "select" || target?.isContentEditable) {
+        return;
+      }
+      const shortcut = toDesktopShortcut(event);
+      if (shortcut) {
+        const passthroughShortcuts = new Set([
+          "ctrl+a",
+          "ctrl+c",
+          "ctrl+x",
+          "ctrl+z",
+          "ctrl+y",
+          "ctrl+shift+z",
+          "ctrl+tab",
+          "ctrl+shift+tab",
+          "alt+tab",
+          "alt+shift+tab",
+        ]);
+        if (shortcut === "ctrl+v") {
+          event.preventDefault();
+          event.stopPropagation();
+          void onDesktopPasteLocalClipboard(desktopSelectedPath || desktopTextInput);
+          return;
+        }
+        if (passthroughShortcuts.has(shortcut)) {
+          event.preventDefault();
+          event.stopPropagation();
+          void onDesktopSendQuickKey(shortcut);
+          return;
+        }
+      }
+
+      const specialKeys: Record<string, string> = {
+        Enter: "enter",
+        Backspace: "backspace",
+        Delete: "delete",
+        Escape: "esc",
+        Tab: "tab",
+        ArrowUp: "up",
+        ArrowDown: "down",
+        ArrowLeft: "left",
+        ArrowRight: "right",
+      };
+      const mappedKey = specialKeys[event.key];
+      if (mappedKey) {
+        event.preventDefault();
+        void onDesktopSendQuickKey(mappedKey);
+        return;
+      }
+      if (event.key === " " || event.key.length === 1) {
+        event.preventDefault();
+        void desktopSendText(event.key)
+          .then((response) => {
+            if (!response.ok) {
+              throw new Error(response.detail || response.error || "Desktop text failed.");
+            }
+            setDesktopAltHeld(Boolean(response.alt_held));
+            setDesktopStatus(`Typed "${event.key}" from fullscreen keyboard.`);
+          })
+          .catch((error: Error) => {
+            setError(`Desktop keyboard failed: ${error.message}`);
+          });
+      }
+    };
+
+    document.addEventListener("keydown", onKeyDown, { capture: true });
+    return () => document.removeEventListener("keydown", onKeyDown, { capture: true });
+  }, [desktopEnabled, desktopFullscreen, desktopSelectedPath, desktopTextInput, onDesktopPasteLocalClipboard, onDesktopSendQuickKey, setError]);
 
   const onRequestPowerAction = useCallback(async (action: PowerActionName, confirmToken = "") => {
     setPowerBusy(true);
@@ -4468,7 +4689,7 @@ export default function App() {
                   <p className="small">
                     Track tmux panes and run Ubuntu, PowerShell, or CMD commands from one monitor.
                   </p>
-                  <div className="row">
+                  <div className="row remote-primary-actions">
                     <button type="button" className="button soft compact" onClick={() => void refreshTmuxState()}>
                       Refresh
                     </button>
@@ -4885,10 +5106,57 @@ export default function App() {
                         className={`stream-wrap remote-stage${desktopFullscreen ? " fullscreen-active" : ""}`}
                         data-remote-gesture="true"
                         data-testid="remote-stage"
+                        tabIndex={0}
+                        onPointerDown={onRemoteStageFocus}
                       >
                         <div className="remote-stage-toolbar">
-                          <span className="badge muted">{desktopTrackpadMode ? "Trackpad mode" : "Direct tap mode"}</span>
-                          <span className="badge muted">{desktopFullscreen ? "Fullscreen" : "Windowed"}</span>
+                          <div className="remote-stage-badges">
+                            <span className="badge muted">{desktopTrackpadMode ? "Trackpad mode" : "Direct tap mode"}</span>
+                            <span className="badge muted">{desktopFullscreen ? "Fullscreen" : "Windowed"}</span>
+                          </div>
+                          <div className="remote-stage-actions">
+                            {!desktopFullscreen ? (
+                              <button
+                                type="button"
+                                className="button soft compact remote-overlay-btn"
+                                data-testid="remote-overlay-fullscreen"
+                                onClick={() => void onToggleDesktopFullscreen()}
+                              >
+                                Fullscreen
+                              </button>
+                            ) : null}
+                            {desktopFullscreen ? (
+                              <>
+                                <button
+                                  type="button"
+                                  className="button soft compact remote-overlay-btn"
+                                  data-testid="remote-overlay-copy-path"
+                                  onClick={() => void onCopyRemoteSelectedPath()}
+                                  disabled={desktopInteractionDisabled}
+                                >
+                                  Copy Focused Path
+                                </button>
+                                <button
+                                  type="button"
+                                  className="button soft compact remote-overlay-btn"
+                                  data-testid="remote-overlay-switch-tab"
+                                  onClick={() => void onDesktopSendQuickKey("alt+tab")}
+                                  disabled={desktopInteractionDisabled}
+                                >
+                                  Switch Tab
+                                </button>
+                                <button
+                                  type="button"
+                                  className="button soft compact remote-overlay-btn"
+                                  data-testid="remote-overlay-all-tabs"
+                                  onClick={() => void onDesktopSendQuickKey("win+tab")}
+                                  disabled={desktopInteractionDisabled}
+                                >
+                                  All Tabs
+                                </button>
+                              </>
+                            ) : null}
+                          </div>
                         </div>
                         <img
                           ref={desktopFrameRef}

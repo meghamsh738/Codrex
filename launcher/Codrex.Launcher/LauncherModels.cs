@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using System.Text.Json.Serialization;
 
 namespace Codrex.Launcher;
@@ -114,4 +115,100 @@ public sealed class ControllerConfigData
 {
     public int Port { get; set; } = 48787;
     public string Token { get; set; } = "";
+}
+
+public sealed class LauncherAccountAuthProfile
+{
+    [JsonPropertyName("account_id")]
+    public string AccountId { get; set; } = "";
+
+    [JsonPropertyName("email")]
+    public string Email { get; set; } = "";
+
+    [JsonPropertyName("plan_type")]
+    public string PlanType { get; set; } = "";
+
+    [JsonPropertyName("subscription_active_until")]
+    public string SubscriptionActiveUntil { get; set; } = "";
+
+    [JsonPropertyName("subscription_last_checked")]
+    public string SubscriptionLastChecked { get; set; } = "";
+}
+
+public sealed class LauncherAccountUsage
+{
+    [JsonPropertyName("ok")]
+    public bool Ok { get; set; }
+
+    [JsonPropertyName("context_left")]
+    public string ContextLeft { get; set; } = "";
+
+    [JsonPropertyName("weekly_left")]
+    public string WeeklyLeft { get; set; } = "";
+
+    [JsonPropertyName("tip")]
+    public string Tip { get; set; } = "";
+
+    [JsonPropertyName("detail")]
+    public string Detail { get; set; } = "";
+
+    [JsonPropertyName("stale")]
+    public bool Stale { get; set; }
+
+    [JsonPropertyName("probed_at")]
+    public long ProbedAt { get; set; }
+}
+
+public sealed class LauncherAccountSummary
+{
+    [JsonPropertyName("id")]
+    public string Id { get; set; } = "";
+
+    [JsonPropertyName("label")]
+    public string Label { get; set; } = "";
+
+    [JsonPropertyName("codex_home")]
+    public string CodexHome { get; set; } = "";
+
+    [JsonPropertyName("implicit_primary")]
+    public bool ImplicitPrimary { get; set; }
+
+    [JsonPropertyName("created_at")]
+    public long CreatedAt { get; set; }
+
+    [JsonPropertyName("last_used_at")]
+    public long LastUsedAt { get; set; }
+
+    [JsonPropertyName("active")]
+    public bool Active { get; set; }
+
+    [JsonPropertyName("auth_profile")]
+    public LauncherAccountAuthProfile? AuthProfile { get; set; }
+
+    [JsonPropertyName("usage")]
+    public LauncherAccountUsage? Usage { get; set; }
+}
+
+public sealed class LauncherAccountsPayload
+{
+    [JsonPropertyName("active_account_id")]
+    public string ActiveAccountId { get; set; } = "";
+
+    [JsonPropertyName("real_codex_path")]
+    public string RealCodexPath { get; set; } = "";
+
+    [JsonPropertyName("accounts")]
+    public List<LauncherAccountSummary> Accounts { get; set; } = new();
+}
+
+public sealed class LauncherAccountActivateResult
+{
+    [JsonPropertyName("active_account_id")]
+    public string ActiveAccountId { get; set; } = "";
+
+    [JsonPropertyName("label")]
+    public string Label { get; set; } = "";
+
+    [JsonPropertyName("codex_home")]
+    public string CodexHome { get; set; } = "";
 }

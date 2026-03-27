@@ -3,6 +3,8 @@ using System.IO;
 using System.Net.Http;
 using System.Text;
 using System.Text.Json;
+using System.Linq;
+using System.Text.RegularExpressions;
 
 namespace Codrex.Launcher;
 
@@ -73,6 +75,17 @@ public sealed class LauncherRuntimeService
 
     public Task<RuntimeActionResult> RepairAsync(CancellationToken cancellationToken = default) =>
         InvokeRuntimeAsync("repair", cancellationToken);
+
+    public Task<LauncherAccountsPayload?> GetAccountsAsync(bool forceUsage = false, CancellationToken cancellationToken = default) =>
+        InvokeAccountToolAsync<LauncherAccountsPayload>(new[]
+        {
+            "list",
+            "--json",
+            "--with-usage",
+        }.Concat(forceUsage ? new[] { "--force-usage" } : Array.Empty<string>()), cancellationToken);
+
+    public Task<LauncherAccountActivateResult?> ActivateAccountAsync(string accountId, CancellationToken cancellationToken = default) =>
+        InvokeAccountToolAsync<LauncherAccountActivateResult>(new[] { "activate", accountId, "--json" }, cancellationToken);
 
     public async Task<NetInfoPayload?> GetNetInfoAsync(int controllerPort, string token, CancellationToken cancellationToken = default)
     {
@@ -265,6 +278,69 @@ public sealed class LauncherRuntimeService
             }
         }
         return payload;
+    }
+
+    private async Task<T?> InvokeAccountToolAsync<T>(IEnumerable<string> args, CancellationToken cancellationToken)
+    {
+        var accountToolPath = ToWslPath(Path.Combine(RepoRoot, "tools", "wsl", "codex-account.py"));
+        var commandParts = new List<string> { QuoteForBash(accountToolPath) };
+        commandParts.AddRange(args.Select(QuoteForBash));
+        var bashCommand = string.Join(" ", commandParts);
+
+        var startInfo = new ProcessStartInfo("wsl.exe")
+        {
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            CreateNoWindow = true,
+        };
+        startInfo.ArgumentList.Add("bash");
+        startInfo.ArgumentList.Add("-lc");
+        startInfo.ArgumentList.Add(bashCommand);
+
+        using var process = new Process { StartInfo = startInfo, EnableRaisingEvents = true };
+        if (!process.Start())
+        {
+            throw new InvalidOperationException("Could not start WSL account helper.");
+        }
+
+        var stdout = await process.StandardOutput.ReadToEndAsync(cancellationToken);
+        var stderr = await process.StandardError.ReadToEndAsync(cancellationToken);
+        await process.WaitForExitAsync(cancellationToken);
+
+        if (process.ExitCode != 0)
+        {
+            var detail = string.IsNullOrWhiteSpace(stderr) ? stdout.Trim() : stderr.Trim();
+            throw new InvalidOperationException(string.IsNullOrWhiteSpace(detail) ? "WSL account helper failed." : detail);
+        }
+
+        var payload = stdout.Trim();
+        if (string.IsNullOrWhiteSpace(payload))
+        {
+            return default;
+        }
+
+        return JsonSerializer.Deserialize<T>(payload, JsonOptions);
+    }
+
+    private static string QuoteForBash(string value)
+    {
+        var raw = value ?? string.Empty;
+        return $"'{raw.Replace("'", "'\"'\"'")}'";
+    }
+
+    private static string ToWslPath(string windowsPath)
+    {
+        var raw = Path.GetFullPath(windowsPath).Replace('\\', '/');
+        var match = Regex.Match(raw, @"^(?<drive>[A-Za-z]):(?<rest>/.*)?$");
+        if (!match.Success)
+        {
+            return raw;
+        }
+
+        var drive = match.Groups["drive"].Value.ToLowerInvariant();
+        var rest = match.Groups["rest"].Value;
+        return string.IsNullOrWhiteSpace(rest) ? $"/mnt/{drive}" : $"/mnt/{drive}{rest}";
     }
 
     private static RuntimeActionResult? ParseRuntimePayload(string stdout)

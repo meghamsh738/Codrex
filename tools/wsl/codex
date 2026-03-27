@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
+SCRIPT_DIR="$(cd "$(dirname "${SCRIPT_PATH}")" && pwd)"
+ACCOUNT_TOOL="${SCRIPT_DIR}/codex-account.py"
+REAL_CODEX_PATH_FILE="/home/megha/.local/share/codrex/accounts/real_codex_path.txt"
+
+if [[ ! -x "${ACCOUNT_TOOL}" ]]; then
+  echo "Missing account tool: ${ACCOUNT_TOOL}" >&2
+  exit 1
+fi
+
+if [[ -f "${REAL_CODEX_PATH_FILE}" ]]; then
+  REAL_CODEX="$(<"${REAL_CODEX_PATH_FILE}")"
+else
+  REAL_CODEX="/home/megha/.local/nodejs/v22.22.0/bin/codex"
+fi
+
+if [[ ! -x "${REAL_CODEX}" ]]; then
+  echo "Real codex binary not found: ${REAL_CODEX}" >&2
+  exit 1
+fi
+
+CODEX_HOME="$("${ACCOUNT_TOOL}" current --field codex_home)"
+if [[ -z "${CODEX_HOME}" ]]; then
+  echo "Could not determine active CODEX_HOME." >&2
+  exit 1
+fi
+
+export CODEX_HOME
+exec "${REAL_CODEX}" "$@"

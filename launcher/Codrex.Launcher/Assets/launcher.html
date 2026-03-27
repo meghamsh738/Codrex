@@ -166,6 +166,7 @@
 
       .summary-card,
       .route-card,
+      .accounts-card,
       .detail-card {
         padding: 14px;
       }
@@ -342,14 +343,114 @@
         display: grid;
       }
 
+      .accounts-shell {
+        display: grid;
+        gap: 10px;
+      }
+
+      .accounts-toolbar {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 10px;
+      }
+
+      .accounts-grid {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 10px;
+      }
+
+      .account-card {
+        border: 1px solid rgba(24, 52, 83, 0.9);
+        border-radius: 12px;
+        background: rgba(6, 12, 20, 0.82);
+        padding: 12px;
+        display: grid;
+        gap: 8px;
+      }
+
+      .account-card.active {
+        border-color: rgba(73, 168, 255, 0.68);
+        box-shadow: inset 0 0 0 1px rgba(73, 168, 255, 0.24);
+      }
+
+      .account-head {
+        display: flex;
+        justify-content: space-between;
+        gap: 8px;
+        align-items: start;
+      }
+
+      .account-head strong {
+        font-size: 1rem;
+      }
+
+      .account-meta,
+      .account-usage {
+        display: grid;
+        gap: 6px;
+      }
+
+      .account-row {
+        display: flex;
+        justify-content: space-between;
+        gap: 12px;
+        align-items: center;
+        font-size: 0.86rem;
+      }
+
+      .account-row span:first-child {
+        color: var(--muted);
+      }
+
+      .account-home {
+        font-size: 0.8rem;
+        color: var(--muted);
+        word-break: break-word;
+        font-family: "Cascadia Mono", "Consolas", ui-monospace, monospace;
+      }
+
+      .usage-pill {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-height: 24px;
+        padding: 4px 8px;
+        border-radius: 999px;
+        border: 1px solid rgba(73, 168, 255, 0.24);
+        background: rgba(12, 26, 43, 0.92);
+        font-size: 0.8rem;
+        font-family: "Cascadia Mono", "Consolas", ui-monospace, monospace;
+      }
+
+      .usage-pill.muted {
+        color: var(--muted);
+      }
+
+      .account-tip {
+        color: var(--muted);
+        font-size: 0.8rem;
+        line-height: 1.4;
+        min-height: 2.4em;
+      }
+
       @media (max-width: 1040px) {
         .shell {
           grid-template-columns: 1fr;
         }
 
         .controls,
-        .meta-grid {
+        .meta-grid,
+        .accounts-grid,
+        .accounts-toolbar {
           grid-template-columns: repeat(2, minmax(0, 1fr));
+        }
+      }
+
+      @media (max-width: 760px) {
+        .accounts-grid,
+        .accounts-toolbar {
+          grid-template-columns: 1fr;
         }
       }
     </style>
@@ -381,6 +482,25 @@
           <div class="meta-tile"><span>Revision</span><strong id="repoRev">n/a</strong></div>
           <div class="meta-tile"><span>Controller Port</span><strong id="controllerPort">n/a</strong></div>
           <div class="meta-tile"><span>Selected Host</span><strong id="selectedHost">n/a</strong></div>
+        </section>
+
+        <section class="panel accounts-card">
+          <h2 class="section-title">Accounts</h2>
+          <div class="accounts-shell">
+            <div class="accounts-toolbar">
+              <button id="openUbuntuCodexButton">Open Ubuntu Codex</button>
+              <button id="openAccountSelectorButton">Account Selector</button>
+              <button id="openSessionSwitcherButton">Session Switcher</button>
+            </div>
+            <div class="accounts-grid" id="accountsGrid">
+              <div class="account-card">
+                <div class="account-head">
+                  <strong>Loading accounts...</strong>
+                  <span class="badge">checking</span>
+                </div>
+              </div>
+            </div>
+          </div>
         </section>
 
         <section class="grid controls">
@@ -503,6 +623,10 @@
         copyPairLinkButton: document.getElementById("copyPairLinkButton"),
         copyLogPathButton: document.getElementById("copyLogPathButton"),
         copyLastErrorButton: document.getElementById("copyLastErrorButton"),
+        openUbuntuCodexButton: document.getElementById("openUbuntuCodexButton"),
+        openAccountSelectorButton: document.getElementById("openAccountSelectorButton"),
+        openSessionSwitcherButton: document.getElementById("openSessionSwitcherButton"),
+        accountsGrid: document.getElementById("accountsGrid"),
         logPathLine: document.getElementById("logPathLine"),
         pairStatus: document.getElementById("pairStatus"),
         qrBox: document.getElementById("qrBox"),
@@ -558,6 +682,70 @@
         els.consoleLog.replaceChildren(...consoleEntries.map(renderConsoleEntry));
       }
 
+      function renderAccountCard(account) {
+        const card = document.createElement("div");
+        card.className = `account-card${account.active ? " active" : ""}`;
+        const activeBadge = account.active ? "ACTIVE" : (account.implicitPrimary ? "PRIMARY" : "AVAILABLE");
+        const planLine = account.planType
+          ? `${account.planType.toUpperCase()}${account.subscriptionActiveUntil ? ` until ${account.subscriptionActiveUntil}` : ""}`
+          : "Plan details unavailable";
+        const contextValue = account.usageContextLeft || "n/a";
+        const weeklyValue = account.usageWeeklyLeft || "n/a";
+        const usageTone = account.usageWeeklyLeft ? "" : " muted";
+        const tip = account.usageTip || account.usageDetail || "Launcher uses the saved WSL account state.";
+        card.innerHTML = `
+          <div class="account-head">
+            <div>
+              <strong></strong>
+              <div class="account-home"></div>
+            </div>
+            <span class="badge"></span>
+          </div>
+          <div class="account-meta">
+            <div class="account-row"><span>Plan</span><strong></strong></div>
+            <div class="account-row"><span>Context left</span><span class="usage-pill${usageTone}"></span></div>
+            <div class="account-row"><span>Weekly left</span><span class="usage-pill${usageTone}"></span></div>
+          </div>
+          <p class="account-tip"></p>
+          <button type="button"></button>
+        `;
+        const strong = card.querySelector(".account-head strong");
+        const home = card.querySelector(".account-home");
+        const badge = card.querySelector(".badge");
+        const plan = card.querySelector(".account-meta .account-row strong");
+        const usagePills = card.querySelectorAll(".usage-pill");
+        const tipNode = card.querySelector(".account-tip");
+        const button = card.querySelector("button");
+        strong.textContent = account.label || account.id || "Account";
+        home.textContent = account.codexHome || "";
+        badge.textContent = activeBadge;
+        plan.textContent = planLine;
+        usagePills[0].textContent = contextValue;
+        usagePills[1].textContent = weeklyValue;
+        tipNode.textContent = tip;
+        button.textContent = account.active ? "Active Now" : "Use This Account";
+        button.disabled = !!account.active;
+        button.addEventListener("click", () => post("activateAccount", { accountId: account.id }));
+        return card;
+      }
+
+      function renderAccounts(accounts) {
+        const items = Array.isArray(accounts) ? accounts : [];
+        if (!items.length) {
+          els.accountsGrid.innerHTML = `
+            <div class="account-card">
+              <div class="account-head">
+                <strong>No saved accounts found.</strong>
+                <span class="badge">n/a</span>
+              </div>
+              <p class="account-tip">Restore or create the WSL account profiles first.</p>
+            </div>
+          `;
+          return;
+        }
+        els.accountsGrid.replaceChildren(...items.map(renderAccountCard));
+      }
+
       function render(next) {
         Object.assign(state, next);
         const tone = state.statusTone || "idle";
@@ -611,6 +799,7 @@
             stop: "busy",
             qr: "ok",
             route: "info",
+            account: "info",
             open: "info",
             copy: "info",
             launcher: "info",
@@ -623,6 +812,8 @@
             tone: toneMap[state.actionEventKind] || (state.actionBusy ? "busy" : "info"),
           });
         }
+
+        renderAccounts(state.accounts);
 
         const nextQrVisible = !!(state.qrVisible && state.qrImageUrl);
         const nextQrUrl = nextQrVisible ? state.qrImageUrl : "";
@@ -660,6 +851,9 @@
       els.copyPairLinkButton.addEventListener("click", () => post("copyPairLink"));
       els.copyLogPathButton.addEventListener("click", () => post("copyLogPath"));
       els.copyLastErrorButton.addEventListener("click", () => post("copyLastError"));
+      els.openUbuntuCodexButton.addEventListener("click", () => post("openUbuntuCodex"));
+      els.openAccountSelectorButton.addEventListener("click", () => post("openAccountSelector"));
+      els.openSessionSwitcherButton.addEventListener("click", () => post("openSessionSwitcher"));
 
       post("ready");
     </script>

@@ -18,6 +18,23 @@ $script:DefaultControllerPort = 48787
 $script:LegacyControllerPort = 8787
 $script:DefaultDevUiPort = 54312
 
+function Get-FirstEnvValue {
+  param(
+    [Parameter(Mandatory = $true)]
+    [string]$Name
+  )
+  foreach ($scope in @("Process", "User", "Machine")) {
+    try {
+      $rawValue = [Environment]::GetEnvironmentVariable($Name, $scope)
+      $value = if ($null -ne $rawValue) { [string]$rawValue } else { "" }
+      if ($value.Trim()) {
+        return $value.Trim()
+      }
+    } catch {}
+  }
+  return ""
+}
+
 function New-SecureToken([int]$ByteCount = 32) {
   $bytes = New-Object byte[] $ByteCount
   $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
@@ -430,6 +447,18 @@ $env:CODEX_WORKDIR = [string]$cfg.workdir
 $env:CODEX_FILE_ROOT = [string]$cfg.fileRoot
 $env:CODEX_MOBILE_UI_PORT = [string]$UiPort
 $env:CODEX_TELEGRAM_DEFAULT_SEND = if ($cfg.telegramDefaultSend) { "1" } else { "0" }
+if (-not ([string]$env:CODEX_TELEGRAM_BOT_TOKEN).Trim()) {
+  $legacyBotToken = Get-FirstEnvValue -Name "TELEGRAM_BOT_TOKEN"
+  if ($legacyBotToken) {
+    $env:CODEX_TELEGRAM_BOT_TOKEN = $legacyBotToken
+  }
+}
+if (-not ([string]$env:CODEX_TELEGRAM_CHAT_ID).Trim()) {
+  $legacyChatId = Get-FirstEnvValue -Name "TELEGRAM_ALLOWED_CHAT_ID"
+  if ($legacyChatId) {
+    $env:CODEX_TELEGRAM_CHAT_ID = $legacyChatId
+  }
+}
 
 $launchCommand = 'start "" /b "{0}" -m uvicorn app.server:app --host 0.0.0.0 --port {1} 1>>"{2}" 2>>"{3}"' -f $python, $cfg.port, $outLog, $errLog
 $null = Start-Process -FilePath "cmd.exe" -ArgumentList @("/d", "/c", $launchCommand) -WorkingDirectory $root -WindowStyle Hidden -PassThru

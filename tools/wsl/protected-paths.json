@@ -1,0 +1,41 @@
+{
+  "paths": [
+    {
+      "path": "/mnt/d/codex-remote-ui",
+      "reason": "Primary Codrex launcher project and custom recovery work."
+    },
+    {
+      "path": "/home/megha/.codex",
+      "reason": "Primary Codex account home, including auth, config, skills, and state."
+    },
+    {
+      "path": "/home/megha/.local/share/codrex",
+      "reason": "Secondary Codex account homes, account registry, and shared Codrex state."
+    },
+    {
+      "path": "/home/megha/.local/state/codrex-remote-ui",
+      "reason": "Codrex launcher session mappings, runtime state, and account bindings."
+    },
+    {
+      "path": "/mnt/c/codex-telegram",
+      "reason": "Telegram bridge scripts and local delivery wiring."
+    },
+    {
+      "path": "/mnt/c/Users/megha/Desktop/WSL Codex Account Selector.lnk",
+      "reason": "Desktop account selector shortcut."
+    },
+    {
+      "path": "/mnt/c/Users/megha/Desktop/WSL Codex Session Switcher.lnk",
+      "reason": "Desktop session switcher shortcut."
+    },
+    {
+      "path": "/mnt/c/Users/megha/Desktop/Codrex.lnk",
+      "reason": "Launcher shortcut when present."
+    }
+  ],
+  "cleanup_policy": [
+    "Never delete or move anything under the protected paths without explicit path-by-path user confirmation.",
+    "For space-cleanup requests, start with read-only size audits and target caches, downloads, temporary build outputs, and package-manager caches outside the protected paths.",
+    "Treat auth.json, .credentials.json, registry.json, session-accounts.json, launcher scripts, and codex-home directories as non-disposable state."
+  ]
+}

@@ -259,6 +259,10 @@ a:focus-visible {
 .top-actions .button {
   justify-content: center;
   min-height: 44px;
+  min-width: 0;
+  white-space: normal;
+  text-align: center;
+  line-height: 1.15;
 }
 
 .install-guide {
@@ -836,6 +840,7 @@ textarea {
   display: inline-flex;
   align-items: center;
   justify-content: center;
+  min-width: 0;
   font-weight: 800;
   font-size: 0.82rem;
   letter-spacing: 0.01em;
@@ -1817,6 +1822,15 @@ button:active,
   box-shadow: var(--shadow-3);
 }
 
+.action-strip-grid .button,
+.session-action-dock .button,
+.remote-quickkeys .button,
+.remote-stage-actions .button {
+  white-space: normal;
+  text-align: center;
+  line-height: 1.15;
+}
+
 .session-action-group,
 .remote-quickkeys {
   display: grid;
@@ -1967,6 +1981,28 @@ button:active,
 
 .remote-key-controls .action-chip {
   flex: 1 1 160px;
+}
+
+.remote-primary-actions {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  align-items: stretch;
+}
+
+.remote-primary-actions .button,
+.remote-primary-actions .badge {
+  min-width: 0;
+}
+
+.remote-primary-actions .button {
+  width: 100%;
+  white-space: normal;
+  text-align: center;
+  line-height: 1.15;
+}
+
+.remote-primary-actions .small {
+  grid-column: 1 / -1;
 }
 
 .remote-workspace {
@@ -2445,15 +2481,49 @@ button:active,
 .remote-stage {
   position: relative;
   padding: 12px;
+  outline: none;
 }
 
 .remote-stage-toolbar {
   position: absolute;
   top: 14px;
   left: 14px;
+  right: 14px;
   display: flex;
-  gap: 8px;
+  justify-content: space-between;
+  gap: 10px;
   z-index: 2;
+  pointer-events: none;
+}
+
+.remote-stage-badges,
+.remote-stage-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
+.remote-stage-actions {
+  justify-content: flex-end;
+  margin-left: auto;
+  pointer-events: auto;
+  min-width: 0;
+}
+
+.remote-stage-badges {
+  pointer-events: none;
+  min-width: 0;
+}
+
+.remote-overlay-btn {
+  min-height: 36px;
+  padding: 8px 12px;
+  border-color: color-mix(in srgb, var(--border-strong) 54%, var(--brand-accent) 46%);
+  background: color-mix(in srgb, var(--surface) 86%, rgba(2, 8, 20, 0.86) 14%);
+  box-shadow: 0 8px 16px rgba(2, 8, 20, 0.34);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
 }
 
 .remote-stage .desktop-frame {
@@ -2469,6 +2539,21 @@ button:active,
   padding: calc(env(safe-area-inset-top) + 16px) calc(env(safe-area-inset-right) + 16px)
     calc(env(safe-area-inset-bottom) + 16px) calc(env(safe-area-inset-left) + 16px);
   background: #020814;
+}
+
+.remote-stage.fullscreen-active .remote-stage-toolbar {
+  top: calc(env(safe-area-inset-top) + 12px);
+  left: calc(env(safe-area-inset-left) + 12px);
+  right: calc(env(safe-area-inset-right) + 12px);
+}
+
+.remote-stage.fullscreen-active .remote-stage-actions {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.remote-stage.fullscreen-active .remote-stage-actions .button {
+  width: 100%;
 }
 
 .qr {
@@ -2832,6 +2917,38 @@ button.event-item:hover {
 
   .swipe-hint .button {
     width: 100%;
+  }
+
+  .remote-stage-toolbar {
+    gap: 6px;
+  }
+
+  .remote-stage-badges {
+    max-width: 48%;
+  }
+
+  .remote-stage-actions {
+    max-width: 52%;
+  }
+
+  .remote-stage-actions .button {
+    font-size: 0.72rem;
+    padding: 8px 10px;
+  }
+
+  .remote-stage.fullscreen-active .remote-stage-toolbar {
+    display: grid;
+    grid-template-columns: 1fr;
+  }
+
+  .remote-stage.fullscreen-active .remote-stage-badges,
+  .remote-stage.fullscreen-active .remote-stage-actions {
+    max-width: none;
+    width: 100%;
+  }
+
+  .remote-stage.fullscreen-active .remote-stage-actions {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
   }
 }
 

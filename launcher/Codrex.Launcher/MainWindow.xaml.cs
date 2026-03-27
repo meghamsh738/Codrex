@@ -13,6 +13,7 @@ public partial class MainWindow : Window
     private static readonly TimeSpan IdleRefreshInterval = TimeSpan.FromSeconds(4);
     private static readonly TimeSpan BusyRefreshInterval = TimeSpan.FromMilliseconds(700);
     private static readonly TimeSpan NetInfoRefreshInterval = TimeSpan.FromSeconds(15);
+    private static readonly TimeSpan AccountsRefreshInterval = TimeSpan.FromMinutes(5);
 
     private readonly LauncherRuntimeService _runtimeService;
     private readonly LauncherStateStore _stateStore;
@@ -21,6 +22,7 @@ public partial class MainWindow : Window
     private RuntimeActionResult? _lastRuntime;
     private PairingResult? _currentPairing;
     private NetInfoPayload? _lastNetInfo;
+    private LauncherAccountsPayload? _lastAccounts;
     private bool _webReady;
     private bool _actionBusy;
     private long _actionGeneration;
@@ -33,6 +35,7 @@ public partial class MainWindow : Window
     private string _lastActionKind = "launcher";
     private string _lastActionAt = DateTime.Now.ToString("HH:mm:ss");
     private DateTime _lastNetInfoRefreshUtc = DateTime.MinValue;
+    private DateTime _lastAccountsRefreshUtc = DateTime.MinValue;
 
     public MainWindow()
     {
@@ -175,6 +178,43 @@ public partial class MainWindow : Window
                     _statusDetail = "Copied logs path.";
                     _errorDetail = "";
                     RecordActionEvent("copy", "copied logs path");
+                    await PublishStateAsync();
+                    break;
+                case "activateAccount":
+                    if (root.TryGetProperty("accountId", out var accountProperty))
+                    {
+                        var accountId = (accountProperty.GetString() ?? string.Empty).Trim();
+                        if (!string.IsNullOrWhiteSpace(accountId))
+                        {
+                            var activated = await _runtimeService.ActivateAccountAsync(accountId);
+                            _lastAccountsRefreshUtc = DateTime.MinValue;
+                            _lastAccounts = await _runtimeService.GetAccountsAsync(forceUsage: true);
+                            _statusDetail = $"Active account is now {activated?.Label ?? accountId}.";
+                            _errorDetail = "";
+                            RecordActionEvent("account", $"active account -> {activated?.Label ?? accountId}");
+                            await PublishStateAsync();
+                        }
+                    }
+                    break;
+                case "openAccountSelector":
+                    OpenScript("open-codex-wsl-selector.ps1");
+                    _statusDetail = "Opened account selector.";
+                    _errorDetail = "";
+                    RecordActionEvent("open", "opened account selector");
+                    await PublishStateAsync();
+                    break;
+                case "openSessionSwitcher":
+                    OpenScript("open-codex-session-switcher.ps1");
+                    _statusDetail = "Opened session switcher.";
+                    _errorDetail = "";
+                    RecordActionEvent("open", "opened session switcher");
+                    await PublishStateAsync();
+                    break;
+                case "openUbuntuCodex":
+                    OpenScript("open-ubuntu-codex.ps1");
+                    _statusDetail = "Opened Ubuntu Codex.";
+                    _errorDetail = "";
+                    RecordActionEvent("open", "opened ubuntu codex");
                     await PublishStateAsync();
                     break;
                 case "copyLastError":
@@ -346,6 +386,15 @@ public partial class MainWindow : Window
                 _lastNetInfo = null;
                 _lastNetInfoRefreshUtc = DateTime.MinValue;
             }
+            var shouldRefreshAccounts =
+                _lastAccounts is null ||
+                DateTime.UtcNow - _lastAccountsRefreshUtc >= AccountsRefreshInterval;
+            if (shouldRefreshAccounts)
+            {
+                var forceUsage = _lastAccounts is null;
+                _lastAccounts = await _runtimeService.GetAccountsAsync(forceUsage);
+                _lastAccountsRefreshUtc = DateTime.UtcNow;
+            }
         }
         catch (Exception ex)
         {
@@ -417,6 +466,23 @@ public partial class MainWindow : Window
             appVersion = runtime.AppVersion,
             repoRev = runtime.RepoRev,
             controllerPort = runtime.ControllerPort,
+            currentAccountId = _lastAccounts?.ActiveAccountId ?? "",
+            realCodexPath = _lastAccounts?.RealCodexPath ?? "",
+            accounts = (_lastAccounts?.Accounts ?? new List<LauncherAccountSummary>()).Select(account => new
+            {
+                id = account.Id,
+                label = account.Label,
+                codexHome = account.CodexHome,
+                active = account.Active,
+                implicitPrimary = account.ImplicitPrimary,
+                planType = account.AuthProfile?.PlanType ?? "",
+                subscriptionActiveUntil = account.AuthProfile?.SubscriptionActiveUntil ?? "",
+                usageContextLeft = account.Usage?.ContextLeft ?? "",
+                usageWeeklyLeft = account.Usage?.WeeklyLeft ?? "",
+                usageTip = account.Usage?.Tip ?? "",
+                usageStale = account.Usage?.Stale ?? false,
+                usageDetail = account.Usage?.Detail ?? "",
+            }),
             route = _preferences.PreferredPairRoute,
             routeHost,
             lanHost = _lastNetInfo?.LanIp ?? "",
@@ -544,6 +610,23 @@ public partial class MainWindow : Window
         {
             FileName = "explorer.exe",
             Arguments = $"\"{path}\"",
+            UseShellExecute = true,
+        });
+    }
+
+    private void OpenScript(string scriptName)
+    {
+        var scriptPath = Path.Combine(_runtimeService.RepoRoot, "tools", "windows", scriptName);
+        if (!File.Exists(scriptPath))
+        {
+            throw new FileNotFoundException($"Launcher helper is missing: {scriptName}", scriptPath);
+        }
+
+        Process.Start(new ProcessStartInfo
+        {
+            FileName = "powershell.exe",
+            Arguments = $"-NoProfile -ExecutionPolicy Bypass -File \"{scriptPath}\"",
+            WorkingDirectory = _runtimeService.RepoRoot,
             UseShellExecute = true,
         });
     }

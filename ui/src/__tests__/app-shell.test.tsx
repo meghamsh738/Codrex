@@ -374,6 +374,25 @@ function setupDefaultMocks(): void {
 describe("app shell tabs", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    let fullscreenElement: Element | null = null;
+    Object.defineProperty(document, "fullscreenElement", {
+      configurable: true,
+      get: () => fullscreenElement,
+    });
+    Object.defineProperty(HTMLElement.prototype, "requestFullscreen", {
+      configurable: true,
+      value: vi.fn(async function requestFullscreen(this: HTMLElement) {
+        fullscreenElement = this;
+        document.dispatchEvent(new Event("fullscreenchange"));
+      }),
+    });
+    Object.defineProperty(document, "exitFullscreen", {
+      configurable: true,
+      value: vi.fn(async () => {
+        fullscreenElement = null;
+        document.dispatchEvent(new Event("fullscreenchange"));
+      }),
+    });
     clipboardWriteTextMock.mockReset();
     clipboardWriteTextMock.mockResolvedValue(undefined);
     Object.defineProperty(navigator, "clipboard", {
@@ -1018,7 +1037,7 @@ describe("app shell tabs", () => {
     await waitFor(() => {
       expect(saveSessionNotesMock).toHaveBeenCalledWith("codex_demo", {
         content: "Ship checklist",
-        last_response_snapshot: "",
+        last_response_snapshot: "Plan heading\nFirst action\nSecond action",
       });
     });
 
@@ -1179,6 +1198,95 @@ describe("app shell tabs", () => {
     const telegramButton = await screen.findByTestId("composer-send-telegram");
     expect(telegramButton).not.toBeDisabled();
     expect(screen.queryByTestId("composer-telegram-hint")).not.toBeInTheDocument();
+  });
+
+  it("keeps the Telegram composer action available even when controller Telegram status is off", async () => {
+    getAuthStatusMock.mockResolvedValue({
+      ok: true,
+      auth_required: true,
+      authenticated: true,
+    });
+    getSessionsMock.mockResolvedValue({
+      ok: true,
+      sessions: [
+        {
+          session: "codex_demo",
+          pane_id: "%1",
+          current_command: "codex",
+          cwd: "/home/megha/work",
+          state: "idle",
+          updated_at: Date.now(),
+          snippet: "Assistant ready",
+        },
+      ],
+    });
+    getTelegramStatusMock.mockResolvedValue({
+      ok: true,
+      configured: false,
+    });
+
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: /open codex_demo/i }));
+
+    const telegramButton = await screen.findByTestId("composer-send-telegram");
+    expect(telegramButton).not.toBeDisabled();
+  });
+
+  it("refreshes remote and tmux surfaces after local laptop auth succeeds", async () => {
+    let authenticated = false;
+    getAuthStatusMock.mockImplementation(async () => ({
+      ok: true,
+      auth_required: true,
+      authenticated,
+    }));
+    bootstrapLocalAuthMock.mockImplementation(async () => {
+      authenticated = true;
+      return {
+        ok: true,
+        auth_required: true,
+        authenticated: true,
+        method: "local_bootstrap",
+      };
+    });
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(bootstrapLocalAuthMock).toHaveBeenCalled();
+      expect(getSessionsMock).toHaveBeenCalled();
+      expect(getTelegramStatusMock).toHaveBeenCalled();
+      expect(getThreadStoreMock).toHaveBeenCalled();
+      expect(getCodexRunsMock).toHaveBeenCalled();
+      expect(getTmuxHealthMock).toHaveBeenCalled();
+      expect(getDesktopInfoMock).toHaveBeenCalled();
+      expect(getPowerStatusMock).toHaveBeenCalled();
+    });
+    expect((await screen.findAllByText("Local laptop authentication is active.")).length).toBeGreaterThan(0);
+  });
+
+  it("shows fullscreen remote overlay actions and captures tablet keyboard input", async () => {
+    getDesktopInfoMock.mockResolvedValue({
+      ok: true,
+      enabled: true,
+      width: 1920,
+      height: 1080,
+    });
+
+    render(<App />);
+
+    fireEvent.click(await screen.findByTestId("tab-remote"));
+    await screen.findByRole("button", { name: "Disable Control" });
+    fireEvent.click(screen.getByTestId("remote-fullscreen-toggle"));
+
+    expect(await screen.findByTestId("remote-overlay-copy-path")).toBeInTheDocument();
+    expect(screen.getByTestId("remote-overlay-switch-tab")).toBeInTheDocument();
+    expect(screen.getByTestId("remote-overlay-all-tabs")).toBeInTheDocument();
+
+    fireEvent.keyDown(document, { key: "a" });
+
+    await waitFor(() => {
+      expect(desktopSendTextMock).toHaveBeenCalledWith("a");
+    });
   });
 
   it("copies notes and latest response with the shared clipboard helper", async () => {
