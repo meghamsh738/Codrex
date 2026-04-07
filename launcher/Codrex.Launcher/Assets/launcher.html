@@ -662,6 +662,7 @@
         pairStatus: "",
         pairLink: "",
         actionEventId: null,
+        accountsSignature: "",
       };
       let renderedQrUrl = "";
       let renderedQrVisible = false;
@@ -801,6 +802,23 @@
 
       function renderAccounts(accounts) {
         const items = Array.isArray(accounts) ? accounts : [];
+        const signature = JSON.stringify(items.map((account) => ({
+          id: account.id || "",
+          label: account.label || "",
+          codexHome: account.codexHome || "",
+          active: !!account.active,
+          implicitPrimary: !!account.implicitPrimary,
+          planType: account.planType || "",
+          subscriptionActiveUntil: account.subscriptionActiveUntil || "",
+          usageContextLeft: account.usageContextLeft || "",
+          usageWeeklyLeft: account.usageWeeklyLeft || "",
+          usageTip: account.usageTip || "",
+          usageDetail: account.usageDetail || "",
+        })));
+        if (rendered.accountsSignature === signature) {
+          return;
+        }
+        rendered.accountsSignature = signature;
         if (!items.length) {
           els.accountsGrid.innerHTML = `
             <div class="account-card">
