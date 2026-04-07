@@ -37,15 +37,11 @@ function Stop-UiProcessById {
 function Stop-UiByPort {
   param([int]$Port)
   $stoppedAny = $false
-  try {
-    $listeners = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue
-  } catch {
-    $listeners = @()
-  }
+  $listeners = @(Get-CodrexListeningTcpRows -Ports @($Port))
   if (-not $listeners) { return $false }
 
-  foreach ($item in ($listeners | Select-Object -Unique OwningProcess)) {
-    $procId = [int]$item.OwningProcess
+  foreach ($item in ($listeners | Select-Object -Unique owning_process)) {
+    $procId = [int]$item.owning_process
     $proc = Get-CimInstance Win32_Process -Filter ("ProcessId = {0}" -f $procId) -ErrorAction SilentlyContinue
     if (-not $proc) { continue }
 
@@ -86,11 +82,7 @@ function Read-ControllerPort {
 
 function Test-PortListening {
   param([int]$Port)
-  try {
-    $listeners = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue
-    return [bool]$listeners
-  } catch {}
-  return $false
+  return (Test-CodrexPortListening -Port $Port)
 }
 
 function Get-CodrexRuntimeDir {

@@ -666,6 +666,40 @@ describe("app shell tabs", () => {
     });
   });
 
+  it("sends fullscreen touch scroll gestures from the stage wrapper", async () => {
+    getDesktopInfoMock.mockResolvedValue({
+      ok: true,
+      enabled: true,
+      width: 1920,
+      height: 1080,
+    });
+
+    render(<App />);
+
+    fireEvent.click(await screen.findByTestId("tab-remote"));
+    await screen.findByRole("button", { name: "Disable Control" });
+    fireEvent.click(screen.getByTestId("remote-fullscreen-toggle"));
+    await screen.findByTestId("remote-overlay-copy-path");
+
+    const remoteStage = screen.getByTestId("remote-stage");
+    const streamImage = screen.getByAltText("Desktop stream");
+    Object.defineProperty(streamImage, "getBoundingClientRect", {
+      configurable: true,
+      value: () => mockRect(960, 540),
+    });
+    Object.defineProperty(remoteStage, "setPointerCapture", {
+      configurable: true,
+      value: vi.fn(),
+    });
+
+    firePointer(remoteStage, "pointerdown", { pointerId: 1, pointerType: "touch", clientX: 220, clientY: 140 });
+    firePointer(remoteStage, "pointermove", { pointerId: 1, pointerType: "touch", clientX: 224, clientY: 190 });
+
+    await waitFor(() => {
+      expect(desktopScrollMock).toHaveBeenCalledWith(240);
+    });
+  });
+
   it("starts and releases a fullscreen touch drag after a short hold", async () => {
     getDesktopInfoMock.mockResolvedValue({
       ok: true,
@@ -750,7 +784,7 @@ describe("app shell tabs", () => {
     });
   });
 
-  it("sends all-tabs and switch-tab quick keys from remote tab", async () => {
+  it("sends windows quick keys from remote tab", async () => {
     getDesktopInfoMock.mockResolvedValue({
       ok: true,
       enabled: true,
@@ -763,12 +797,18 @@ describe("app shell tabs", () => {
     const remotePanel = await screen.findByTestId("tab-panel-remote");
     await within(remotePanel).findByRole("button", { name: "Disable Control" });
 
-    fireEvent.click(within(remotePanel).getByRole("button", { name: "All Tabs" }));
+    fireEvent.click(within(remotePanel).getByTestId("remote-win-start"));
+    fireEvent.click(within(remotePanel).getByTestId("remote-win-left"));
+    fireEvent.click(within(remotePanel).getByTestId("remote-win-right"));
+    fireEvent.click(within(remotePanel).getByTestId("remote-task-view"));
     fireEvent.click(within(remotePanel).getByRole("button", { name: "Hold Alt+Tab" }));
-    fireEvent.click(within(remotePanel).getByRole("button", { name: "Switch Tab" }));
+    fireEvent.click(within(remotePanel).getByTestId("remote-next-window"));
     fireEvent.click(within(remotePanel).getByRole("button", { name: "Release Alt" }));
 
     await waitFor(() => {
+      expect(desktopSendKeyMock).toHaveBeenCalledWith("win");
+      expect(desktopSendKeyMock).toHaveBeenCalledWith("win+left");
+      expect(desktopSendKeyMock).toHaveBeenCalledWith("win+right");
       expect(desktopSendKeyMock).toHaveBeenCalledWith("win+tab");
       expect(desktopSendKeyMock).toHaveBeenCalledWith("alt+tab-hold");
       expect(desktopSendKeyMock).toHaveBeenCalledWith("alt+tab");
@@ -888,6 +928,91 @@ describe("app shell tabs", () => {
         cwd: "",
         reasoning_effort: "high",
         resume_last: true,
+      });
+    });
+  });
+
+  it("resumes a recent closed session from sessions tab", async () => {
+    getSessionsMock.mockResolvedValueOnce({
+      ok: true,
+      sessions: [],
+      recent_closed: [
+        {
+          session: "codex_closed_demo",
+          pane_id: "",
+          current_command: "codex",
+          cwd: "/home/megha/work",
+          state: "done",
+          updated_at: Date.now(),
+          snippet: "Last cached response",
+          model: "gpt-5-codex",
+          reasoning_effort: "high",
+          active: false,
+          closed_at: Date.now(),
+          can_resume: true,
+          resume_id: "019d31aa-4346-76c3-8880-5c85b5924616",
+        },
+      ],
+    });
+    createSessionMock.mockResolvedValueOnce({
+      ok: true,
+      session: "codex_closed_demo",
+      resume_id: "019d31aa-4346-76c3-8880-5c85b5924616",
+    });
+
+    render(<App />);
+    await screen.findByTestId("tab-panel-sessions");
+
+    fireEvent.click(await screen.findByRole("button", { name: "Resume" }));
+
+    await waitFor(() => {
+      expect(createSessionMock).toHaveBeenCalledWith({
+        name: "codex_closed_demo",
+        cwd: "/home/megha/work",
+        model: "gpt-5-codex",
+        reasoning_effort: "high",
+        resume_id: "019d31aa-4346-76c3-8880-5c85b5924616",
+      });
+    });
+  });
+
+  it("reopens a recent closed session when no exact resume id exists", async () => {
+    getSessionsMock.mockResolvedValueOnce({
+      ok: true,
+      sessions: [],
+      recent_closed: [
+        {
+          session: "codex_reopen_demo",
+          pane_id: "",
+          current_command: "codex",
+          cwd: "/home/megha/reopen",
+          state: "done",
+          updated_at: Date.now(),
+          snippet: "No resume id available",
+          model: "gpt-5-codex",
+          reasoning_effort: "high",
+          active: false,
+          closed_at: Date.now(),
+          can_resume: false,
+        },
+      ],
+    });
+    createSessionMock.mockResolvedValueOnce({
+      ok: true,
+      session: "codex_reopen_demo",
+    });
+
+    render(<App />);
+    await screen.findByTestId("tab-panel-sessions");
+
+    fireEvent.click(await screen.findByRole("button", { name: "Reopen" }));
+
+    await waitFor(() => {
+      expect(createSessionMock).toHaveBeenCalledWith({
+        name: "codex_reopen_demo",
+        cwd: "/home/megha/reopen",
+        model: "gpt-5-codex",
+        reasoning_effort: "high",
       });
     });
   });
@@ -1194,6 +1319,40 @@ describe("app shell tabs", () => {
     });
   });
 
+  it("keeps cached session output visible while a session is recovering without a pane", async () => {
+    getSessionsMock.mockResolvedValue({
+      ok: true,
+      sessions: [
+        {
+          session: "codex_demo",
+          pane_id: "",
+          current_command: "codex",
+          cwd: "/home/megha/work",
+          state: "recovering",
+          updated_at: Date.now(),
+          snippet: "cached line 2",
+        },
+      ],
+    });
+    getSessionScreenMock.mockResolvedValue({
+      ok: true,
+      session: "codex_demo",
+      pane_id: "",
+      current_command: "codex",
+      state: "recovering",
+      text: "cached line 1\ncached line 2",
+      detail: "Session 'codex_demo' has no panes. Returning cached screen while recovering.",
+    });
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(getSessionScreenMock).toHaveBeenCalledWith("codex_demo");
+    });
+    expect(screen.queryByText(/Could not read screen:/i)).not.toBeInTheDocument();
+    expect(screen.getAllByText(/cached line 2/i).length).toBeGreaterThan(0);
+  });
+
   it("shows a notes-only lower pane for sessions", async () => {
     getSessionsMock.mockResolvedValue({
       ok: true,
@@ -1432,6 +1591,110 @@ describe("app shell tabs", () => {
 
     await waitFor(() => {
       expect(desktopSendTextMock).toHaveBeenCalledWith("a");
+    });
+  });
+
+  it("toggles keyboard light mode in fullscreen remote", async () => {
+    getDesktopInfoMock.mockResolvedValue({
+      ok: true,
+      enabled: true,
+      width: 1920,
+      height: 1080,
+    });
+
+    render(<App />);
+
+    fireEvent.click(await screen.findByTestId("tab-remote"));
+    await screen.findByRole("button", { name: "Disable Control" });
+    fireEvent.click(screen.getByTestId("remote-fullscreen-toggle"));
+    await screen.findByTestId("remote-overlay-copy-path");
+
+    const remoteStage = screen.getByTestId("remote-stage");
+    expect(remoteStage.className).not.toContain("fullscreen-light");
+
+    fireEvent.click(screen.getByTestId("remote-overlay-keyboard-light"));
+
+    expect(remoteStage.className).toContain("fullscreen-light");
+  });
+
+  it("sends a remote image through the desktop clipboard flow", async () => {
+    window.localStorage.setItem("codrex.ui.selected_session.v1", "codex_demo");
+    getSessionsMock.mockResolvedValue({
+      ok: true,
+      sessions: [
+        {
+          session: "codex_demo",
+          pane_id: "%7",
+          cwd: "/home/megha/codrex-work",
+          state: "running",
+          updated_at: Date.now(),
+          current_command: "codex",
+          snippet: "Ready",
+          model: "gpt-5-codex",
+          reasoning_effort: "high",
+        },
+      ],
+    });
+    getDesktopInfoMock.mockResolvedValue({
+      ok: true,
+      enabled: true,
+      width: 1920,
+      height: 1080,
+    });
+    sendSessionImageMock.mockResolvedValue({
+      ok: true,
+      delivery_mode: "desktop_clipboard",
+      paste_ok: true,
+      detail: "Image copied to desktop clipboard and Ctrl+V sent to focused window.",
+    });
+
+    render(<App />);
+
+    fireEvent.click(await screen.findByTestId("tab-remote"));
+    await screen.findByRole("button", { name: "Disable Control" });
+
+    const remoteImageInput = screen.getByTestId("remote-image-input") as HTMLInputElement;
+    const imageFile = new File(["demo"], "ubuntu.png", { type: "image/png" });
+    fireEvent.change(remoteImageInput, { target: { files: [imageFile] } });
+
+    fireEvent.change(screen.getByPlaceholderText("Optional note for the session file"), {
+      target: { value: "Inspect this in Ubuntu" },
+    });
+    fireEvent.click(screen.getByTestId("remote-send-image"));
+
+    await waitFor(() => {
+      expect(sendSessionImageMock).toHaveBeenCalledWith(
+        "codex_demo",
+        imageFile,
+        "Inspect this in Ubuntu",
+        expect.objectContaining({
+          paste_desktop: true,
+          delivery_mode: "desktop_clipboard",
+        }),
+      );
+    });
+  });
+
+  it("forwards Shift+Tab in fullscreen keyboard mode", async () => {
+    getDesktopInfoMock.mockResolvedValue({
+      ok: true,
+      enabled: true,
+      width: 1920,
+      height: 1080,
+    });
+
+    render(<App />);
+
+    fireEvent.click(await screen.findByTestId("tab-remote"));
+    await screen.findByRole("button", { name: "Disable Control" });
+    fireEvent.click(screen.getByTestId("remote-fullscreen-toggle"));
+    await screen.findByTestId("remote-overlay-copy-path");
+
+    desktopSendKeyMock.mockClear();
+    fireEvent.keyDown(document, { key: "Tab", shiftKey: true });
+
+    await waitFor(() => {
+      expect(desktopSendKeyMock).toHaveBeenCalledWith("shift+tab");
     });
   });
 

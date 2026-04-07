@@ -9,15 +9,19 @@ interface SessionGroupView {
 interface SessionListPanelProps {
   sessionsLoading: boolean;
   sessionsCount: number;
+  recentClosedCount: number;
   filteredCount: number;
   visibleSessionCountLabel: string;
   sessionViewMode: "grouped" | "flat";
   groupedSessions: SessionGroupView[];
   filteredSessions: SessionInfo[];
+  recentClosedSessions: SessionInfo[];
   selectedSession: string;
   sessionBusy: boolean;
   onSelectSession: (session: string) => void;
   onCloseSession: (session: string) => void;
+  onResumeSession: (session: SessionInfo) => void;
+  onReopenSession: (session: SessionInfo) => void;
   inferProjectFromCwd: (cwd: string) => string;
 }
 
@@ -26,8 +30,11 @@ interface SessionCardProps {
   selected: boolean;
   project: string;
   sessionBusy: boolean;
-  onSelectSession: (session: string) => void;
-  onCloseSession: (session: string) => void;
+  mode: "live" | "closed";
+  onSelectSession?: (session: string) => void;
+  onCloseSession?: (session: string) => void;
+  onResumeSession?: (session: SessionInfo) => void;
+  onReopenSession?: (session: SessionInfo) => void;
 }
 
 const SessionCard = memo(function SessionCard({
@@ -35,21 +42,26 @@ const SessionCard = memo(function SessionCard({
   selected,
   project,
   sessionBusy,
+  mode,
   onSelectSession,
   onCloseSession,
+  onResumeSession,
+  onReopenSession,
 }: SessionCardProps) {
   const handleSelectSession = () => {
-    onSelectSession(session.session);
+    onSelectSession?.(session.session);
   };
+  const isClosed = mode === "closed";
+  const statusLabel = isClosed ? "closed" : session.state;
 
   return (
     <div
-      role="button"
-      tabIndex={0}
-      aria-label={`Open ${session.session}`}
-      className={`session-item ${selected ? "selected" : ""}`}
-      onClick={handleSelectSession}
-      onKeyDown={(event) => {
+      role={isClosed ? undefined : "button"}
+      tabIndex={isClosed ? undefined : 0}
+      aria-label={isClosed ? undefined : `Open ${session.session}`}
+      className={`session-item ${selected ? "selected" : ""}${isClosed ? " session-item-closed" : ""}`}
+      onClick={isClosed ? undefined : handleSelectSession}
+      onKeyDown={isClosed ? undefined : (event) => {
         if (event.key === "Enter" || event.key === " ") {
           event.preventDefault();
           handleSelectSession();
@@ -59,20 +71,44 @@ const SessionCard = memo(function SessionCard({
       <div className="session-row">
         <strong>{session.session}</strong>
         <div className="session-row-actions">
-          <span className={`state state-${session.state}`}>{session.state}</span>
-          <button
-            type="button"
-            className="session-close-chip"
-            aria-label={`Close ${session.session}`}
-            title={`Close ${session.session}`}
-            onClick={(event) => {
-              event.stopPropagation();
-              onCloseSession(session.session);
-            }}
-            disabled={sessionBusy}
-          >
-            ×
-          </button>
+          <span className={`state state-${statusLabel}`}>{statusLabel}</span>
+          {isClosed ? (
+            <div className="session-card-actions">
+              {session.can_resume ? (
+                <button
+                  type="button"
+                  className="button soft compact"
+                  onClick={() => onResumeSession?.(session)}
+                  disabled={sessionBusy}
+                >
+                  Resume
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  className="button soft compact"
+                  onClick={() => onReopenSession?.(session)}
+                  disabled={sessionBusy}
+                >
+                  Reopen
+                </button>
+              )}
+            </div>
+          ) : (
+            <button
+              type="button"
+              className="session-close-chip"
+              aria-label={`Close ${session.session}`}
+              title={`Close ${session.session}`}
+              onClick={(event) => {
+                event.stopPropagation();
+                onCloseSession?.(session.session);
+              }}
+              disabled={sessionBusy}
+            >
+              ×
+            </button>
+          )}
         </div>
       </div>
       <p className="session-snippet">{session.snippet || "No output yet."}</p>
@@ -89,26 +125,30 @@ const SessionCard = memo(function SessionCard({
 export const SessionListPanel = memo(function SessionListPanel({
   sessionsLoading,
   sessionsCount,
+  recentClosedCount,
   filteredCount,
   visibleSessionCountLabel,
   sessionViewMode,
   groupedSessions,
   filteredSessions,
+  recentClosedSessions,
   selectedSession,
   sessionBusy,
   onSelectSession,
   onCloseSession,
+  onResumeSession,
+  onReopenSession,
   inferProjectFromCwd,
 }: SessionListPanelProps) {
   return (
     <>
       <div className="session-subhead">
         <p>{visibleSessionCountLabel}</p>
-        <p>Only the selected session stays live; background sessions use cached summaries.</p>
+        <p>Only the selected session stays live; background sessions use cached summaries. Recent closed: {recentClosedCount}.</p>
       </div>
 
       {sessionsLoading ? <p className="small">Loading sessions...</p> : null}
-      {!sessionsLoading && sessionsCount === 0 ? (
+      {!sessionsLoading && sessionsCount === 0 && recentClosedCount === 0 ? (
         <div className="empty-state panel-empty">
           <h3>No sessions yet</h3>
           <p>Create one to start interacting with Codex from mobile.</p>
@@ -136,6 +176,7 @@ export const SessionListPanel = memo(function SessionListPanel({
                   selected={session.session === selectedSession}
                   project={inferProjectFromCwd(session.cwd)}
                   sessionBusy={sessionBusy}
+                  mode="live"
                   onSelectSession={onSelectSession}
                   onCloseSession={onCloseSession}
                 />
@@ -152,12 +193,36 @@ export const SessionListPanel = memo(function SessionListPanel({
               selected={session.session === selectedSession}
               project={inferProjectFromCwd(session.cwd)}
               sessionBusy={sessionBusy}
+              mode="live"
               onSelectSession={onSelectSession}
               onCloseSession={onCloseSession}
             />
           ))}
         </div>
       )}
+
+      {recentClosedSessions.length > 0 ? (
+        <div className="session-group">
+          <div className="session-group-head">
+            <strong>Recent Closed Sessions</strong>
+            <span className="badge muted">{recentClosedSessions.length}</span>
+          </div>
+          <div className="session-card-grid">
+            {recentClosedSessions.map((session) => (
+              <SessionCard
+                key={`closed_${session.session}`}
+                session={session}
+                selected={false}
+                project={inferProjectFromCwd(session.cwd)}
+                sessionBusy={sessionBusy}
+                mode="closed"
+                onResumeSession={onResumeSession}
+                onReopenSession={onReopenSession}
+              />
+            ))}
+          </div>
+        </div>
+      ) : null}
     </>
   );
 });

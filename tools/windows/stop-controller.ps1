@@ -96,22 +96,12 @@ function Get-CodrexControllerProcesses {
   param(
     [int]$PortNumber
   )
-  try {
-    $listeners = Get-NetTCPConnection -LocalPort $PortNumber -State Listen -ErrorAction SilentlyContinue
-  } catch {
-    return @()
-  }
-  if (-not $listeners) {
-    return @()
-  }
-  $owners = New-Object System.Collections.Generic.List[object]
-  foreach ($entry in ($listeners | Select-Object -Unique OwningProcess)) {
-    $proc = Get-CimInstance Win32_Process -Filter ("ProcessId = {0}" -f $entry.OwningProcess) -ErrorAction SilentlyContinue
-    if ($proc -and $proc.CommandLine -and $proc.CommandLine -match "app\.server:app") {
-      $owners.Add($proc) | Out-Null
-    }
-  }
-  return @($owners | Sort-Object ProcessId -Descending)
+  $owners = @(Get-CodrexPortOwnerProcesses -Ports @($PortNumber))
+  return @(
+    $owners |
+      Where-Object { $_.CommandLine -and $_.CommandLine -match "app\.server:app" } |
+      Sort-Object ProcessId -Descending
+  )
 }
 
 function Stop-CodrexProcess {

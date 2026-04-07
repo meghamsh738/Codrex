@@ -62,7 +62,10 @@ public partial class MainWindow : Window
     {
         try
         {
-            await LauncherView.EnsureCoreWebView2Async();
+            var webViewUserDataDir = Path.Combine(_stateStore.RuntimeDir, "launcher-webview");
+            Directory.CreateDirectory(webViewUserDataDir);
+            var webViewEnvironment = await CoreWebView2Environment.CreateAsync(userDataFolder: webViewUserDataDir);
+            await LauncherView.EnsureCoreWebView2Async(webViewEnvironment);
             LauncherView.CoreWebView2.WebMessageReceived += OnWebMessageReceived;
             LauncherView.NavigationCompleted += async (_, _) =>
             {

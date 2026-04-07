@@ -99,16 +99,22 @@ export interface SessionInfo {
   snippet: string;
   model?: string;
   reasoning_effort?: string;
+  active?: boolean;
+  closed_at?: number;
+  can_resume?: boolean;
+  resume_id?: string;
 }
 
 export interface SessionsMeta {
   total_sessions?: number;
+  total_recent_closed?: number;
   background_mode?: string;
   summary_updated_at?: number;
 }
 
 export interface SessionsResult extends BasicResult {
   sessions?: SessionInfo[];
+  recent_closed?: SessionInfo[];
   meta?: SessionsMeta;
 }
 
@@ -118,6 +124,7 @@ export interface SessionCreateResult extends BasicResult {
   model?: string;
   reasoning_effort?: string;
   resume_last?: boolean;
+  resume_id?: string;
 }
 
 export interface SessionProfileApplyResult extends BasicResult {

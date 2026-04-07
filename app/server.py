@@ -743,6 +743,7 @@ VALID_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 VALID_PANE_RE = re.compile(r"^%\d+$")
 VALID_ENTITY_ID_RE = re.compile(r"^[A-Za-z0-9_.-]{3,96}$")
 VALID_CODEX_MODEL_RE = re.compile(r"^[A-Za-z0-9._:/-]{2,120}$")
+VALID_RESUME_ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,}$")
 
 # -------------------------
 # Small in-memory run store
@@ -851,6 +852,19 @@ SESSION_NOTES_MAX_SNAPSHOT_CHARS = int(os.environ.get("CODEX_SESSION_NOTES_MAX_S
 SESSION_NOTES_DATA: Dict[str, Any] = {
     "notes": {},
 }
+DEFAULT_SESSION_HISTORY_FILE = os.path.abspath(
+    os.environ.get(
+        "CODEX_SESSION_HISTORY_FILE",
+        os.path.join(CODEX_RUNTIME_STATE_DIR, "session-history.json"),
+    )
+)
+SESSION_HISTORY_FILE = DEFAULT_SESSION_HISTORY_FILE
+SESSION_HISTORY_LOCK = threading.Lock()
+SESSION_HISTORY_LOADED = False
+SESSION_HISTORY_MAX_KEEP = int(os.environ.get("CODEX_SESSION_HISTORY_MAX_KEEP", "240") or "240")
+SESSION_HISTORY_DATA: Dict[str, Any] = {
+    "items": [],
+}
 APP_RUNTIME_SESSION_FILE = os.path.abspath(
     os.environ.get(
         "CODEX_APP_RUNTIME_SESSION_FILE",
@@ -868,6 +882,11 @@ SESSION_STREAM_STATES: Dict[str, Dict[str, Any]] = {}
 SESSION_RECOVERING_AFTER_S = float(os.environ.get("CODEX_SESSION_RECOVERING_AFTER_S", "20") or "20")
 SESSION_STALE_TTL_S = float(os.environ.get("CODEX_SESSION_STALE_TTL_S", "180") or "180")
 SESSION_BACKGROUND_MODE = "selected_only"
+CODEX_HISTORY_CACHE_LOCK = threading.Lock()
+CODEX_HISTORY_CACHE: Dict[str, Any] = {
+    "loaded_at": 0.0,
+    "entries": [],
+}
 
 # -------------------------
 # Telegram delivery (optional)
@@ -1182,6 +1201,263 @@ def _find_thread_unlocked(thread_id: str) -> Optional[Dict[str, Any]]:
         if thread.get("id") == thread_id:
             return thread
     return None
+
+
+def _normalize_codex_resume_id(raw: Any) -> str:
+    candidate = str(raw or "").strip()
+    if not candidate:
+        return ""
+    if not VALID_RESUME_ID_RE.fullmatch(candidate):
+        raise HTTPException(status_code=400, detail="Invalid resume id format.")
+    return candidate
+
+
+def _build_session_history_record(raw: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    data = raw if isinstance(raw, dict) else {}
+    session = str(data.get("session") or "").strip()
+    if not session:
+        return None
+    session = _validate_session_name(session)
+    now = time.time()
+    state = str(data.get("state") or "starting").strip().lower() or "starting"
+    if state not in {"starting", "idle", "busy", "running", "waiting", "done", "error", "recovering"}:
+        state = "starting"
+    created_at = float(data.get("created_at") or now)
+    updated_at = float(data.get("updated_at") or created_at or now)
+    last_seen_at = float(data.get("last_seen_at") or updated_at or created_at or now)
+    closed_at_raw = data.get("closed_at")
+    closed_at = float(closed_at_raw) if closed_at_raw not in {None, ""} else None
+    resume_id = str(data.get("resume_id") or "").strip()
+    if resume_id and not VALID_RESUME_ID_RE.fullmatch(resume_id):
+        resume_id = ""
+    return {
+        "session": session,
+        "pane_id": str(data.get("pane_id") or ""),
+        "current_command": str(data.get("current_command") or ""),
+        "cwd": str(data.get("cwd") or ""),
+        "state": state,
+        "updated_at": updated_at,
+        "last_seen_at": last_seen_at,
+        "snippet": str(data.get("snippet") or ""),
+        "model": str(data.get("model") or CODEX_DEFAULT_MODEL),
+        "reasoning_effort": str(data.get("reasoning_effort") or CODEX_DEFAULT_REASONING_EFFORT),
+        "created_at": created_at,
+        "closed_at": closed_at,
+        "active": bool(data.get("active", closed_at is None)),
+        "resume_id": resume_id,
+        "last_user_prompt": str(data.get("last_user_prompt") or ""),
+        "last_prompt_at": float(data.get("last_prompt_at") or 0.0),
+    }
+
+
+def _sort_and_trim_session_history_unlocked() -> None:
+    normalized: List[Dict[str, Any]] = []
+    seen = set()
+    for item in SESSION_HISTORY_DATA.get("items") or []:
+        built = _build_session_history_record(item if isinstance(item, dict) else {})
+        if not built:
+            continue
+        session = built["session"]
+        if session in seen:
+            continue
+        seen.add(session)
+        normalized.append(built)
+    normalized.sort(
+        key=lambda item: max(
+            float(item.get("closed_at") or 0.0),
+            float(item.get("updated_at") or 0.0),
+            float(item.get("created_at") or 0.0),
+        ),
+        reverse=True,
+    )
+    if len(normalized) > SESSION_HISTORY_MAX_KEEP:
+        normalized = normalized[:SESSION_HISTORY_MAX_KEEP]
+    SESSION_HISTORY_DATA["items"] = normalized
+
+
+def _persist_session_history_unlocked() -> None:
+    _sort_and_trim_session_history_unlocked()
+    parent = os.path.dirname(SESSION_HISTORY_FILE)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    temp_path = SESSION_HISTORY_FILE + ".tmp"
+    payload = {"items": SESSION_HISTORY_DATA.get("items") or []}
+    with open(temp_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    os.replace(temp_path, SESSION_HISTORY_FILE)
+
+
+def _load_session_history_unlocked() -> None:
+    global SESSION_HISTORY_LOADED
+    if SESSION_HISTORY_LOADED:
+        return
+    SESSION_HISTORY_LOADED = True
+    SESSION_HISTORY_DATA["items"] = []
+    raw = _read_json_file(SESSION_HISTORY_FILE)
+    items = raw.get("items")
+    if isinstance(items, list):
+        SESSION_HISTORY_DATA["items"] = [item for item in items if isinstance(item, dict)]
+    _sort_and_trim_session_history_unlocked()
+
+
+def _find_session_history_unlocked(session: str) -> Optional[Dict[str, Any]]:
+    session_id = _validate_session_name(session)
+    for item in SESSION_HISTORY_DATA.get("items") or []:
+        if str(item.get("session") or "").strip() == session_id:
+            return item
+    return None
+
+
+def _upsert_session_history_unlocked(session: str, patch: Dict[str, Any]) -> Dict[str, Any]:
+    session_id = _validate_session_name(session)
+    _load_session_history_unlocked()
+    existing = _find_session_history_unlocked(session_id)
+    base = dict(existing) if existing else {"session": session_id, "created_at": time.time()}
+    next_record = dict(base)
+    for key, value in (patch or {}).items():
+        if key == "session":
+            continue
+        if value is None:
+            if key in {"closed_at", "resume_id", "last_user_prompt", "last_prompt_at"}:
+                next_record.pop(key, None)
+            continue
+        next_record[key] = value
+    built = _build_session_history_record(next_record)
+    if not built:
+        raise HTTPException(status_code=500, detail="session_history_build_failed")
+    items = [
+        item
+        for item in (SESSION_HISTORY_DATA.get("items") or [])
+        if str(item.get("session") or "").strip() != session_id
+    ]
+    items.insert(0, built)
+    SESSION_HISTORY_DATA["items"] = items
+    _persist_session_history_unlocked()
+    return built
+
+
+def _latest_thread_user_message_for_session_unlocked(session: str) -> Optional[Dict[str, Any]]:
+    session_id = _validate_session_name(session)
+    _load_threads_store_unlocked()
+    latest: Optional[Dict[str, Any]] = None
+    for thread in THREADS_DATA.get("threads") or []:
+        if str((thread or {}).get("session") or "").strip() != session_id:
+            continue
+        thread_id = str((thread or {}).get("id") or "").strip()
+        if not thread_id:
+            continue
+        for message in THREADS_DATA.get("messages", {}).get(thread_id, []) or []:
+            if str((message or {}).get("role") or "").strip().lower() != "user":
+                continue
+            text = str((message or {}).get("text") or "").strip()
+            if not text:
+                continue
+            at = float(message.get("at") or 0.0)
+            if not latest or at > float(latest.get("at") or 0.0):
+                latest = {"text": text, "at": at}
+    return latest
+
+
+def _read_codex_history_entries(limit: int = 4000) -> List[Dict[str, Any]]:
+    now = time.time()
+    with CODEX_HISTORY_CACHE_LOCK:
+        cached_at = float(CODEX_HISTORY_CACHE.get("loaded_at") or 0.0)
+        if now - cached_at < 3.0:
+            return list(CODEX_HISTORY_CACHE.get("entries") or [])
+    command = f'if [ -f "$HOME/.codex/history.jsonl" ]; then tail -n {max(200, int(limit or 0))} "$HOME/.codex/history.jsonl"; fi'
+    result = run_wsl_bash(command, timeout_s=20)
+    entries: List[Dict[str, Any]] = []
+    if result.get("exit_code") == 0:
+        for raw_line in str(result.get("stdout") or "").splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                parsed = json.loads(line)
+            except Exception:
+                continue
+            if not isinstance(parsed, dict):
+                continue
+            session_id = str(parsed.get("session_id") or "").strip()
+            text = str(parsed.get("text") or "")
+            try:
+                ts = float(parsed.get("ts") or 0.0)
+            except Exception:
+                ts = 0.0
+            if not session_id or not text:
+                continue
+            entries.append({"session_id": session_id, "text": text, "ts": ts})
+    with CODEX_HISTORY_CACHE_LOCK:
+        CODEX_HISTORY_CACHE["loaded_at"] = now
+        CODEX_HISTORY_CACHE["entries"] = list(entries)
+    return entries
+
+
+def _match_codex_resume_id(prompt_text: str, prompt_at_s: float = 0.0) -> str:
+    needle = str(prompt_text or "").strip()
+    if not needle:
+        return ""
+    best_id = ""
+    best_delta: Optional[float] = None
+    for entry in reversed(_read_codex_history_entries()):
+        if str(entry.get("text") or "").strip() != needle:
+            continue
+        session_id = str(entry.get("session_id") or "").strip()
+        if not VALID_RESUME_ID_RE.fullmatch(session_id):
+            continue
+        if prompt_at_s > 0:
+            delta = abs(float(entry.get("ts") or 0.0) - prompt_at_s)
+            if delta > 21600:
+                continue
+            if best_delta is None or delta < best_delta:
+                best_delta = delta
+                best_id = session_id
+                if delta <= 5:
+                    break
+            continue
+        return session_id
+    return best_id
+
+
+def _resolve_session_resume_id(session: str, prev: Optional[Dict[str, Any]] = None) -> str:
+    session_id = _validate_session_name(session)
+    source = dict(prev or {})
+    existing_resume_id = str(source.get("resume_id") or "").strip()
+    if existing_resume_id:
+        return existing_resume_id
+    prompt_text = str(source.get("last_user_prompt") or "").strip()
+    prompt_at_s = float(source.get("last_prompt_at") or 0.0)
+    if not prompt_text:
+        with THREADS_LOCK:
+            candidate = _latest_thread_user_message_for_session_unlocked(session_id)
+        if candidate:
+            prompt_text = str(candidate.get("text") or "").strip()
+            prompt_at_s = max(prompt_at_s, float(candidate.get("at") or 0.0) / 1000.0)
+    return _match_codex_resume_id(prompt_text, prompt_at_s)
+
+
+def _public_session_record(item: Dict[str, Any]) -> Dict[str, Any]:
+    record = {
+        "session": str(item.get("session") or ""),
+        "pane_id": str(item.get("pane_id") or ""),
+        "current_command": str(item.get("current_command") or ""),
+        "cwd": str(item.get("cwd") or ""),
+        "state": str(item.get("state") or "starting"),
+        "updated_at": float(item.get("updated_at") or time.time()),
+        "last_seen_at": float(item.get("last_seen_at") or item.get("updated_at") or time.time()),
+        "snippet": str(item.get("snippet") or ""),
+        "model": str(item.get("model") or CODEX_DEFAULT_MODEL),
+        "reasoning_effort": str(item.get("reasoning_effort") or CODEX_DEFAULT_REASONING_EFFORT),
+        "active": bool(item.get("active", True)),
+        "can_resume": bool(str(item.get("resume_id") or "").strip()),
+    }
+    resume_id = str(item.get("resume_id") or "").strip()
+    if resume_id:
+        record["resume_id"] = resume_id
+    closed_at = item.get("closed_at")
+    if closed_at not in {None, ""}:
+        record["closed_at"] = float(closed_at)
+    return record
 
 
 def _session_id_from_created_by(created_by: str) -> str:
@@ -2257,6 +2533,7 @@ VK_BACK = 0x08
 VK_TAB = 0x09
 VK_RETURN = 0x0D
 VK_ESCAPE = 0x1B
+VK_SHIFT = 0x10
 VK_DELETE = 0x2E
 VK_SPACE = 0x20
 
@@ -3601,12 +3878,21 @@ def _desktop_send_key(key: str) -> Dict[str, Any]:
         "ctrl+v": ([VK_CONTROL], 0x56),
         "ctrl+x": ([VK_CONTROL], 0x58),
         "ctrl+z": ([VK_CONTROL], 0x5A),
+        "ctrl+shift+z": ([VK_CONTROL, VK_SHIFT], 0x5A),
+        "ctrl+y": ([VK_CONTROL], 0x59),
+        "ctrl+tab": ([VK_CONTROL], VK_TAB),
+        "ctrl+shift+tab": ([VK_CONTROL, VK_SHIFT], VK_TAB),
+        "shift+tab": ([VK_SHIFT], VK_TAB),
         "alt+tab": ([VK_MENU], VK_TAB),
+        "alt+shift+tab": ([VK_MENU, VK_SHIFT], VK_TAB),
+        "win": ([VK_LWIN], 0x20),
+        "win+left": ([VK_LWIN], VK_LEFT),
+        "win+right": ([VK_LWIN], VK_RIGHT),
         "win+tab": ([VK_LWIN], VK_TAB),
     }
     if k in native_combos:
         mods, vk = native_combos[k]
-        _send_vk_combo(mods, vk, extended=(k in {"alt+tab", "win+tab"}))
+        _send_vk_combo(mods, vk, extended=(k in {"alt+tab", "alt+shift+tab", "win+left", "win+right", "win+tab"}))
         return {"exit_code": 0, "stdout": "", "stderr": "", "mode": "native_combo", "key": k, "alt_held": False}
 
     if k == "alt+tab-hold":
@@ -3622,7 +3908,13 @@ def _desktop_send_key(key: str) -> Dict[str, Any]:
     }
     spec = ps_key_map.get(k)
     if not spec:
-        raise HTTPException(status_code=400, detail="Unsupported key. Try: enter, esc, tab, arrows, alt+tab, alt+tab-hold, alt+release, win+tab, ctrl+c.")
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Unsupported key. Try: enter, esc, tab, shift+tab, arrows, "
+                "alt+tab, alt+tab-hold, alt+release, win, win+left, win+right, win+tab, ctrl+c."
+            ),
+        )
     script = "Add-Type -AssemblyName System.Windows.Forms; " + f"[System.Windows.Forms.SendKeys]::SendWait('{spec}')"
     r = _run_powershell(script, timeout_s=8)
     r["mode"] = "powershell_sendkeys"
@@ -7851,7 +8143,14 @@ def codex_session_create(payload: Optional[Dict[str, Any]] = Body(default=None))
         model=model,
     )
     resume_last = bool(payload.get("resume_last"))
-    codex_cmd = "codex resume --last" if resume_last else _build_codex_launch_command(model, reasoning_effort)
+    resume_id = _normalize_codex_resume_id(payload.get("resume_id")) if payload.get("resume_id") not in {None, ""} else ""
+    if resume_id and resume_last:
+        raise HTTPException(status_code=400, detail="Use either resume_id or resume_last, not both.")
+    codex_cmd = (
+        f"codex resume {resume_id}"
+        if resume_id
+        else ("codex resume --last" if resume_last else _build_codex_launch_command(model, reasoning_effort))
+    )
     cmd = f"tmux new-session -d -s {name} -c " + _bash_quote(cwd) + " " + _bash_quote(codex_cmd)
     r = run_wsl_bash(cmd, timeout_s=45)
     if r.get("exit_code") != 0:
@@ -7873,7 +8172,26 @@ def codex_session_create(payload: Optional[Dict[str, Any]] = Body(default=None))
             "model": model,
             "reasoning_effort": reasoning_effort,
             "resume_last": resume_last,
+            "resume_id": resume_id,
         }
+    with SESSION_HISTORY_LOCK:
+        _upsert_session_history_unlocked(
+            name,
+            {
+                "session": name,
+                "cwd": cwd,
+                "state": "starting",
+                "updated_at": time.time(),
+                "last_seen_at": time.time(),
+                "snippet": "",
+                "model": model,
+                "reasoning_effort": reasoning_effort,
+                "created_at": time.time(),
+                "active": True,
+                "closed_at": None,
+                "resume_id": resume_id or None,
+            },
+        )
     return {
         "ok": True,
         "session": name,
@@ -7881,11 +8199,14 @@ def codex_session_create(payload: Optional[Dict[str, Any]] = Body(default=None))
         "model": model,
         "reasoning_effort": reasoning_effort,
         "resume_last": resume_last,
+        "resume_id": resume_id or None,
     }
 
 @app.delete("/codex/session/{session}")
 def codex_session_close(session: str):
     session = _validate_session_name(session)
+    with SESSIONS_LOCK:
+        prev = dict(SESSIONS.get(session) or {})
     r = run_wsl_bash(f"tmux kill-session -t {session}", timeout_s=20)
     if r.get("exit_code") != 0:
         stderr = (r.get("stderr") or "").lower()
@@ -7894,6 +8215,17 @@ def codex_session_close(session: str):
         return {"ok": False, "error": "close_failed", "raw": r}
     with SESSIONS_LOCK:
         SESSIONS.pop(session, None)
+    with SESSION_HISTORY_LOCK:
+        _upsert_session_history_unlocked(
+            session,
+            {
+                **prev,
+                "session": session,
+                "active": False,
+                "closed_at": time.time(),
+                "updated_at": time.time(),
+            },
+        )
     return {"ok": True, "session": session}
 
 def _session_pane(session: str) -> Optional[Dict[str, Any]]:
@@ -8254,6 +8586,33 @@ def codex_session_send(session: str, text: str = Body(..., media_type="text/plai
     p = _tmux_send_text(pane["pane_id"], text, codex_mode=True, timeout_s=20)
     if p.get("exit_code") != 0:
         return {"ok": False, "error": "send_failed", "raw": p}
+    sent_at = time.time()
+    resume_id = ""
+    with SESSIONS_LOCK:
+        prev = SESSIONS.get(session, {})
+        next_record = {
+            **prev,
+            "session": session,
+            "updated_at": sent_at,
+            "last_user_prompt": text,
+            "last_prompt_at": sent_at,
+        }
+        resume_id = _resolve_session_resume_id(session, next_record)
+        if resume_id:
+            next_record["resume_id"] = resume_id
+        SESSIONS[session] = next_record
+    with SESSION_HISTORY_LOCK:
+        _upsert_session_history_unlocked(
+            session,
+            {
+                "session": session,
+                "updated_at": sent_at,
+                "last_user_prompt": text,
+                "last_prompt_at": sent_at,
+                "resume_id": resume_id or None,
+                "active": True,
+            },
+        )
     out: Dict[str, Any] = {"ok": True, "session": session}
     if repair_applied:
         out["profile_repaired"] = True
@@ -8261,6 +8620,8 @@ def codex_session_send(session: str, text: str = Body(..., media_type="text/plai
         out["profile_reasoning_effort"] = repair.get("reasoning_effort")
     if repair_warning:
         out["profile_repair_warning"] = repair_warning
+    if resume_id:
+        out["resume_id"] = resume_id
     return out
 
 
@@ -8395,6 +8756,27 @@ def codex_session_screen(session: str):
                     "state": "recovering",
                     "updated_at": time.time(),
                 }
+                with SESSION_HISTORY_LOCK:
+                    _upsert_session_history_unlocked(
+                        session,
+                        {
+                            **prev,
+                            "session": session,
+                            "state": "recovering",
+                            "updated_at": time.time(),
+                            "active": True,
+                        },
+                    )
+                cached_text = str(prev.get("last_text") or prev.get("snippet") or "")
+                return {
+                    "ok": True,
+                    "session": session,
+                    "pane_id": str(prev.get("pane_id") or ""),
+                    "current_command": str(prev.get("current_command") or ""),
+                    "state": "recovering",
+                    "text": cached_text,
+                    "detail": f"Session '{session}' has no panes. Returning cached screen while recovering.",
+                }
         return {"ok": False, "error": "not_found", "detail": f"Session '{session}' has no panes."}
     # Full pane capture is needed for Codex because it renders in the alternate screen.
     text = _capture_pane_full(pane["pane_id"], max_chars=25000)
@@ -8402,6 +8784,7 @@ def codex_session_screen(session: str):
     state = _infer_progress_state(text or snippet, pane.get("current_command", ""))
     with SESSIONS_LOCK:
         prev = SESSIONS.get(session, {})
+        resume_id = _resolve_session_resume_id(session, prev)
         SESSIONS[session] = {
             **prev,
             "session": session,
@@ -8413,7 +8796,18 @@ def codex_session_screen(session: str):
             "snippet": (text or snippet).splitlines()[-1][:240] if (text or snippet) else "",
             "model": prev.get("model") or CODEX_DEFAULT_MODEL,
             "reasoning_effort": prev.get("reasoning_effort") or CODEX_DEFAULT_REASONING_EFFORT,
+            "resume_id": resume_id or prev.get("resume_id") or "",
         }
+        next_record = dict(SESSIONS[session])
+    with SESSION_HISTORY_LOCK:
+        _upsert_session_history_unlocked(
+            session,
+            {
+                **next_record,
+                "active": True,
+                "closed_at": None,
+            },
+        )
     _publish_session_stream_snapshot(
         session,
         pane["pane_id"],
@@ -8428,6 +8822,7 @@ def codex_session_screen(session: str):
         "current_command": pane.get("current_command", ""),
         "state": state,
         "text": text or snippet,
+        "resume_id": next_record.get("resume_id") or None,
     }
 
 
@@ -8625,9 +9020,21 @@ def codex_sessions_live():
             "model": prev.get("model") or CODEX_DEFAULT_MODEL,
             "reasoning_effort": prev.get("reasoning_effort") or CODEX_DEFAULT_REASONING_EFFORT,
         }
+        resume_id = _resolve_session_resume_id(session, prev)
+        if resume_id:
+            item["resume_id"] = resume_id
         live.append(item)
         with SESSIONS_LOCK:
             SESSIONS[session] = {**prev, **item}
+        with SESSION_HISTORY_LOCK:
+            _upsert_session_history_unlocked(
+                session,
+                {
+                    **item,
+                    "active": True,
+                    "closed_at": None,
+                },
+            )
 
     # Keep known sessions visible during transient pane discovery gaps.
     for session, prev in known_items.items():
@@ -8641,6 +9048,17 @@ def codex_sessions_live():
             with SESSIONS_LOCK:
                 if session in SESSIONS and session not in seen_sessions:
                     SESSIONS.pop(session, None)
+            with SESSION_HISTORY_LOCK:
+                _upsert_session_history_unlocked(
+                    session,
+                    {
+                        **prev,
+                        "session": session,
+                        "active": False,
+                        "closed_at": now,
+                        "updated_at": now,
+                    },
+                )
             continue
         fallback_snippet = _session_cached_snippet(prev)
         fallback_state = str(prev.get("state") or "").strip().lower()
@@ -8648,26 +9066,54 @@ def codex_sessions_live():
             fallback_state = "recovering"
         elif not fallback_state:
             fallback_state = "starting"
-        live.append(
-            {
-                "session": session,
-                "pane_id": str(prev.get("pane_id") or ""),
-                "current_command": str(prev.get("current_command") or ""),
-                "cwd": str(prev.get("cwd") or ""),
-                "state": fallback_state or "starting",
-                "updated_at": now,
-                "last_seen_at": last_seen_at,
-                "snippet": fallback_snippet,
-                "model": prev.get("model") or CODEX_DEFAULT_MODEL,
-                "reasoning_effort": prev.get("reasoning_effort") or CODEX_DEFAULT_REASONING_EFFORT,
-            }
-        )
+        fallback_item = {
+            "session": session,
+            "pane_id": str(prev.get("pane_id") or ""),
+            "current_command": str(prev.get("current_command") or ""),
+            "cwd": str(prev.get("cwd") or ""),
+            "state": fallback_state or "starting",
+            "updated_at": now,
+            "last_seen_at": last_seen_at,
+            "snippet": fallback_snippet,
+            "model": prev.get("model") or CODEX_DEFAULT_MODEL,
+            "reasoning_effort": prev.get("reasoning_effort") or CODEX_DEFAULT_REASONING_EFFORT,
+        }
+        resume_id = _resolve_session_resume_id(session, prev)
+        if resume_id:
+            fallback_item["resume_id"] = resume_id
+        live.append(fallback_item)
+        with SESSION_HISTORY_LOCK:
+            _upsert_session_history_unlocked(
+                session,
+                {
+                    **prev,
+                    **fallback_item,
+                    "active": True,
+                },
+            )
     live.sort(key=lambda x: x["session"])
+    active_sessions = {str(item.get("session") or "").strip() for item in live}
+    recent_closed: List[Dict[str, Any]] = []
+    with SESSION_HISTORY_LOCK:
+        _load_session_history_unlocked()
+        for item in SESSION_HISTORY_DATA.get("items") or []:
+            session = str(item.get("session") or "").strip()
+            if not session or session in active_sessions:
+                continue
+            if not item.get("closed_at") and item.get("active", False):
+                continue
+            if not item.get("resume_id"):
+                resume_id = _resolve_session_resume_id(session, item)
+                if resume_id:
+                    item["resume_id"] = resume_id
+            recent_closed.append(_public_session_record(item))
     return {
         "ok": True,
         "sessions": live,
+        "recent_closed": recent_closed,
         "meta": {
             "total_sessions": len(live),
+            "total_recent_closed": len(recent_closed),
             "background_mode": SESSION_BACKGROUND_MODE,
             "summary_updated_at": now,
         },

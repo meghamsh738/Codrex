@@ -92,6 +92,150 @@ function Get-CodrexStringTail {
   return ("..." + $Value.Substring($Value.Length - $MaxChars))
 }
 
+function Get-CodrexPrimaryIPv4 {
+  try {
+    $socket = [System.Net.Sockets.Socket]::new(
+      [System.Net.Sockets.AddressFamily]::InterNetwork,
+      [System.Net.Sockets.SocketType]::Dgram,
+      [System.Net.Sockets.ProtocolType]::Udp
+    )
+    try {
+      $socket.Connect("8.8.8.8", 53)
+      $endpoint = $socket.LocalEndPoint
+      if ($endpoint -and $endpoint.Address) {
+        $ip = [string]$endpoint.Address.IPAddressToString
+        if ($ip -and $ip -notlike "169.254*" -and $ip -ne "127.0.0.1") {
+          return $ip
+        }
+      }
+    } finally {
+      if ($socket) {
+        $socket.Dispose()
+      }
+    }
+  } catch {}
+
+  try {
+    $address = [System.Net.Dns]::GetHostAddresses([System.Net.Dns]::GetHostName()) |
+      Where-Object {
+        $_.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork -and
+        $_.IPAddressToString -notlike "169.254*" -and
+        $_.IPAddressToString -ne "127.0.0.1"
+      } |
+      Select-Object -First 1
+    if ($address) {
+      return [string]$address.IPAddressToString
+    }
+  } catch {}
+
+  return "127.0.0.1"
+}
+
+function Get-CodrexListeningTcpRows {
+  param(
+    [int[]]$Ports
+  )
+  $portList = @($Ports | Where-Object { $_ -gt 0 } | Select-Object -Unique)
+  $filterPorts = $portList.Count -gt 0
+  $rows = New-Object System.Collections.Generic.List[object]
+
+  try {
+    $lines = @(netstat -ano -p tcp 2>$null)
+  } catch {
+    return @()
+  }
+
+  foreach ($line in $lines) {
+    $trimmed = ([string]$line).Trim()
+    if (-not $trimmed.StartsWith("TCP")) {
+      continue
+    }
+
+    $parts = $trimmed -split "\s+"
+    if ($parts.Count -lt 5) {
+      continue
+    }
+
+    $state = [string]$parts[3]
+    if ($state -notin @("LISTENING", "LISTEN")) {
+      continue
+    }
+
+    $endpoint = [string]$parts[1]
+    $localAddress = ""
+    $localPort = 0
+    if ($endpoint -match '^\[(?<address>.+)\]:(?<port>\d+)$') {
+      $localAddress = [string]$matches["address"]
+      $null = [int]::TryParse([string]$matches["port"], [ref]$localPort)
+    } elseif ($endpoint -match '^(?<address>[^:]+):(?<port>\d+)$') {
+      $localAddress = [string]$matches["address"]
+      $null = [int]::TryParse([string]$matches["port"], [ref]$localPort)
+    } else {
+      continue
+    }
+
+    if ($localPort -le 0) {
+      continue
+    }
+    if ($filterPorts -and ($portList -notcontains $localPort)) {
+      continue
+    }
+
+    $procId = 0
+    $null = [int]::TryParse([string]$parts[4], [ref]$procId)
+    $rows.Add([pscustomobject]@{
+      local_address = $localAddress
+      local_port = $localPort
+      state = $state
+      owning_process = $procId
+    }) | Out-Null
+  }
+
+  return @($rows | ForEach-Object { $_ })
+}
+
+function Get-CodrexListeningProcessId {
+  param(
+    [int]$Port
+  )
+  $rows = @(Get-CodrexListeningTcpRows -Ports @($Port))
+  if (-not $rows -or $rows.Count -eq 0) {
+    return $null
+  }
+  $procId = [int]$rows[0].owning_process
+  if ($procId -le 0) {
+    return $null
+  }
+  return $procId
+}
+
+function Test-CodrexPortListening {
+  param(
+    [int]$Port
+  )
+  return (@(Get-CodrexListeningTcpRows -Ports @($Port)).Count -gt 0)
+}
+
+function Get-CodrexPortOwnerProcesses {
+  param(
+    [int[]]$Ports
+  )
+  $rows = @(Get-CodrexListeningTcpRows -Ports $Ports)
+  if (-not $rows -or $rows.Count -eq 0) {
+    return @()
+  }
+
+  $owners = New-Object System.Collections.Generic.List[object]
+  foreach ($procId in ($rows | ForEach-Object { [int]$_.owning_process } | Where-Object { $_ -gt 0 } | Select-Object -Unique)) {
+    $proc = Get-CimInstance Win32_Process -Filter ("ProcessId = {0}" -f $procId) -ErrorAction SilentlyContinue
+    if ($proc) {
+      $owners.Add($proc) | Out-Null
+    }
+  }
+
+  return @($owners | ForEach-Object { $_ })
+}
+
 function Get-CodrexTextTail {
   param(
     [AllowNull()]
@@ -277,18 +421,13 @@ function Get-CodrexPortDiagnosticsSnapshot {
     return @()
   }
   $snapshots = @()
-  try {
-    $connections = @(Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue | Where-Object { $portList -contains [int]$_.LocalPort })
-  } catch {
-    $connections = @()
-  }
-  foreach ($connection in $connections) {
-    $procId = [int]$connection.OwningProcess
+  foreach ($connection in (Get-CodrexListeningTcpRows -Ports $portList)) {
+    $procId = [int]$connection.owning_process
     $process = Get-CimInstance Win32_Process -Filter ("ProcessId = {0}" -f $procId) -ErrorAction SilentlyContinue
     $snapshots += ,([pscustomobject]@{
-      local_address = [string]$connection.LocalAddress
-      local_port = [int]$connection.LocalPort
-      state = [string]$connection.State
+      local_address = [string]$connection.local_address
+      local_port = [int]$connection.local_port
+      state = [string]$connection.state
       owning_process = $procId
       process_name = if ($process) { [string]$process.Name } else { "" }
       command_line_tail = if ($process -and $process.CommandLine) { Get-CodrexStringTail -Value ([string]$process.CommandLine) -MaxChars 280 } else { "" }

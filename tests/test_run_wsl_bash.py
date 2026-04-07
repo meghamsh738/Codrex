@@ -625,6 +625,23 @@ class CodexSessionConfigTests(unittest.TestCase):
         self.assertIn("model=gpt-5-codex", cmd)
         self.assertIn("model_reasoning_effort=high", cmd)
 
+    def test_codex_session_create_uses_specific_resume_id(self):
+        with mock.patch.object(server_mod, "run_wsl_bash", return_value={
+            "exit_code": 0,
+            "stdout": "",
+            "stderr": "",
+        }) as run_mock:
+            out = server_mod.codex_session_create({
+                "name": "demo",
+                "cwd": "/home/megha/work",
+                "resume_id": "019d31aa-4346-76c3-8880-5c85b5924616",
+            })
+
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["resume_id"], "019d31aa-4346-76c3-8880-5c85b5924616")
+        cmd = run_mock.call_args.args[0]
+        self.assertIn("codex resume 019d31aa-4346-76c3-8880-5c85b5924616", cmd)
+
     def test_codex_session_apply_profile_sends_model_command(self):
         fake_sessions = {"codex_demo": {"session": "codex_demo"}}
         with mock.patch.object(server_mod, "_session_pane", return_value={"pane_id": "%9"}), \
@@ -915,6 +932,36 @@ class CodexSessionConfigTests(unittest.TestCase):
         self.assertEqual(out["sessions"][0]["state"], "recovering")
         self.assertIn("codex_stale", fake_sessions)
 
+    def test_codex_sessions_live_returns_recent_closed_history_items(self):
+        fake_history = {
+            "items": [
+                {
+                    "session": "codex_closed",
+                    "cwd": "/home/megha/work",
+                    "state": "done",
+                    "updated_at": server_mod.time.time() - 20,
+                    "last_seen_at": server_mod.time.time() - 20,
+                    "snippet": "Last cached response",
+                    "model": "gpt-5-codex",
+                    "reasoning_effort": "high",
+                    "active": False,
+                    "closed_at": server_mod.time.time() - 10,
+                    "resume_id": "019d31aa-4346-76c3-8880-5c85b5924616",
+                }
+            ]
+        }
+        with mock.patch.object(server_mod, "_tmux_list_panes", return_value=[]), \
+             mock.patch.object(server_mod, "SESSIONS", {}), \
+             mock.patch.object(server_mod, "SESSION_HISTORY_DATA", fake_history), \
+             mock.patch.object(server_mod, "SESSION_HISTORY_LOADED", True):
+            out = server_mod.codex_sessions_live()
+
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["sessions"], [])
+        self.assertEqual(len(out["recent_closed"]), 1)
+        self.assertEqual(out["recent_closed"][0]["session"], "codex_closed")
+        self.assertTrue(out["recent_closed"][0]["can_resume"])
+
     def test_codex_sessions_live_drops_stale_known_session_without_pane_after_ttl(self):
         old = server_mod.time.time() - (server_mod.SESSION_STALE_TTL_S + 60)
         fake_sessions = {
@@ -963,15 +1010,34 @@ class CodexSessionConfigTests(unittest.TestCase):
         self.assertEqual(out["sessions"][0]["snippet"], "latest cached line")
         self.assertEqual(out["meta"]["background_mode"], "selected_only")
 
-    def test_codex_session_screen_marks_session_recovering_without_pane(self):
-        fake_sessions = {"codex_demo": {"session": "codex_demo", "state": "starting"}}
+    def test_codex_session_screen_returns_cached_text_while_session_recovers_without_pane(self):
+        fake_sessions = {
+            "codex_demo": {
+                "session": "codex_demo",
+                "state": "starting",
+                "pane_id": "%7",
+                "current_command": "codex",
+                "last_text": "cached line 1\ncached line 2",
+            }
+        }
         with mock.patch.object(server_mod, "_session_pane", return_value=None), \
              mock.patch.object(server_mod, "SESSIONS", fake_sessions):
             out = server_mod.codex_session_screen("codex_demo")
 
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["state"], "recovering")
+        self.assertEqual(out["pane_id"], "%7")
+        self.assertEqual(out["current_command"], "codex")
+        self.assertEqual(out["text"], "cached line 1\ncached line 2")
+        self.assertEqual(fake_sessions["codex_demo"]["state"], "recovering")
+
+    def test_codex_session_screen_returns_not_found_for_unknown_session_without_pane(self):
+        with mock.patch.object(server_mod, "_session_pane", return_value=None), \
+             mock.patch.object(server_mod, "SESSIONS", {}):
+            out = server_mod.codex_session_screen("codex_demo")
+
         self.assertFalse(out["ok"])
         self.assertEqual(out["error"], "not_found")
-        self.assertEqual(fake_sessions["codex_demo"]["state"], "recovering")
 
     def test_auth_bootstrap_local_rejects_non_localhost(self):
         req = SimpleNamespace(

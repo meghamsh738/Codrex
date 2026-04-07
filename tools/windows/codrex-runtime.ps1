@@ -62,23 +62,7 @@ function Write-JsonFile {
 }
 
 function Get-PrimaryIPv4 {
-  try {
-    $route = Get-NetRoute -DestinationPrefix "0.0.0.0/0" -ErrorAction Stop |
-      Where-Object { $_.NextHop -and $_.NextHop -ne "0.0.0.0" } |
-      Sort-Object RouteMetric, ifMetric |
-      Select-Object -First 1
-    if ($route) {
-      $ip = Get-NetIPAddress -InterfaceIndex $route.ifIndex -AddressFamily IPv4 -ErrorAction Stop |
-        Where-Object { $_.IPAddress -notlike "169.254*" -and $_.IPAddress -ne "127.0.0.1" } |
-        Select-Object -First 1 -ExpandProperty IPAddress
-      if ($ip) { return [string]$ip }
-    }
-  } catch {}
-  try {
-    $line = (ipconfig | Select-String "IPv4 Address").Line | Select-Object -First 1
-    if ($line -match ":\s*([0-9\.]+)\s*$") { return [string]$matches[1] }
-  } catch {}
-  return "127.0.0.1"
+  return (Get-CodrexPrimaryIPv4)
 }
 
 function Get-RepoRevision {
@@ -201,22 +185,10 @@ function Get-CodrexControllerProcessesByPort {
   if ($Port -le 0) {
     return @()
   }
-  try {
-    $listeners = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue
-  } catch {
-    return @()
-  }
-  if (-not $listeners) {
-    return @()
-  }
-  $owners = New-Object System.Collections.Generic.List[object]
-  foreach ($entry in ($listeners | Select-Object -Unique OwningProcess)) {
-    $proc = Get-CimInstance Win32_Process -Filter ("ProcessId = {0}" -f $entry.OwningProcess) -ErrorAction SilentlyContinue
-    if ($proc -and $proc.CommandLine -and $proc.CommandLine -match "app\.server:app") {
-      $owners.Add($proc) | Out-Null
-    }
-  }
-  return @($owners | ForEach-Object { $_ })
+  return @(
+    Get-CodrexPortOwnerProcesses -Ports @($Port) |
+      Where-Object { $_.CommandLine -and $_.CommandLine -match "app\.server:app" }
+  )
 }
 
 function Get-CodrexControllerProcessById {
@@ -239,10 +211,7 @@ function Test-PortListening {
   param(
     [int]$Port
   )
-  try {
-    return [bool](Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue)
-  } catch {}
-  return $false
+  return (Test-CodrexPortListening -Port $Port)
 }
 
 function Stop-CodrexControllerProcesses {
@@ -436,41 +405,19 @@ function Invoke-ScriptCapture {
   if ($Arguments) {
     $invokeArgs += $Arguments
   }
-  $stdoutPath = [System.IO.Path]::GetTempFileName()
-  $stderrPath = [System.IO.Path]::GetTempFileName()
-  try {
-    $proc = Start-Process -FilePath "powershell.exe" `
-      -ArgumentList $invokeArgs `
-      -Wait `
-      -PassThru `
-      -WindowStyle Hidden `
-      -RedirectStandardOutput $stdoutPath `
-      -RedirectStandardError $stderrPath
-
-    $lines = New-Object System.Collections.Generic.List[string]
-    foreach ($capturePath in @($stdoutPath, $stderrPath)) {
-      if (-not (Test-Path $capturePath)) {
-        continue
-      }
-      try {
-        foreach ($line in (Get-Content -Path $capturePath -ErrorAction SilentlyContinue)) {
-          $lines.Add([string]$line) | Out-Null
-        }
-      } catch {}
+  $lines = New-Object System.Collections.Generic.List[string]
+  $output = @(& powershell.exe @invokeArgs 2>&1)
+  $exitCode = [int]$LASTEXITCODE
+  foreach ($entry in $output) {
+    if ($null -ne $entry) {
+      $lines.Add([string]$entry) | Out-Null
     }
-    $allLines = @($lines)
-    $exitCode = if ($proc -and $null -ne $proc.ExitCode) { [int]$proc.ExitCode } else { 0 }
-    return [pscustomobject]@{
-      exit_code = $exitCode
-      lines = $allLines
-      text = (($allLines | Where-Object { $_ -ne $null }) -join "`n").Trim()
-    }
-  } finally {
-    foreach ($capturePath in @($stdoutPath, $stderrPath)) {
-      if ($capturePath -and (Test-Path $capturePath)) {
-        Remove-Item -Path $capturePath -Force -ErrorAction SilentlyContinue
-      }
-    }
+  }
+  $allLines = @($lines)
+  return [pscustomobject]@{
+    exit_code = $exitCode
+    lines = $allLines
+    text = (($allLines | Where-Object { $_ -ne $null }) -join "`n").Trim()
   }
 }
 
@@ -593,6 +540,30 @@ function Wait-ForStableStartSnapshot {
     if ($attempt -lt ($Attempts - 1)) {
       Start-Sleep -Milliseconds $DelayMs
       $latest = Get-StatusSnapshot -Paths $Paths
+    }
+  }
+  return $latest
+}
+
+function Wait-ForMatchingSession {
+  param(
+    [object]$Paths,
+    [int]$ExpectedPort,
+    [int]$Attempts = 12,
+    [int]$DelayMs = 100
+  )
+  $latest = Read-MobileSession -Paths $Paths
+  for ($attempt = 0; $attempt -lt $Attempts; $attempt++) {
+    if ($latest -and $latest.controller_port) {
+      try {
+        if ([int]$latest.controller_port -eq $ExpectedPort) {
+          return $latest
+        }
+      } catch {}
+    }
+    if ($attempt -lt ($Attempts - 1)) {
+      Start-Sleep -Milliseconds $DelayMs
+      $latest = Read-MobileSession -Paths $Paths
     }
   }
   return $latest
@@ -842,13 +813,17 @@ function Start-Runtime {
       Remove-Item Env:CODEX_ACTION_SOURCE -ErrorAction SilentlyContinue
     }
   }
+  $childReportedReady = Test-ChildReportedReady -ScriptResult $result
+  $sessionAfterStart = if ($result.exit_code -eq 0) {
+    Wait-ForMatchingSession -Paths $Paths -ExpectedPort $beforeControllerPort
+  } else {
+    Read-MobileSession -Paths $Paths
+  }
   $fresh = if ($result.exit_code -eq 0) {
     Wait-ForStableStartSnapshot -Paths $Paths -ExpectedPort $beforeControllerPort
   } else {
     Get-StatusSnapshot -Paths $Paths
   }
-  $childReportedReady = Test-ChildReportedReady -ScriptResult $result
-  $sessionAfterStart = Read-MobileSession -Paths $Paths
   $sessionMatchesPort = $false
   if ($sessionAfterStart -and $sessionAfterStart.controller_port) {
     try {

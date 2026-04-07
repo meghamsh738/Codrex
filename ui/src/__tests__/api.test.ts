@@ -168,6 +168,38 @@ describe("session profile apply API", () => {
       }),
     );
   });
+
+  it("posts resume_id when creating a specific resume session", async () => {
+    fetchMock.mockResolvedValue({
+      ok: true,
+      status: 200,
+      text: async () => JSON.stringify({ ok: true, session: "codex_resume_demo", resume_id: "019d31aa-4346-76c3-8880-5c85b5924616" }),
+    });
+
+    const out = await createSessionWithOptions({
+      name: "codex_resume_demo",
+      cwd: "/home/megha/codrex-work",
+      reasoning_effort: "high",
+      resume_id: "019d31aa-4346-76c3-8880-5c85b5924616",
+    });
+    expect(out.ok).toBe(true);
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/codex/session",
+      expect.objectContaining({
+        method: "POST",
+        credentials: "include",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          name: "codex_resume_demo",
+          cwd: "/home/megha/codrex-work",
+          reasoning_effort: "high",
+          resume_id: "019d31aa-4346-76c3-8880-5c85b5924616",
+        }),
+      }),
+    );
+  });
 });
 
 describe("shared files API", () => {

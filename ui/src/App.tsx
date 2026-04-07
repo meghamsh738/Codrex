@@ -160,6 +160,11 @@ async function copyTextWithFallback(text: string): Promise<void> {
   }
 }
 
+function isInteractiveRemoteOverlayTarget(target: EventTarget | null): boolean {
+  const node = target as HTMLElement | null;
+  return Boolean(node?.closest("button, input, select, textarea, a, label"));
+}
+
 interface ChatThread {
   id: string;
   title: string;
@@ -224,6 +229,13 @@ const POWER_ACTION_LABELS: Record<"lock" | "sleep" | "hibernate" | "restart" | "
   restart: "Restart",
   shutdown: "Shutdown",
 };
+const DESKTOP_WINDOWS_SHORTCUTS: Array<{ key: string; label: string; testId?: string }> = [
+  { key: "win", label: "Start", testId: "remote-win-start" },
+  { key: "win+left", label: "Snap Left", testId: "remote-win-left" },
+  { key: "win+right", label: "Snap Right", testId: "remote-win-right" },
+  { key: "alt+tab", label: "Next Window", testId: "remote-next-window" },
+  { key: "win+tab", label: "Task View", testId: "remote-task-view" },
+];
 const FALLBACK_MODELS = ["gpt-5-codex", "gpt-5", "gpt-5-mini", "gpt-4.1", "o4-mini"];
 const FALLBACK_REASONING_EFFORTS: ReasoningEffort[] = ["minimal", "low", "medium", "high", "xhigh"];
 const TMUX_SHELL_BOOT_COMMAND: Record<TmuxShellProfile, string> = {
@@ -701,6 +713,7 @@ export default function App() {
   const [pairBusy, setPairBusy] = useState(false);
 
   const [sessions, setSessions] = useState<SessionInfo[]>([]);
+  const [recentClosedSessions, setRecentClosedSessions] = useState<SessionInfo[]>([]);
   const [sessionsMeta, setSessionsMeta] = useState<{ total_sessions?: number; background_mode?: string } | null>(null);
   const [sessionsLoading, setSessionsLoading] = useState(true);
   const [selectedSession, setSelectedSession] = useState(() => safeStorageGet(SESSION_SELECTED_STORAGE));
@@ -733,7 +746,7 @@ export default function App() {
   const [sessionNotesInfo, setSessionNotesInfo] = useState<SessionNoteInfo | null>(null);
   const [sessionNotesLoading, setSessionNotesLoading] = useState(false);
   const [sessionNotesBusy, setSessionNotesBusy] = useState(false);
-  const [telegramConfigured, setTelegramConfigured] = useState(false);
+  const [, setTelegramConfigured] = useState(false);
   const [composerTelegramBusy, setComposerTelegramBusy] = useState(false);
   const [pageVisible, setPageVisible] = useState(() =>
     typeof document === "undefined" ? true : !document.hidden,
@@ -792,6 +805,7 @@ export default function App() {
   const [desktopPerfEnabled, setDesktopPerfEnabled] = useState(true);
   const [desktopPerfActive, setDesktopPerfActive] = useState(false);
   const [desktopFullscreen, setDesktopFullscreen] = useState(false);
+  const [desktopFullscreenLight, setDesktopFullscreenLight] = useState(false);
   const [desktopTrackpadMode, setDesktopTrackpadMode] = useState(true);
   const [powerStatus, setPowerStatus] = useState<PowerStatusResult | null>(null);
   const [powerBusy, setPowerBusy] = useState(false);
@@ -1215,8 +1229,10 @@ export default function App() {
         throw new Error(response.detail || response.error || "Failed to read sessions.");
       }
       const nextSessions = response.sessions || [];
+      const nextRecentClosed = response.recent_closed || [];
       setSessionsMeta(response.meta || null);
       setSessions(nextSessions);
+      setRecentClosedSessions(nextRecentClosed);
       setSelectedSession((current) => {
         if (current && nextSessions.some((s) => s.session === current)) {
           return current;
@@ -2414,6 +2430,9 @@ export default function App() {
   const desktopPathSummary = desktopSelectedPath
     ? `Copied: ${desktopSelectedPath}`
     : "Works for the currently focused File Explorer window or desktop selection on the host.";
+  const remoteImageSummary = sessionImageFile
+    ? `Ready to paste ${sessionImageFile.name} into the focused Ubuntu app with Ctrl+V.`
+    : "Choose an image, focus the Ubuntu app in the remote desktop, then send.";
   const installButtonLabel =
     installState === "installed"
       ? "Installed"
@@ -2907,6 +2926,41 @@ export default function App() {
     setError,
     setStatus,
   ]);
+
+  const onSendRemoteDesktopImage = useCallback(async () => {
+    if (!selectedSession) {
+      setError("Select a session first so the image can be staged for the remote desktop.");
+      return;
+    }
+    if (!desktopEnabled) {
+      setError("Enable remote control first.");
+      return;
+    }
+    if (!sessionImageFile) {
+      setError("Choose an image file first.");
+      return;
+    }
+    setSessionBusy(true);
+    try {
+      const response = await sendSessionImage(selectedSession, sessionImageFile, sessionImagePrompt, {
+        paste_desktop: true,
+        delivery_mode: "desktop_clipboard",
+      });
+      if (!response.ok) {
+        throw new Error(response.detail || response.error || "Remote image paste failed.");
+      }
+      setSessionImageFile(null);
+      setSessionImagePrompt("");
+      remoteStageRef.current?.focus({ preventScroll: true });
+      setStatus(
+        response.detail || `Image copied to the Windows clipboard and pasted into the focused Ubuntu app for ${selectedSession}.`,
+      );
+    } catch (error) {
+      setError(`Remote image paste failed: ${(error as Error).message}`);
+    } finally {
+      setSessionBusy(false);
+    }
+  }, [desktopEnabled, selectedSession, sessionImageFile, sessionImagePrompt, setError, setStatus]);
 
   const onSaveSessionNotes = useCallback(async () => {
     if (!selectedSession) {
@@ -3752,8 +3806,11 @@ export default function App() {
     await onDesktopScroll(event.deltaY >= 0 ? 240 : -240);
   }, [desktopEnabled, onDesktopScroll]);
 
-  const onDesktopPointerDown = useCallback((event: React.PointerEvent<HTMLImageElement>) => {
+  const onDesktopPointerDown = useCallback((event: React.PointerEvent<HTMLElement>) => {
     if (!desktopEnabled) {
+      return;
+    }
+    if (isInteractiveRemoteOverlayTarget(event.target)) {
       return;
     }
     const pointerType = normalizeDesktopPointerType(event.pointerType);
@@ -3778,11 +3835,16 @@ export default function App() {
         void beginDesktopTouchDrag();
       }, 220);
     }
-    event.currentTarget.setPointerCapture(event.pointerId);
+    if ("setPointerCapture" in event.currentTarget) {
+      event.currentTarget.setPointerCapture(event.pointerId);
+    }
   }, [beginDesktopTouchDrag, clearDesktopDragHoldTimer, desktopEnabled, desktopFullscreen, desktopTrackpadMode, normalizeDesktopPointerType]);
 
-  const onDesktopPointerMove = useCallback(async (event: React.PointerEvent<HTMLImageElement>) => {
+  const onDesktopPointerMove = useCallback(async (event: React.PointerEvent<HTMLElement>) => {
     if (!desktopEnabled || !desktopPointerRef.current.active) {
+      return;
+    }
+    if (isInteractiveRemoteOverlayTarget(event.target)) {
       return;
     }
     const state = desktopPointerRef.current;
@@ -3841,7 +3903,7 @@ export default function App() {
     await onDesktopMovePointer(event.clientX, event.clientY);
   }, [clearDesktopDragHoldTimer, desktopEnabled, desktopFullscreen, desktopTrackpadMode, onDesktopMovePointer, onDesktopScroll]);
 
-  const onDesktopPointerUp = useCallback(async (event: React.PointerEvent<HTMLImageElement>) => {
+  const onDesktopPointerUp = useCallback(async (event: React.PointerEvent<HTMLElement>) => {
     const state = desktopPointerRef.current;
     clearDesktopDragHoldTimer();
     desktopPointerRef.current = {
@@ -3856,6 +3918,9 @@ export default function App() {
       pointerType: "",
     };
     if (!desktopEnabled) {
+      return;
+    }
+    if (isInteractiveRemoteOverlayTarget(event.target)) {
       return;
     }
     if (!state.active) {
@@ -4218,6 +4283,8 @@ export default function App() {
         quickKey = "alt+shift+tab";
       } else if (alt && normalizedKey === "tab") {
         quickKey = "alt+tab";
+      } else if (!ctrlOrMeta && !alt && shift && normalizedKey === "tab") {
+        quickKey = "shift+tab";
       } else if (!ctrlOrMeta && !alt && normalizedKey === "enter") {
         quickKey = "enter";
       } else if (!ctrlOrMeta && !alt && normalizedKey === "escape") {
@@ -4301,6 +4368,21 @@ export default function App() {
       document.removeEventListener("cut", onCopyOrCut, { capture: true });
     };
   }, [desktopEnabled, desktopFullscreen, desktopSelectedPath, desktopTextInput, onDesktopPasteLocalClipboard, onDesktopSendQuickKey]);
+
+  useEffect(() => {
+    if (typeof document === "undefined") {
+      return;
+    }
+    const body = document.body;
+    const root = document.documentElement;
+    const active = desktopFullscreen && activeTab === "remote";
+    body.classList.toggle("remote-fullscreen-active", active);
+    root.classList.toggle("remote-fullscreen-active", active);
+    return () => {
+      body.classList.remove("remote-fullscreen-active");
+      root.classList.remove("remote-fullscreen-active");
+    };
+  }, [activeTab, desktopFullscreen]);
 
   useEffect(() => {
     const wantsAutoPerf = activeTab === "remote" && desktopFullscreen && desktopEnabled;
@@ -4533,6 +4615,17 @@ export default function App() {
           setSessionNotesInfo(null);
           setSelectedSession("");
         }
+        const closedSession = sessions.find((item) => item.session === closingSession);
+        if (closedSession) {
+          setRecentClosedSessions((current) => [
+            {
+              ...closedSession,
+              active: false,
+              closed_at: Date.now() / 1000,
+            },
+            ...current.filter((item) => item.session !== closingSession),
+          ]);
+        }
         delete sessionStreamSeqRef.current[closingSession];
         scheduleSessionsRefresh(200);
       } catch (error) {
@@ -4541,7 +4634,66 @@ export default function App() {
         setSessionBusy(false);
       }
     })();
-  }, [closeSession, scheduleSessionsRefresh, selectedSession, sessionBusy, setError, setStatus]);
+  }, [closeSession, scheduleSessionsRefresh, selectedSession, sessionBusy, sessions, setError, setStatus]);
+
+  const onResumeClosedSession = useCallback(async (sessionInfo: SessionInfo) => {
+    if (sessionBusy) {
+      return;
+    }
+    setSessionBusy(true);
+    try {
+      const response = await createSessionWithOptions({
+        name: sessionInfo.session,
+        cwd: sessionInfo.cwd || "",
+        model: sessionInfo.model,
+        reasoning_effort: sessionInfo.reasoning_effort,
+        resume_id: sessionInfo.resume_id,
+      });
+      if (!response.ok || !response.session) {
+        throw new Error(response.detail || response.error || "Could not resume session.");
+      }
+      setSelectedSession(response.session);
+      setStreamEnabled(true);
+      setOutputFeedState("polling");
+      setRecentClosedSessions((current) => current.filter((item) => item.session !== sessionInfo.session));
+      scheduleSessionsRefresh(250);
+      setActiveTab("sessions");
+      setStatus(`Resumed ${response.session}.`);
+    } catch (error) {
+      setError(`Resume session failed: ${(error as Error).message}`);
+    } finally {
+      setSessionBusy(false);
+    }
+  }, [createSessionWithOptions, scheduleSessionsRefresh, sessionBusy, setError, setStatus]);
+
+  const onReopenClosedSession = useCallback(async (sessionInfo: SessionInfo) => {
+    if (sessionBusy) {
+      return;
+    }
+    setSessionBusy(true);
+    try {
+      const response = await createSessionWithOptions({
+        name: sessionInfo.session,
+        cwd: sessionInfo.cwd || "",
+        model: sessionInfo.model,
+        reasoning_effort: sessionInfo.reasoning_effort,
+      });
+      if (!response.ok || !response.session) {
+        throw new Error(response.detail || response.error || "Could not reopen session.");
+      }
+      setSelectedSession(response.session);
+      setStreamEnabled(true);
+      setOutputFeedState("polling");
+      setRecentClosedSessions((current) => current.filter((item) => item.session !== sessionInfo.session));
+      scheduleSessionsRefresh(250);
+      setActiveTab("sessions");
+      setStatus(`Reopened ${response.session}.`);
+    } catch (error) {
+      setError(`Reopen session failed: ${(error as Error).message}`);
+    } finally {
+      setSessionBusy(false);
+    }
+  }, [createSessionWithOptions, scheduleSessionsRefresh, sessionBusy, setError, setStatus]);
 
   const renderNavIcon = useCallback((tab: MainTab) => {
     if (tab === "sessions") {
@@ -4879,15 +5031,19 @@ export default function App() {
                 <SessionListPanel
                   sessionsLoading={sessionsLoading}
                   sessionsCount={sessions.length}
+                  recentClosedCount={recentClosedSessions.length}
                   filteredCount={filteredSessions.length}
                   visibleSessionCountLabel={visibleSessionCountLabel}
                   sessionViewMode={sessionViewMode}
                   groupedSessions={groupedSessions}
                   filteredSessions={filteredSessions}
+                  recentClosedSessions={recentClosedSessions}
                   selectedSession={selectedSession}
                   sessionBusy={sessionBusy}
                   onSelectSession={onSelectSessionCard}
                   onCloseSession={onCloseSessionCard}
+                  onResumeSession={onResumeClosedSession}
+                  onReopenSession={onReopenClosedSession}
                   inferProjectFromCwd={inferProjectFromCwd}
                 />
               </div>
@@ -5368,6 +5524,13 @@ export default function App() {
                     >
                       Boost Host: {desktopPerfEnabled ? "On" : "Off"}
                     </button>
+                    <button
+                      type="button"
+                      className={`button soft compact ${desktopFullscreenLight ? "active" : ""}`}
+                      onClick={() => setDesktopFullscreenLight((current) => !current)}
+                    >
+                      Keyboard Light: {desktopFullscreenLight ? "On" : "Off"}
+                    </button>
                     {desktopAltHeld ? <span className="badge warn">Alt held</span> : null}
                     {desktopPerfActive ? <span className="badge active">Boost active</span> : null}
                     <span className="small">
@@ -5401,16 +5564,23 @@ export default function App() {
                     <div className="remote-view-stack">
                       <div
                         ref={remoteStageRef}
-                        className={`stream-wrap remote-stage${desktopFullscreen ? " fullscreen-active" : ""}`}
+                        className={`stream-wrap remote-stage${desktopFullscreen ? " fullscreen-active" : ""}${desktopFullscreenLight ? " fullscreen-light" : ""}`}
                         data-remote-gesture="true"
                         data-testid="remote-stage"
                         tabIndex={0}
-                        onPointerDown={onRemoteStageFocus}
+                        onPointerDown={(event) => {
+                          onRemoteStageFocus();
+                          onDesktopPointerDown(event);
+                        }}
+                        onPointerMove={(event) => void onDesktopPointerMove(event)}
+                        onPointerUp={(event) => void onDesktopPointerUp(event)}
+                        onPointerCancel={onDesktopPointerCancel}
                       >
                         <div className="remote-stage-toolbar">
                           <div className="remote-stage-badges">
                             <span className="badge muted">{desktopTrackpadMode ? "Trackpad mode" : "Direct tap mode"}</span>
                             <span className="badge muted">{desktopFullscreen ? "Fullscreen" : "Windowed"}</span>
+                            {desktopFullscreen ? <span className="badge muted">Use the rail for Windows shortcuts</span> : null}
                           </div>
                           <div className="remote-stage-actions">
                             {!desktopFullscreen ? (
@@ -5434,23 +5604,39 @@ export default function App() {
                                 >
                                   Copy Focused Path
                                 </button>
+                                {DESKTOP_WINDOWS_SHORTCUTS.map((shortcut) => (
+                                  <button
+                                    key={`overlay-${shortcut.key}`}
+                                    type="button"
+                                    className="button soft compact remote-overlay-btn"
+                                    data-testid={
+                                      shortcut.testId === "remote-next-window"
+                                        ? "remote-overlay-switch-tab"
+                                        : shortcut.testId === "remote-task-view"
+                                          ? "remote-overlay-all-tabs"
+                                          : `remote-overlay-${shortcut.key.replaceAll("+", "-")}`
+                                    }
+                                    onClick={() => void onDesktopSendQuickKey(shortcut.key)}
+                                    disabled={desktopInteractionDisabled}
+                                  >
+                                    {shortcut.label}
+                                  </button>
+                                ))}
                                 <button
                                   type="button"
                                   className="button soft compact remote-overlay-btn"
-                                  data-testid="remote-overlay-switch-tab"
-                                  onClick={() => void onDesktopSendQuickKey("alt+tab")}
-                                  disabled={desktopInteractionDisabled}
+                                  data-testid="remote-overlay-exit-fullscreen"
+                                  onClick={() => void onToggleDesktopFullscreen()}
                                 >
-                                  Switch Tab
+                                  Exit Fullscreen
                                 </button>
                                 <button
                                   type="button"
                                   className="button soft compact remote-overlay-btn"
-                                  data-testid="remote-overlay-all-tabs"
-                                  onClick={() => void onDesktopSendQuickKey("win+tab")}
-                                  disabled={desktopInteractionDisabled}
+                                  data-testid="remote-overlay-keyboard-light"
+                                  onClick={() => setDesktopFullscreenLight((current) => !current)}
                                 >
-                                  All Tabs
+                                  Keyboard Light {desktopFullscreenLight ? "On" : "Off"}
                                 </button>
                               </>
                             ) : null}
@@ -5461,13 +5647,12 @@ export default function App() {
                           className="desktop-frame"
                           src={desktopStreamUrl}
                           alt="Desktop stream"
+                          decoding="async"
+                          fetchPriority="high"
+                          draggable={false}
                           onClick={(event) => void onDesktopFrameTap(event)}
                           onContextMenu={(event) => void onDesktopContextMenu(event)}
                           onWheel={(event) => void onDesktopWheel(event)}
-                          onPointerDown={(event) => void onDesktopPointerDown(event)}
-                          onPointerMove={(event) => void onDesktopPointerMove(event)}
-                          onPointerUp={(event) => void onDesktopPointerUp(event)}
-                          onPointerCancel={onDesktopPointerCancel}
                         />
                       </div>
                       <p className="small">
@@ -5476,6 +5661,39 @@ export default function App() {
                     </div>
 
                     <div className="remote-control-stack">
+                      <div className="remote-control-group">
+                        <h4>Windows Controls</h4>
+                        <div className="remote-quickkeys remote-quickkeys-windows" role="group" aria-label="Remote Windows controls">
+                          {DESKTOP_WINDOWS_SHORTCUTS.map((shortcut) => (
+                            <button
+                              key={shortcut.key}
+                              type="button"
+                              className="button soft compact action-chip"
+                              data-testid={shortcut.testId}
+                              onClick={() => void onDesktopSendQuickKey(shortcut.key)}
+                              disabled={desktopInteractionDisabled}
+                            >
+                              <span className="btn-text">{shortcut.label}</span>
+                            </button>
+                          ))}
+                          <button
+                            type="button"
+                            className={`button soft compact action-chip${desktopAltHeld ? " warn" : ""}`}
+                            onClick={() => void onDesktopSendQuickKey("alt+tab-hold")}
+                            disabled={desktopInteractionDisabled}
+                          >
+                            <span className="btn-text">{desktopAltHeld ? "Alt Held" : "Hold Alt+Tab"}</span>
+                          </button>
+                          <button
+                            type="button"
+                            className="button soft compact action-chip"
+                            onClick={() => void onDesktopSendQuickKey("alt+release")}
+                            disabled={desktopInteractionDisabled}
+                          >
+                            <span className="btn-text">Release Alt</span>
+                          </button>
+                        </div>
+                      </div>
                       <div className="remote-control-group">
                         <h4>Pointer Controls</h4>
                         <div className="row remote-mouse-controls">
@@ -5534,10 +5752,14 @@ export default function App() {
                             <option value="delete">Delete</option>
                             <option value="esc">Esc</option>
                             <option value="tab">Tab</option>
+                            <option value="shift+tab">Shift+Tab</option>
                             <option value="up">Up</option>
                             <option value="down">Down</option>
                             <option value="left">Left</option>
                             <option value="right">Right</option>
+                            <option value="win">Win / Start</option>
+                            <option value="win+left">Win+Left</option>
+                            <option value="win+right">Win+Right</option>
                             <option value="win+tab">Win+Tab</option>
                             <option value="alt+tab">Alt+Tab</option>
                             <option value="ctrl+a">Ctrl+A</option>
@@ -5571,6 +5793,10 @@ export default function App() {
                               <span className="btn-glyph" aria-hidden="true">⇥</span>
                               <span className="btn-text">Tab</span>
                             </button>
+                            <button type="button" className="button soft compact action-chip" onClick={() => void onDesktopSendQuickKey("shift+tab")} disabled={desktopInteractionDisabled}>
+                              <span className="btn-glyph" aria-hidden="true">⇤</span>
+                              <span className="btn-text">Shift+Tab</span>
+                            </button>
                             <button type="button" className="button soft compact action-chip" onClick={() => void onDesktopSendQuickKey("esc")} disabled={desktopInteractionDisabled}>
                               <span className="btn-glyph" aria-hidden="true">⎋</span>
                               <span className="btn-text">Esc</span>
@@ -5578,18 +5804,6 @@ export default function App() {
                             <button type="button" className="button soft compact action-chip" onClick={() => void onDesktopSendQuickKey("enter")} disabled={desktopInteractionDisabled}>
                               <span className="btn-glyph" aria-hidden="true">↵</span>
                               <span className="btn-text">Enter</span>
-                            </button>
-                            <button type="button" className="button soft compact action-chip" onClick={() => void onDesktopSendQuickKey("win+tab")} disabled={desktopInteractionDisabled}>
-                              <span className="btn-text">All Tabs</span>
-                            </button>
-                            <button type="button" className={`button soft compact action-chip${desktopAltHeld ? " warn" : ""}`} onClick={() => void onDesktopSendQuickKey("alt+tab-hold")} disabled={desktopInteractionDisabled}>
-                              <span className="btn-text">{desktopAltHeld ? "Alt Held" : "Hold Alt+Tab"}</span>
-                            </button>
-                            <button type="button" className="button soft compact action-chip" onClick={() => void onDesktopSendQuickKey("alt+tab")} disabled={desktopInteractionDisabled}>
-                              <span className="btn-text">Switch Tab</span>
-                            </button>
-                            <button type="button" className="button soft compact action-chip" onClick={() => void onDesktopSendQuickKey("alt+release")} disabled={desktopInteractionDisabled}>
-                              <span className="btn-text">Release Alt</span>
                             </button>
                             <button type="button" className="button soft compact action-chip" onClick={() => void onDesktopSendQuickKey("ctrl+c")} disabled={desktopInteractionDisabled}>
                               <span className="btn-text">Ctrl+C</span>
@@ -5599,6 +5813,62 @@ export default function App() {
                             </button>
                           </div>
                         </div>
+                      </div>
+                      <div className="remote-control-group" data-testid="remote-image-send">
+                        <div className="remote-group-head">
+                          <h4>Paste Image To Desktop App</h4>
+                          <span className="small">{remoteImageSummary}</span>
+                        </div>
+                        <input
+                          ref={sessionImageInputRef}
+                          type="file"
+                          accept="image/*"
+                          data-testid="remote-image-input"
+                          className="sr-only"
+                          onChange={(event) => onSessionImageFileChange(event.target.files?.[0] || null)}
+                        />
+                        <div className="remote-image-actions">
+                          <button
+                            type="button"
+                            className={`button soft compact action-chip${sessionImageFile ? " active" : ""}`}
+                            onClick={onOpenSessionImagePicker}
+                            disabled={sessionBusy}
+                          >
+                            <span className="btn-text">{sessionImageFile ? "Change Image" : "Choose Image"}</span>
+                          </button>
+                          <button
+                            type="button"
+                            className="button soft compact action-chip"
+                            onClick={() => onSessionImageFileChange(null)}
+                            disabled={sessionBusy || !sessionImageFile}
+                          >
+                            <span className="btn-text">Clear Image</span>
+                          </button>
+                        </div>
+                        {sessionImageFile ? (
+                          <div className="remote-image-panel">
+                            <span className="mode-pill mode-ready">{sessionImageFile.name}</span>
+                            <input
+                              type="text"
+                              value={sessionImagePrompt}
+                              onChange={(event) => onSessionImagePromptChange(event.target.value)}
+                              placeholder="Optional note for the session file"
+                              disabled={sessionBusy}
+                            />
+                            <button
+                              type="button"
+                              className="button soft compact action-chip"
+                              data-testid="remote-send-image"
+                              onClick={() => void onSendRemoteDesktopImage()}
+                              disabled={sessionBusy || !sessionImageFile || !selectedSession || !desktopEnabled}
+                            >
+                              <span className="btn-text">Paste Image With Ctrl+V</span>
+                            </button>
+                          </div>
+                        ) : null}
+                        {!selectedSession ? (
+                          <p className="small">Select a live session first so the image can be staged under that workspace.</p>
+                        ) : null}
                       </div>
                       <div className="remote-control-group" data-testid="remote-selected-path">
                         <div className="remote-group-head">

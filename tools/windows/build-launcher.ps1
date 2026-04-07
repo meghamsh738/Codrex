@@ -49,6 +49,11 @@ if (-not (Test-Path $publishedExe)) {
 
 $currentDir = Join-Path $root "launcher\Codrex.Launcher\bin\current"
 New-Item -ItemType Directory -Path $currentDir -Force | Out-Null
-Copy-Item -Path (Join-Path $root "launcher\Codrex.Launcher\bin\$Configuration\net8.0-windows\win-x64\publish\*") -Destination $currentDir -Recurse -Force
+$publishDir = Join-Path $root "launcher\Codrex.Launcher\bin\$Configuration\net8.0-windows\win-x64\publish"
+$publishItems = Get-ChildItem -Path $publishDir -Force | Where-Object { $_.Name -ne "Codrex.Launcher.exe.WebView2" }
+foreach ($item in $publishItems) {
+  Copy-Item -Path $item.FullName -Destination $currentDir -Recurse -Force
+}
+Remove-Item -Path (Join-Path $currentDir "Codrex.Launcher.exe.WebView2") -Recurse -Force -ErrorAction SilentlyContinue
 
 Write-Output $publishedExe

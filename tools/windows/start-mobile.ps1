@@ -17,23 +17,7 @@ $script:LegacyControllerPort = 8787
 $script:DefaultDevUiPort = 54312
 
 function Get-PrimaryIPv4 {
-  try {
-    $route = Get-NetRoute -DestinationPrefix "0.0.0.0/0" -ErrorAction Stop |
-      Where-Object { $_.NextHop -and $_.NextHop -ne "0.0.0.0" } |
-      Sort-Object RouteMetric, ifMetric |
-      Select-Object -First 1
-    if ($route) {
-      $ip = Get-NetIPAddress -InterfaceIndex $route.ifIndex -AddressFamily IPv4 -ErrorAction Stop |
-        Where-Object { $_.IPAddress -notlike "169.254*" -and $_.IPAddress -ne "127.0.0.1" } |
-        Select-Object -First 1 -ExpandProperty IPAddress
-      if ($ip) { return [string]$ip }
-    }
-  } catch {}
-  try {
-    $line = (ipconfig | Select-String "IPv4 Address").Line | Select-Object -First 1
-    if ($line -match ":\s*([0-9\.]+)\s*$") { return [string]$matches[1] }
-  } catch {}
-  return "127.0.0.1"
+  return (Get-CodrexPrimaryIPv4)
 }
 
 function Read-ControllerPort {
@@ -125,23 +109,7 @@ function Get-UiOwnerInfo {
   param(
     [int]$Port
   )
-  try {
-    $listeners = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue
-  } catch {
-    return @()
-  }
-  if (-not $listeners) {
-    return @()
-  }
-  $owners = @()
-  foreach ($listener in ($listeners | Select-Object -Unique OwningProcess)) {
-    $procId = [int]$listener.OwningProcess
-    $proc = Get-CimInstance Win32_Process -Filter ("ProcessId = {0}" -f $procId) -ErrorAction SilentlyContinue
-    if ($proc) {
-      $owners += $proc
-    }
-  }
-  return $owners
+  return @(Get-CodrexPortOwnerProcesses -Ports @($Port))
 }
 
 function Get-ProcessIdByListeningPort {
@@ -151,14 +119,7 @@ function Get-ProcessIdByListeningPort {
   if ($Port -le 0) {
     return $null
   }
-  try {
-    $listener = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue |
-      Select-Object -First 1
-    if ($listener -and $listener.OwningProcess) {
-      return [int]$listener.OwningProcess
-    }
-  } catch {}
-  return $null
+  return (Get-CodrexListeningProcessId -Port $Port)
 }
 
 function Resolve-DevUiPort {

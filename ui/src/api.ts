@@ -325,6 +325,7 @@ export function createSessionWithOptions(options: {
   model?: string;
   reasoning_effort?: string;
   resume_last?: boolean;
+  resume_id?: string;
 }): Promise<SessionCreateResult> {
   const payload: Record<string, string | boolean> = {};
   if (options.name && options.name.trim()) {
@@ -341,6 +342,9 @@ export function createSessionWithOptions(options: {
   }
   if (options.resume_last) {
     payload.resume_last = true;
+  }
+  if (options.resume_id && options.resume_id.trim()) {
+    payload.resume_id = options.resume_id.trim();
   }
   return requestJson<SessionCreateResult>("/codex/session", {
     method: "POST",

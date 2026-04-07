@@ -215,6 +215,67 @@ public sealed class LauncherRuntimeService
         return File.Exists(StateStore.LastActionPath) ? StateStore.LastActionPath : null;
     }
 
+    private static TimeSpan GetRuntimeActionTimeout(string action) =>
+        action switch
+        {
+            "start" => TimeSpan.FromSeconds(12),
+            "stop" => TimeSpan.FromSeconds(12),
+            "repair" => TimeSpan.FromSeconds(8),
+            _ => TimeSpan.FromSeconds(5),
+        };
+
+    private static bool RuntimeStateSatisfiesAction(string action, RuntimeActionResult? runtime)
+    {
+        if (runtime is null || !runtime.Ok)
+        {
+            return false;
+        }
+
+        var status = (runtime.Status ?? string.Empty).Trim().ToLowerInvariant();
+        return action switch
+        {
+            "start" => status == "running" || (runtime.ControllerPort > 0 && runtime.SessionPresent && status is "checking" or "recovering"),
+            "stop" => status == "stopped",
+            "repair" => status is "running" or "stopped" or "checking" or "recovering",
+            _ => true,
+        };
+    }
+
+    private async Task<RuntimeActionResult?> WaitForRuntimeGoalAsync(string action, CancellationToken cancellationToken)
+    {
+        var deadline = DateTime.UtcNow + (action == "start" ? TimeSpan.FromSeconds(8) : TimeSpan.FromSeconds(6));
+        while (DateTime.UtcNow < deadline)
+        {
+            RuntimeActionResult status;
+            try
+            {
+                status = await GetStatusAsync(cancellationToken);
+            }
+            catch
+            {
+                status = null!;
+            }
+
+            if (RuntimeStateSatisfiesAction(action, status))
+            {
+                status.Action = action;
+                if (string.IsNullOrWhiteSpace(status.Detail))
+                {
+                    status.Detail = action == "start"
+                        ? "Codrex app stack started."
+                        : action == "stop"
+                            ? "Codrex app stack stopped."
+                            : "Codrex runtime is healthy.";
+                }
+                return status;
+            }
+
+            await Task.Delay(500, cancellationToken);
+        }
+
+        return null;
+    }
+
     private async Task<RuntimeActionResult> InvokeRuntimeAsync(string action, CancellationToken cancellationToken)
     {
         var startInfo = new ProcessStartInfo("powershell.exe")
@@ -258,15 +319,58 @@ public sealed class LauncherRuntimeService
 
         process.BeginOutputReadLine();
         process.BeginErrorReadLine();
-        await process.WaitForExitAsync(cancellationToken);
+        var waitForExitTask = process.WaitForExitAsync(cancellationToken);
+        var timeout = GetRuntimeActionTimeout(action);
+        var completedTask = await Task.WhenAny(waitForExitTask, Task.Delay(timeout, cancellationToken));
+        if (completedTask != waitForExitTask)
+        {
+            try
+            {
+                if (!process.HasExited)
+                {
+                    process.Kill(entireProcessTree: true);
+                }
+            }
+            catch
+            {
+            }
+
+            var recovered = await WaitForRuntimeGoalAsync(action, cancellationToken);
+            if (recovered is not null)
+            {
+                return recovered;
+            }
+
+            throw new TimeoutException($"Codrex runtime action '{action}' timed out after {timeout.TotalSeconds:0} seconds.");
+        }
+
+        await waitForExitTask;
 
         var stdout = stdoutTask.ToString();
         var stderr = stderrTask.ToString();
         var payload = ParseRuntimePayload(stdout);
         if (payload is null)
         {
+            var recovered = await WaitForRuntimeGoalAsync(action, cancellationToken);
+            if (recovered is not null)
+            {
+                return recovered;
+            }
             throw new InvalidOperationException(
                 $"Codrex runtime did not return JSON for '{action}'. Stdout: {stdout.Trim()} Stderr: {stderr.Trim()}");
+        }
+
+        if (action is "start" or "stop")
+        {
+            var runtimeLooksGood = RuntimeStateSatisfiesAction(action, payload);
+            if (!runtimeLooksGood || process.ExitCode != 0)
+            {
+                var recovered = await WaitForRuntimeGoalAsync(action, cancellationToken);
+                if (recovered is not null)
+                {
+                    return recovered;
+                }
+            }
         }
 
         if (process.ExitCode != 0)
