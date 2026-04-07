@@ -94,7 +94,7 @@ public sealed class LauncherRuntimeService
             return null;
         }
 
-        using var client = BuildHttpClient(token);
+        using var client = BuildHttpClient(token, TimeSpan.FromSeconds(20));
         using var response = await client.GetAsync($"http://127.0.0.1:{controllerPort}/net/info", cancellationToken);
         response.EnsureSuccessStatusCode();
         var payload = await response.Content.ReadAsStringAsync(cancellationToken);
@@ -465,11 +465,11 @@ public sealed class LauncherRuntimeService
         return null;
     }
 
-    private static HttpClient BuildHttpClient(string token)
+    private static HttpClient BuildHttpClient(string token, TimeSpan? timeout = null)
     {
         var client = new HttpClient
         {
-            Timeout = TimeSpan.FromSeconds(10),
+            Timeout = timeout ?? TimeSpan.FromSeconds(10),
         };
         if (!string.IsNullOrWhiteSpace(token))
         {

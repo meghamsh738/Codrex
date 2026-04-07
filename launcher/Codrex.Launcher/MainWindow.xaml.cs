@@ -36,6 +36,9 @@ public partial class MainWindow : Window
     private string _lastActionAt = DateTime.Now.ToString("HH:mm:ss");
     private DateTime _lastNetInfoRefreshUtc = DateTime.MinValue;
     private DateTime _lastAccountsRefreshUtc = DateTime.MinValue;
+    private bool _refreshInFlight;
+    private bool _refreshQueued;
+    private string _routeNotice = "";
 
     public MainWindow()
     {
@@ -115,6 +118,7 @@ public partial class MainWindow : Window
                         _preferences.PreferredPairRoute = route;
                         _stateStore.SavePreferences(_preferences);
                         _currentPairing = null;
+                        _routeNotice = "";
                         _statusDetail = $"Selected {route} route.";
                         var routeHost = route == "tailscale"
                             ? (_lastNetInfo?.TailscaleIp?.Trim() ?? "")
@@ -268,6 +272,7 @@ public partial class MainWindow : Window
         var generation = _actionGeneration;
         _pendingAction = action;
         _errorDetail = "";
+        _routeNotice = "";
         _currentPairing = action == "stop" ? null : _currentPairing;
         _statusDetail = action == "start" ? "Starting Codrex runtime..." : action == "stop" ? "Stopping Codrex runtime..." : "Running Codrex action...";
         RecordActionEvent(action, action == "start" ? "starting codrex runtime" : action == "stop" ? "stopping codrex runtime" : $"running {action}");
@@ -367,44 +372,89 @@ public partial class MainWindow : Window
 
     private async Task RefreshStateAsync()
     {
-        try
+        if (_refreshInFlight)
         {
-            _lastRuntime = await _runtimeService.GetStatusAsync();
-            TryCompletePendingActionFromLiveState(_lastRuntime);
-            if (_lastRuntime.Ok && _lastRuntime.Status.Equals("running", StringComparison.OrdinalIgnoreCase))
-            {
-                var shouldRefreshNetInfo =
-                    _actionBusy ||
-                    _lastNetInfo is null ||
-                    DateTime.UtcNow - _lastNetInfoRefreshUtc >= NetInfoRefreshInterval;
-                if (shouldRefreshNetInfo)
-                {
-                    var config = _runtimeService.ReadControllerConfig();
-                    _lastNetInfo = await _runtimeService.GetNetInfoAsync(_lastRuntime.ControllerPort, config.Token);
-                    _lastNetInfoRefreshUtc = DateTime.UtcNow;
-                }
-            }
-            else
-            {
-                _lastNetInfo = null;
-                _lastNetInfoRefreshUtc = DateTime.MinValue;
-            }
-            var shouldRefreshAccounts =
-                _lastAccounts is null ||
-                DateTime.UtcNow - _lastAccountsRefreshUtc >= AccountsRefreshInterval;
-            if (shouldRefreshAccounts)
-            {
-                var forceUsage = _lastAccounts is null;
-                _lastAccounts = await _runtimeService.GetAccountsAsync(forceUsage);
-                _lastAccountsRefreshUtc = DateTime.UtcNow;
-            }
-        }
-        catch (Exception ex)
-        {
-            _errorDetail = ex.Message;
+            _refreshQueued = true;
+            return;
         }
 
-        await PublishStateAsync();
+        _refreshInFlight = true;
+        try
+        {
+            do
+            {
+                _refreshQueued = false;
+
+                try
+                {
+                    _lastRuntime = await _runtimeService.GetStatusAsync();
+                    TryCompletePendingActionFromLiveState(_lastRuntime);
+                    _errorDetail = "";
+                }
+                catch (Exception ex)
+                {
+                    _errorDetail = ex.Message;
+                    _routeNotice = "";
+                    await PublishStateAsync();
+                    return;
+                }
+
+                if (_lastRuntime.Ok && _lastRuntime.Status.Equals("running", StringComparison.OrdinalIgnoreCase))
+                {
+                    var shouldRefreshNetInfo =
+                        _actionBusy ||
+                        _lastNetInfo is null ||
+                        DateTime.UtcNow - _lastNetInfoRefreshUtc >= NetInfoRefreshInterval;
+                    if (shouldRefreshNetInfo)
+                    {
+                        try
+                        {
+                            var config = _runtimeService.ReadControllerConfig();
+                            _lastNetInfo = await _runtimeService.GetNetInfoAsync(_lastRuntime.ControllerPort, config.Token);
+                            _lastNetInfoRefreshUtc = DateTime.UtcNow;
+                            _routeNotice = "";
+                        }
+                        catch (Exception ex)
+                        {
+                            _routeNotice = string.IsNullOrWhiteSpace(_lastNetInfo?.LanIp) && string.IsNullOrWhiteSpace(_lastNetInfo?.TailscaleIp)
+                                ? "Route lookup is delayed right now."
+                                : "Using the last known route while lookup catches up.";
+                            RecordActionEvent("network", $"route refresh delayed -> {ex.Message}");
+                        }
+                    }
+                }
+                else
+                {
+                    _lastNetInfo = null;
+                    _lastNetInfoRefreshUtc = DateTime.MinValue;
+                    _routeNotice = "";
+                }
+
+                var shouldRefreshAccounts =
+                    _lastAccounts is null ||
+                    DateTime.UtcNow - _lastAccountsRefreshUtc >= AccountsRefreshInterval;
+                if (shouldRefreshAccounts)
+                {
+                    try
+                    {
+                        var forceUsage = _lastAccounts is null;
+                        _lastAccounts = await _runtimeService.GetAccountsAsync(forceUsage);
+                        _lastAccountsRefreshUtc = DateTime.UtcNow;
+                    }
+                    catch (Exception ex)
+                    {
+                        RecordActionEvent("accounts", $"account refresh delayed -> {ex.Message}");
+                    }
+                }
+
+                await PublishStateAsync();
+            }
+            while (_refreshQueued);
+        }
+        finally
+        {
+            _refreshInFlight = false;
+        }
     }
 
     private void TryCompletePendingActionFromLiveState(RuntimeActionResult? runtime)
@@ -488,6 +538,7 @@ public partial class MainWindow : Window
             }),
             route = _preferences.PreferredPairRoute,
             routeHost,
+            routeNote = _routeNotice,
             lanHost = _lastNetInfo?.LanIp ?? "",
             tailscaleHost = _lastNetInfo?.TailscaleIp ?? "",
             lanAvailable = !string.IsNullOrWhiteSpace(_lastNetInfo?.LanIp),

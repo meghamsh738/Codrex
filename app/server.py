@@ -424,6 +424,31 @@ def guess_lan_ipv4() -> str:
         return ""
 
 
+def _compute_net_info_payload() -> Dict[str, Any]:
+    mac_info = _wake_mac_info()
+    return {
+        "ok": True,
+        "lan_ip": guess_lan_ipv4(),
+        "tailscale_ip": get_tailscale_ipv4(),
+        "primary_mac": str(mac_info.get("primary_mac") or ""),
+        "wake_candidate_macs": list(mac_info.get("wake_candidate_macs") or []),
+        "wake_supported": bool(mac_info.get("wake_supported")),
+    }
+
+
+def _get_cached_net_info(force: bool = False) -> Dict[str, Any]:
+    now = time.time()
+    with NET_INFO_CACHE_LOCK:
+        cached_at = float(NET_INFO_CACHE.get("loaded_at") or 0.0)
+        cached_payload = NET_INFO_CACHE.get("payload")
+        if not force and isinstance(cached_payload, dict) and (now - cached_at) < NET_INFO_CACHE_TTL_S:
+            return dict(cached_payload)
+        payload = _compute_net_info_payload()
+        NET_INFO_CACHE["loaded_at"] = now
+        NET_INFO_CACHE["payload"] = dict(payload)
+        return payload
+
+
 def _normalize_mac_address(value: str) -> str:
     raw = re.sub(r"[^0-9A-Fa-f]", "", str(value or ""))
     if len(raw) != 12:
@@ -886,6 +911,12 @@ CODEX_HISTORY_CACHE_LOCK = threading.Lock()
 CODEX_HISTORY_CACHE: Dict[str, Any] = {
     "loaded_at": 0.0,
     "entries": [],
+}
+NET_INFO_CACHE_LOCK = threading.Lock()
+NET_INFO_CACHE_TTL_S = float(os.environ.get("CODEX_NET_INFO_CACHE_TTL_S", "30") or "30")
+NET_INFO_CACHE: Dict[str, Any] = {
+    "loaded_at": 0.0,
+    "payload": None,
 }
 
 # -------------------------
@@ -7430,15 +7461,7 @@ def _power_status_payload() -> Dict[str, Any]:
 @app.get("/net/info")
 def net_info():
     # Helper for UI to suggest reachable base URLs (LAN vs Tailscale).
-    mac_info = _wake_mac_info()
-    return {
-        "ok": True,
-        "lan_ip": guess_lan_ipv4(),
-        "tailscale_ip": get_tailscale_ipv4(),
-        "primary_mac": str(mac_info.get("primary_mac") or ""),
-        "wake_candidate_macs": list(mac_info.get("wake_candidate_macs") or []),
-        "wake_supported": bool(mac_info.get("wake_supported")),
-    }
+    return _get_cached_net_info()
 
 
 @app.post("/auth/pair/create")
