@@ -79,6 +79,11 @@ import type {
   TmuxPaneInfo,
 } from "./types";
 import type { IpcEvent } from "./api";
+import {
+  DESKTOP_PROFILE_STREAM,
+  resolveDesktopStreamParams,
+} from "./desktopStream";
+import type { DesktopStreamProfile } from "./desktopStream";
 import { SessionListPanel } from "./components/sessions/SessionListPanel";
 import { SelectedSessionWorkspace } from "./components/sessions/SelectedSessionWorkspace";
 const PairTab = lazy(() => import("./tabs/PairTab"));
@@ -94,7 +99,6 @@ type StreamProfile = "fast" | "balanced" | "battery";
 type TmuxShellProfile = "ubuntu" | "powershell" | "cmd";
 type OutputFeedState = "off" | "polling" | "connecting" | "live" | "error";
 type TabTransitionClass = "tab-still" | "tab-slide-left" | "tab-slide-right";
-type DesktopStreamProfile = "responsive" | "balanced" | "saver" | "ultra" | "extreme";
 type SessionImageDeliveryMode = "insert_path" | "desktop_clipboard" | "session_path";
 type PowerActionName = "lock" | "sleep" | "hibernate" | "restart" | "shutdown";
 
@@ -205,16 +209,10 @@ const STREAM_ENABLED_STORAGE = "codrex.ui.stream_enabled.v1";
 const SWIPE_HINT_SEEN_STORAGE = "codrex.ui.swipe_hint_seen.v1";
 const COMPACT_TRANSCRIPT_STORAGE = "codrex.ui.compact_transcript.v1";
 const TOUCH_COMFORT_STORAGE = "codrex.ui.touch_comfort.v1";
+const DESKTOP_ADAPTIVE_STREAM_STORAGE = "codrex.ui.desktop_adaptive_stream.v1";
 const THREADS_STORAGE = "codrex.ui.threads.v2";
 const THREAD_MESSAGES_STORAGE = "codrex.ui.thread_messages.v2";
 const THREAD_MESSAGES_LEGACY_STORAGE = "codrex.ui.thread_messages.v1";
-const DESKTOP_PROFILE_STREAM: Record<DesktopStreamProfile, { fps: number; level: number; scale: number; bw: boolean }> = {
-  responsive: { fps: 8, level: 1, scale: 1, bw: false },
-  balanced: { fps: 6, level: 2, scale: 2, bw: false },
-  saver: { fps: 4, level: 3, scale: 3, bw: false },
-  ultra: { fps: 3, level: 2, scale: 3, bw: true },
-  extreme: { fps: 2, level: 3, scale: 4, bw: true },
-};
 const SESSION_SUMMARY_POLL_MS = 3000;
 const SESSION_SUMMARY_HIDDEN_POLL_MS = 9000;
 const REMOTE_POLL_MS = 3500;
@@ -796,6 +794,10 @@ export default function App() {
   const [desktopInfo, setDesktopInfo] = useState<DesktopInfoResult | null>(null);
   const [desktopEnabled, setDesktopEnabled] = useState(false);
   const [desktopProfile, setDesktopProfile] = useState<DesktopStreamProfile>("responsive");
+  const [desktopAdaptiveStream, setDesktopAdaptiveStream] = useState<boolean>(() => {
+    const stored = parseStoredToggle(safeStorageGet(DESKTOP_ADAPTIVE_STREAM_STORAGE));
+    return stored == null ? true : stored;
+  });
   const [desktopKeyInput, setDesktopKeyInput] = useState("enter");
   const [desktopTextInput, setDesktopTextInput] = useState("");
   const [desktopStatus, setDesktopStatus] = useState("");
@@ -914,10 +916,16 @@ export default function App() {
   const sessionTranscriptText = useMemo(() => transcriptToText(sessionTranscriptChunks), [sessionTranscriptChunks]);
   const latestSessionResponseSnapshot = useMemo(() => compactAssistantSnapshot(sessionTranscriptText), [sessionTranscriptText]);
   const tailscaleRouteUnavailable = routeHint === "tailscale" && !netInfo?.tailscale_ip;
+  const desktopStreamParams = useMemo(() => {
+    return resolveDesktopStreamParams(desktopProfile, {
+      active: activeTab === "remote" && pageVisible,
+      fullscreen: desktopFullscreen,
+      adaptiveBoost: desktopAdaptiveStream,
+    });
+  }, [activeTab, desktopAdaptiveStream, desktopFullscreen, desktopProfile, pageVisible]);
   const desktopStreamUrl = useMemo(() => {
-    const profile = DESKTOP_PROFILE_STREAM[desktopProfile];
-    return buildDesktopStreamUrl(profile);
-  }, [desktopProfile]);
+    return buildDesktopStreamUrl(desktopStreamParams);
+  }, [desktopStreamParams]);
   const desktopInteractionDisabled = !desktopEnabled;
   const threadTmuxPanes = useMemo(() => {
     return tmuxPanes.filter((pane) => !isCodexTmuxPane(pane));
@@ -972,6 +980,13 @@ export default function App() {
     }
     return filteredIpcHistory.find((item) => item.id === selectedIpcId) || null;
   }, [filteredIpcHistory, selectedIpcId]);
+  const desktopBaseStreamSummary = `${DESKTOP_PROFILE_STREAM[desktopProfile].fps}fps / scale x${DESKTOP_PROFILE_STREAM[desktopProfile].scale}${DESKTOP_PROFILE_STREAM[desktopProfile].bw ? " / grayscale" : ""}`;
+  const desktopEffectiveStreamSummary = `${desktopStreamParams.fps}fps / scale x${desktopStreamParams.scale}${desktopStreamParams.bw ? " / grayscale" : ""}`;
+  const desktopAdaptiveSummary = desktopAdaptiveStream
+    ? desktopEffectiveStreamSummary === desktopBaseStreamSummary
+      ? "Adaptive stream is ready. Fullscreen boosts speed automatically."
+      : `Adaptive stream active: ${desktopEffectiveStreamSummary}`
+    : "Adaptive stream is off. Manual profile stays fixed.";
 
   const addEvent = useCallback((level: AppEventLevel, message: string) => {
     const trimmed = message.trim();
@@ -2054,6 +2069,10 @@ export default function App() {
   useEffect(() => {
     safeStorageSet(TOUCH_COMFORT_STORAGE, touchComfortMode ? "true" : "false");
   }, [touchComfortMode]);
+
+  useEffect(() => {
+    safeStorageSet(DESKTOP_ADAPTIVE_STREAM_STORAGE, desktopAdaptiveStream ? "true" : "false");
+  }, [desktopAdaptiveStream]);
 
   useEffect(() => {
     safeStorageSet(THEME_MODE_STORAGE, themeMode);
@@ -4540,10 +4559,9 @@ export default function App() {
   }, [setError, setStatus, wslUploadDest, wslUploadFile]);
 
   const onCaptureLatestShot = useCallback(() => {
-    const profile = DESKTOP_PROFILE_STREAM[desktopProfile];
-    setLatestCaptureUrl(buildDesktopShotUrl(profile));
+    setLatestCaptureUrl(buildDesktopShotUrl(desktopStreamParams));
     setStatus("Captured latest desktop screenshot.");
-  }, [desktopProfile, setStatus]);
+  }, [desktopStreamParams, setStatus]);
 
   const onClearIpcHistory = useCallback(() => {
     setIpcHistory([]);
@@ -5526,6 +5544,13 @@ export default function App() {
                     </button>
                     <button
                       type="button"
+                      className={`button soft compact ${desktopAdaptiveStream ? "active" : ""}`}
+                      onClick={() => setDesktopAdaptiveStream((current) => !current)}
+                    >
+                      Adaptive Speed: {desktopAdaptiveStream ? "On" : "Off"}
+                    </button>
+                    <button
+                      type="button"
                       className={`button soft compact ${desktopFullscreenLight ? "active" : ""}`}
                       onClick={() => setDesktopFullscreenLight((current) => !current)}
                     >
@@ -5555,10 +5580,13 @@ export default function App() {
                   <p className="small">
                     Current profile:{" "}
                     <strong>
-                      {DESKTOP_PROFILE_STREAM[desktopProfile].fps}fps / scale x{DESKTOP_PROFILE_STREAM[desktopProfile].scale}
-                      {DESKTOP_PROFILE_STREAM[desktopProfile].bw ? " / grayscale" : ""}
+                      {desktopBaseStreamSummary}
                     </strong>
                   </p>
+                  <p className="small">
+                    Effective stream: <strong>{desktopEffectiveStreamSummary}</strong>
+                  </p>
+                  <p className="small">{desktopAdaptiveSummary}</p>
                   <p className="small">{desktopStatus || desktopPerfSummary || "Desktop controls are available only on Windows host."}</p>
                   <div className="remote-workspace">
                     <div className="remote-view-stack">
