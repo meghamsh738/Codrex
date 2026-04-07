@@ -83,7 +83,7 @@ function Convert-WindowsPathToWsl {
   return $norm
 }
 
-function Ensure-CodrexSendHelper {
+function Start-CodrexSendHelperInstall {
   param(
     [string]$RepoRoot,
     [string]$Distro
@@ -101,9 +101,9 @@ mkdir -p ~/.local/bin
 ln -sf '$helperWsl' ~/.local/bin/codrex-send
 chmod +x '$helperWsl' ~/.local/bin/codrex-send >/dev/null 2>&1 || true
 "@
-    & wsl.exe -d $Distro -- bash -lc $installCmd | Out-Null
+    Start-Process -FilePath "wsl.exe" -ArgumentList @("-d", $Distro, "--", "bash", "-lc", $installCmd) -WindowStyle Hidden | Out-Null
   } catch {
-    Write-Host "Warning: could not install codrex-send helper in WSL ($($_.Exception.Message))."
+    Write-Host "Warning: could not start codrex-send helper install in WSL ($($_.Exception.Message))."
   }
 }
 
@@ -388,9 +388,6 @@ $persistLocal = [ordered]@{
 }
 $persistLocal | ConvertTo-Json | Set-Content -Path $localConfigPath -Encoding UTF8
 
-# Ensure `codrex-send` helper exists inside WSL for Codex sessions.
-Ensure-CodrexSendHelper -RepoRoot $root -Distro $cfg.distro
-
 # Stop old controller processes on this port.
 $existing = Get-PortOwners -Port ([int]$cfg.port) |
   Where-Object { $_.CommandLine -and $_.CommandLine -match "app\.server:app" }
@@ -475,6 +472,9 @@ if ($OpenFirewall) {
     Write-Host "Warning: firewall rule not applied ($($_.Exception.Message))."
   }
 }
+
+# Install/update the codrex-send helper without blocking controller readiness.
+Start-CodrexSendHelperInstall -RepoRoot $root -Distro $cfg.distro
 
 $ip = Get-PrimaryIPv4
 $controllerProc = Get-PortOwners -Port ([int]$cfg.port) |

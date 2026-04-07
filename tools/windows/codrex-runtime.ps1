@@ -814,15 +814,26 @@ function Start-Runtime {
     }
   }
   $childReportedReady = Test-ChildReportedReady -ScriptResult $result
-  $sessionAfterStart = if ($result.exit_code -eq 0) {
-    Wait-ForMatchingSession -Paths $Paths -ExpectedPort $beforeControllerPort
+  $expectedPortAfterStart = $beforeControllerPort
+  $sessionAfterStart = $null
+  $fresh = $null
+  if ($result.exit_code -eq 0) {
+    $sessionAfterStart = Read-MobileSession -Paths $Paths
+    if ($sessionAfterStart -and $sessionAfterStart.controller_port) {
+      try {
+        $expectedPortAfterStart = [int]$sessionAfterStart.controller_port
+      } catch {}
+    }
+    $sessionAfterStart = Wait-ForMatchingSession -Paths $Paths -ExpectedPort $expectedPortAfterStart
+    if ($sessionAfterStart -and $sessionAfterStart.controller_port) {
+      try {
+        $expectedPortAfterStart = [int]$sessionAfterStart.controller_port
+      } catch {}
+    }
+    $fresh = Wait-ForStableStartSnapshot -Paths $Paths -ExpectedPort $expectedPortAfterStart
   } else {
-    Read-MobileSession -Paths $Paths
-  }
-  $fresh = if ($result.exit_code -eq 0) {
-    Wait-ForStableStartSnapshot -Paths $Paths -ExpectedPort $beforeControllerPort
-  } else {
-    Get-StatusSnapshot -Paths $Paths
+    $sessionAfterStart = Read-MobileSession -Paths $Paths
+    $fresh = Get-StatusSnapshot -Paths $Paths
   }
   $sessionMatchesPort = $false
   if ($sessionAfterStart -and $sessionAfterStart.controller_port) {
@@ -830,7 +841,7 @@ function Start-Runtime {
       $sessionMatchesPort = ([int]$sessionAfterStart.controller_port -eq $beforeControllerPort)
     } catch {}
   }
-  $controllerListeningAfterStart = Test-PortListening -Port $beforeControllerPort
+  $controllerListeningAfterStart = Test-PortListening -Port $expectedPortAfterStart
   $treatAsStarted = ($result.exit_code -eq 0) -and (
     $fresh.status -eq "running" -or
     ($fresh.status -eq "checking" -and $controllerListeningAfterStart -and $sessionMatchesPort) -or
