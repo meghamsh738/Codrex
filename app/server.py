@@ -455,6 +455,281 @@ def _resume_trusted_device(device_id: str, device_token: str, current_origin: st
             return dict(item)
     return {}
 
+
+def _privacy_lock_default_config() -> Dict[str, Any]:
+    return {
+        "pin_configured": False,
+        "pin_salt_b64": "",
+        "pin_hash_b64": "",
+        "pin_iterations": PRIVACY_LOCK_PIN_ITERATIONS,
+        "updated_at": 0.0,
+    }
+
+
+def _privacy_lock_default_state() -> Dict[str, Any]:
+    return {
+        "active": False,
+        "mode": "hard",
+        "display_scope": "all",
+        "owner_device_id": "",
+        "owner_device_name": "",
+        "locked_at": 0.0,
+        "updated_at": 0.0,
+        "lock_id": "",
+        "callback_token": "",
+        "controller_port": 0,
+        "helper_pid": 0,
+        "helper_ready": False,
+        "helper_error": "",
+        "last_unlock_source": "",
+    }
+
+
+def _load_privacy_lock_config_unlocked() -> None:
+    global PRIVACY_LOCK_CONFIG_LOADED
+    if PRIVACY_LOCK_CONFIG_LOADED:
+        return
+    loaded = _read_json_file(PRIVACY_LOCK_CONFIG_FILE)
+    config = _privacy_lock_default_config()
+    if loaded:
+        config.update({
+            "pin_configured": bool(loaded.get("pin_configured")),
+            "pin_salt_b64": str(loaded.get("pin_salt_b64") or "").strip(),
+            "pin_hash_b64": str(loaded.get("pin_hash_b64") or "").strip(),
+            "pin_iterations": max(int(loaded.get("pin_iterations") or PRIVACY_LOCK_PIN_ITERATIONS), 1000),
+            "updated_at": float(loaded.get("updated_at") or 0.0),
+        })
+    PRIVACY_LOCK_CONFIG_DATA.clear()
+    PRIVACY_LOCK_CONFIG_DATA.update(config)
+    PRIVACY_LOCK_CONFIG_LOADED = True
+
+
+def _load_privacy_lock_state_unlocked() -> None:
+    global PRIVACY_LOCK_STATE_LOADED
+    if PRIVACY_LOCK_STATE_LOADED:
+        return
+    loaded = _read_json_file(PRIVACY_LOCK_STATE_FILE)
+    state = _privacy_lock_default_state()
+    if loaded:
+        state.update({
+            "active": bool(loaded.get("active")),
+            "mode": str(loaded.get("mode") or "hard").strip() or "hard",
+            "display_scope": str(loaded.get("display_scope") or "all").strip() or "all",
+            "owner_device_id": str(loaded.get("owner_device_id") or "").strip(),
+            "owner_device_name": str(loaded.get("owner_device_name") or "").strip(),
+            "locked_at": float(loaded.get("locked_at") or 0.0),
+            "updated_at": float(loaded.get("updated_at") or 0.0),
+            "lock_id": str(loaded.get("lock_id") or "").strip(),
+            "callback_token": str(loaded.get("callback_token") or "").strip(),
+            "controller_port": int(loaded.get("controller_port") or 0),
+            "helper_pid": int(loaded.get("helper_pid") or 0),
+            "helper_ready": bool(loaded.get("helper_ready")),
+            "helper_error": str(loaded.get("helper_error") or "").strip(),
+            "last_unlock_source": str(loaded.get("last_unlock_source") or "").strip(),
+        })
+    PRIVACY_LOCK_STATE_DATA.clear()
+    PRIVACY_LOCK_STATE_DATA.update(state)
+    PRIVACY_LOCK_STATE_LOADED = True
+
+
+def _persist_privacy_lock_config_unlocked() -> None:
+    config = dict(PRIVACY_LOCK_CONFIG_DATA or {})
+    _write_json_file(PRIVACY_LOCK_CONFIG_FILE, {
+        "pin_configured": bool(config.get("pin_configured")),
+        "pin_salt_b64": str(config.get("pin_salt_b64") or "").strip(),
+        "pin_hash_b64": str(config.get("pin_hash_b64") or "").strip(),
+        "pin_iterations": max(int(config.get("pin_iterations") or PRIVACY_LOCK_PIN_ITERATIONS), 1000),
+        "updated_at": float(config.get("updated_at") or 0.0),
+    })
+
+
+def _persist_privacy_lock_state_unlocked() -> None:
+    state = dict(PRIVACY_LOCK_STATE_DATA or {})
+    _write_json_file(PRIVACY_LOCK_STATE_FILE, {
+        "active": bool(state.get("active")),
+        "mode": str(state.get("mode") or "hard").strip() or "hard",
+        "display_scope": str(state.get("display_scope") or "all").strip() or "all",
+        "owner_device_id": str(state.get("owner_device_id") or "").strip(),
+        "owner_device_name": str(state.get("owner_device_name") or "").strip(),
+        "locked_at": float(state.get("locked_at") or 0.0),
+        "updated_at": float(state.get("updated_at") or 0.0),
+        "lock_id": str(state.get("lock_id") or "").strip(),
+        "callback_token": str(state.get("callback_token") or "").strip(),
+        "controller_port": int(state.get("controller_port") or 0),
+        "helper_pid": int(state.get("helper_pid") or 0),
+        "helper_ready": bool(state.get("helper_ready")),
+        "helper_error": str(state.get("helper_error") or "").strip(),
+        "last_unlock_source": str(state.get("last_unlock_source") or "").strip(),
+    })
+
+
+def _privacy_lock_pbkdf2(pin: str, salt_bytes: bytes, iterations: int) -> bytes:
+    return hashlib.pbkdf2_hmac(
+        "sha256",
+        str(pin or "").encode("utf-8"),
+        salt_bytes,
+        max(int(iterations or PRIVACY_LOCK_PIN_ITERATIONS), 1000),
+    )
+
+
+def _privacy_lock_validate_pin_format(pin: str) -> str:
+    candidate = str(pin or "").strip()
+    if not re.fullmatch(rf"\d{{{PRIVACY_LOCK_PIN_MIN_LENGTH},{PRIVACY_LOCK_PIN_MAX_LENGTH}}}", candidate):
+        raise HTTPException(
+            status_code=400,
+            detail=f"PIN must be {PRIVACY_LOCK_PIN_MIN_LENGTH}-{PRIVACY_LOCK_PIN_MAX_LENGTH} digits.",
+        )
+    return candidate
+
+
+def _privacy_lock_set_pin_unlocked(pin: str) -> None:
+    candidate = _privacy_lock_validate_pin_format(pin)
+    salt_bytes = secrets.token_bytes(16)
+    digest = _privacy_lock_pbkdf2(candidate, salt_bytes, PRIVACY_LOCK_PIN_ITERATIONS)
+    PRIVACY_LOCK_CONFIG_DATA.update({
+        "pin_configured": True,
+        "pin_salt_b64": base64.b64encode(salt_bytes).decode("ascii"),
+        "pin_hash_b64": base64.b64encode(digest).decode("ascii"),
+        "pin_iterations": PRIVACY_LOCK_PIN_ITERATIONS,
+        "updated_at": time.time(),
+    })
+    _persist_privacy_lock_config_unlocked()
+
+
+def _privacy_lock_clear_pin_unlocked() -> None:
+    PRIVACY_LOCK_CONFIG_DATA.clear()
+    PRIVACY_LOCK_CONFIG_DATA.update(_privacy_lock_default_config())
+    PRIVACY_LOCK_CONFIG_DATA["updated_at"] = time.time()
+    _persist_privacy_lock_config_unlocked()
+
+
+def _privacy_lock_verify_pin_unlocked(pin: str) -> bool:
+    if not bool(PRIVACY_LOCK_CONFIG_DATA.get("pin_configured")):
+        return False
+    salt_b64 = str(PRIVACY_LOCK_CONFIG_DATA.get("pin_salt_b64") or "").strip()
+    hash_b64 = str(PRIVACY_LOCK_CONFIG_DATA.get("pin_hash_b64") or "").strip()
+    iterations = max(int(PRIVACY_LOCK_CONFIG_DATA.get("pin_iterations") or PRIVACY_LOCK_PIN_ITERATIONS), 1000)
+    if not salt_b64 or not hash_b64:
+        return False
+    try:
+        salt_bytes = base64.b64decode(salt_b64)
+        wanted = base64.b64decode(hash_b64)
+    except Exception:
+        return False
+    actual = _privacy_lock_pbkdf2(str(pin or "").strip(), salt_bytes, iterations)
+    return secrets.compare_digest(actual, wanted)
+
+
+def _privacy_lock_launcher_exe_path() -> str:
+    return os.path.join(APP_ROOT_DIR, "launcher", "Codrex.Launcher", "bin", "current", "Codrex.Launcher.exe")
+
+
+def _privacy_lock_support_snapshot_unlocked() -> Dict[str, Any]:
+    if os.name != "nt":
+        return {"supported": False, "detail": "Privacy lock is only available on Windows hosts."}
+    helper_path = _privacy_lock_launcher_exe_path()
+    if not os.path.isfile(helper_path):
+        return {"supported": False, "detail": "Privacy lock helper is missing. Rebuild the launcher first."}
+    return {"supported": True, "detail": ""}
+
+
+def _win_kernel32():
+    _ensure_windows_host()
+    return ctypes.windll.kernel32
+
+
+def _is_windows_pid_running(pid: int) -> bool:
+    if os.name != "nt":
+        return False
+    wanted_pid = int(pid or 0)
+    if wanted_pid <= 0:
+        return False
+    kernel32 = _win_kernel32()
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    STILL_ACTIVE = 259
+    handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, wanted_pid)
+    if not handle:
+        return False
+    try:
+        exit_code = wintypes.DWORD(0)
+        ok = kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code))
+        if not ok:
+            return False
+        return int(exit_code.value or 0) == STILL_ACTIVE
+    finally:
+        try:
+            kernel32.CloseHandle(handle)
+        except Exception:
+            pass
+
+
+def _privacy_lock_reconcile_unlocked() -> None:
+    if not bool(PRIVACY_LOCK_STATE_DATA.get("active")):
+        return
+    helper_pid = int(PRIVACY_LOCK_STATE_DATA.get("helper_pid") or 0)
+    if helper_pid > 0 and _is_windows_pid_running(helper_pid):
+        return
+    if not bool(PRIVACY_LOCK_STATE_DATA.get("helper_ready")):
+        started_at = max(
+            float(PRIVACY_LOCK_STATE_DATA.get("updated_at") or 0.0),
+            float(PRIVACY_LOCK_STATE_DATA.get("locked_at") or 0.0),
+        )
+        if started_at > 0 and (time.time() - started_at) < max(PRIVACY_LOCK_HELPER_START_TIMEOUT_S + 1.0, 3.0):
+            return
+    PRIVACY_LOCK_STATE_DATA.update({
+        "active": False,
+        "owner_device_id": "",
+        "owner_device_name": "",
+        "lock_id": "",
+        "callback_token": "",
+        "controller_port": 0,
+        "helper_pid": 0,
+        "helper_ready": False,
+        "helper_error": "",
+        "updated_at": time.time(),
+    })
+    _persist_privacy_lock_state_unlocked()
+
+
+def _privacy_lock_status_payload_unlocked() -> Dict[str, Any]:
+    _load_privacy_lock_config_unlocked()
+    _load_privacy_lock_state_unlocked()
+    _privacy_lock_reconcile_unlocked()
+    support = _privacy_lock_support_snapshot_unlocked()
+    return {
+        "ok": True,
+        "supported": bool(support.get("supported")),
+        "detail": str(support.get("detail") or "").strip(),
+        "pin_configured": bool(PRIVACY_LOCK_CONFIG_DATA.get("pin_configured")),
+        "active": bool(PRIVACY_LOCK_STATE_DATA.get("active")),
+        "mode": str(PRIVACY_LOCK_STATE_DATA.get("mode") or "hard"),
+        "display_scope": str(PRIVACY_LOCK_STATE_DATA.get("display_scope") or "all"),
+        "owner_device_id": str(PRIVACY_LOCK_STATE_DATA.get("owner_device_id") or "").strip(),
+        "owner_device_name": str(PRIVACY_LOCK_STATE_DATA.get("owner_device_name") or "").strip(),
+        "locked_at": float(PRIVACY_LOCK_STATE_DATA.get("locked_at") or 0.0),
+        "updated_at": float(PRIVACY_LOCK_STATE_DATA.get("updated_at") or 0.0),
+        "helper_ready": bool(PRIVACY_LOCK_STATE_DATA.get("helper_ready")),
+        "helper_error": str(PRIVACY_LOCK_STATE_DATA.get("helper_error") or "").strip(),
+        "last_unlock_source": str(PRIVACY_LOCK_STATE_DATA.get("last_unlock_source") or "").strip(),
+    }
+
+
+def _privacy_lock_mark_unlocked_unlocked(source: str) -> None:
+    PRIVACY_LOCK_STATE_DATA.update({
+        "active": False,
+        "owner_device_id": "",
+        "owner_device_name": "",
+        "lock_id": "",
+        "callback_token": "",
+        "controller_port": 0,
+        "helper_ready": False,
+        "helper_error": "",
+        "updated_at": time.time(),
+        "last_unlock_source": str(source or "").strip() or "unknown",
+    })
+    _persist_privacy_lock_state_unlocked()
+
+
 def _tailscale_exe_path() -> str:
     if os.name != "nt":
         return ""
@@ -1242,6 +1517,48 @@ TRUSTED_DEVICES_DATA: Dict[str, Any] = {
     "devices": [],
 }
 TRUSTED_DEVICES_LOADED = False
+PRIVACY_LOCK_CONFIG_FILE = os.path.abspath(
+    os.environ.get(
+        "CODEX_PRIVACY_LOCK_CONFIG_FILE",
+        os.path.join(CODEX_RUNTIME_STATE_DIR, "privacy-lock.config.json"),
+    )
+)
+PRIVACY_LOCK_STATE_FILE = os.path.abspath(
+    os.environ.get(
+        "CODEX_PRIVACY_LOCK_STATE_FILE",
+        os.path.join(CODEX_RUNTIME_STATE_DIR, "privacy-lock.state.json"),
+    )
+)
+PRIVACY_LOCK_LOCK = threading.Lock()
+PRIVACY_LOCK_PIN_MIN_LENGTH = int(os.environ.get("CODEX_PRIVACY_LOCK_PIN_MIN_LENGTH", "4") or "4")
+PRIVACY_LOCK_PIN_MAX_LENGTH = int(os.environ.get("CODEX_PRIVACY_LOCK_PIN_MAX_LENGTH", "12") or "12")
+PRIVACY_LOCK_PIN_ITERATIONS = int(os.environ.get("CODEX_PRIVACY_LOCK_PIN_ITERATIONS", "200000") or "200000")
+PRIVACY_LOCK_HELPER_START_TIMEOUT_S = float(os.environ.get("CODEX_PRIVACY_LOCK_HELPER_START_TIMEOUT_S", "5") or "5")
+PRIVACY_LOCK_CONFIG_LOADED = False
+PRIVACY_LOCK_STATE_LOADED = False
+PRIVACY_LOCK_CONFIG_DATA: Dict[str, Any] = {
+    "pin_configured": False,
+    "pin_salt_b64": "",
+    "pin_hash_b64": "",
+    "pin_iterations": PRIVACY_LOCK_PIN_ITERATIONS,
+    "updated_at": 0.0,
+}
+PRIVACY_LOCK_STATE_DATA: Dict[str, Any] = {
+    "active": False,
+    "mode": "hard",
+    "display_scope": "all",
+    "owner_device_id": "",
+    "owner_device_name": "",
+    "locked_at": 0.0,
+    "updated_at": 0.0,
+    "lock_id": "",
+    "callback_token": "",
+    "controller_port": 0,
+    "helper_pid": 0,
+    "helper_ready": False,
+    "helper_error": "",
+    "last_unlock_source": "",
+}
 
 # -------------------------
 # Session output stream state
@@ -4209,6 +4526,42 @@ def _is_valid_auth_token(token: str) -> bool:
     return secrets.compare_digest(token, CODEX_AUTH_TOKEN)
 
 
+def _require_authenticated_request(request: Request) -> None:
+    if _is_valid_auth_token(_auth_token_from_request(request)):
+        return
+    raise HTTPException(status_code=401, detail="Login required.")
+
+
+def _is_local_client_request(request: Request) -> bool:
+    try:
+        client_host = str(getattr(getattr(request, "client", None), "host", "") or "").strip()
+    except Exception:
+        client_host = ""
+    return _is_loopback_ip(client_host)
+
+
+def _require_local_client_request(request: Request) -> None:
+    if _is_local_client_request(request):
+        return
+    raise HTTPException(status_code=403, detail="This action is only available from the local laptop.")
+
+
+def _privacy_lock_require_trusted_device(request: Request, payload: Dict[str, Any]) -> Dict[str, Any]:
+    _require_authenticated_request(request)
+    device_id = str(payload.get("device_id") or "").strip()
+    device_token = str(payload.get("device_token") or "").strip()
+    current_origin = (
+        str(getattr(request.url, "scheme", "http") or "http")
+        + "://"
+        + str(getattr(request.url, "hostname", "") or "").strip()
+        + (f":{int(getattr(request.url, 'port', 0) or 0)}" if int(getattr(request.url, "port", 0) or 0) else "")
+    )
+    trusted = _resume_trusted_device(device_id, device_token, current_origin=current_origin)
+    if trusted:
+        return trusted
+    raise HTTPException(status_code=401, detail="Trusted device token is invalid.")
+
+
 def _is_localhost_label(host: str) -> bool:
     h = (host or "").strip().lower().strip("[]")
     return h in {"localhost", "127.0.0.1", "::1"}
@@ -5294,6 +5647,53 @@ def _spawn_windows_background_process(args: List[str], *, detached: bool = True)
         return {"ok": True, "pid": int(getattr(proc, "pid", 0) or 0)}
     except Exception as e:
         return {"ok": False, "detail": f"{type(e).__name__}: {e}"}
+
+
+def _launch_privacy_lock_helper(lock_id: str, callback_token: str, controller_port: int) -> subprocess.Popen[str]:
+    helper_path = _privacy_lock_launcher_exe_path()
+    if not os.path.isfile(helper_path):
+        raise HTTPException(status_code=503, detail="Privacy lock helper is missing. Rebuild the launcher first.")
+    creationflags = int(getattr(subprocess, "CREATE_NO_WINDOW", 0) or 0)
+    return subprocess.Popen(
+        [
+            helper_path,
+            "--privacy-lock-helper",
+            "--runtime-dir",
+            CODEX_RUNTIME_DIR,
+            "--state-file",
+            PRIVACY_LOCK_STATE_FILE,
+            "--config-file",
+            PRIVACY_LOCK_CONFIG_FILE,
+            "--lock-id",
+            str(lock_id or "").strip(),
+            "--callback-token",
+            str(callback_token or "").strip(),
+            "--controller-port",
+            str(int(controller_port or 0)),
+        ],
+        cwd=os.path.dirname(helper_path),
+        close_fds=True,
+        creationflags=creationflags,
+    )
+
+
+def _wait_for_privacy_lock_helper_ready(lock_id: str, process: subprocess.Popen[str]) -> Dict[str, Any]:
+    deadline = time.time() + max(PRIVACY_LOCK_HELPER_START_TIMEOUT_S, 1.0)
+    while time.time() < deadline:
+        with PRIVACY_LOCK_LOCK:
+            _load_privacy_lock_state_unlocked()
+            state = dict(PRIVACY_LOCK_STATE_DATA)
+        if str(state.get("lock_id") or "").strip() != str(lock_id or "").strip():
+            raise HTTPException(status_code=409, detail="Privacy lock state changed during helper startup.")
+        if bool(state.get("helper_ready")):
+            return state
+        helper_error = str(state.get("helper_error") or "").strip()
+        if helper_error:
+            raise HTTPException(status_code=503, detail=helper_error)
+        if process.poll() is not None:
+            raise HTTPException(status_code=503, detail="Privacy lock helper exited before it became ready.")
+        time.sleep(0.12)
+    raise HTTPException(status_code=504, detail="Privacy lock helper did not become ready in time.")
 
 
 def _create_power_confirmation(action: str) -> Dict[str, Any]:
@@ -9863,6 +10263,157 @@ async def desktop_stream(
         media_type=f"multipart/x-mixed-replace; boundary={boundary}",
         headers=headers,
     )
+
+
+@app.get("/desktop/privacy-lock/status")
+def desktop_privacy_lock_status(request: Request):
+    _require_authenticated_request(request)
+    with PRIVACY_LOCK_LOCK:
+        payload = _privacy_lock_status_payload_unlocked()
+    return payload
+
+
+@app.post("/desktop/privacy-lock/config")
+def desktop_privacy_lock_config(request: Request, payload: Dict[str, Any] = Body(...)):
+    _ensure_windows_host()
+    _require_authenticated_request(request)
+    _require_local_client_request(request)
+    current_pin = str(payload.get("current_pin") or "").strip()
+    new_pin = str(payload.get("new_pin") or "").strip()
+    clear = _truthy_flag(payload.get("clear"))
+    with PRIVACY_LOCK_LOCK:
+        _load_privacy_lock_config_unlocked()
+        _load_privacy_lock_state_unlocked()
+        support = _privacy_lock_support_snapshot_unlocked()
+        if not bool(support.get("supported")):
+            raise HTTPException(status_code=503, detail=str(support.get("detail") or "Privacy lock is unavailable."))
+        pin_configured = bool(PRIVACY_LOCK_CONFIG_DATA.get("pin_configured"))
+        if clear:
+            if pin_configured and not _privacy_lock_verify_pin_unlocked(current_pin):
+                raise HTTPException(status_code=403, detail="Current PIN is incorrect.")
+            _privacy_lock_clear_pin_unlocked()
+            detail = "Privacy PIN cleared."
+        else:
+            if not new_pin:
+                raise HTTPException(status_code=400, detail="new_pin is required unless clear=true.")
+            if pin_configured and not _privacy_lock_verify_pin_unlocked(current_pin):
+                raise HTTPException(status_code=403, detail="Current PIN is incorrect.")
+            _privacy_lock_set_pin_unlocked(new_pin)
+            detail = "Privacy PIN saved."
+        status = _privacy_lock_status_payload_unlocked()
+    return {**status, "ok": True, "detail": detail}
+
+
+@app.post("/desktop/privacy-lock/lock")
+def desktop_privacy_lock_lock(request: Request, payload: Dict[str, Any] = Body(...)):
+    _ensure_windows_host()
+    trusted = _privacy_lock_require_trusted_device(request, payload)
+    lock_id = uuid.uuid4().hex
+    callback_token = secrets.token_urlsafe(24)
+    controller_port = int(getattr(request.url, "port", 0) or 48787)
+    with PRIVACY_LOCK_LOCK:
+        _load_privacy_lock_config_unlocked()
+        _load_privacy_lock_state_unlocked()
+        _privacy_lock_reconcile_unlocked()
+        support = _privacy_lock_support_snapshot_unlocked()
+        if not bool(support.get("supported")):
+            raise HTTPException(status_code=503, detail=str(support.get("detail") or "Privacy lock is unavailable."))
+        if not bool(PRIVACY_LOCK_CONFIG_DATA.get("pin_configured")):
+            raise HTTPException(status_code=400, detail="pin_not_configured")
+        if bool(PRIVACY_LOCK_STATE_DATA.get("active")):
+            owner_device_id = str(PRIVACY_LOCK_STATE_DATA.get("owner_device_id") or "").strip()
+            if owner_device_id and owner_device_id != str(trusted.get("id") or "").strip():
+                raise HTTPException(status_code=409, detail="Privacy lock is already owned by another device.")
+            return {
+                "ok": True,
+                "detail": "Privacy lock is already active.",
+                **_privacy_lock_status_payload_unlocked(),
+            }
+        PRIVACY_LOCK_STATE_DATA.update({
+            "active": True,
+            "mode": "hard",
+            "display_scope": "all",
+            "owner_device_id": str(trusted.get("id") or "").strip(),
+            "owner_device_name": str(trusted.get("name") or "").strip(),
+            "locked_at": time.time(),
+            "updated_at": time.time(),
+            "lock_id": lock_id,
+            "callback_token": callback_token,
+            "controller_port": controller_port,
+            "helper_pid": 0,
+            "helper_ready": False,
+            "helper_error": "",
+            "last_unlock_source": "",
+        })
+        _persist_privacy_lock_state_unlocked()
+    try:
+        helper_process = _launch_privacy_lock_helper(lock_id, callback_token, controller_port)
+    except Exception:
+        with PRIVACY_LOCK_LOCK:
+            _load_privacy_lock_state_unlocked()
+            if str(PRIVACY_LOCK_STATE_DATA.get("lock_id") or "").strip() == lock_id:
+                _privacy_lock_mark_unlocked_unlocked("helper_start_failed")
+        raise
+    with PRIVACY_LOCK_LOCK:
+        _load_privacy_lock_state_unlocked()
+        if str(PRIVACY_LOCK_STATE_DATA.get("lock_id") or "").strip() == lock_id:
+            PRIVACY_LOCK_STATE_DATA["helper_pid"] = int(getattr(helper_process, "pid", 0) or 0)
+            PRIVACY_LOCK_STATE_DATA["updated_at"] = time.time()
+            _persist_privacy_lock_state_unlocked()
+    try:
+        _wait_for_privacy_lock_helper_ready(lock_id, helper_process)
+    except Exception:
+        with PRIVACY_LOCK_LOCK:
+            _load_privacy_lock_state_unlocked()
+            if str(PRIVACY_LOCK_STATE_DATA.get("lock_id") or "").strip() == lock_id:
+                _privacy_lock_mark_unlocked_unlocked("helper_start_failed")
+        raise
+    with PRIVACY_LOCK_LOCK:
+        status = _privacy_lock_status_payload_unlocked()
+    return {**status, "ok": True, "detail": "Privacy lock enabled."}
+
+
+@app.post("/desktop/privacy-lock/unlock")
+def desktop_privacy_lock_unlock(request: Request, payload: Dict[str, Any] = Body(...)):
+    _ensure_windows_host()
+    trusted = _privacy_lock_require_trusted_device(request, payload)
+    with PRIVACY_LOCK_LOCK:
+        _load_privacy_lock_state_unlocked()
+        _load_privacy_lock_config_unlocked()
+        _privacy_lock_reconcile_unlocked()
+        if not bool(PRIVACY_LOCK_STATE_DATA.get("active")):
+            return {"ok": True, "detail": "Privacy lock is already inactive.", **_privacy_lock_status_payload_unlocked()}
+        owner_device_id = str(PRIVACY_LOCK_STATE_DATA.get("owner_device_id") or "").strip()
+        if owner_device_id and owner_device_id != str(trusted.get("id") or "").strip():
+            raise HTTPException(status_code=403, detail="Only the device that locked the laptop can unlock it remotely.")
+        _privacy_lock_mark_unlocked_unlocked("remote")
+        status = _privacy_lock_status_payload_unlocked()
+    return {**status, "ok": True, "detail": "Privacy lock disabled."}
+
+
+@app.post("/desktop/privacy-lock/internal/release")
+def desktop_privacy_lock_internal_release(request: Request, payload: Dict[str, Any] = Body(...)):
+    _ensure_windows_host()
+    _require_local_client_request(request)
+    lock_id = str(payload.get("lock_id") or "").strip()
+    callback_token = str(payload.get("callback_token") or "").strip()
+    source = str(payload.get("source") or "local_pin").strip()
+    with PRIVACY_LOCK_LOCK:
+        _load_privacy_lock_state_unlocked()
+        _load_privacy_lock_config_unlocked()
+        _privacy_lock_reconcile_unlocked()
+        if not bool(PRIVACY_LOCK_STATE_DATA.get("active")):
+            status = _privacy_lock_status_payload_unlocked()
+            return {**status, "ok": True, "detail": "Privacy lock is already inactive."}
+        if lock_id and str(PRIVACY_LOCK_STATE_DATA.get("lock_id") or "").strip() != lock_id:
+            raise HTTPException(status_code=403, detail="Lock id mismatch.")
+        expected_token = str(PRIVACY_LOCK_STATE_DATA.get("callback_token") or "").strip()
+        if not expected_token or not callback_token or not secrets.compare_digest(callback_token, expected_token):
+            raise HTTPException(status_code=403, detail="Invalid privacy lock callback token.")
+        _privacy_lock_mark_unlocked_unlocked(source or "local_pin")
+        status = _privacy_lock_status_payload_unlocked()
+    return {**status, "ok": True, "detail": "Privacy lock released locally."}
+
 
 @app.post("/desktop/mode")
 def desktop_mode(request: Request, payload: Dict[str, Any] = Body(...)):

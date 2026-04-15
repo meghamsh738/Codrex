@@ -13,9 +13,19 @@ public partial class App : System.Windows.Application
     private EventWaitHandle? _activateEvent;
     private CancellationTokenSource? _activateCts;
     private Task? _activateTask;
+    private PrivacyLockHelperSession? _privacyLockHelper;
 
     protected override void OnStartup(StartupEventArgs e)
     {
+        if (PrivacyLockHelperOptions.TryParse(e.Args, out var helperOptions) && helperOptions is not null)
+        {
+            ShutdownMode = ShutdownMode.OnExplicitShutdown;
+            _privacyLockHelper = new PrivacyLockHelperSession(helperOptions);
+            _privacyLockHelper.Start();
+            base.OnStartup(e);
+            return;
+        }
+
         var createdNew = false;
         _instanceMutex = new Mutex(true, LauncherMutexName, out createdNew);
         if (!createdNew)

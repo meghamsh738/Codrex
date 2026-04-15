@@ -675,6 +675,15 @@
             <button id="copyLogPathButton">Copy Log Path</button>
             <button id="copyLastErrorButton">Copy Last Error</button>
           </div>
+          <div style="margin-top: 18px;">
+            <h2 class="section-title">Privacy Lock</h2>
+            <p class="subtle" id="privacySummary">Start Codrex to manage the privacy PIN.</p>
+            <div class="grid controls" style="margin-top: 10px;">
+              <button id="privacySetPinButton">Set PIN</button>
+              <button id="privacyChangePinButton">Change PIN</button>
+              <button id="privacyClearPinButton">Clear PIN</button>
+            </div>
+          </div>
           <p class="subtle" id="logPathLine">Logs: n/a</p>
         </section>
       </section>
@@ -728,6 +737,10 @@
         logsDir: "",
         pairStatus: "",
         pairLink: "",
+        privacySummary: "",
+        privacySetPinDisabled: null,
+        privacyChangePinDisabled: null,
+        privacyClearPinDisabled: null,
         actionEventId: null,
         accountsSignature: "",
       };
@@ -766,12 +779,16 @@
         copyPairLinkButton: document.getElementById("copyPairLinkButton"),
         copyLogPathButton: document.getElementById("copyLogPathButton"),
         copyLastErrorButton: document.getElementById("copyLastErrorButton"),
+        privacySetPinButton: document.getElementById("privacySetPinButton"),
+        privacyChangePinButton: document.getElementById("privacyChangePinButton"),
+        privacyClearPinButton: document.getElementById("privacyClearPinButton"),
         openUbuntuCodexButton: document.getElementById("openUbuntuCodexButton"),
         openAccountSelectorButton: document.getElementById("openAccountSelectorButton"),
         openSessionSwitcherButton: document.getElementById("openSessionSwitcherButton"),
         accountsGrid: document.getElementById("accountsGrid"),
         logPathLine: document.getElementById("logPathLine"),
         backgroundSummary: document.getElementById("backgroundSummary"),
+        privacySummary: document.getElementById("privacySummary"),
         pairStatus: document.getElementById("pairStatus"),
         qrBox: document.getElementById("qrBox"),
         pairLink: document.getElementById("pairLink"),
@@ -976,6 +993,20 @@
             ? `Pairing QR ready for ${state.route}. ${state.routeHost || "Waiting for route host."}`
             : "Press Show Pair QR after Codrex is running.");
         setText(els.pairStatus, pairStatus, "pairStatus");
+        const runtimeRunning = state.status === "running";
+        const privacySummary = !runtimeRunning
+          ? "Start Codrex to manage the privacy PIN."
+          : !state.privacySupported
+            ? (state.privacyDetail || "Privacy lock is unavailable on this laptop.")
+            : state.privacyActive
+              ? `Privacy lock is active${state.privacyOwner ? ` for ${state.privacyOwner}` : ""}.`
+              : state.privacyPinConfigured
+                ? "Privacy PIN is configured. Your tablet can lock the laptop remotely."
+                : "Set a local PIN before using privacy lock from the tablet.";
+        setText(els.privacySummary, privacySummary, "privacySummary");
+        setDisabled(els.privacySetPinButton, !runtimeRunning || !state.privacySupported || !!state.privacyActive, "privacySetPinDisabled");
+        setDisabled(els.privacyChangePinButton, !runtimeRunning || !state.privacySupported || !state.privacyPinConfigured || !!state.privacyActive, "privacyChangePinDisabled");
+        setDisabled(els.privacyClearPinButton, !runtimeRunning || !state.privacySupported || !state.privacyPinConfigured || !!state.privacyActive, "privacyClearPinDisabled");
         if (rendered.pairLink !== (state.pairLink || "")) {
           rendered.pairLink = state.pairLink || "";
           els.pairLink.value = rendered.pairLink;
@@ -1049,6 +1080,24 @@
       els.copyPairLinkButton.addEventListener("click", () => post("copyPairLink"));
       els.copyLogPathButton.addEventListener("click", () => post("copyLogPath"));
       els.copyLastErrorButton.addEventListener("click", () => post("copyLastError"));
+      els.privacySetPinButton.addEventListener("click", () => {
+        const newPin = window.prompt("Enter a new privacy PIN (4-12 digits).", "");
+        if (newPin === null || !newPin.trim()) return;
+        post("privacySetPin", { newPin: newPin.trim() });
+      });
+      els.privacyChangePinButton.addEventListener("click", () => {
+        const currentPin = window.prompt("Enter the current privacy PIN.", "");
+        if (currentPin === null || !currentPin.trim()) return;
+        const newPin = window.prompt("Enter the new privacy PIN (4-12 digits).", "");
+        if (newPin === null || !newPin.trim()) return;
+        post("privacyChangePin", { currentPin: currentPin.trim(), newPin: newPin.trim() });
+      });
+      els.privacyClearPinButton.addEventListener("click", () => {
+        if (!window.confirm("Clear the privacy PIN? Remote privacy lock will stop working until you set a new PIN.")) return;
+        const currentPin = window.prompt("Enter the current privacy PIN to confirm.", "");
+        if (currentPin === null || !currentPin.trim()) return;
+        post("privacyClearPin", { currentPin: currentPin.trim() });
+      });
       els.openUbuntuCodexButton.addEventListener("click", () => post("openUbuntuCodex"));
       els.openAccountSelectorButton.addEventListener("click", () => post("openAccountSelector"));
       els.openSessionSwitcherButton.addEventListener("click", () => post("openSessionSwitcher"));
