@@ -449,7 +449,7 @@ function Write-StartMobileDiagnostic {
     [object]$Extra = $null
   )
   $currentSession = Read-SessionData -Path $sessionPath
-  $lanIp = Get-PrimaryIPv4
+  $routeInfo = Get-CodrexPublishedNetworkInfo -RuntimeDir $runtimeDir -Port $controllerPort
   $payload = [ordered]@{
     ok = $Ok
     status = if ($Ok) { "completed" } else { "error" }
@@ -460,9 +460,12 @@ function Write-StartMobileDiagnostic {
     controller_port = $controllerPort
     ui_port = $UiPort
     ui_mode = if ($DevUi) { "dev" } else { "built" }
-    selected_pair_route = Get-CodrexSelectedRouteFromState -RuntimeDir $runtimeDir
-    local_url = if ($controllerPort -gt 0) { ("http://127.0.0.1:{0}/" -f $controllerPort) } else { "" }
-    network_url = if ($lanIp -and $lanIp -ne "127.0.0.1" -and $controllerPort -gt 0) { ("http://{0}:{1}/" -f $lanIp, $controllerPort) } else { "" }
+    selected_pair_route = [string]$routeInfo.selected_pair_route
+    lan_ip = [string]$routeInfo.lan_ip
+    tailscale_ip = [string]$routeInfo.tailscale_ip
+    netbird_ip = [string]$routeInfo.netbird_ip
+    local_url = [string]$routeInfo.local_url
+    network_url = [string]$routeInfo.network_url
     session_file = $sessionPath
     session_state_before = $script:DiagBeforeSessionState
     session_state_after = if ($currentSession) { "present" } else { "missing" }

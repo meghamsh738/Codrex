@@ -2,9 +2,12 @@ using System.Diagnostics;
 using System.IO;
 using System.Reflection;
 using System.Text.Json;
+using System.ComponentModel;
 using System.Windows;
 using System.Windows.Threading;
 using Microsoft.Web.WebView2.Core;
+using Forms = System.Windows.Forms;
+using Drawing = System.Drawing;
 
 namespace Codrex.Launcher;
 
@@ -39,21 +42,105 @@ public partial class MainWindow : Window
     private bool _refreshInFlight;
     private bool _refreshQueued;
     private string _routeNotice = "";
+    private readonly Forms.NotifyIcon _trayIcon;
+    private readonly Forms.ContextMenuStrip _trayMenu;
+    private readonly Forms.ToolStripMenuItem _trayShowItem;
+    private readonly Forms.ToolStripMenuItem _trayStartItem;
+    private readonly Forms.ToolStripMenuItem _trayStopItem;
+    private readonly Forms.ToolStripMenuItem _trayPairItem;
+    private readonly Forms.ToolStripMenuItem _trayOpenLocalItem;
+    private readonly Forms.ToolStripMenuItem _trayOpenNetworkItem;
+    private readonly Forms.ToolStripMenuItem _trayToggleStartupItem;
+    private readonly Forms.ToolStripMenuItem _trayExitItem;
+    private readonly bool _startHiddenToTray;
+    private readonly string _startupBootstrapLogPath;
+    private bool _startupEnabled;
+    private bool _startupBusy;
+    private bool _allowClose;
+    private bool _trayInitialized;
 
-    public MainWindow()
+    public MainWindow(bool startHiddenToTray = false)
     {
         InitializeComponent();
         var repoRoot = LauncherRuntimeService.FindRepoRoot();
         _stateStore = new LauncherStateStore(repoRoot);
         _runtimeService = new LauncherRuntimeService(repoRoot, _stateStore);
         _preferences = _stateStore.LoadPreferences();
+        _startHiddenToTray = startHiddenToTray;
+        Directory.CreateDirectory(_stateStore.LogsDir);
+        _startupBootstrapLogPath = Path.Combine(_stateStore.LogsDir, "startup-bootstrap.log");
+        WriteStartupBreadcrumb($"constructed startHiddenToTray={_startHiddenToTray}");
         _refreshTimer = new DispatcherTimer
         {
             Interval = IdleRefreshInterval,
         };
+        _trayMenu = new Forms.ContextMenuStrip();
+        _trayShowItem = new Forms.ToolStripMenuItem("Show Launcher", null, (_, _) => RestoreFromTray());
+        _trayStartItem = new Forms.ToolStripMenuItem("Start Codrex", null, async (_, _) => await RunRuntimeActionAsync("start"));
+        _trayStopItem = new Forms.ToolStripMenuItem("Stop Codrex", null, async (_, _) => await RunRuntimeActionAsync("stop"));
+        _trayPairItem = new Forms.ToolStripMenuItem("Show Pair QR", null, async (_, _) =>
+        {
+            RestoreFromTray();
+            await GeneratePairingAsync();
+        });
+        _trayOpenLocalItem = new Forms.ToolStripMenuItem("Open Local App", null, (_, _) =>
+        {
+            RestoreFromTray();
+            if (_lastRuntime is { Ok: true } runtime && !string.IsNullOrWhiteSpace(runtime.LocalUrl))
+            {
+                OpenUrl(runtime.LocalUrl);
+            }
+        });
+        _trayOpenNetworkItem = new Forms.ToolStripMenuItem("Open Network App", null, (_, _) =>
+        {
+            RestoreFromTray();
+            var networkUrl = BuildSelectedNetworkUrl();
+            if (!string.IsNullOrWhiteSpace(networkUrl))
+            {
+                OpenUrl(networkUrl);
+            }
+        });
+        _trayToggleStartupItem = new Forms.ToolStripMenuItem("Enable Startup", null, async (_, _) => await ToggleStartupAsync());
+        _trayExitItem = new Forms.ToolStripMenuItem("Exit Launcher", null, (_, _) => ExitLauncher());
+        _trayMenu.Items.AddRange(new Forms.ToolStripItem[]
+        {
+            _trayShowItem,
+            new Forms.ToolStripSeparator(),
+            _trayStartItem,
+            _trayStopItem,
+            _trayPairItem,
+            _trayOpenLocalItem,
+            _trayOpenNetworkItem,
+            new Forms.ToolStripSeparator(),
+            _trayToggleStartupItem,
+            new Forms.ToolStripSeparator(),
+            _trayExitItem,
+        });
+        _trayIcon = new Forms.NotifyIcon
+        {
+            Icon = Drawing.Icon.ExtractAssociatedIcon(Assembly.GetExecutingAssembly().Location) ?? Drawing.SystemIcons.Application,
+            Visible = false,
+            Text = "Codrex Launcher",
+            ContextMenuStrip = _trayMenu,
+        };
+        _trayIcon.DoubleClick += (_, _) => RestoreFromTray();
         _refreshTimer.Tick += async (_, _) => await RefreshStateAsync();
         Loaded += async (_, _) => await InitializeLauncherAsync();
-        Closed += (_, _) => _refreshTimer.Stop();
+        StateChanged += (_, _) =>
+        {
+            if (WindowState == WindowState.Minimized && _preferences.MinimizeToTray)
+            {
+                HideToTray("Launcher is still running in the tray.");
+            }
+        };
+        Closing += OnWindowClosing;
+        Closed += (_, _) =>
+        {
+            _refreshTimer.Stop();
+            _trayIcon.Visible = false;
+            _trayIcon.Dispose();
+            _trayMenu.Dispose();
+        };
     }
 
     private void UpdateRefreshInterval()
@@ -65,6 +152,7 @@ public partial class MainWindow : Window
     {
         try
         {
+            WriteStartupBreadcrumb("initializing launcher UI");
             var webViewUserDataDir = Path.Combine(_stateStore.RuntimeDir, "launcher-webview");
             Directory.CreateDirectory(webViewUserDataDir);
             var webViewEnvironment = await CoreWebView2Environment.CreateAsync(userDataFolder: webViewUserDataDir);
@@ -79,15 +167,27 @@ public partial class MainWindow : Window
             LauncherView.NavigateToString(html);
             UpdateRefreshInterval();
             _refreshTimer.Start();
+            _trayInitialized = true;
+            _trayIcon.Visible = true;
+            WriteStartupBreadcrumb("tray icon visible");
+            await RefreshStartupStateAsync();
+            UpdateTrayState();
+            if (_startHiddenToTray)
+            {
+                WriteStartupBreadcrumb("startup requested hidden to tray");
+                Dispatcher.BeginInvoke(() => HideToTray("Launcher started in the tray."), DispatcherPriority.ApplicationIdle);
+            }
             await RefreshStateAsync();
         }
         catch (Exception ex)
         {
-            MessageBox.Show(
+            WriteStartupBreadcrumb($"initialize failed: {ex.Message}");
+            System.Windows.MessageBox.Show(
                 $"Codrex desktop launcher could not initialize WebView2.\n\n{ex.Message}",
                 "Codrex Launcher",
                 MessageBoxButton.OK,
                 MessageBoxImage.Error);
+            _allowClose = true;
             Close();
         }
     }
@@ -120,9 +220,7 @@ public partial class MainWindow : Window
                         _currentPairing = null;
                         _routeNotice = "";
                         _statusDetail = $"Selected {route} route.";
-                        var routeHost = route == "tailscale"
-                            ? (_lastNetInfo?.TailscaleIp?.Trim() ?? "")
-                            : (_lastNetInfo?.LanIp?.Trim() ?? "");
+                        var routeHost = GetRouteHost(route);
                         RecordActionEvent("route", string.IsNullOrWhiteSpace(routeHost)
                             ? $"{route} selected"
                             : $"{route} selected -> {routeHost}");
@@ -134,6 +232,23 @@ public partial class MainWindow : Window
                     _stateStore.SavePreferences(_preferences);
                     RecordActionEvent("ui", _preferences.AdvancedVisible ? "advanced opened" : "advanced closed");
                     await PublishStateAsync();
+                    break;
+                case "toggleStartup":
+                    await ToggleStartupAsync();
+                    break;
+                case "toggleMinimizeToTray":
+                    _preferences.MinimizeToTray = !_preferences.MinimizeToTray;
+                    _stateStore.SavePreferences(_preferences);
+                    _statusDetail = _preferences.MinimizeToTray
+                        ? "Launcher will hide to tray when minimized or closed."
+                        : "Launcher will close normally when you exit.";
+                    _errorDetail = "";
+                    RecordActionEvent("tray", _preferences.MinimizeToTray ? "minimize to tray enabled" : "minimize to tray disabled");
+                    UpdateTrayState();
+                    await PublishStateAsync();
+                    break;
+                case "hideToTray":
+                    HideToTray("Launcher hidden to tray.");
                     break;
                 case "showQr":
                     await GeneratePairingAsync();
@@ -173,7 +288,7 @@ public partial class MainWindow : Window
                 case "copyPairLink":
                     if (!string.IsNullOrWhiteSpace(_currentPairing?.PairLink))
                     {
-                        Clipboard.SetText(_currentPairing.PairLink);
+                        System.Windows.Clipboard.SetText(_currentPairing.PairLink);
                         _statusDetail = "Copied pairing link.";
                         _errorDetail = "";
                         RecordActionEvent("copy", "copied pairing link");
@@ -181,7 +296,7 @@ public partial class MainWindow : Window
                     }
                     break;
                 case "copyLogPath":
-                    Clipboard.SetText(_stateStore.LogsDir);
+                    System.Windows.Clipboard.SetText(_stateStore.LogsDir);
                     _statusDetail = "Copied logs path.";
                     _errorDetail = "";
                     RecordActionEvent("copy", "copied logs path");
@@ -227,7 +342,7 @@ public partial class MainWindow : Window
                 case "copyLastError":
                     if (File.Exists(_stateStore.LastErrorPath))
                     {
-                        Clipboard.SetText(_stateStore.LastErrorPath);
+                        System.Windows.Clipboard.SetText(_stateStore.LastErrorPath);
                         _statusDetail = "Copied last error path.";
                         _errorDetail = "";
                         RecordActionEvent("copy", "copied last error path");
@@ -416,7 +531,9 @@ public partial class MainWindow : Window
                         }
                         catch (Exception ex)
                         {
-                            _routeNotice = string.IsNullOrWhiteSpace(_lastNetInfo?.LanIp) && string.IsNullOrWhiteSpace(_lastNetInfo?.TailscaleIp)
+                            _routeNotice = string.IsNullOrWhiteSpace(_lastNetInfo?.LanIp)
+                                && string.IsNullOrWhiteSpace(_lastNetInfo?.TailscaleIp)
+                                && string.IsNullOrWhiteSpace(_lastNetInfo?.NetbirdIp)
                                 ? "Route lookup is delayed right now."
                                 : "Using the last known route while lookup catches up.";
                             RecordActionEvent("network", $"route refresh delayed -> {ex.Message}");
@@ -488,12 +605,14 @@ public partial class MainWindow : Window
         }
     }
 
-    private async Task PublishStateAsync()
+    private Task PublishStateAsync()
     {
         if (!_webReady || LauncherView.CoreWebView2 is null)
         {
-            return;
+            return Task.CompletedTask;
         }
+
+        UpdateTrayState();
 
         var runtime = _lastRuntime ?? new RuntimeActionResult
         {
@@ -539,16 +658,27 @@ public partial class MainWindow : Window
             route = _preferences.PreferredPairRoute,
             routeHost,
             routeNote = _routeNotice,
+            routeProvider = _lastNetInfo?.RouteProvider ?? "",
+            routeState = _lastNetInfo?.RouteState ?? "",
+            preferredOrigin = _lastNetInfo?.PreferredOrigin ?? "",
             lanHost = _lastNetInfo?.LanIp ?? "",
             tailscaleHost = _lastNetInfo?.TailscaleIp ?? "",
+            netbirdHost = _lastNetInfo?.NetbirdIp ?? "",
             lanAvailable = !string.IsNullOrWhiteSpace(_lastNetInfo?.LanIp),
             tailscaleAvailable = !string.IsNullOrWhiteSpace(_lastNetInfo?.TailscaleIp),
+            netbirdAvailable = !string.IsNullOrWhiteSpace(_lastNetInfo?.NetbirdIp),
+            controllerMode = runtime.ControllerMode,
+            sessionsRuntimeState = runtime.SessionsRuntimeState,
             pairLink = _currentPairing?.PairLink ?? "",
             qrImageUrl = _currentPairing?.QrImageUrl ?? "",
             qrVisible = !string.IsNullOrWhiteSpace(_currentPairing?.QrImageUrl),
             pairDetail = _currentPairing?.Detail ?? "",
             logsDir = _stateStore.LogsDir,
             advancedVisible = _preferences.AdvancedVisible,
+            minimizeToTray = _preferences.MinimizeToTray,
+            startupEnabled = _startupEnabled,
+            startupBusy = _startupBusy,
+            trayReady = _trayInitialized,
             startEnabled = !_actionBusy && !runtime.Status.Equals("running", StringComparison.OrdinalIgnoreCase) && !runtime.Status.Equals("starting", StringComparison.OrdinalIgnoreCase),
             stopEnabled = !_actionBusy && runtime.Status is not ("stopped" or "stopping"),
             showQrEnabled = !_actionBusy && runtime.Status.Equals("running", StringComparison.OrdinalIgnoreCase),
@@ -563,7 +693,7 @@ public partial class MainWindow : Window
         var stateJson = JsonSerializer.Serialize(state);
         if (string.Equals(stateJson, _lastPublishedStateJson, StringComparison.Ordinal))
         {
-            return;
+            return Task.CompletedTask;
         }
 
         _lastPublishedStateJson = stateJson;
@@ -571,6 +701,7 @@ public partial class MainWindow : Window
 
         string _statusDetailOrRuntime(string runtimeDetail) =>
             !string.IsNullOrWhiteSpace(_statusDetail) ? _statusDetail : runtimeDetail;
+        return Task.CompletedTask;
     }
 
     private string BuildSelectedNetworkUrl()
@@ -591,9 +722,34 @@ public partial class MainWindow : Window
 
     private string GetSelectedRouteHost()
     {
-        if (NormalizeRoute(_preferences.PreferredPairRoute) == "tailscale")
+        return GetRouteHost(_preferences.PreferredPairRoute);
+    }
+
+    private string GetRouteHost(string? route)
+    {
+        var normalized = NormalizeRoute(route);
+        if (normalized == "preferred")
+        {
+            if (!string.IsNullOrWhiteSpace(_lastNetInfo?.PreferredOrigin))
+            {
+                try
+                {
+                    return new Uri(_lastNetInfo.PreferredOrigin).Host;
+                }
+                catch
+                {
+                }
+            }
+        }
+
+        if (normalized == "tailscale")
         {
             return _lastNetInfo?.TailscaleIp?.Trim() ?? "";
+        }
+
+        if (normalized == "netbird")
+        {
+            return _lastNetInfo?.NetbirdIp?.Trim() ?? "";
         }
 
         if (!string.IsNullOrWhiteSpace(_lastNetInfo?.LanIp))
@@ -633,7 +789,14 @@ public partial class MainWindow : Window
     private static string NormalizeRoute(string? raw)
     {
         var value = (raw ?? string.Empty).Trim().ToLowerInvariant();
-        return value == "tailscale" ? "tailscale" : "lan";
+        return value switch
+        {
+            "tailscale" => "tailscale",
+            "netbird" => "netbird",
+            "lan" => "lan",
+            "current" => "current",
+            _ => "preferred",
+        };
     }
 
     private void RecordActionEvent(string kind, string message)
@@ -683,5 +846,141 @@ public partial class MainWindow : Window
             WorkingDirectory = _runtimeService.RepoRoot,
             UseShellExecute = true,
         });
+    }
+
+    private async Task ToggleStartupAsync()
+    {
+        if (_startupBusy)
+        {
+            return;
+        }
+
+        _startupBusy = true;
+        UpdateTrayState();
+        await PublishStateAsync();
+        try
+        {
+            await _runtimeService.SetStartupEnabledAsync(!_startupEnabled);
+            _startupEnabled = !_startupEnabled;
+            _statusDetail = _startupEnabled
+                ? "Autostart and watchdog are enabled."
+                : "Autostart and watchdog are disabled.";
+            _errorDetail = "";
+            RecordActionEvent("startup", _startupEnabled ? "startup enabled" : "startup disabled");
+        }
+        catch (Exception ex)
+        {
+            _errorDetail = ex.Message;
+            RecordActionEvent("error", $"startup toggle failed -> {ex.Message}");
+        }
+        finally
+        {
+            _startupBusy = false;
+            UpdateTrayState();
+            await PublishStateAsync();
+        }
+    }
+
+    private async Task RefreshStartupStateAsync()
+    {
+        try
+        {
+            _startupEnabled = await _runtimeService.GetStartupEnabledAsync();
+        }
+        catch (Exception ex)
+        {
+            RecordActionEvent("startup", $"startup status unavailable -> {ex.Message}");
+        }
+    }
+
+    private void UpdateTrayState()
+    {
+        var runtimeRunning = _lastRuntime is { Ok: true } runtime && runtime.Status.Equals("running", StringComparison.OrdinalIgnoreCase);
+        _trayIcon.Text = runtimeRunning ? "Codrex Launcher: running" : "Codrex Launcher: stopped";
+        _trayShowItem.Text = IsVisible ? "Focus Launcher" : "Show Launcher";
+        _trayStartItem.Enabled = !_actionBusy && !runtimeRunning;
+        _trayStopItem.Enabled = !_actionBusy && runtimeRunning;
+        _trayPairItem.Enabled = !_actionBusy && runtimeRunning;
+        _trayOpenLocalItem.Enabled = !_actionBusy && runtimeRunning && !string.IsNullOrWhiteSpace(_lastRuntime?.LocalUrl);
+        _trayOpenNetworkItem.Enabled = !_actionBusy && runtimeRunning && !string.IsNullOrWhiteSpace(BuildSelectedNetworkUrl());
+        _trayToggleStartupItem.Text = _startupBusy
+            ? "Updating Startup..."
+            : _startupEnabled ? "Disable Startup" : "Enable Startup";
+        _trayToggleStartupItem.Enabled = !_startupBusy;
+    }
+
+    private void HideToTray(string statusMessage)
+    {
+        if (!_trayInitialized)
+        {
+            return;
+        }
+
+        _statusDetail = statusMessage;
+        _errorDetail = "";
+        Opacity = 0;
+        Hide();
+        ShowInTaskbar = false;
+        UpdateTrayState();
+        WriteStartupBreadcrumb($"hidden to tray: {statusMessage}");
+        _trayIcon.BalloonTipTitle = "Codrex Launcher";
+        _trayIcon.BalloonTipText = statusMessage;
+        try
+        {
+            _trayIcon.ShowBalloonTip(1800);
+        }
+        catch
+        {
+        }
+    }
+
+    private void RestoreFromTray()
+    {
+        Opacity = 1;
+        ShowInTaskbar = true;
+        if (!IsVisible)
+        {
+            Show();
+        }
+        if (WindowState == WindowState.Minimized)
+        {
+            WindowState = WindowState.Normal;
+        }
+        Activate();
+        Focus();
+        UpdateTrayState();
+        WriteStartupBreadcrumb("restored from tray");
+    }
+
+    private void ExitLauncher()
+    {
+        _allowClose = true;
+        Close();
+    }
+
+    private void OnWindowClosing(object? sender, CancelEventArgs e)
+    {
+        if (_allowClose)
+        {
+            return;
+        }
+
+        if (_preferences.MinimizeToTray)
+        {
+            e.Cancel = true;
+            HideToTray("Launcher hidden to tray. Use the tray icon to restore it.");
+        }
+    }
+
+    private void WriteStartupBreadcrumb(string message)
+    {
+        try
+        {
+            var stamp = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff");
+            File.AppendAllText(_startupBootstrapLogPath, $"{stamp} [launcher] {message}{Environment.NewLine}");
+        }
+        catch
+        {
+        }
     }
 }

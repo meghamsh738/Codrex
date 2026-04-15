@@ -134,6 +134,69 @@ function Get-TailscaleIPv4 {
   return ""
 }
 
+function Get-NetbirdIPv4 {
+  try {
+    $adapters = @(Get-NetAdapter -ErrorAction Stop | Where-Object { $_.Status -ne "Disabled" })
+    foreach ($adapter in $adapters) {
+      $haystack = ("{0} {1}" -f [string]$adapter.Name, [string]$adapter.InterfaceDescription).Trim().ToLowerInvariant()
+      if (-not $haystack -or $haystack -notlike "*netbird*") {
+        continue
+      }
+      $ip = Get-NetIPAddress -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+        Where-Object { $_.IPAddress -and $_.IPAddress -notlike "169.254*" -and $_.IPAddress -ne "127.0.0.1" } |
+        Select-Object -First 1 -ExpandProperty IPAddress
+      if ($ip) {
+        return [string]$ip
+      }
+    }
+  } catch {}
+  return ""
+}
+
+function Get-PreferredPairRoute {
+  $statePath = Join-Path $script:StateDir "launcher.state.json"
+  if (-not (Test-Path $statePath)) {
+    return "tailscale"
+  }
+  try {
+    $payload = Get-Content -Path $statePath -Raw | ConvertFrom-Json
+    $route = ([string]$payload.preferred_pair_route).Trim().ToLowerInvariant()
+    if ($route -in @("lan", "tailscale", "netbird")) {
+      return $route
+    }
+  } catch {}
+  return "tailscale"
+}
+
+function Resolve-PublishedRoute {
+  param(
+    [string]$PreferredRoute,
+    [string]$LanIp,
+    [string]$TailscaleIp,
+    [string]$NetbirdIp
+  )
+  $route = ([string]$PreferredRoute).Trim().ToLowerInvariant()
+  switch ($route) {
+    "tailscale" {
+      if ($TailscaleIp) { return [pscustomobject]@{ route = "tailscale"; host = $TailscaleIp; confidence = "high confidence" } }
+      if ($LanIp -and $LanIp -ne "127.0.0.1") { return [pscustomobject]@{ route = "lan"; host = $LanIp; confidence = "medium confidence" } }
+    }
+    "netbird" {
+      if ($NetbirdIp) { return [pscustomobject]@{ route = "netbird"; host = $NetbirdIp; confidence = "high confidence" } }
+      if ($LanIp -and $LanIp -ne "127.0.0.1") { return [pscustomobject]@{ route = "lan"; host = $LanIp; confidence = "medium confidence" } }
+    }
+    "lan" {
+      if ($LanIp -and $LanIp -ne "127.0.0.1") { return [pscustomobject]@{ route = "lan"; host = $LanIp; confidence = "medium confidence" } }
+      if ($TailscaleIp) { return [pscustomobject]@{ route = "tailscale"; host = $TailscaleIp; confidence = "high confidence" } }
+      if ($NetbirdIp) { return [pscustomobject]@{ route = "netbird"; host = $NetbirdIp; confidence = "high confidence" } }
+    }
+  }
+  if ($TailscaleIp) { return [pscustomobject]@{ route = "tailscale"; host = $TailscaleIp; confidence = "high confidence" } }
+  if ($NetbirdIp) { return [pscustomobject]@{ route = "netbird"; host = $NetbirdIp; confidence = "high confidence" } }
+  if ($LanIp -and $LanIp -ne "127.0.0.1") { return [pscustomobject]@{ route = "lan"; host = $LanIp; confidence = "medium confidence" } }
+  return [pscustomobject]@{ route = "localhost"; host = "127.0.0.1"; confidence = "low confidence" }
+}
+
 function Invoke-Json {
   param(
     [string]$Url,
@@ -196,24 +259,19 @@ function Show-PairQrWindow {
     return
   }
 
-  $tailscaleIp = Get-TailscaleIPv4
+  $preferredRoute = Get-PreferredPairRoute
   $lanIp = [string]$status.lan_ip
-  $pairHost = ""
-  $routeLabel = ""
-  $routeConfidence = ""
-  if ($tailscaleIp) {
-    $pairHost = $tailscaleIp
-    $routeLabel = "Tailscale"
-    $routeConfidence = "high confidence"
-  } elseif ($lanIp -and $lanIp -ne "127.0.0.1") {
-    $pairHost = $lanIp
-    $routeLabel = "LAN"
-    $routeConfidence = "medium confidence"
-  } else {
-    $pairHost = "127.0.0.1"
-    $routeLabel = "Localhost"
-    $routeConfidence = "low confidence"
+  $tailscaleIp = if ($status.tailscale_ip) { [string]$status.tailscale_ip } else { Get-TailscaleIPv4 }
+  $netbirdIp = if ($status.netbird_ip) { [string]$status.netbird_ip } else { Get-NetbirdIPv4 }
+  $routeChoice = Resolve-PublishedRoute -PreferredRoute $preferredRoute -LanIp $lanIp -TailscaleIp $tailscaleIp -NetbirdIp $netbirdIp
+  $pairHost = [string]$routeChoice.host
+  $routeLabel = switch ([string]$routeChoice.route) {
+    "tailscale" { "Tailscale" }
+    "netbird" { "NetBird" }
+    "lan" { "LAN" }
+    default { "Localhost" }
   }
+  $routeConfidence = [string]$routeChoice.confidence
 
   $controllerPort = [int]$status.controller_port
   $createUrl = "http://127.0.0.1:$controllerPort/auth/pair/create"
@@ -364,6 +422,10 @@ function Get-StackStatus {
   $ui = Get-UiProcess
   $controllerPort = Read-ControllerPort
   $lanIp = Get-PrimaryIPv4
+  $tailscaleIp = Get-TailscaleIPv4
+  $netbirdIp = Get-NetbirdIPv4
+  $preferredRoute = Get-PreferredPairRoute
+  $published = Resolve-PublishedRoute -PreferredRoute $preferredRoute -LanIp $lanIp -TailscaleIp $tailscaleIp -NetbirdIp $netbirdIp
   return [pscustomobject]@{
     controller_running = ($null -ne $controller)
     controller_pid = $(if ($controller) { [int]$controller.ProcessId } else { 0 })
@@ -372,6 +434,11 @@ function Get-StackStatus {
     ui_pid = $(if ($ui) { [int]$ui.ProcessId } else { 0 })
     ui_port = $script:UiPort
     lan_ip = $lanIp
+    tailscale_ip = $tailscaleIp
+    netbird_ip = $netbirdIp
+    selected_pair_route = $preferredRoute
+    network_host = [string]$published.host
+    network_route = [string]$published.route
   }
 }
 
@@ -480,14 +547,20 @@ function Update-UiState {
   }
 
   $script:StatusItem.Text = "Status: $stateText"
-  $script:StatusDetailsItem.Text = "Controller $($status.controller_port) (PID $($status.controller_pid)) | UI $($status.ui_port) (PID $($status.ui_pid)) | LAN $($status.lan_ip)"
+  $routeLabel = switch ([string]$status.network_route) {
+    "tailscale" { "Tailscale" }
+    "netbird" { "NetBird" }
+    "lan" { "LAN" }
+    default { "Localhost" }
+  }
+  $script:StatusDetailsItem.Text = "Controller $($status.controller_port) (PID $($status.controller_pid)) | UI $($status.ui_port) (PID $($status.ui_pid)) | Route $routeLabel $($status.network_host)"
 
   $isBusy = [bool]$script:PendingAction
   $script:StartItem.Enabled = (-not $isBusy) -and (-not ($status.controller_running -and $status.ui_running))
   $script:StopItem.Enabled = (-not $isBusy) -and ($status.controller_running -or $status.ui_running)
 
   $script:OpenUiLocalItem.Enabled = $status.ui_running
-  $script:OpenUiNetworkItem.Enabled = $status.ui_running -and $status.lan_ip -and $status.lan_ip -ne "127.0.0.1"
+  $script:OpenUiNetworkItem.Enabled = $status.ui_running -and $status.network_host -and $status.network_host -ne "127.0.0.1"
   $script:OpenControllerItem.Enabled = $status.controller_running
   $script:PairQrItem.Enabled = (-not $isBusy) -and $status.controller_running -and $status.ui_running
 
@@ -551,7 +624,7 @@ $script:OpenUiLocalItem.Add_Click({
 })
 $script:OpenUiNetworkItem.Add_Click({
   if (-not $script:LastStatus) { Update-UiState }
-  $ip = [string]$script:LastStatus.lan_ip
+  $ip = [string]$script:LastStatus.network_host
   if ($ip) {
     $port = if ($script:LastStatus -and $script:LastStatus.controller_port) { [int]$script:LastStatus.controller_port } else { $script:DefaultControllerPort }
     Open-Url ("http://{0}:{1}" -f $ip, $port)

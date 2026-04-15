@@ -12,6 +12,7 @@ Normal use:
 Advanced tools kept here:
 - `mobile-launcher.ps1`: legacy launcher UI kept as a compatibility fallback
 - `build-launcher.ps1`: publishes the .NET 8 WebView2 desktop launcher
+- `start-launcher.ps1`: starts the .NET launcher directly and supports `-Tray` for hidden tray launch
 - `codrex-runtime.ps1`: authoritative JSON lifecycle entrypoint used by setup and the launcher
 - `start-mobile.ps1` / `stop-mobile.ps1`: direct stack control
 - `start-mobile.ps1 -DevUi`: optional developer-only Vite runtime on `54312` or the next free port

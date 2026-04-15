@@ -295,7 +295,7 @@ function Write-MobileSession {
   )
   $owners = @(Get-CodrexControllerProcessesByPort -Port $ControllerPort | Sort-Object ProcessId -Descending)
   $controllerPid = if ($owners.Count -gt 0) { [int]$owners[0].ProcessId } else { $null }
-  $lanIp = Get-PrimaryIPv4
+  $routeInfo = Get-CodrexPublishedNetworkInfo -RuntimeDir $Paths.runtime_dir -Port $ControllerPort
   $payload = [ordered]@{
     started_at = (Get-Date).ToString("o")
     controller_port = [int]$ControllerPort
@@ -306,8 +306,8 @@ function Write-MobileSession {
     repo_root = $root
     runtime_dir = $Paths.runtime_dir
     session_file = $Paths.session_path
-    app_url = ("http://127.0.0.1:{0}/" -f $ControllerPort)
-    network_app_url = if ($lanIp -and $lanIp -ne "127.0.0.1") { ("http://{0}:{1}/" -f $lanIp, $ControllerPort) } else { "" }
+    app_url = [string]$routeInfo.local_url
+    network_app_url = [string]$routeInfo.network_url
   }
   Write-JsonFile -Path $Paths.session_path -Data $payload
   return Read-JsonFile -Path $Paths.session_path
@@ -486,9 +486,9 @@ function Get-StatusSnapshot {
     $status = "recovering"
     $detail = "Runtime session file exists without a live controller."
   }
-  $localUrl = if ($controllerOn -or $sessionPresent) { "http://127.0.0.1:$port/" } else { "" }
-  $lanIp = Get-PrimaryIPv4
-  $networkUrl = if ($lanIp -and $lanIp -ne "127.0.0.1" -and ($controllerOn -or $sessionPresent)) { "http://$lanIp`:$port/" } else { "" }
+  $routeInfo = Get-CodrexPublishedNetworkInfo -RuntimeDir $Paths.runtime_dir -Port $port
+  $localUrl = if ($controllerOn -or $sessionPresent) { [string]$routeInfo.local_url } else { "" }
+  $networkUrl = if ($controllerOn -or $sessionPresent) { [string]$routeInfo.network_url } else { "" }
   $repoRev = Get-RepoRevision
   return [pscustomobject]@{
     ok = $true
@@ -499,6 +499,10 @@ function Get-StatusSnapshot {
     repo_rev = $repoRev
     runtime_dir = $Paths.runtime_dir
     logs_dir = $Paths.logs_dir
+    selected_pair_route = [string]$routeInfo.selected_pair_route
+    lan_ip = [string]$routeInfo.lan_ip
+    tailscale_ip = [string]$routeInfo.tailscale_ip
+    netbird_ip = [string]$routeInfo.netbird_ip
     controller_port = $port
     controller_pid = if ($owners.Count -gt 0) { [int]$owners[0].ProcessId } elseif ($sessionProcessAlive) { [int]$sessionReportedPid } else { $null }
     controller_pids = if ($owners.Count -gt 0) { @($owners | ForEach-Object { [int]$_.ProcessId }) } elseif ($sessionProcessAlive) { @([int]$sessionReportedPid) } else { @() }
@@ -598,9 +602,30 @@ function Repair-Runtime {
     }
   }
   $snapshot = Get-StatusSnapshot -Paths $Paths
-  if ($snapshot.session_present -and -not $snapshot.controller_pid) {
+  $sessionInvalid = $false
+  $session = if ($snapshot.session_present) { Read-MobileSession -Paths $Paths } else { $null }
+  if ($session) {
+    $expectedRouteInfo = Get-CodrexPublishedNetworkInfo -RuntimeDir $Paths.runtime_dir -Port $snapshot.controller_port
+    $sessionPort = 0
+    try {
+      if ($session.controller_port) {
+        $sessionPort = [int]$session.controller_port
+      }
+    } catch {}
+    $sessionAppUrl = [string]$session.app_url
+    $sessionNetworkUrl = [string]$session.network_app_url
+    $sessionRuntimeDir = [string]$session.runtime_dir
+    $sessionInvalid =
+      ($sessionPort -le 0) -or
+      ($snapshot.controller_port -gt 0 -and $sessionPort -ne $snapshot.controller_port) -or
+      (-not $sessionAppUrl) -or
+      ($sessionAppUrl -ne [string]$expectedRouteInfo.local_url) -or
+      ($sessionNetworkUrl -ne [string]$expectedRouteInfo.network_url) -or
+      ($sessionRuntimeDir -and ($sessionRuntimeDir -ne $Paths.runtime_dir))
+  }
+  if ($snapshot.session_present -and ((-not $snapshot.controller_pid) -or $sessionInvalid)) {
     Remove-MobileSessionFiles -Paths $Paths
-    $repaired.Add("removed stale runtime session") | Out-Null
+    $repaired.Add("removed stale or invalid runtime session") | Out-Null
     $snapshot = Get-StatusSnapshot -Paths $Paths
   }
   if ($snapshot.controller_pid -and $snapshot.app_ready -and -not $snapshot.session_present) {

@@ -1,7 +1,7 @@
 import type { Dispatch, SetStateAction } from "react";
 import type { AuthStatus, NetInfo } from "../types";
 
-type RouteHint = "lan" | "tailscale" | "current";
+type RouteHint = "preferred" | "lan" | "tailscale" | "netbird" | "current";
 type ThemeMode = "system" | "light" | "dark";
 
 interface SettingsTabProps {
@@ -140,13 +140,15 @@ export default function SettingsTab({
 
           <div className="stack">
             <div className="quick-open-card settings-note">
-              <h3>Network Diagnostics</h3>
+              <h3>Connection Details</h3>
               <p className="small">Current route: <strong>{controllerRouteSummary}</strong></p>
               <p className={`small severity ${controllerRouteSeverity}`}>{controllerRouteAdvice}</p>
               <p className="small">Controller base: <code>{controllerBase || "(not set)"}</code></p>
               <p className="small">Route hint: <strong>{prettyRouteLabel(routeHint)}</strong></p>
               <p className="small">LAN: <strong>{netInfo?.lan_ip || "n/a"}</strong></p>
               <p className="small">Tailscale: <strong>{netInfo?.tailscale_ip || "n/a"}</strong></p>
+              <p className="small">NetBird: <strong>{netInfo?.netbird_ip || "n/a"}</strong></p>
+              <p className="small">Preferred origin: <strong>{netInfo?.preferred_origin || "n/a"}</strong></p>
               <p className="small">Browser origin: <code>{typeof window !== "undefined" ? window.location.origin : "n/a"}</code></p>
               <div className="row">
                 <button type="button" className="button soft compact" onClick={() => void refreshNet()}>
@@ -160,7 +162,7 @@ export default function SettingsTab({
 
             <div className="empty-state settings-note">
               <h3>Remote safety checklist</h3>
-              <p>Use Tailscale/private network and keep token auth enabled on backend.</p>
+              <p>Use a private route and keep token auth enabled on backend.</p>
               <ul className="safety-list">
                 <li>Avoid exposing backend ports directly to public internet.</li>
                 <li>Use QR pairing for mobile sign-in instead of sharing raw token.</li>

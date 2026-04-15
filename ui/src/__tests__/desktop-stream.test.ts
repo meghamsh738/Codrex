@@ -37,9 +37,30 @@ describe("resolveDesktopStreamParams", () => {
     ).toEqual({
       fps: 2,
       level: 2,
+      scale: 3,
+      bw: false,
+    });
+  });
+
+  it("biases the responsive profile toward lighter default mobile frames", () => {
+    expect(DESKTOP_PROFILE_STREAM.responsive).toEqual({
+      fps: 10,
+      level: 1,
       scale: 2,
+      bw: false,
+    });
+
+    expect(
+      resolveDesktopStreamParams("responsive", {
+        active: true,
+        fullscreen: true,
+        adaptiveBoost: true,
+      }),
+    ).toEqual({
+      fps: 12,
+      level: 0,
+      scale: 1,
       bw: false,
     });
   });
 });
-

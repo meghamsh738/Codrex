@@ -222,6 +222,8 @@ function Resolve-LogTargetPath {
 $runtimeDir = Get-CodrexRuntimeDir -RepoRoot $root
 $stateDir = Join-Path $runtimeDir "state"
 $logsDir = Join-Path $runtimeDir "logs"
+$startupLogPath = Join-Path $logsDir "startup-bootstrap.log"
+$controllerStartupStatePath = Join-Path $stateDir "controller.starting.json"
 $configPath = Join-Path $root "controller.config.json"
 $localConfigPath = Join-Path $stateDir "controller.config.local.json"
 $legacyLocalConfigPath = Join-Path $root "controller.config.local.json"
@@ -233,6 +235,44 @@ foreach ($dir in @($runtimeDir, $stateDir, $logsDir)) {
     New-Item -Path $dir -ItemType Directory -Force | Out-Null
   }
 }
+
+function Write-StartupControllerBreadcrumb {
+  param(
+    [string]$Message
+  )
+  try {
+    $stamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss.fff"
+    Add-Content -Path $startupLogPath -Value "$stamp [start-controller] $Message"
+  } catch {}
+}
+
+function Set-ControllerStartupState {
+  param(
+    [string]$Stage
+  )
+  try {
+    $payload = [ordered]@{
+      started_at = (Get-Date).ToString("o")
+      stage = $Stage
+      pid = [int]$PID
+    }
+    if ($cfg -and $cfg.port) {
+      $payload.port = [int]$cfg.port
+    }
+    $payload | ConvertTo-Json -Depth 4 | Set-Content -Path $controllerStartupStatePath -Encoding UTF8
+  } catch {}
+}
+
+function Clear-ControllerStartupState {
+  try {
+    if (Test-Path $controllerStartupStatePath) {
+      Remove-Item -Path $controllerStartupStatePath -Force -ErrorAction SilentlyContinue
+    }
+  } catch {}
+}
+
+Write-StartupControllerBreadcrumb ("invoked preferredPort={0} uiPort={1} distro={2}" -f $Port, $UiPort, $Distro)
+
 $script:DiagnosticsLayout = Ensure-CodrexDiagnosticsLayout -RuntimeDir $runtimeDir
 $script:DiagActionId = Get-CodrexCurrentActionId
 if (-not $script:DiagActionId) {
@@ -253,7 +293,7 @@ function Write-StartControllerDiagnostic {
     [AllowNull()]
     [object]$Extra = $null
   )
-  $lanIp = Get-PrimaryIPv4
+  $routeInfo = Get-CodrexPublishedNetworkInfo -RuntimeDir $runtimeDir -Port ([int]$cfg.port)
   $payload = [ordered]@{
     ok = $Ok
     status = if ($Ok) { "completed" } else { "error" }
@@ -263,9 +303,12 @@ function Write-StartControllerDiagnostic {
     logs_dir = $logsDir
     controller_port = [int]$cfg.port
     ui_port = [int]$UiPort
-    selected_pair_route = Get-CodrexSelectedRouteFromState -RuntimeDir $runtimeDir
-    local_url = ("http://127.0.0.1:{0}/" -f $cfg.port)
-    network_url = if ($lanIp -and $lanIp -ne "127.0.0.1") { ("http://{0}:{1}/" -f $lanIp, $cfg.port) } else { "" }
+    selected_pair_route = [string]$routeInfo.selected_pair_route
+    lan_ip = [string]$routeInfo.lan_ip
+    tailscale_ip = [string]$routeInfo.tailscale_ip
+    netbird_ip = [string]$routeInfo.netbird_ip
+    local_url = [string]$routeInfo.local_url
+    network_url = [string]$routeInfo.network_url
     session_file = Join-Path $stateDir "mobile.session.json"
     controller_port_snapshot_before = @($script:DiagBeforeControllerSnapshot)
     controller_port_snapshot_after = Get-CodrexPortDiagnosticsSnapshot -Ports @([int]$cfg.port)
@@ -291,6 +334,7 @@ function Write-StartControllerDiagnostic {
 
 trap {
   $message = if ($_.Exception -and $_.Exception.Message) { [string]$_.Exception.Message } else { [string]$_ }
+  Clear-ControllerStartupState
   Write-StartControllerDiagnostic -Ok:$false -Detail $message -Extra ([pscustomobject]@{
     failure_stage = "start-controller"
   })
@@ -425,12 +469,14 @@ if (-not ([string]$env:CODEX_TELEGRAM_CHAT_ID).Trim()) {
 }
 
 $launchCommand = 'start "" /b "{0}" -m uvicorn app.server:app --host 0.0.0.0 --port {1} 1>>"{2}" 2>>"{3}"' -f $python, $cfg.port, $outLog, $errLog
+Set-ControllerStartupState -Stage "launching"
 $null = Start-Process -FilePath "cmd.exe" -ArgumentList @("/d", "/c", $launchCommand) -WorkingDirectory $root -WindowStyle Hidden -PassThru
 
 # Wait until endpoint responds.
 $ok = $false
 $readyHost = ""
 $probeHosts = @("127.0.0.1", "localhost") | Select-Object -Unique
+Set-ControllerStartupState -Stage "probing"
 for ($i = 0; $i -lt 40; $i++) {
   foreach ($h in $probeHosts) {
     if (Test-ControllerReady -ProbeHost $h -Port $cfg.port -Token $cfg.token) {
@@ -492,6 +538,7 @@ Write-Host ("Token file: {0}" -f $localConfigPath)
 Write-Host ("Runtime dir: {0}" -f $runtimeDir)
 Write-Host "PID: $controllerPid"
 Write-Host "Logs: $outLog"
+Clear-ControllerStartupState
 Write-StartControllerDiagnostic -Ok:$true -Detail "Controller started." -Extra ([pscustomobject]@{
   controller_pid = $controllerPid
   ready_host = $readyHost

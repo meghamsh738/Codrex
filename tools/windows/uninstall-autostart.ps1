@@ -2,7 +2,8 @@ $ErrorActionPreference = "Stop"
 $taskNames = @(
   "CodrexRemoteController",
   "CodrexRemoteController.Startup",
-  "CodrexRemoteController.Watchdog"
+  "CodrexRemoteController.Watchdog",
+  "CodrexLauncher.Tray"
 )
 
 foreach ($taskName in $taskNames) {

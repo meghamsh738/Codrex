@@ -29,6 +29,8 @@ public sealed class LauncherRuntimeService
     public string RuntimeScriptPath { get; }
     public string ConfigPath { get; }
     public string LocalConfigPath { get; }
+    public string InstallAutostartScriptPath => Path.Combine(RepoRoot, "tools", "windows", "install-autostart.ps1");
+    public string UninstallAutostartScriptPath => Path.Combine(RepoRoot, "tools", "windows", "uninstall-autostart.ps1");
 
     public static string FindRepoRoot()
     {
@@ -75,6 +77,12 @@ public sealed class LauncherRuntimeService
 
     public Task<RuntimeActionResult> RepairAsync(CancellationToken cancellationToken = default) =>
         InvokeRuntimeAsync("repair", cancellationToken);
+
+    public Task<bool> GetStartupEnabledAsync(CancellationToken cancellationToken = default) =>
+        QueryAutostartTaskStateAsync(cancellationToken);
+
+    public Task SetStartupEnabledAsync(bool enabled, CancellationToken cancellationToken = default) =>
+        InvokeAutostartScriptAsync(enabled ? InstallAutostartScriptPath : UninstallAutostartScriptPath, cancellationToken);
 
     public Task<LauncherAccountsPayload?> GetAccountsAsync(bool forceUsage = false, CancellationToken cancellationToken = default) =>
         InvokeAccountToolAsync<LauncherAccountsPayload>(new[]
@@ -147,9 +155,7 @@ public sealed class LauncherRuntimeService
             return new PairingResult
             {
                 Ok = false,
-                Detail = route == "tailscale"
-                    ? "Tailscale is unavailable on this laptop."
-                    : "LAN IP is unavailable on this laptop.",
+                Detail = DescribeUnavailableRoute(route),
             };
         }
 
@@ -285,10 +291,9 @@ public sealed class LauncherRuntimeService
             RedirectStandardError = true,
             UseShellExecute = false,
             CreateNoWindow = true,
+            WindowStyle = ProcessWindowStyle.Hidden,
         };
-        startInfo.ArgumentList.Add("-NoProfile");
-        startInfo.ArgumentList.Add("-ExecutionPolicy");
-        startInfo.ArgumentList.Add("Bypass");
+        ConfigurePowerShellStartInfo(startInfo);
         startInfo.ArgumentList.Add("-File");
         startInfo.ArgumentList.Add(RuntimeScriptPath);
         startInfo.ArgumentList.Add("-Action");
@@ -480,9 +485,35 @@ public sealed class LauncherRuntimeService
 
     private static string ResolveRouteHost(string route, NetInfoPayload netInfo, RuntimeActionResult runtime)
     {
-        if (string.Equals(route, "tailscale", StringComparison.OrdinalIgnoreCase))
+        var normalized = (route ?? string.Empty).Trim().ToLowerInvariant();
+        if (string.Equals(normalized, "preferred", StringComparison.OrdinalIgnoreCase))
+        {
+            var preferredHost = ExtractHostFromOrigin(netInfo.PreferredOrigin);
+            if (!string.IsNullOrWhiteSpace(preferredHost))
+            {
+                return preferredHost;
+            }
+        }
+
+        if (string.Equals(normalized, "tailscale", StringComparison.OrdinalIgnoreCase))
         {
             return string.IsNullOrWhiteSpace(netInfo.TailscaleIp) ? "" : netInfo.TailscaleIp.Trim();
+        }
+
+        if (string.Equals(normalized, "netbird", StringComparison.OrdinalIgnoreCase))
+        {
+            return string.IsNullOrWhiteSpace(netInfo.NetbirdIp) ? "" : netInfo.NetbirdIp.Trim();
+        }
+
+        if (string.Equals(normalized, "current", StringComparison.OrdinalIgnoreCase) && !string.IsNullOrWhiteSpace(runtime.NetworkUrl))
+        {
+            try
+            {
+                return new Uri(runtime.NetworkUrl).Host;
+            }
+            catch
+            {
+            }
         }
 
         if (!string.IsNullOrWhiteSpace(netInfo.LanIp))
@@ -503,4 +534,133 @@ public sealed class LauncherRuntimeService
 
         return "";
     }
+
+    private static string ExtractHostFromOrigin(string origin)
+    {
+        if (string.IsNullOrWhiteSpace(origin))
+        {
+            return "";
+        }
+
+        try
+        {
+            return new Uri(origin).Host;
+        }
+        catch
+        {
+            return "";
+        }
+    }
+
+    private static string DescribeUnavailableRoute(string route)
+    {
+        return (route ?? string.Empty).Trim().ToLowerInvariant() switch
+        {
+            "tailscale" => "Tailscale is unavailable on this laptop.",
+            "netbird" => "NetBird is unavailable on this laptop.",
+            "current" => "The current route is unavailable on this laptop.",
+            "preferred" => "No private route is available on this laptop yet.",
+            _ => "LAN IP is unavailable on this laptop.",
+        };
+    }
+
+    private async Task<bool> QueryAutostartTaskStateAsync(CancellationToken cancellationToken)
+    {
+        const string startupTaskName = "CodrexRemoteController.Startup";
+        const string watchdogTaskName = "CodrexRemoteController.Watchdog";
+        const string launcherTaskName = "CodrexLauncher.Tray";
+        const string script = @"
+$startup = Get-ScheduledTask -TaskName 'CodrexRemoteController.Startup' -ErrorAction SilentlyContinue
+$watchdog = Get-ScheduledTask -TaskName 'CodrexRemoteController.Watchdog' -ErrorAction SilentlyContinue
+$launcher = Get-ScheduledTask -TaskName 'CodrexLauncher.Tray' -ErrorAction SilentlyContinue
+if ($startup -and $watchdog -and $launcher) { 'true' } else { 'false' }
+";
+        var result = await InvokePowerShellAsync(script, cancellationToken);
+        if (result.ExitCode != 0)
+        {
+            var detail = string.IsNullOrWhiteSpace(result.Stderr) ? result.Stdout.Trim() : result.Stderr.Trim();
+            throw new InvalidOperationException(string.IsNullOrWhiteSpace(detail)
+                ? $"Could not query startup tasks '{startupTaskName}', '{watchdogTaskName}', and '{launcherTaskName}'."
+                : detail);
+        }
+        return string.Equals(result.Stdout.Trim(), "true", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private async Task InvokeAutostartScriptAsync(string scriptPath, CancellationToken cancellationToken)
+    {
+        if (!File.Exists(scriptPath))
+        {
+            throw new FileNotFoundException("Autostart helper script is missing.", scriptPath);
+        }
+
+        var result = await InvokePowerShellFileAsync(scriptPath, cancellationToken);
+        if (result.ExitCode == 0)
+        {
+            return;
+        }
+
+        var detail = string.IsNullOrWhiteSpace(result.Stderr) ? result.Stdout.Trim() : result.Stderr.Trim();
+        throw new InvalidOperationException(string.IsNullOrWhiteSpace(detail) ? "Autostart update failed." : detail);
+    }
+
+    private Task<PowerShellInvocationResult> InvokePowerShellFileAsync(string scriptPath, CancellationToken cancellationToken)
+    {
+        var startInfo = new ProcessStartInfo("powershell.exe")
+        {
+            WorkingDirectory = RepoRoot,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            WindowStyle = ProcessWindowStyle.Hidden,
+        };
+        ConfigurePowerShellStartInfo(startInfo);
+        startInfo.ArgumentList.Add("-File");
+        startInfo.ArgumentList.Add(scriptPath);
+        return InvokePowerShellProcessAsync(startInfo, cancellationToken);
+    }
+
+    private Task<PowerShellInvocationResult> InvokePowerShellAsync(string script, CancellationToken cancellationToken)
+    {
+        var startInfo = new ProcessStartInfo("powershell.exe")
+        {
+            WorkingDirectory = RepoRoot,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            WindowStyle = ProcessWindowStyle.Hidden,
+        };
+        ConfigurePowerShellStartInfo(startInfo);
+        startInfo.ArgumentList.Add("-Command");
+        startInfo.ArgumentList.Add(script);
+        return InvokePowerShellProcessAsync(startInfo, cancellationToken);
+    }
+
+    private static void ConfigurePowerShellStartInfo(ProcessStartInfo startInfo)
+    {
+        startInfo.ArgumentList.Add("-NoLogo");
+        startInfo.ArgumentList.Add("-NoProfile");
+        startInfo.ArgumentList.Add("-NonInteractive");
+        startInfo.ArgumentList.Add("-WindowStyle");
+        startInfo.ArgumentList.Add("Hidden");
+        startInfo.ArgumentList.Add("-ExecutionPolicy");
+        startInfo.ArgumentList.Add("Bypass");
+    }
+
+    private static async Task<PowerShellInvocationResult> InvokePowerShellProcessAsync(ProcessStartInfo startInfo, CancellationToken cancellationToken)
+    {
+        using var process = new Process { StartInfo = startInfo, EnableRaisingEvents = true };
+        if (!process.Start())
+        {
+            throw new InvalidOperationException("Could not start PowerShell.");
+        }
+
+        var stdout = await process.StandardOutput.ReadToEndAsync(cancellationToken);
+        var stderr = await process.StandardError.ReadToEndAsync(cancellationToken);
+        await process.WaitForExitAsync(cancellationToken);
+        return new PowerShellInvocationResult(process.ExitCode, stdout, stderr);
+    }
+
+    private readonly record struct PowerShellInvocationResult(int ExitCode, string Stdout, string Stderr);
 }

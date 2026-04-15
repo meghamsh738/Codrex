@@ -7,93 +7,104 @@
     <style>
       :root {
         color-scheme: dark;
-        --bg: #050b14;
-        --bg-2: #08111d;
-        --panel: #091523;
-        --panel-2: #0d1c2f;
-        --border: #183453;
-        --border-strong: #2565a8;
-        --text: #e6eef8;
-        --muted: #8ea2bd;
-        --blue: #49a8ff;
-        --green: #37d889;
-        --amber: #ffb44e;
-        --red: #ff7c8b;
-        --radius: 18px;
+        --bg: #030913;
+        --bg-2: #06101b;
+        --surface: rgba(7, 16, 28, 0.88);
+        --surface-strong: rgba(10, 21, 36, 0.96);
+        --surface-soft: rgba(12, 25, 42, 0.76);
+        --border: rgba(58, 84, 116, 0.54);
+        --border-strong: rgba(78, 126, 176, 0.72);
+        --text: #eef5fd;
+        --muted: #8fa7c1;
+        --accent: #1ec8ff;
+        --accent-strong: #0e97ff;
+        --green: #42da9a;
+        --amber: #ffb863;
+        --red: #ff758c;
+        --radius: 24px;
+        --radius-s: 14px;
+        --shadow: 0 28px 64px rgba(1, 5, 14, 0.42);
       }
 
-      * { box-sizing: border-box; }
+      * {
+        box-sizing: border-box;
+      }
+
       body {
         margin: 0;
         min-height: 100vh;
-        font-family: "Segoe UI Variable", "Segoe UI", system-ui, sans-serif;
+        font-family: "Aptos", "Segoe UI Variable", "Segoe UI", system-ui, sans-serif;
         background:
-          radial-gradient(1200px 520px at 10% -10%, rgba(73, 168, 255, 0.16), transparent 52%),
-          radial-gradient(860px 420px at 100% 0%, rgba(55, 216, 137, 0.08), transparent 48%),
+          radial-gradient(980px 520px at -4% -10%, rgba(30, 200, 255, 0.15), transparent 58%),
+          radial-gradient(860px 420px at 102% -6%, rgba(14, 151, 255, 0.12), transparent 56%),
           linear-gradient(180deg, var(--bg) 0%, var(--bg-2) 100%);
         color: var(--text);
       }
 
       .shell {
         display: grid;
-        grid-template-columns: minmax(0, 1.45fr) 320px;
-        gap: 16px;
+        grid-template-columns: minmax(0, 1.32fr) 340px;
+        gap: 18px;
         min-height: 100vh;
-        padding: 18px;
+        max-width: 1520px;
+        margin: 0 auto;
+        padding: 24px;
       }
 
       .panel {
-        background: linear-gradient(180deg, rgba(9, 21, 35, 0.98), rgba(6, 15, 26, 0.99));
-        border: 1px solid rgba(24, 52, 83, 0.88);
+        background: linear-gradient(180deg, var(--surface) 0%, var(--surface-strong) 100%);
+        border: 1px solid var(--border);
         border-radius: var(--radius);
         min-width: 0;
         box-shadow:
           inset 0 1px 0 rgba(255, 255, 255, 0.03),
-          0 20px 40px rgba(2, 8, 20, 0.22);
+          var(--shadow);
+        backdrop-filter: blur(20px);
       }
 
       .main {
         display: grid;
-        gap: 14px;
-        padding: 18px;
+        gap: 18px;
+        padding: 24px;
       }
 
       .hero {
         display: grid;
         grid-template-columns: minmax(0, 1fr) auto;
-        gap: 16px;
+        gap: 20px;
         align-items: end;
-        padding: 6px 2px 2px;
+        padding: 6px 2px 4px;
       }
 
       .hero-copy {
         display: grid;
-        gap: 8px;
+        gap: 10px;
       }
 
       .kicker {
         display: inline-flex;
         align-items: center;
         gap: 8px;
-        font-size: 0.78rem;
+        font-size: 0.74rem;
         letter-spacing: 0.12em;
         text-transform: uppercase;
-        color: rgba(143, 187, 235, 0.82);
-        font-family: "Cascadia Mono", "Consolas", ui-monospace, monospace;
+        color: rgba(144, 194, 244, 0.78);
+        font-family: "Cascadia Code", "Consolas", ui-monospace, monospace;
       }
 
       .hero h1 {
         margin: 0;
-        font-size: 1.92rem;
+        font-size: clamp(2rem, 4vw, 2.8rem);
         font-weight: 760;
         letter-spacing: -0.03em;
+        line-height: 0.98;
       }
 
       .hero p {
         margin: 0;
         color: var(--muted);
-        max-width: 40rem;
-        line-height: 1.4;
+        max-width: 42rem;
+        line-height: 1.45;
         font-size: 0.98rem;
       }
 
@@ -106,11 +117,11 @@
       }
 
       .light {
-        width: 10px;
-        height: 10px;
+        width: 9px;
+        height: 9px;
         border-radius: 999px;
         display: inline-block;
-        box-shadow: 0 0 0 1px rgba(255,255,255,0.06), 0 0 10px currentColor;
+        box-shadow: 0 0 0 1px rgba(255,255,255,0.06), 0 0 14px currentColor;
       }
       .light.ok { color: var(--green); background: var(--green); }
       .light.busy { color: var(--amber); background: var(--amber); }
@@ -122,12 +133,21 @@
         align-items: center;
         gap: 8px;
         border-radius: 999px;
-        border: 1px solid rgba(73, 168, 255, 0.16);
-        background: rgba(10, 24, 40, 0.84);
-        padding: 7px 11px;
-        font-size: 0.88rem;
+        min-height: 40px;
+        border: 1px solid rgba(64, 93, 126, 0.52);
+        background: rgba(7, 15, 26, 0.84);
+        padding: 0 14px;
+        font-size: 0.8rem;
+        font-weight: 700;
         color: var(--muted);
-        font-family: "Cascadia Mono", "Consolas", ui-monospace, monospace;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        font-family: "Cascadia Code", "Consolas", ui-monospace, monospace;
+      }
+
+      .badge strong {
+        color: var(--text);
+        font-size: 0.84rem;
       }
 
       .grid {
@@ -140,31 +160,32 @@
       }
 
       .routes {
-        grid-template-columns: repeat(2, minmax(0, 1fr));
+        grid-template-columns: repeat(4, minmax(0, 1fr));
       }
 
       button {
         appearance: none;
-        border: 1px solid rgba(73, 168, 255, 0.12);
-        background: linear-gradient(180deg, rgba(16, 36, 60, 0.96), rgba(9, 23, 39, 0.98));
+        border: 1px solid rgba(62, 92, 126, 0.68);
+        background: rgba(7, 16, 28, 0.92);
         color: var(--text);
-        border-radius: 12px;
+        border-radius: var(--radius-s);
         padding: 13px 14px;
-        font-size: 0.95rem;
-        font-weight: 600;
+        font-size: 0.9rem;
+        font-weight: 650;
         cursor: pointer;
         transition: transform 120ms ease, border-color 120ms ease, background 120ms ease, box-shadow 120ms ease;
-        text-transform: uppercase;
-        letter-spacing: 0.03em;
-        font-family: "Cascadia Mono", "Consolas", ui-monospace, monospace;
+        letter-spacing: 0.01em;
+        font-family: inherit;
       }
 
       button:hover:not(:disabled),
       button:focus-visible:not(:disabled) {
         outline: none;
         transform: translateY(-1px);
-        border-color: rgba(73, 168, 255, 0.44);
-        box-shadow: 0 0 0 2px rgba(73, 168, 255, 0.16);
+        border-color: rgba(30, 200, 255, 0.46);
+        box-shadow:
+          0 0 0 2px rgba(30, 200, 255, 0.12),
+          0 10px 20px rgba(2, 8, 20, 0.18);
       }
 
       button:disabled {
@@ -173,33 +194,36 @@
       }
 
       .button-accent {
-        background: linear-gradient(180deg, rgba(73, 168, 255, 0.24), rgba(12, 31, 51, 0.98));
+        background: linear-gradient(180deg, rgba(30, 200, 255, 0.24), rgba(9, 31, 49, 0.96));
+        border-color: rgba(30, 200, 255, 0.42);
       }
 
       .button-warn {
-        background: linear-gradient(180deg, rgba(255, 124, 139, 0.22), rgba(52, 12, 22, 0.96));
-        border-color: rgba(255, 125, 125, 0.2);
+        background: linear-gradient(180deg, rgba(255, 117, 140, 0.2), rgba(39, 11, 18, 0.95));
+        border-color: rgba(255, 117, 140, 0.32);
       }
 
       .button-active {
-        border-color: rgba(73, 168, 255, 0.7);
-        box-shadow: inset 0 0 0 1px rgba(73, 168, 255, 0.35), 0 0 0 1px rgba(73, 168, 255, 0.12);
+        background: linear-gradient(180deg, rgba(17, 46, 69, 0.98), rgba(8, 18, 31, 0.98));
+        border-color: rgba(30, 200, 255, 0.66);
+        box-shadow: inset 0 0 0 1px rgba(30, 200, 255, 0.24);
       }
 
       .summary-card,
       .route-card,
       .accounts-card,
       .detail-card {
-        padding: 14px;
+        padding: 18px;
       }
 
       .section-title {
-        margin: 0 0 8px;
-        font-size: 0.92rem;
+        margin: 0 0 10px;
+        font-size: 0.78rem;
         font-weight: 700;
         text-transform: uppercase;
-        letter-spacing: 0.08em;
-        font-family: "Cascadia Mono", "Consolas", ui-monospace, monospace;
+        letter-spacing: 0.12em;
+        color: rgba(144, 194, 244, 0.72);
+        font-family: "Cascadia Code", "Consolas", ui-monospace, monospace;
       }
 
       .subtle {
@@ -211,17 +235,18 @@
       .status-card {
         display: grid;
         grid-template-columns: minmax(0, 1fr) auto;
-        gap: 14px;
-        padding: 16px;
+        gap: 16px;
+        padding: 18px;
         align-items: center;
         background:
-          radial-gradient(520px 180px at 0% 0%, rgba(73, 168, 255, 0.08), transparent 60%),
-          linear-gradient(180deg, rgba(11, 26, 42, 0.96), rgba(8, 20, 34, 0.98));
+          radial-gradient(560px 200px at 0% 0%, rgba(30, 200, 255, 0.12), transparent 60%),
+          linear-gradient(180deg, rgba(10, 23, 39, 0.96), rgba(8, 17, 29, 0.98));
+        border-radius: 20px;
       }
 
       .status-card strong {
         display: block;
-        font-size: 1.08rem;
+        font-size: 1.12rem;
       }
 
       .status-card p {
@@ -237,11 +262,11 @@
       .status-caption {
         display: block;
         margin-bottom: 6px;
-        color: rgba(143, 187, 235, 0.76);
-        font-size: 0.78rem;
-        letter-spacing: 0.1em;
+        color: rgba(144, 194, 244, 0.76);
+        font-size: 0.74rem;
+        letter-spacing: 0.14em;
         text-transform: uppercase;
-        font-family: "Cascadia Mono", "Consolas", ui-monospace, monospace;
+        font-family: "Cascadia Code", "Consolas", ui-monospace, monospace;
       }
 
       .meta-grid {
@@ -251,41 +276,45 @@
       }
 
       .meta-tile {
-        padding: 12px;
-        border-radius: 12px;
-        border: 1px solid rgba(24, 52, 83, 0.8);
-        background: rgba(7, 15, 26, 0.54);
+        padding: 14px;
+        border-radius: 16px;
+        border: 1px solid rgba(58, 84, 116, 0.44);
+        background: rgba(8, 17, 29, 0.58);
       }
 
       .meta-tile span {
         display: block;
-        font-size: 0.78rem;
+        font-size: 0.72rem;
         color: var(--muted);
         text-transform: uppercase;
-        letter-spacing: 0.08em;
-        font-family: "Cascadia Mono", "Consolas", ui-monospace, monospace;
+        letter-spacing: 0.12em;
+        font-family: "Cascadia Code", "Consolas", ui-monospace, monospace;
       }
 
       .meta-tile strong {
-        margin-top: 6px;
+        margin-top: 8px;
         display: block;
-        font-family: "Cascadia Mono", "Consolas", ui-monospace, monospace;
+        font-size: 0.96rem;
+        font-family: "Cascadia Code", "Consolas", ui-monospace, monospace;
       }
 
       .side {
         display: grid;
-        gap: 12px;
-        padding: 18px;
+        gap: 16px;
+        padding: 24px;
         align-content: start;
+        position: sticky;
+        top: 24px;
+        height: fit-content;
       }
 
       .qr-box {
-        min-height: 290px;
+        min-height: 320px;
         display: grid;
         place-items: center;
-        border: 1px dashed rgba(73, 168, 255, 0.18);
-        border-radius: 14px;
-        background: rgba(4, 10, 18, 0.5);
+        border: 1px solid rgba(58, 84, 116, 0.48);
+        border-radius: 20px;
+        background: rgba(5, 12, 21, 0.72);
         overflow: hidden;
       }
 
@@ -297,12 +326,12 @@
 
       .pair-link {
         width: 100%;
-        padding: 11px 12px;
-        border-radius: 12px;
-        border: 1px solid rgba(24, 52, 83, 0.9);
-        background: rgba(6, 12, 20, 0.96);
+        padding: 12px 14px;
+        border-radius: 14px;
+        border: 1px solid rgba(58, 84, 116, 0.52);
+        background: rgba(5, 11, 19, 0.98);
         color: var(--text);
-        font-family: "Cascadia Mono", "Consolas", ui-monospace, monospace;
+        font-family: "Cascadia Code", "Consolas", ui-monospace, monospace;
       }
 
       .console {
@@ -315,9 +344,9 @@
         justify-content: space-between;
         gap: 12px;
         align-items: center;
-        padding: 12px 14px;
-        border-bottom: 1px solid rgba(24, 52, 83, 0.8);
-        background: rgba(5, 11, 20, 0.92);
+        padding: 14px 16px;
+        border-bottom: 1px solid rgba(58, 84, 116, 0.42);
+        background: rgba(5, 11, 19, 0.92);
       }
 
       .console-header .subtle {
@@ -327,15 +356,15 @@
       .console-log {
         list-style: none;
         margin: 0;
-        padding: 12px 14px;
+        padding: 14px 16px;
         display: grid;
         gap: 8px;
-        min-height: 154px;
-        max-height: 196px;
+        min-height: 172px;
+        max-height: 220px;
         overflow: auto;
         background: rgba(4, 10, 18, 0.72);
-        font-family: "Cascadia Mono", "Consolas", ui-monospace, monospace;
-        font-size: 0.88rem;
+        font-family: "Cascadia Code", "Consolas", ui-monospace, monospace;
+        font-size: 0.86rem;
       }
 
       .console-entry {
@@ -385,7 +414,7 @@
 
       .accounts-shell {
         display: grid;
-        gap: 10px;
+        gap: 12px;
       }
 
       .accounts-toolbar {
@@ -401,24 +430,24 @@
       }
 
       .account-card {
-        border: 1px solid rgba(24, 52, 83, 0.9);
-        border-radius: 12px;
-        background: linear-gradient(180deg, rgba(7, 16, 27, 0.9), rgba(6, 13, 22, 0.98));
-        padding: 12px;
+        border: 1px solid rgba(58, 84, 116, 0.46);
+        border-radius: 18px;
+        background: linear-gradient(180deg, rgba(7, 15, 26, 0.9), rgba(6, 12, 20, 0.98));
+        padding: 14px;
         display: grid;
-        gap: 8px;
+        gap: 10px;
         transition: border-color 140ms ease, transform 140ms ease, box-shadow 140ms ease;
       }
 
       .account-card:hover {
-        border-color: rgba(73, 168, 255, 0.34);
+        border-color: rgba(30, 200, 255, 0.3);
         transform: translateY(-1px);
-        box-shadow: 0 14px 30px rgba(2, 8, 20, 0.16);
+        box-shadow: 0 18px 34px rgba(2, 8, 20, 0.18);
       }
 
       .account-card.active {
-        border-color: rgba(73, 168, 255, 0.68);
-        box-shadow: inset 0 0 0 1px rgba(73, 168, 255, 0.24);
+        border-color: rgba(30, 200, 255, 0.58);
+        box-shadow: inset 0 0 0 1px rgba(30, 200, 255, 0.16);
       }
 
       .account-head {
@@ -451,10 +480,10 @@
       }
 
       .account-home {
-        font-size: 0.8rem;
+        font-size: 0.78rem;
         color: var(--muted);
         word-break: break-word;
-        font-family: "Cascadia Mono", "Consolas", ui-monospace, monospace;
+        font-family: "Cascadia Code", "Consolas", ui-monospace, monospace;
       }
 
       .usage-pill {
@@ -464,10 +493,10 @@
         min-height: 24px;
         padding: 4px 8px;
         border-radius: 999px;
-        border: 1px solid rgba(73, 168, 255, 0.24);
-        background: rgba(12, 26, 43, 0.92);
+        border: 1px solid rgba(58, 84, 116, 0.48);
+        background: rgba(10, 22, 38, 0.92);
         font-size: 0.8rem;
-        font-family: "Cascadia Mono", "Consolas", ui-monospace, monospace;
+        font-family: "Cascadia Code", "Consolas", ui-monospace, monospace;
       }
 
       .usage-pill.muted {
@@ -484,6 +513,11 @@
       @media (max-width: 1040px) {
         .shell {
           grid-template-columns: 1fr;
+        }
+
+        .side {
+          position: static;
+          top: auto;
         }
 
         .hero {
@@ -518,6 +552,22 @@
         .meta-grid {
           grid-template-columns: 1fr;
         }
+
+        .routes,
+        .controls {
+          grid-template-columns: repeat(2, minmax(0, 1fr));
+        }
+      }
+
+      @media (max-width: 560px) {
+        .shell {
+          padding: 14px;
+        }
+
+        .routes,
+        .controls {
+          grid-template-columns: 1fr;
+        }
       }
     </style>
   </head>
@@ -528,11 +578,11 @@
           <div class="hero-copy">
             <span class="kicker">Control Plane</span>
             <h1>Codrex Launcher</h1>
-            <p>Start and stop Codrex, choose the pairing route, generate QR on demand, and launch the web UI only when you ask for it.</p>
+            <p>Keep the controller alive in the tray, switch routes only when needed, and open the UI on demand.</p>
           </div>
           <div class="status-strip">
             <span class="badge"><span id="statusLight" class="light idle"></span><strong id="statusLabel">Checking</strong></span>
-            <span class="badge">Route <strong id="routeLabel">LAN</strong></span>
+            <span class="badge">Route <strong id="routeLabel">PREFERRED</strong></span>
           </div>
         </header>
 
@@ -580,19 +630,31 @@
           <button id="advancedButton">Advanced</button>
         </section>
 
+        <section class="panel detail-card">
+          <h2 class="section-title">Startup</h2>
+          <div class="grid controls">
+            <button id="startupButton">Enable Startup</button>
+            <button id="trayToggleButton">Tray Mode On</button>
+            <button id="hideToTrayButton">Hide To Tray</button>
+          </div>
+          <p class="subtle" id="backgroundSummary">Autostart is off. The controller can stay available in the tray without starting sessions.</p>
+        </section>
+
         <section class="grid routes">
-          <button id="lanRouteButton" class="button-active">Use LAN</button>
+          <button id="preferredRouteButton" class="button-active">Best Route</button>
+          <button id="netbirdRouteButton">Use NetBird</button>
+          <button id="lanRouteButton">Use LAN</button>
           <button id="tailscaleRouteButton">Use Tailscale</button>
         </section>
 
         <section class="panel route-card">
-          <h2 class="section-title">Route Details</h2>
-          <p class="subtle" id="routeSummary">LAN route is selected.</p>
+          <h2 class="section-title">Private Route</h2>
+          <p class="subtle" id="routeSummary">Best route selection is active.</p>
         </section>
 
         <section class="panel console">
           <div class="console-header">
-            <h2 class="section-title">Launcher Console</h2>
+            <h2 class="section-title">Activity</h2>
             <span class="subtle">Immediate action feedback</span>
           </div>
           <ol class="console-log" id="consoleLog">
@@ -630,7 +692,7 @@
     <script>
       const state = {
         status: "checking",
-        route: "lan",
+        route: "preferred",
         routeNote: "",
         advancedVisible: false,
         pairLink: "",
@@ -652,12 +714,17 @@
         routeHost: "",
         routeNote: "",
         routeSummary: "",
+        backgroundSummary: "",
         startEnabled: null,
         stopEnabled: null,
         openAppEnabled: null,
         showQrEnabled: null,
         openNetworkEnabled: null,
         advancedVisible: null,
+        startupBusy: null,
+        startupEnabled: null,
+        minimizeToTray: null,
+        trayReady: null,
         logsDir: "",
         pairStatus: "",
         pairLink: "",
@@ -686,6 +753,11 @@
         showQrButton: document.getElementById("showQrButton"),
         openNetworkButton: document.getElementById("openNetworkButton"),
         advancedButton: document.getElementById("advancedButton"),
+        startupButton: document.getElementById("startupButton"),
+        trayToggleButton: document.getElementById("trayToggleButton"),
+        hideToTrayButton: document.getElementById("hideToTrayButton"),
+        preferredRouteButton: document.getElementById("preferredRouteButton"),
+        netbirdRouteButton: document.getElementById("netbirdRouteButton"),
         lanRouteButton: document.getElementById("lanRouteButton"),
         tailscaleRouteButton: document.getElementById("tailscaleRouteButton"),
         advancedPanel: document.getElementById("advancedPanel"),
@@ -699,6 +771,7 @@
         openSessionSwitcherButton: document.getElementById("openSessionSwitcherButton"),
         accountsGrid: document.getElementById("accountsGrid"),
         logPathLine: document.getElementById("logPathLine"),
+        backgroundSummary: document.getElementById("backgroundSummary"),
         pairStatus: document.getElementById("pairStatus"),
         qrBox: document.getElementById("qrBox"),
         pairLink: document.getElementById("pairLink"),
@@ -847,7 +920,7 @@
           els.busyLight.className = `light ${busyTone}`;
         }
         setText(els.statusLabel, state.status || "checking", "status");
-        setText(els.routeLabel, (state.route || "lan").toUpperCase(), "route");
+        setText(els.routeLabel, (state.route || "preferred").toUpperCase(), "route");
         const headline = state.status === "running" ? "Codrex is running." : state.status === "stopped" ? "Codrex is stopped." : "Codrex status update";
         setText(els.statusHeadline, headline, "headline");
         setText(els.statusDetail, state.detail || "Launcher ready.", "detail");
@@ -859,7 +932,11 @@
         setText(els.selectedHost, state.routeHost || "n/a", "routeHost");
         const routeSummaryBase = state.route === "tailscale"
           ? (state.tailscaleAvailable ? `Tailscale route selected: ${state.tailscaleHost}` : "Tailscale route selected, but no Tailscale IP is available.")
-          : (state.lanAvailable ? `LAN route selected: ${state.lanHost}` : "LAN route selected, but no LAN IP is available.");
+          : state.route === "netbird"
+            ? (state.netbirdAvailable ? `NetBird route selected: ${state.netbirdHost}` : "NetBird route selected, but no NetBird IP is available.")
+            : state.route === "preferred"
+              ? (state.preferredOrigin ? `Best route selected: ${state.preferredOrigin}` : "Best route selected, but no private origin is available yet.")
+              : (state.lanAvailable ? `LAN route selected: ${state.lanHost}` : "LAN route selected, but no LAN IP is available.");
         const routeSummary = state.routeNote
           ? `${routeSummaryBase} ${state.routeNote}`
           : routeSummaryBase;
@@ -869,10 +946,31 @@
         setDisabled(els.openAppButton, !state.openAppEnabled, "openAppEnabled");
         setDisabled(els.showQrButton, !state.showQrEnabled, "showQrEnabled");
         setDisabled(els.openNetworkButton, !state.openNetworkEnabled, "openNetworkEnabled");
+        setDisabled(els.startupButton, !!state.startupBusy, "startupBusy");
+        setDisabled(els.hideToTrayButton, !state.trayReady, "trayReady");
+        setClassToggle(els.preferredRouteButton, "button-active", state.route === "preferred", "preferredActive");
+        setClassToggle(els.netbirdRouteButton, "button-active", state.route === "netbird", "netbirdActive");
         setClassToggle(els.lanRouteButton, "button-active", state.route === "lan", "lanActive");
         setClassToggle(els.tailscaleRouteButton, "button-active", state.route === "tailscale", "tailscaleActive");
         setClassToggle(els.advancedPanel, "visible", !!state.advancedVisible, "advancedVisible");
+        setClassToggle(els.startupButton, "button-active", !!state.startupEnabled, "startupEnabled");
+        setClassToggle(els.trayToggleButton, "button-active", !!state.minimizeToTray, "minimizeToTray");
         setText(els.logPathLine, state.logsDir ? `Logs: ${state.logsDir}` : "Logs: n/a", "logsDir");
+        setText(
+          els.startupButton,
+          state.startupBusy ? "Updating Startup..." : (state.startupEnabled ? "Disable Startup" : "Enable Startup"),
+          "startupLabel",
+        );
+        setText(
+          els.trayToggleButton,
+          state.minimizeToTray ? "Tray Mode On" : "Tray Mode Off",
+          "trayToggleLabel",
+        );
+        const controllerSummary = state.controllerMode === "sessions-running"
+          ? "Sessions are currently running."
+          : "Controller-only startup keeps sessions off until you start them manually.";
+        const backgroundSummary = `${state.startupEnabled ? "Autostart and watchdog are enabled." : "Autostart is off."} ${state.minimizeToTray ? "Launcher hides to tray on minimize or close." : "Launcher closes normally when you exit."} ${controllerSummary}`;
+        setText(els.backgroundSummary, backgroundSummary, "backgroundSummary");
         const pairStatus = state.pairDetail
           || (state.qrVisible
             ? `Pairing QR ready for ${state.route}. ${state.routeHost || "Waiting for route host."}`
@@ -897,6 +995,8 @@
             copy: "info",
             launcher: "info",
             ui: "info",
+            startup: "info",
+            tray: "info",
           };
           pushConsoleEntry({
             at: state.actionEventAt || "--:--:--",
@@ -937,6 +1037,11 @@
       els.showQrButton.addEventListener("click", () => post("showQr"));
       els.openNetworkButton.addEventListener("click", () => post("openNetworkApp"));
       els.advancedButton.addEventListener("click", () => post("toggleAdvanced"));
+      els.startupButton.addEventListener("click", () => post("toggleStartup"));
+      els.trayToggleButton.addEventListener("click", () => post("toggleMinimizeToTray"));
+      els.hideToTrayButton.addEventListener("click", () => post("hideToTray"));
+      els.preferredRouteButton.addEventListener("click", () => setRoute("preferred"));
+      els.netbirdRouteButton.addEventListener("click", () => setRoute("netbird"));
       els.lanRouteButton.addEventListener("click", () => setRoute("lan"));
       els.tailscaleRouteButton.addEventListener("click", () => setRoute("tailscale"));
       els.openFallbackButton.addEventListener("click", () => post("openFallback"));

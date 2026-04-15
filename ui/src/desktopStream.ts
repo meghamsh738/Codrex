@@ -14,7 +14,7 @@ export interface DesktopStreamTuningOptions {
 }
 
 export const DESKTOP_PROFILE_STREAM: Record<DesktopStreamProfile, DesktopStreamParams> = {
-  responsive: { fps: 8, level: 1, scale: 1, bw: false },
+  responsive: { fps: 10, level: 1, scale: 2, bw: false },
   balanced: { fps: 6, level: 2, scale: 2, bw: false },
   saver: { fps: 4, level: 3, scale: 3, bw: false },
   ultra: { fps: 3, level: 2, scale: 3, bw: true },
@@ -22,7 +22,7 @@ export const DESKTOP_PROFILE_STREAM: Record<DesktopStreamProfile, DesktopStreamP
 };
 
 const DESKTOP_FULLSCREEN_BOOST: Record<DesktopStreamProfile, DesktopStreamParams> = {
-  responsive: { fps: 10, level: 0, scale: 1, bw: false },
+  responsive: { fps: 12, level: 0, scale: 1, bw: false },
   balanced: { fps: 8, level: 1, scale: 1, bw: false },
   saver: { fps: 6, level: 2, scale: 2, bw: false },
   ultra: { fps: 5, level: 2, scale: 2, bw: true },
@@ -53,4 +53,3 @@ export function resolveDesktopStreamParams(
   }
   return { ...base };
 }
-

@@ -8,7 +8,15 @@ if ([Threading.Thread]::CurrentThread.ApartmentState -ne [Threading.ApartmentSta
     "-STA",
     "-File", $PSCommandPath
   )
-  Start-Process -FilePath "powershell.exe" -WorkingDirectory (Split-Path -Parent $PSCommandPath) -ArgumentList $launcherArgs | Out-Null
+  $scriptRoot = Split-Path -Parent $PSCommandPath
+  $hiddenPsWrapper = Join-Path $scriptRoot "powershell-hidden.vbs"
+  if (Test-Path -LiteralPath $hiddenPsWrapper) {
+    Start-Process -FilePath "wscript.exe" -WorkingDirectory $scriptRoot -ArgumentList @(
+      $hiddenPsWrapper
+    ) + $launcherArgs | Out-Null
+  } else {
+    Start-Process -FilePath "powershell.exe" -WorkingDirectory $scriptRoot -ArgumentList $launcherArgs -WindowStyle Hidden | Out-Null
+  }
   exit 0
 }
 
@@ -69,6 +77,23 @@ function Get-RepoRevision {
     $rev = git -C $root rev-parse --short HEAD 2>$null | Select-Object -First 1
     if ($rev) {
       return ([string]$rev).Trim()
+    }
+  } catch {}
+  return ""
+}
+
+function Get-NetbirdIPv4 {
+  try {
+    $adapters = @(Get-NetAdapter -ErrorAction Stop | Where-Object { $_.Status -ne "Disabled" })
+    foreach ($adapter in $adapters) {
+      $haystack = ("{0} {1}" -f [string]$adapter.Name, [string]$adapter.InterfaceDescription).Trim().ToLowerInvariant()
+      if (-not $haystack -or $haystack -notlike "*netbird*") {
+        continue
+      }
+      $ip = Get-NetIPAddress -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+        Where-Object { $_.IPAddress -and $_.IPAddress -notlike "169.254*" -and $_.IPAddress -ne "127.0.0.1" } |
+        Select-Object -First 1 -ExpandProperty IPAddress
+      if ($ip) { return [string]$ip }
     }
   } catch {}
   return ""
@@ -519,8 +544,14 @@ function Get-LauncherStatusSnapshot {
   $repoLabel = Split-Path -Leaf $repoRoot
   $lanIp = Get-CachedLanIp
   $tailscaleIp = Get-CachedTailscaleIp
+  $netbirdIp = Get-CachedNetbirdIp
   $localUrl = if ($controllerOn -or $sessionPresent) { "http://127.0.0.1:$controllerPort/" } else { "offline" }
-  $networkUrl = if ($lanIp -and $lanIp -ne "127.0.0.1" -and ($controllerOn -or $sessionPresent)) { "http://$lanIp`:$controllerPort/" } else { "n/a" }
+  $selectedNetworkHost = switch ($script:selectedPairRoute) {
+    "tailscale" { if ($tailscaleIp) { $tailscaleIp } elseif ($lanIp -and $lanIp -ne "127.0.0.1") { $lanIp } else { "" } }
+    "netbird" { if ($netbirdIp) { $netbirdIp } elseif ($lanIp -and $lanIp -ne "127.0.0.1") { $lanIp } else { "" } }
+    default { if ($lanIp -and $lanIp -ne "127.0.0.1") { $lanIp } elseif ($tailscaleIp) { $tailscaleIp } elseif ($netbirdIp) { $netbirdIp } else { "" } }
+  }
+  $networkUrl = if ($selectedNetworkHost -and ($controllerOn -or $sessionPresent)) { "http://$selectedNetworkHost`:$controllerPort/" } else { "n/a" }
   return [pscustomobject]@{
     session = $session
     controller_port = [int]$controllerPort
@@ -539,6 +570,7 @@ function Get-LauncherStatusSnapshot {
     status = $status
     lan_ip = $lanIp
     tailscale_ip = $tailscaleIp
+    netbird_ip = $netbirdIp
     detail = $detail
   }
 }
@@ -750,6 +782,7 @@ $script:advancedVisible = $false
 $script:selectedPairRoute = "lan"
 $script:lastKnownLanIp = ""
 $script:lastKnownTailnetIp = ""
+$script:lastKnownNetbirdIp = ""
 $script:pendingStart = $false
 $script:pendingStartAt = [DateTime]::MinValue
 $script:pendingStartTimeoutSec = 45
@@ -783,6 +816,7 @@ function Save-LauncherState {
 function Resolve-SelectedRouteIp {
   switch ($script:selectedPairRoute) {
     "tailscale" { return $script:lastKnownTailnetIp }
+    "netbird" { return $script:lastKnownNetbirdIp }
     default { return $script:lastKnownLanIp }
   }
 }
@@ -790,6 +824,7 @@ function Resolve-SelectedRouteIp {
 function Resolve-SelectedRouteLabel {
   switch ($script:selectedPairRoute) {
     "tailscale" { return "Tailscale" }
+    "netbird" { return "NetBird" }
     default { return "LAN" }
   }
 }
@@ -799,7 +834,11 @@ function Get-RouteButtonLabel {
     [string]$Route,
     [bool]$IsActive
   )
-  $base = if ($Route -eq "tailscale") { "Tailscale" } else { "LAN" }
+  $base = switch ($Route) {
+    "tailscale" { "Tailscale" }
+    "netbird" { "NetBird" }
+    default { "LAN" }
+  }
   if ($IsActive) {
     return ("● {0}" -f $base)
   }
@@ -813,6 +852,12 @@ function Resolve-SelectedRouteHost {
   }
   if ($script:lastKnownLanIp -and $script:lastKnownLanIp -ne "127.0.0.1") {
     return $script:lastKnownLanIp
+  }
+  if ($script:lastKnownNetbirdIp) {
+    return $script:lastKnownNetbirdIp
+  }
+  if ($script:lastKnownTailnetIp) {
+    return $script:lastKnownTailnetIp
   }
   return "127.0.0.1"
 }
@@ -1085,6 +1130,10 @@ $btnRouteTailscale = New-Object System.Windows.Forms.Button
 $btnRouteTailscale.Text = "Use Tailscale"
 $rowRoute.Controls.Add($btnRouteTailscale) | Out-Null
 
+$btnRouteNetbird = New-Object System.Windows.Forms.Button
+$btnRouteNetbird.Text = "Use NetBird"
+$rowRoute.Controls.Add($btnRouteNetbird) | Out-Null
+
 $btnAdvanced = New-Object System.Windows.Forms.Button
 $btnAdvanced.Text = "Advanced"
 $rowRoute.Controls.Add($btnAdvanced) | Out-Null
@@ -1232,6 +1281,9 @@ $picQr.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
 
 Set-LauncherButtonStyle -Button $btnStart -Primary $true
 Set-LauncherButtonStyle -Button $btnOpenLocal
+Set-LauncherButtonStyle -Button $btnRouteLan
+Set-LauncherButtonStyle -Button $btnRouteTailscale
+Set-LauncherButtonStyle -Button $btnRouteNetbird
 Set-LauncherButtonStyle -Button $btnAdvanced
 Set-LauncherButtonStyle -Button $btnOpenNetwork
 Set-LauncherButtonStyle -Button $btnOpenController
@@ -1250,6 +1302,7 @@ $btnOpenController,
 $btnOpenLogs,
 $btnRouteLan,
 $btnRouteTailscale,
+$btnRouteNetbird,
 $btnGenQr,
 $btnCopyPair,
 $btnOpenPair,
@@ -1261,6 +1314,7 @@ $script:launcherButtons = @(
   $btnOpenLocal,
   $btnRouteLan,
   $btnRouteTailscale,
+  $btnRouteNetbird,
   $btnAdvanced,
   $btnOpenNetwork,
   $btnOpenController,
@@ -1349,16 +1403,24 @@ function Apply-RouteSelection {
   if (-not $Busy) {
     $script:lastKnownLanIp = Get-CachedLanIp
     $script:lastKnownTailnetIp = Get-CachedTailscaleIp
+    $script:lastKnownNetbirdIp = Get-CachedNetbirdIp
   }
-  $normalized = if ($Route -eq "tailscale") { "tailscale" } else { "lan" }
+  $normalizedRoute = ([string]$Route).Trim().ToLowerInvariant()
+  $normalized = switch ($normalizedRoute) {
+    "tailscale" { "tailscale" }
+    "netbird" { "netbird" }
+    default { "lan" }
+  }
   $script:selectedPairRoute = $normalized
   $activeLabel = Resolve-SelectedRouteLabel
   $activeHost = Resolve-SelectedRouteHost
   $lblRouteInfo.Text = "Selected route: $activeLabel  •  Host: $activeHost"
   $lanAvailable = [bool]($script:lastKnownLanIp -and $script:lastKnownLanIp -ne "127.0.0.1")
   $tailAvailable = [bool]($script:lastKnownTailnetIp)
+  $netbirdAvailable = [bool]($script:lastKnownNetbirdIp)
   Set-RouteButtonState -Button $btnRouteLan -Route "lan" -IsActive:($normalized -eq "lan") -IsAvailable:(($lanAvailable -or -not $tailAvailable) -and (-not $Busy))
   Set-RouteButtonState -Button $btnRouteTailscale -Route "tailscale" -IsActive:($normalized -eq "tailscale") -IsAvailable:($tailAvailable -and (-not $Busy))
+  Set-RouteButtonState -Button $btnRouteNetbird -Route "netbird" -IsActive:($normalized -eq "netbird") -IsAvailable:($netbirdAvailable -and (-not $Busy))
   if ($Persist) {
     Save-LauncherState
   }
@@ -1531,6 +1593,15 @@ function Get-CachedTailscaleIp {
   return $script:cachedTailnetIp
 }
 
+function Get-CachedNetbirdIp {
+  $now = Get-Date
+  if (($null -eq $script:cachedNetbirdIp) -or ($now -ge $script:cachedNetbirdIpAt)) {
+    $script:cachedNetbirdIp = Get-NetbirdIPv4
+    $script:cachedNetbirdIpAt = $now.AddSeconds(15)
+  }
+  return $script:cachedNetbirdIp
+}
+
 function Get-CachedRepoRevision {
   if (-not $script:cachedRepoRevision) {
     $script:cachedRepoRevision = Get-RepoRevision
@@ -1551,8 +1622,9 @@ function Refresh-State {
   $script:refreshInProgress = $true
   try {
     $snapshot = Get-LauncherStatusSnapshot
-    $script:lastKnownLanIp = if ($snapshot.lan_ip) { [string]$snapshot.lan_ip } else { "" }
-    $script:lastKnownTailnetIp = if ($snapshot.tailscale_ip) { [string]$snapshot.tailscale_ip } else { "" }
+$script:lastKnownLanIp = if ($snapshot.lan_ip) { [string]$snapshot.lan_ip } else { "" }
+$script:lastKnownTailnetIp = if ($snapshot.tailscale_ip) { [string]$snapshot.tailscale_ip } else { "" }
+$script:lastKnownNetbirdIp = if ($snapshot.netbird_ip) { [string]$snapshot.netbird_ip } else { "" }
     $stackActive = ($snapshot.controller_on -or $snapshot.session_state -eq "present")
     $pendingAction = [string]$script:pendingRuntimeAction
     $helperAlive = Test-LauncherProcessAlive -ProcessId ([int]$script:pendingRuntimeHelperPid)
@@ -1667,11 +1739,15 @@ function Generate-PairQr {
   }
 
   $script:lastKnownTailnetIp = Get-TailscaleIPv4
+  $script:lastKnownNetbirdIp = Get-NetbirdIPv4
   $script:lastKnownLanIp = Get-CachedLanIp
   $pairHost = Resolve-SelectedRouteHost
   $route = Resolve-SelectedRouteLabel
   if ($script:selectedPairRoute -eq "tailscale" -and -not $script:lastKnownTailnetIp) {
     throw "Tailscale route is unavailable on this laptop right now."
+  }
+  if ($script:selectedPairRoute -eq "netbird" -and -not $script:lastKnownNetbirdIp) {
+    throw "NetBird route is unavailable on this laptop right now."
   }
   if ($script:selectedPairRoute -eq "lan" -and (-not $script:lastKnownLanIp -or $script:lastKnownLanIp -eq "127.0.0.1")) {
     throw "LAN route is unavailable on this laptop right now."
@@ -1797,6 +1873,7 @@ $btnOpenNetwork.Add_Click({
 $btnRouteLan.Add_Click({
   $script:lastKnownLanIp = Get-CachedLanIp
   $script:lastKnownTailnetIp = Get-CachedTailscaleIp
+  $script:lastKnownNetbirdIp = Get-CachedNetbirdIp
   Apply-RouteSelection -Route "lan" -Persist
   Append-Log ("Preferred pair route set to LAN ({0})." -f (Resolve-SelectedRouteHost)) -Action "route-lan"
   $null = Write-LauncherActionRecord -ActionName "route-lan" -Ok:$true -Detail ("Preferred pair route set to LAN ({0})." -f (Resolve-SelectedRouteHost))
@@ -1805,6 +1882,7 @@ $btnRouteLan.Add_Click({
 $btnRouteTailscale.Add_Click({
   $script:lastKnownLanIp = Get-CachedLanIp
   $script:lastKnownTailnetIp = Get-CachedTailscaleIp
+  $script:lastKnownNetbirdIp = Get-CachedNetbirdIp
   if (-not $script:lastKnownTailnetIp) {
     $message = "Tailscale is installed, but no active Tailscale IPv4 is available right now."
     Append-Log $message -Level "error" -Action "route-tailscale"
@@ -1820,6 +1898,27 @@ $btnRouteTailscale.Add_Click({
   Apply-RouteSelection -Route "tailscale" -Persist
   Append-Log ("Preferred pair route set to Tailscale ({0})." -f (Resolve-SelectedRouteHost)) -Action "route-tailscale"
   $null = Write-LauncherActionRecord -ActionName "route-tailscale" -Ok:$true -Detail ("Preferred pair route set to Tailscale ({0})." -f (Resolve-SelectedRouteHost))
+  Refresh-State -Force
+})
+$btnRouteNetbird.Add_Click({
+  $script:lastKnownLanIp = Get-CachedLanIp
+  $script:lastKnownTailnetIp = Get-CachedTailscaleIp
+  $script:lastKnownNetbirdIp = Get-CachedNetbirdIp
+  if (-not $script:lastKnownNetbirdIp) {
+    $message = "NetBird is installed, but no active NetBird IPv4 is available right now."
+    Append-Log $message -Level "error" -Action "route-netbird"
+    $null = Write-LauncherActionRecord -ActionName "route-netbird" -Ok:$false -Detail $message
+    [System.Windows.Forms.MessageBox]::Show(
+      $message,
+      "Codrex",
+      [System.Windows.Forms.MessageBoxButtons]::OK,
+      [System.Windows.Forms.MessageBoxIcon]::Warning
+    ) | Out-Null
+    return
+  }
+  Apply-RouteSelection -Route "netbird" -Persist
+  Append-Log ("Preferred pair route set to NetBird ({0})." -f (Resolve-SelectedRouteHost)) -Action "route-netbird"
+  $null = Write-LauncherActionRecord -ActionName "route-netbird" -Ok:$true -Detail ("Preferred pair route set to NetBird ({0})." -f (Resolve-SelectedRouteHost))
   Refresh-State -Force
 })
 $btnOpenController.Add_Click({
@@ -1889,7 +1988,7 @@ $script:refreshTimer.Start()
 $launcherState = Read-LauncherState
 if ($launcherState -and $launcherState.preferred_pair_route) {
   $preferredRoute = ([string]$launcherState.preferred_pair_route).Trim().ToLowerInvariant()
-  if ($preferredRoute -in @("lan", "tailscale")) {
+  if ($preferredRoute -in @("lan", "tailscale", "netbird")) {
     $script:selectedPairRoute = $preferredRoute
   }
 }

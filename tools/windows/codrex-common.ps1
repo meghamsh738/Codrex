@@ -211,6 +211,26 @@ function Get-TailscaleIpv4 {
   return ""
 }
 
+function Get-NetbirdIpv4 {
+  try {
+    $adapters = @(Get-NetAdapter -ErrorAction Stop | Where-Object { $_.Status -ne "Disabled" })
+    foreach ($adapter in $adapters) {
+      $haystack = ("{0} {1}" -f [string]$adapter.Name, [string]$adapter.InterfaceDescription).Trim().ToLowerInvariant()
+      if (-not $haystack -or $haystack -notlike "*netbird*") {
+        continue
+      }
+      $ip = Get-NetIPAddress -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+        Where-Object { $_.IPAddress -and $_.IPAddress -notlike "169.254*" -and $_.IPAddress -ne "127.0.0.1" } |
+        Select-Object -First 1 -ExpandProperty IPAddress
+      if ($ip) {
+        return [string]$ip
+      }
+    }
+  } catch {
+  }
+  return ""
+}
+
 function Get-PreferredNetworkUrl {
   param(
     [Parameter(Mandatory = $true)]
@@ -224,11 +244,19 @@ function Get-PreferredNetworkUrl {
   }
   $lan = Get-LanIpv4
   $tailscale = Get-TailscaleIpv4
-  $chosen = if ($route -eq "tailscale" -and $tailscale) { $tailscale } else { $lan }
+  $netbird = Get-NetbirdIpv4
+  $normalizedRoute = ([string]$route).Trim().ToLowerInvariant()
+  $chosen = switch ($normalizedRoute) {
+    "tailscale" { if ($tailscale) { $tailscale } elseif ($lan -and $lan -ne "127.0.0.1") { $lan } else { "" }; break }
+    "netbird" { if ($netbird) { $netbird } elseif ($lan -and $lan -ne "127.0.0.1") { $lan } else { "" }; break }
+    "lan" { if ($lan -and $lan -ne "127.0.0.1") { $lan } else { "" }; break }
+    default { if ($tailscale) { $tailscale } elseif ($netbird) { $netbird } elseif ($lan -and $lan -ne "127.0.0.1") { $lan } else { "" } }
+  }
   return [ordered]@{
     selected_pair_route = $route
     lan_ip = $lan
     tailscale_ip = $tailscale
+    netbird_ip = $netbird
     local_url = ("http://127.0.0.1:{0}/" -f $Port)
     network_url = if ($chosen) { "http://{0}:{1}/" -f $chosen, $Port } else { "" }
   }
@@ -442,6 +470,7 @@ function Get-RuntimeStatus {
     network_url = $net.network_url
     lan_ip = $net.lan_ip
     tailscale_ip = $net.tailscale_ip
+    netbird_ip = $net.netbird_ip
     selected_pair_route = $net.selected_pair_route
     active_account_id = if ($active) { [string]$active.active_account_id } else { "" }
     active_account_label = if ($active) { [string]$active.label } else { "" }

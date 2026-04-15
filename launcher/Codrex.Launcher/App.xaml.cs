@@ -4,7 +4,7 @@ using System.Windows.Threading;
 
 namespace Codrex.Launcher;
 
-public partial class App : Application
+public partial class App : System.Windows.Application
 {
     private const string LauncherMutexName = "Codrex.Launcher.Singleton";
     private const string LauncherActivateEventName = "Codrex.Launcher.Activate";
@@ -30,7 +30,17 @@ public partial class App : Application
         _activateTask = Task.Run(() => WaitForActivationSignalAsync(_activateCts.Token));
 
         ShutdownMode = ShutdownMode.OnMainWindowClose;
-        MainWindow = new MainWindow();
+        var startInTray = e.Args.Any(arg =>
+            string.Equals(arg, "--tray", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(arg, "/tray", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(arg, "--minimized-to-tray", StringComparison.OrdinalIgnoreCase));
+        MainWindow = new MainWindow(startInTray);
+        if (startInTray)
+        {
+            MainWindow.ShowInTaskbar = false;
+            MainWindow.Opacity = 0;
+            MainWindow.WindowState = WindowState.Minimized;
+        }
         MainWindow.Show();
         base.OnStartup(e);
     }
@@ -112,6 +122,7 @@ public partial class App : Application
         {
             window.Show();
         }
+        window.ShowInTaskbar = true;
 
         if (window.WindowState == WindowState.Minimized)
         {

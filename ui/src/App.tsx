@@ -11,8 +11,10 @@ import {
   buildSuggestedControllerUrl,
   buildWslDownloadUrl,
   bootstrapLocalAuth,
+  closeDesktopWebrtcSession,
   closeSession,
   closeTmuxSession,
+  createDesktopWebrtcOffer,
   createThreadRecord,
   createSessionWithOptions,
   createTmuxSession,
@@ -33,6 +35,7 @@ import {
   getDesktopInfo,
   getAuthStatus,
   getCodexOptions,
+  getCodexRuntimeStatus,
   getCodexRun,
   getCodexRuns,
   getNetInfo,
@@ -47,10 +50,16 @@ import {
   getSessions,
   interruptSession,
   interruptPane,
+  listSharedFiles,
   login,
   logout,
+  openHostPath,
+  pasteDesktopImage,
+  pickAndShareHostFile,
   reportIpcEvent,
+  revealHostPath,
   saveSessionNotes,
+  shareHostSelection,
   sendPowerAction,
   sendSessionImage,
   sendToPaneKey,
@@ -59,20 +68,26 @@ import {
   setDesktopMode,
   setDesktopPerfMode,
   setIpcObserver,
+  startCodexRuntime,
   startCodexExec,
+  stopCodexRuntime,
   updateThreadRecord,
+  uploadHostFile,
   uploadWslFile,
 } from "./api";
 import type {
   AppRuntimeResult,
   AuthStatus,
   CodexRunDetail,
+  CodexRuntimeStatusResult,
   CodexRunSummary,
   DesktopInfoResult,
+  DesktopWebrtcSessionDescription,
   NetInfo,
   PowerStatusResult,
   SessionInfo,
   SessionNoteInfo,
+  SharedFileInfo,
   SessionStreamEvent,
   ThreadInfo,
   ThreadMessageInfo,
@@ -86,12 +101,33 @@ import {
 import type { DesktopStreamProfile } from "./desktopStream";
 import { SessionListPanel } from "./components/sessions/SessionListPanel";
 import { SelectedSessionWorkspace } from "./components/sessions/SelectedSessionWorkspace";
+import { TranscriptMessageContent } from "./components/TranscriptMessageContent";
+import TransferWorkspace from "./components/transfers/TransferWorkspace";
+import type { TransferWorkspaceItem } from "./components/transfers/TransferWorkspace";
+const HomeTab = lazy(() => import("./tabs/HomeTab"));
 const PairTab = lazy(() => import("./tabs/PairTab"));
 const SettingsTab = lazy(() => import("./tabs/SettingsTab"));
 const DebugTab = lazy(() => import("./tabs/DebugTab"));
 
-type RouteHint = "lan" | "tailscale" | "current";
-type MainTab = "sessions" | "threads" | "remote" | "pair" | "settings" | "debug";
+declare global {
+  interface Window {
+    CodrexAndroidBridge?: {
+      readClipboardText?: () => string;
+      writeClipboardText?: (text: string) => boolean;
+      openDownloads?: () => boolean;
+      setShellMode?: (mode: string) => boolean | void;
+      openNativeRemote?: (origin: string) => boolean | void;
+      canUseNativeRemote?: () => boolean | void;
+    };
+    CodrexNative?: {
+      setShellMode?: (mode: string) => boolean | void;
+    };
+    __codrexRequestedTab?: string;
+  }
+}
+
+type RouteHint = "preferred" | "lan" | "tailscale" | "netbird" | "current";
+type MainTab = "home" | "sessions" | "threads" | "remote" | "pair" | "settings" | "debug";
 type ThemeMode = "system" | "light" | "dark";
 type ReasoningEffort = "minimal" | "low" | "medium" | "high" | "xhigh";
 type SessionViewMode = "grouped" | "flat";
@@ -101,6 +137,9 @@ type OutputFeedState = "off" | "polling" | "connecting" | "live" | "error";
 type TabTransitionClass = "tab-still" | "tab-slide-left" | "tab-slide-right";
 type SessionImageDeliveryMode = "insert_path" | "desktop_clipboard" | "session_path";
 type PowerActionName = "lock" | "sleep" | "hibernate" | "restart" | "shutdown";
+type HostTransferMode = "default" | "focused";
+type HostTransferPostAction = "none" | "open" | "reveal";
+type RemotePanelKind = "keyboard" | "files" | "advanced";
 
 type AppEventLevel = "info" | "error";
 type InstallState = "hidden" | "ready" | "prompting" | "installed";
@@ -195,7 +234,7 @@ interface TranscriptChunk {
   text: string;
 }
 
-const TAB_ORDER: MainTab[] = ["sessions", "threads", "remote", "pair", "settings", "debug"];
+const TAB_ORDER: MainTab[] = ["home", "sessions", "remote", "pair", "settings", "threads", "debug"];
 
 const CONTROLLER_BASE_STORAGE = "codrex.ui.controller_base.v1";
 const REASONING_EFFORT_STORAGE = "codrex.ui.reasoning_effort.v1";
@@ -271,6 +310,12 @@ function safeStorageRemove(key: string): void {
 }
 
 function prettyRouteLabel(route: RouteHint): string {
+  if (route === "preferred") {
+    return "Best Private Route";
+  }
+  if (route === "netbird") {
+    return "NetBird";
+  }
   if (route === "lan") {
     return "LAN";
   }
@@ -280,7 +325,7 @@ function prettyRouteLabel(route: RouteHint): string {
   return "Current Host";
 }
 
-function classifyControllerRoute(baseUrl: string, netInfo: NetInfo | null): "tailscale" | "lan" | "localhost" | "unknown" {
+function classifyControllerRoute(baseUrl: string, netInfo: NetInfo | null): "tailscale" | "netbird" | "lan" | "localhost" | "unknown" {
   const value = baseUrl.trim();
   if (!value) {
     return "unknown";
@@ -290,6 +335,9 @@ function classifyControllerRoute(baseUrl: string, netInfo: NetInfo | null): "tai
     const host = new URL(candidate).hostname.toLowerCase();
     if (host === "localhost" || host === "127.0.0.1" || host === "::1") {
       return "localhost";
+    }
+    if (netInfo?.netbird_ip && host === netInfo.netbird_ip.toLowerCase()) {
+      return "netbird";
     }
     if (netInfo?.tailscale_ip && host === netInfo.tailscale_ip.toLowerCase()) {
       return "tailscale";
@@ -319,16 +367,24 @@ function isLocalHostName(hostname: string): boolean {
 
 function parseInitialTab(): MainTab {
   if (typeof window === "undefined") {
-    return "sessions";
+    return "home";
   }
   try {
     const url = new URL(window.location.href);
-    const raw = (url.searchParams.get("tab") || "").trim().toLowerCase();
-    if (raw === "sessions" || raw === "threads" || raw === "remote" || raw === "pair" || raw === "settings" || raw === "debug") {
+    const raw = normalizeMainTab(url.searchParams.get("tab") || "");
+    if (raw) {
       return raw;
     }
   } catch {}
-  return "sessions";
+  return "home";
+}
+
+function normalizeMainTab(value: string): MainTab | null {
+  const raw = value.trim().toLowerCase();
+  if (raw === "home" || raw === "sessions" || raw === "threads" || raw === "remote" || raw === "pair" || raw === "settings" || raw === "debug") {
+    return raw;
+  }
+  return null;
 }
 
 function parsePort(): number {
@@ -690,7 +746,7 @@ function appendTranscriptChunks(chunks: TranscriptChunk[], text: string): Transc
 export default function App() {
   const [activeTab, setActiveTab] = useState<MainTab>(() => parseInitialTab());
   const [tabTransitionClass, setTabTransitionClass] = useState<TabTransitionClass>("tab-still");
-  const previousTabRef = useRef<MainTab>("sessions");
+  const previousTabRef = useRef<MainTab>("home");
 
   const [auth, setAuth] = useState<AuthStatus | null>(null);
   const [authLoading, setAuthLoading] = useState(true);
@@ -698,11 +754,13 @@ export default function App() {
   const [authBusy, setAuthBusy] = useState(false);
 
   const [netInfo, setNetInfo] = useState<NetInfo | null>(null);
-  const [routeHint, setRouteHint] = useState<RouteHint>("tailscale");
+  const [routeHint, setRouteHint] = useState<RouteHint>("preferred");
   const [controllerBase, setControllerBase] = useState(() => {
     const saved = safeStorageGet(CONTROLLER_BASE_STORAGE);
     return saved || "";
   });
+  const [sessionsRuntime, setSessionsRuntime] = useState<CodexRuntimeStatusResult | null>(null);
+  const [sessionsRuntimeBusy, setSessionsRuntimeBusy] = useState(false);
 
   const [pairCode, setPairCode] = useState("");
   const [pairExpiry, setPairExpiry] = useState<number | null>(null);
@@ -809,6 +867,11 @@ export default function App() {
   const [desktopFullscreen, setDesktopFullscreen] = useState(false);
   const [desktopFullscreenLight, setDesktopFullscreenLight] = useState(false);
   const [desktopTrackpadMode, setDesktopTrackpadMode] = useState(true);
+  const [desktopWebrtcState, setDesktopWebrtcState] = useState<"idle" | "connecting" | "live" | "error">("idle");
+  const [desktopWebrtcError, setDesktopWebrtcError] = useState("");
+  const [remoteKeyboardPanelOpen, setRemoteKeyboardPanelOpen] = useState(false);
+  const [remoteFilesPanelOpen, setRemoteFilesPanelOpen] = useState(false);
+  const [remoteAdvancedPanelOpen, setRemoteAdvancedPanelOpen] = useState(false);
   const [powerStatus, setPowerStatus] = useState<PowerStatusResult | null>(null);
   const [powerBusy, setPowerBusy] = useState(false);
   const [powerConfirmAction, setPowerConfirmAction] = useState<PowerActionName | "">("");
@@ -821,6 +884,12 @@ export default function App() {
   const [wslUploadDest, setWslUploadDest] = useState("");
   const [wslUploadFile, setWslUploadFile] = useState<File | null>(null);
   const [fileStatus, setFileStatus] = useState("");
+  const [sharedFiles, setSharedFiles] = useState<SharedFileInfo[]>([]);
+  const [hostTransferFile, setHostTransferFile] = useState<File | null>(null);
+  const [hostTransferMode, setHostTransferMode] = useState<HostTransferMode>("default");
+  const [hostTransferBusy, setHostTransferBusy] = useState(false);
+  const [hostTransferStatus, setHostTransferStatus] = useState("");
+  const [lastHostTransferPath, setLastHostTransferPath] = useState("");
   const [latestCaptureUrl, setLatestCaptureUrl] = useState("");
 
   const [ipcHistory, setIpcHistory] = useState<IpcEvent[]>([]);
@@ -879,7 +948,12 @@ export default function App() {
   const desktopRecentRemoteCopyAtRef = useRef(0);
   const desktopAutoPerfRef = useRef(false);
   const desktopAutoPerfBusyRef = useRef(false);
-  const desktopFrameRef = useRef<HTMLImageElement | null>(null);
+  const desktopFrameRef = useRef<HTMLImageElement | HTMLVideoElement | null>(null);
+  const desktopVideoRef = useRef<HTMLVideoElement | null>(null);
+  const desktopWebrtcPeerRef = useRef<RTCPeerConnection | null>(null);
+  const desktopWebrtcStreamRef = useRef<MediaStream | null>(null);
+  const desktopWebrtcSessionIdRef = useRef("");
+  const desktopWebrtcFallbackTimerRef = useRef<number | null>(null);
   const desktopPointerRef = useRef<{
     active: boolean;
     startX: number;
@@ -1014,6 +1088,15 @@ export default function App() {
     setErrorMessage(message);
     addEvent("error", message);
   }, [addEvent]);
+
+  const onOpenTranscriptPath = useCallback(async (path: string) => {
+    try {
+      const response = await openHostPath(path);
+      setStatus(response.detail || "Opened path.");
+    } catch (error) {
+      setError(`Open path failed: ${(error as Error).message}`);
+    }
+  }, [setError, setStatus]);
 
   const addIpc = useCallback((event: IpcEvent) => {
     setIpcHistory((current) => [event, ...current].slice(0, 800));
@@ -1173,6 +1256,21 @@ export default function App() {
     }
   }, [setError]);
 
+  const refreshSessionsRuntime = useCallback(async () => {
+    try {
+      const response = await getCodexRuntimeStatus();
+      if (!response.ok) {
+        throw new Error(response.detail || response.error || "Could not read sessions runtime.");
+      }
+      setSessionsRuntime(response);
+      return response;
+    } catch (error) {
+      addEvent("error", `Could not read sessions runtime: ${(error as Error).message}`);
+      setSessionsRuntime(null);
+      return null;
+    }
+  }, [addEvent]);
+
   const refreshAppRuntime = useCallback(async () => {
     try {
       const response = await getAppRuntime();
@@ -1180,6 +1278,14 @@ export default function App() {
         throw new Error(response.detail || response.error || "Could not read app runtime.");
       }
       setAppRuntime(response);
+      setSessionsRuntime({
+        ok: true,
+        state: response.sessions_runtime_state,
+        detail: response.sessions_runtime_detail,
+        distro: response.sessions_runtime_distro,
+        can_start: response.sessions_runtime_can_start,
+        can_stop: response.sessions_runtime_can_stop,
+      });
     } catch (error) {
       addEvent("error", `Could not read app runtime: ${(error as Error).message}`);
       setAppRuntime(null);
@@ -1273,6 +1379,43 @@ export default function App() {
     }
   }, [setError, setStatus]);
 
+  const onStartSessionsRuntime = useCallback(async () => {
+    setSessionsRuntimeBusy(true);
+    try {
+      const response = await startCodexRuntime();
+      if (!response.ok) {
+        throw new Error(response.detail || response.error || "Could not start Ubuntu runtime.");
+      }
+      setSessionsRuntime(response);
+      await refreshSessions();
+      setStatus("Ubuntu runtime started.");
+      setActiveTab("sessions");
+    } catch (error) {
+      setError(`Could not start sessions runtime: ${(error as Error).message}`);
+    } finally {
+      setSessionsRuntimeBusy(false);
+    }
+  }, [refreshSessions, setError, setStatus]);
+
+  const onStopSessionsRuntime = useCallback(async () => {
+    setSessionsRuntimeBusy(true);
+    try {
+      const response = await stopCodexRuntime();
+      if (!response.ok) {
+        throw new Error(response.detail || response.error || "Could not stop Ubuntu runtime.");
+      }
+      setSessionsRuntime(response);
+      setSessions([]);
+      setRecentClosedSessions([]);
+      setSelectedSession("");
+      setStatus("Ubuntu runtime stopped.");
+    } catch (error) {
+      setError(`Could not stop sessions runtime: ${(error as Error).message}`);
+    } finally {
+      setSessionsRuntimeBusy(false);
+    }
+  }, [setError, setStatus]);
+
   const scheduleSessionsRefresh = useCallback((delayMs = SESSION_MUTATION_REVALIDATE_MS) => {
     if (typeof window === "undefined") {
       void refreshSessions();
@@ -1318,6 +1461,19 @@ export default function App() {
       setTelegramConfigured(false);
     }
   }, []);
+
+  const refreshSharedFiles = useCallback(async () => {
+    try {
+      const response = await listSharedFiles();
+      if (!response.ok) {
+        throw new Error(response.detail || response.error || "Failed to read shared files.");
+      }
+      setSharedFiles(response.items || []);
+    } catch (error) {
+      addEvent("error", `Could not refresh shared files: ${(error as Error).message}`);
+      setSharedFiles([]);
+    }
+  }, [addEvent]);
 
   const refreshThreads = useCallback(async () => {
     try {
@@ -1451,6 +1607,7 @@ export default function App() {
         throw new Error(response.detail || response.error || "Desktop info unavailable.");
       }
       setDesktopInfo(response);
+      setDesktopStatus("");
       if (typeof response.enabled === "boolean") {
         setDesktopEnabled(response.enabled);
         if (!response.enabled) {
@@ -1469,6 +1626,185 @@ export default function App() {
       setDesktopStatus(`Desktop unavailable: ${(error as Error).message}`);
     }
   }, []);
+
+  const waitForDesktopIceGathering = useCallback((pc: RTCPeerConnection): Promise<void> => {
+    if (pc.iceGatheringState === "complete") {
+      return Promise.resolve();
+    }
+    return new Promise((resolve) => {
+      const timeoutId = window.setTimeout(() => {
+        pc.removeEventListener("icegatheringstatechange", onChange);
+        resolve();
+      }, 1500);
+      const onChange = () => {
+        if (pc.iceGatheringState === "complete") {
+          window.clearTimeout(timeoutId);
+          pc.removeEventListener("icegatheringstatechange", onChange);
+          resolve();
+        }
+      };
+      pc.addEventListener("icegatheringstatechange", onChange);
+    });
+  }, []);
+
+  const releaseDesktopWebrtc = useCallback(async (notifyServer = true) => {
+    if (desktopWebrtcFallbackTimerRef.current !== null) {
+      window.clearTimeout(desktopWebrtcFallbackTimerRef.current);
+      desktopWebrtcFallbackTimerRef.current = null;
+    }
+    const sessionId = desktopWebrtcSessionIdRef.current;
+    desktopWebrtcSessionIdRef.current = "";
+    const stream = desktopWebrtcStreamRef.current;
+    desktopWebrtcStreamRef.current = null;
+    stream?.getTracks().forEach((track) => track.stop());
+    if (desktopVideoRef.current) {
+      desktopVideoRef.current.srcObject = null;
+    }
+    const pc = desktopWebrtcPeerRef.current;
+    desktopWebrtcPeerRef.current = null;
+    try {
+      pc?.close();
+    } catch {}
+    if (notifyServer && sessionId) {
+      try {
+        await closeDesktopWebrtcSession(sessionId);
+      } catch {}
+    }
+  }, []);
+
+  useEffect(() => {
+    const prefersWebrtc = (desktopInfo || appRuntime)?.desktop_stream_transport === "webrtc";
+    if (!prefersWebrtc) {
+      setDesktopWebrtcState("idle");
+      setDesktopWebrtcError("");
+      void releaseDesktopWebrtc();
+      return;
+    }
+    if (activeTab !== "remote" || !pageVisible || !desktopEnabled) {
+      setDesktopWebrtcState("idle");
+      void releaseDesktopWebrtc();
+      return;
+    }
+    if (typeof RTCPeerConnection === "undefined") {
+      setDesktopWebrtcState("error");
+      setDesktopWebrtcError("RTCPeerConnection is unavailable in this browser.");
+      return;
+    }
+
+    let cancelled = false;
+    void (async () => {
+      try {
+        await releaseDesktopWebrtc();
+        setDesktopWebrtcError("");
+        setDesktopWebrtcState("connecting");
+        desktopWebrtcFallbackTimerRef.current = window.setTimeout(() => {
+          desktopWebrtcFallbackTimerRef.current = null;
+          if (cancelled) {
+            return;
+          }
+          setDesktopWebrtcState("error");
+          setDesktopWebrtcError("WebRTC did not become ready in time. Falling back to the image stream.");
+          void releaseDesktopWebrtc(false);
+        }, 4500);
+        const pc = new RTCPeerConnection({ iceServers: [] });
+        desktopWebrtcPeerRef.current = pc;
+        pc.addTransceiver("video", { direction: "recvonly" });
+        pc.addEventListener("track", (event) => {
+          if (cancelled) {
+            return;
+          }
+          if (desktopWebrtcFallbackTimerRef.current !== null) {
+            window.clearTimeout(desktopWebrtcFallbackTimerRef.current);
+            desktopWebrtcFallbackTimerRef.current = null;
+          }
+          const stream = event.streams[0] || new MediaStream([event.track]);
+          desktopWebrtcStreamRef.current = stream;
+          if (desktopVideoRef.current) {
+            desktopVideoRef.current.srcObject = stream;
+            void desktopVideoRef.current.play().catch(() => undefined);
+          }
+          setDesktopStatus("");
+          setDesktopWebrtcState("live");
+        });
+        pc.addEventListener("connectionstatechange", () => {
+          if (cancelled) {
+            return;
+          }
+          if (pc.connectionState === "connected") {
+            if (desktopWebrtcFallbackTimerRef.current !== null) {
+              window.clearTimeout(desktopWebrtcFallbackTimerRef.current);
+              desktopWebrtcFallbackTimerRef.current = null;
+            }
+            return;
+          }
+          if ((pc.connectionState === "failed" || pc.connectionState === "disconnected") && desktopWebrtcFallbackTimerRef.current === null) {
+            setDesktopWebrtcError("WebRTC link is unstable. Waiting briefly before fallback.");
+            desktopWebrtcFallbackTimerRef.current = window.setTimeout(() => {
+              desktopWebrtcFallbackTimerRef.current = null;
+              if (cancelled) {
+                return;
+              }
+              setDesktopWebrtcState("error");
+              setDesktopWebrtcError("WebRTC stream disconnected. Falling back to the image stream.");
+              void releaseDesktopWebrtc(false);
+            }, 3000);
+          }
+        });
+        const offer = await pc.createOffer({ offerToReceiveVideo: true });
+        await pc.setLocalDescription(offer);
+        await waitForDesktopIceGathering(pc);
+        if (cancelled || !pc.localDescription?.sdp) {
+          return;
+        }
+        const response = await createDesktopWebrtcOffer({
+          offer: {
+            type: pc.localDescription.type,
+            sdp: pc.localDescription.sdp,
+          },
+          fps: desktopStreamParams.fps,
+          scale: desktopStreamParams.scale,
+          bw: desktopStreamParams.bw,
+        });
+        if (!response.ok || !response.answer?.sdp) {
+          throw new Error(response.detail || response.error || "WebRTC answer missing.");
+        }
+        if (cancelled) {
+          if (response.session_id) {
+            void closeDesktopWebrtcSession(response.session_id);
+          }
+          return;
+        }
+        desktopWebrtcSessionIdRef.current = response.session_id || "";
+        await pc.setRemoteDescription({
+          type: response.answer.type as RTCSdpType,
+          sdp: response.answer.sdp,
+        } as DesktopWebrtcSessionDescription & RTCSessionDescriptionInit);
+      } catch (error) {
+        if (cancelled) {
+          return;
+        }
+        setDesktopWebrtcState("error");
+        setDesktopWebrtcError((error as Error).message || "WebRTC setup failed.");
+        void releaseDesktopWebrtc();
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+      void releaseDesktopWebrtc();
+    };
+  }, [
+    activeTab,
+    appRuntime?.desktop_stream_transport,
+    desktopEnabled,
+    desktopInfo?.desktop_stream_transport,
+    desktopStreamParams.bw,
+    desktopStreamParams.fps,
+    desktopStreamParams.scale,
+    pageVisible,
+    releaseDesktopWebrtc,
+    waitForDesktopIceGathering,
+  ]);
 
   useEffect(() => {
     if (!powerConfirmToken || powerConfirmExpiresIn <= 0) {
@@ -1616,17 +1952,39 @@ export default function App() {
         refreshAuth(),
         refreshCodexOptions(),
         refreshNet(),
+        refreshSessionsRuntime(),
         refreshPowerStatus(),
-        refreshSessions(),
+        refreshSharedFiles(),
         refreshTelegramStatus(),
-        refreshThreads(),
-        refreshDebugRuns(),
-        refreshTmuxState(),
         refreshDesktopState(),
       ]);
       setStatus("Connected. Ready.");
     })();
-  }, [refreshAppRuntime, refreshAuth, refreshCodexOptions, refreshDebugRuns, refreshDesktopState, refreshNet, refreshPowerStatus, refreshSessions, refreshTelegramStatus, refreshThreads, refreshTmuxState, setStatus]);
+  }, [refreshAppRuntime, refreshAuth, refreshCodexOptions, refreshDesktopState, refreshNet, refreshPowerStatus, refreshSessionsRuntime, refreshSharedFiles, refreshTelegramStatus, setStatus]);
+
+  useEffect(() => {
+    if (activeTab === "sessions") {
+      void (async () => {
+        const runtime = await refreshSessionsRuntime();
+        if (runtime?.state === "running") {
+          await refreshSessions();
+          return;
+        }
+        setSessions([]);
+        setRecentClosedSessions([]);
+        setSessionsLoading(false);
+      })();
+      return;
+    }
+    if (activeTab === "threads") {
+      void refreshThreads();
+      void refreshTmuxState();
+      return;
+    }
+    if (activeTab === "debug") {
+      void refreshDebugRuns();
+    }
+  }, [activeTab, refreshDebugRuns, refreshSessions, refreshSessionsRuntime, refreshThreads, refreshTmuxState]);
 
   useEffect(() => {
     if (typeof window === "undefined") {
@@ -1811,6 +2169,48 @@ export default function App() {
     if (typeof window === "undefined") {
       return;
     }
+
+    const requestedTab = normalizeMainTab(window.__codrexRequestedTab || "");
+    if (requestedTab && requestedTab !== activeTab) {
+      setActiveTab(requestedTab);
+    }
+    window.__codrexRequestedTab = "";
+
+    const handleRequestedTab = (event: Event) => {
+      const detail = (event as CustomEvent<string>).detail || "";
+      const nextTab = normalizeMainTab(String(detail));
+      if (!nextTab) {
+        return;
+      }
+      setActiveTab(nextTab);
+      window.__codrexRequestedTab = "";
+    };
+
+    window.addEventListener("codrex:set-tab", handleRequestedTab as EventListener);
+    return () => {
+      window.removeEventListener("codrex:set-tab", handleRequestedTab as EventListener);
+    };
+  }, [activeTab]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+    try {
+      const url = new URL(window.location.href);
+      const currentTab = normalizeMainTab(url.searchParams.get("tab") || "");
+      if (currentTab === activeTab) {
+        return;
+      }
+      url.searchParams.set("tab", activeTab);
+      window.history.replaceState(window.history.state, "", url.toString());
+    } catch {}
+  }, [activeTab]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
     const tapTargetSelector = "button, .nav-item, .chip-action, .seg-item, .session-item, .run-item";
     const handlePointerDown = (event: PointerEvent) => {
       if (event.pointerType && event.pointerType !== "touch") {
@@ -1949,7 +2349,7 @@ export default function App() {
             ? SESSION_SUMMARY_POLL_MS
             : DEFAULT_BACKGROUND_POLL_MS;
     const interval = window.setInterval(() => {
-      const shouldPollSessions = activeTab === "sessions";
+      const shouldPollSessions = activeTab === "sessions" && sessionsRuntime?.state === "running";
       if (shouldPollSessions) {
         void refreshSessions();
       }
@@ -2000,6 +2400,7 @@ export default function App() {
     selectedRunId,
     selectedSession,
     selectedTmuxPane,
+    sessionsRuntime?.state,
     streamEnabled,
     streamProfile,
     pageVisible,
@@ -2397,8 +2798,12 @@ export default function App() {
   const errorEvents = eventLog.filter((evt) => evt.level === "error").length;
   const resolvedTheme = themeMode === "system" ? (prefersDarkTheme ? "dark" : "light") : themeMode;
   const controllerRouteKind = classifyControllerRoute(controllerBase, netInfo);
+  const availableOrigins = netInfo?.available_origins || appRuntime?.available_origins || [];
+  const preferredOrigin = (netInfo?.preferred_origin || appRuntime?.preferred_origin || controllerBase || "").trim();
   const controllerRouteSummary =
-    controllerRouteKind === "tailscale"
+    controllerRouteKind === "netbird"
+      ? "NetBird route"
+      : controllerRouteKind === "tailscale"
       ? "Tailscale route"
       : controllerRouteKind === "lan"
         ? "LAN route"
@@ -2406,15 +2811,17 @@ export default function App() {
           ? "Localhost route"
           : "Route unknown";
   const controllerRouteAdvice =
-    controllerRouteKind === "tailscale"
-      ? "Best for remote access over trusted private network."
+    controllerRouteKind === "netbird"
+      ? "Private route ready through NetBird."
+      : controllerRouteKind === "tailscale"
+      ? "Private route ready through Tailscale."
       : controllerRouteKind === "lan"
         ? "Works on local Wi-Fi only; not reachable outside LAN."
         : controllerRouteKind === "localhost"
-          ? "Phone/tablet cannot reach localhost. Use LAN or Tailscale."
+          ? "Phone/tablet cannot reach localhost. Use LAN or a private route."
           : "Set a valid base URL before generating pairing QR.";
   const controllerRouteSeverity =
-    controllerRouteKind === "tailscale"
+    controllerRouteKind === "netbird" || controllerRouteKind === "tailscale"
       ? "ok"
       : controllerRouteKind === "lan"
         ? "caution"
@@ -2446,12 +2853,79 @@ export default function App() {
       ? "Boost host: active"
       : "Boost host: armed"
     : "Boost host: off";
+  const desktopTransportSource = desktopInfo || appRuntime;
+  const desktopPrefersWebrtc = desktopTransportSource?.desktop_stream_transport === "webrtc";
+  const desktopTransportSummary = desktopPrefersWebrtc
+    ? `Stream: WebRTC primary (${desktopWebrtcState}${desktopWebrtcError ? `: ${desktopWebrtcError}` : ""}), delayed ${desktopTransportSource?.desktop_stream_fallback || "fallback"} fallback`
+    : `Stream: ${desktopTransportSource?.desktop_stream_fallback || "multipart_png"} fallback active`;
+  const desktopShowWebrtcVideo = desktopPrefersWebrtc && desktopWebrtcState === "live";
+  const desktopShowFallbackImage = !desktopPrefersWebrtc || desktopWebrtcState === "error";
   const desktopPathSummary = desktopSelectedPath
     ? `Copied: ${desktopSelectedPath}`
     : "Works for the currently focused File Explorer window or desktop selection on the host.";
   const remoteImageSummary = sessionImageFile
-    ? `Ready to paste ${sessionImageFile.name} into the focused Ubuntu app with Ctrl+V.`
-    : "Choose an image, focus the Ubuntu app in the remote desktop, then send.";
+    ? `Ready to send ${sessionImageFile.name} to either the focused Windows app or the selected Ubuntu session.`
+    : "Choose an image once, then send it to either the focused Windows app or the active Ubuntu session.";
+  const recentHostSharedFiles = sharedFiles.filter((item) => {
+      const sourceKind = (item.source_kind || "").toLowerCase();
+      return sourceKind === "host_transfer" || sourceKind === "host_selection" || sourceKind === "host_picker";
+    }).slice(0, 4);
+  const describeHostTransferItem = useCallback((item: SharedFileInfo) => {
+    const sourceKind = (item.source_kind || "").toLowerCase();
+    if (sourceKind === "host_transfer") {
+      return {
+        label: "Device -> Laptop",
+        detail: item.windows_path || item.display_path || "Sent to the host laptop.",
+      };
+    }
+    if (sourceKind === "host_picker") {
+      return {
+        label: "Laptop -> Device",
+        detail: item.windows_path || item.display_path || "Picked from the laptop for device download.",
+      };
+    }
+      return {
+        label: "Explorer -> Device",
+        detail: item.windows_path || item.display_path || "Shared from the focused Explorer selection.",
+      };
+    }, []);
+  const recentTransferItems = useMemo<TransferWorkspaceItem[]>(() => {
+    return recentHostSharedFiles.map((item) => {
+      const meta = describeHostTransferItem(item);
+      return {
+        ...item,
+        activityLabel: meta.label,
+        activityDetail: meta.detail,
+      };
+    });
+  }, [describeHostTransferItem, recentHostSharedFiles]);
+  const remoteActivePanel: RemotePanelKind | null = remoteKeyboardPanelOpen
+    ? "keyboard"
+    : remoteFilesPanelOpen
+      ? "files"
+      : remoteAdvancedPanelOpen
+        ? "advanced"
+        : null;
+  const remoteToolDrawerOpen = remoteActivePanel != null;
+  const remoteKeyboardLabel = remoteKeyboardPanelOpen ? "Hide Keyboard" : "Keyboard";
+  const remoteFilesLabel = remoteFilesPanelOpen ? "Hide Files" : "Files";
+  const remoteAdvancedLabel = remoteAdvancedPanelOpen ? "Hide More" : "More";
+  const remoteDrawerTitle =
+    remoteActivePanel === "keyboard"
+      ? "Keyboard & Text"
+      : remoteActivePanel === "files"
+        ? "Transfers & Paste"
+        : remoteActivePanel === "advanced"
+          ? "More Controls"
+          : "";
+  const remoteDrawerDetail =
+    remoteActivePanel === "keyboard"
+      ? "Use host-first keyboard actions, typed text, and directional keys without covering the stream."
+      : remoteActivePanel === "files"
+        ? "Handle Windows paste, Ubuntu session image send, and task-based transfers from one place."
+        : remoteActivePanel === "advanced"
+          ? "Keep Windows shortcuts, pointer tools, screenshot capture, and power actions off the stage until needed."
+          : "";
   const installButtonLabel =
     installState === "installed"
       ? "Installed"
@@ -2462,22 +2936,56 @@ export default function App() {
           : "Install Help";
   const appVersionLabel = appRuntime?.version ? `v${appRuntime.version}` : "version unavailable";
   const appModeLabel = appRuntime?.ui_mode || "offline";
-  const screenCardClassName = `card screen-card ${tabTransitionClass}`;
+  const sessionsRuntimeState = (sessionsRuntime?.state || appRuntime?.sessions_runtime_state || "unknown").toUpperCase();
+  const sessionsRuntimeDetail = (sessionsRuntime?.detail || appRuntime?.sessions_runtime_detail || "Ubuntu runtime status is unavailable.").trim();
+  const sessionsCanStart = Boolean(sessionsRuntime?.can_start ?? appRuntime?.sessions_runtime_can_start);
+  const sessionsCanStop = Boolean(sessionsRuntime?.can_stop ?? appRuntime?.sessions_runtime_can_stop);
+  const homeRouteHeadline =
+    availableOrigins.some((item) => item.private)
+      ? "Private route ready"
+      : controllerRouteKind === "lan"
+        ? "LAN only"
+        : "Route needs attention";
+  const homeRouteDetail =
+    availableOrigins.some((item) => item.private)
+      ? "Your host can be reached through a private mesh route. Pairing and reconnect should prefer that path."
+      : controllerRouteKind === "lan"
+        ? "The controller is reachable only on the current local network."
+        : "No usable private route is detected yet. Pairing may still work on LAN.";
+  const isAndroidShell = typeof window !== "undefined" && Boolean(window.CodrexAndroidBridge);
+  const isRemoteWorkspace = activeTab === "remote";
+  const hideShellChrome = isAndroidShell && !isRemoteWorkspace;
+  const screenCardClassName = `card screen-card ${tabTransitionClass}${isRemoteWorkspace ? " remote-screen-card" : ""}`;
+  const appShellClassName = `app-shell${compactTranscript ? " compact-transcript" : ""}${touchComfortMode ? " touch-comfort" : ""}${isRemoteWorkspace ? " remote-app-mode" : ""}${hideShellChrome ? " android-shell" : ""}`;
+
+  const closeRemotePanels = useCallback(() => {
+    setRemoteKeyboardPanelOpen(false);
+    setRemoteFilesPanelOpen(false);
+    setRemoteAdvancedPanelOpen(false);
+  }, []);
+
+  const toggleRemotePanel = useCallback((panel: RemotePanelKind) => {
+    const willOpen = remoteActivePanel !== panel;
+    setRemoteKeyboardPanelOpen(willOpen && panel === "keyboard");
+    setRemoteFilesPanelOpen(willOpen && panel === "files");
+    setRemoteAdvancedPanelOpen(willOpen && panel === "advanced");
+  }, [remoteActivePanel]);
 
   const onHardRefresh = useCallback(async () => {
     setStatus("Syncing controller state...");
+    const runtime = await refreshSessionsRuntime();
     await Promise.all([
       refreshAppRuntime(),
       refreshAuth(),
       refreshCodexOptions(),
       refreshNet(),
       refreshPowerStatus(),
-      refreshSessions(),
+      refreshSharedFiles(),
       refreshTelegramStatus(),
-      refreshThreads(),
-      refreshDebugRuns(),
-      refreshTmuxState(),
       refreshDesktopState(),
+      ...(runtime?.state === "running" ? [refreshSessions()] : []),
+      ...(activeTab === "threads" ? [refreshThreads(), refreshTmuxState()] : []),
+      ...(activeTab === "debug" ? [refreshDebugRuns()] : []),
     ]);
     if (selectedSession) {
       await refreshScreen(selectedSession);
@@ -2490,7 +2998,7 @@ export default function App() {
       await refreshRunDetail(selectedRunId);
     }
     setStatus("Synced.");
-  }, [refreshAppRuntime, refreshAuth, refreshCodexOptions, refreshDebugRuns, refreshDesktopState, refreshNet, refreshPowerStatus, refreshRunDetail, refreshScreen, refreshSessionNotes, refreshSessions, refreshTelegramStatus, refreshThreads, refreshTmuxScreen, refreshTmuxState, selectedRunId, selectedSession, selectedTmuxPane, setStatus]);
+  }, [activeTab, refreshAppRuntime, refreshAuth, refreshCodexOptions, refreshDebugRuns, refreshDesktopState, refreshNet, refreshPowerStatus, refreshRunDetail, refreshScreen, refreshSessionNotes, refreshSessions, refreshSessionsRuntime, refreshSharedFiles, refreshTelegramStatus, refreshThreads, refreshTmuxScreen, refreshTmuxState, selectedRunId, selectedSession, selectedTmuxPane, setStatus]);
 
   const onLogin = useCallback(async () => {
     if (!tokenInput.trim()) {
@@ -2584,7 +3092,7 @@ export default function App() {
 
   const onRouteHintChange = useCallback((nextRoute: RouteHint) => {
     if ((nextRoute === "lan" || nextRoute === "current") && !isLocalBrowser) {
-      setError("LAN/current routes are disabled on remote browsers. Keep route hint on Tailscale.");
+      setError("LAN/current routes are disabled on remote browsers. Keep the route hint on a private route.");
       return;
     }
     setRouteHint(nextRoute);
@@ -2599,7 +3107,7 @@ export default function App() {
 
   const onGeneratePairing = useCallback(async () => {
     if ((routeHint === "lan" || routeHint === "current") && !isLocalBrowser) {
-      setError("LAN/current pairing is allowed only from localhost browser. Switch to Tailscale route.");
+      setError("LAN/current pairing is allowed only from localhost browser. Switch to a private route.");
       return;
     }
     setPairBusy(true);
@@ -2947,10 +3455,6 @@ export default function App() {
   ]);
 
   const onSendRemoteDesktopImage = useCallback(async () => {
-    if (!selectedSession) {
-      setError("Select a session first so the image can be staged for the remote desktop.");
-      return;
-    }
     if (!desktopEnabled) {
       setError("Enable remote control first.");
       return;
@@ -2961,25 +3465,27 @@ export default function App() {
     }
     setSessionBusy(true);
     try {
-      const response = await sendSessionImage(selectedSession, sessionImageFile, sessionImagePrompt, {
-        paste_desktop: true,
-        delivery_mode: "desktop_clipboard",
-      });
+      const response = await pasteDesktopImage(sessionImageFile);
       if (!response.ok) {
         throw new Error(response.detail || response.error || "Remote image paste failed.");
       }
-      setSessionImageFile(null);
-      setSessionImagePrompt("");
-      remoteStageRef.current?.focus({ preventScroll: true });
-      setStatus(
-        response.detail || `Image copied to the Windows clipboard and pasted into the focused Ubuntu app for ${selectedSession}.`,
-      );
+        setSessionImageFile(null);
+        setSessionImagePrompt("");
+        remoteStageRef.current?.focus({ preventScroll: true });
+        setStatus(
+          response.detail
+            || (response.target_label
+              ? `Image pasted into ${response.target_label}.`
+              : response.target_process
+                ? `Image pasted into ${response.target_process}.`
+              : "Image pasted into the focused Windows app."),
+        );
     } catch (error) {
       setError(`Remote image paste failed: ${(error as Error).message}`);
     } finally {
       setSessionBusy(false);
     }
-  }, [desktopEnabled, selectedSession, sessionImageFile, sessionImagePrompt, setError, setStatus]);
+  }, [desktopEnabled, sessionImageFile, setError, setStatus]);
 
   const onSaveSessionNotes = useCallback(async () => {
     if (!selectedSession) {
@@ -3686,34 +4192,41 @@ export default function App() {
     }
 
     if (!text) {
-      text = desktopTextInput;
-    }
-    if (!text) {
-      setError("Clipboard is empty/unavailable. Paste text into the field, then send.");
+      setError("Clipboard is empty/unavailable. Copy plain text on this device first.");
       return;
     }
     try {
-      setDesktopTextInput(text);
-      setDesktopStatus(`Loaded clipboard text into the remote text box for ${desktopFocusPoint.x}, ${desktopFocusPoint.y}.`);
+      const response = await desktopSendText(text);
+      if (!response.ok) {
+        throw new Error(response.detail || response.error || "Desktop paste failed.");
+      }
+      setDesktopAltHeld(Boolean(response.alt_held));
+      setDesktopTextInput("");
+      setDesktopStatus(`Pasted plain text into the focused app at ${desktopFocusPoint.x}, ${desktopFocusPoint.y}.`);
     } catch (error) {
       setError(`Desktop paste failed: ${(error as Error).message}`);
     }
-  }, [desktopEnabled, desktopFocusPoint, desktopTextInput, setError]);
+  }, [desktopEnabled, desktopFocusPoint, setError]);
 
   const mapDesktopPointFromClient = useCallback((clientX: number, clientY: number) => {
     if (!desktopInfo?.width || !desktopInfo?.height) {
       return null;
     }
-    const img = desktopFrameRef.current;
-    if (!img) {
+    const media = desktopFrameRef.current;
+    if (!media) {
       return null;
     }
-    const rect = img.getBoundingClientRect();
+    const rect = media.getBoundingClientRect();
     if (rect.width <= 0 || rect.height <= 0) {
       return null;
     }
-    const sourceWidth = img.naturalWidth > 0 ? img.naturalWidth : desktopInfo.width;
-    const sourceHeight = img.naturalHeight > 0 ? img.naturalHeight : desktopInfo.height;
+    const mediaIsVideo = typeof HTMLVideoElement !== "undefined" && media instanceof HTMLVideoElement;
+    const sourceWidth = mediaIsVideo
+      ? (((media as HTMLVideoElement).videoWidth > 0 ? (media as HTMLVideoElement).videoWidth : desktopInfo.width))
+      : (((media as HTMLImageElement).naturalWidth > 0 ? (media as HTMLImageElement).naturalWidth : desktopInfo.width));
+    const sourceHeight = mediaIsVideo
+      ? (((media as HTMLVideoElement).videoHeight > 0 ? (media as HTMLVideoElement).videoHeight : desktopInfo.height))
+      : (((media as HTMLImageElement).naturalHeight > 0 ? (media as HTMLImageElement).naturalHeight : desktopInfo.height));
     if (sourceWidth <= 0 || sourceHeight <= 0) {
       return null;
     }
@@ -3817,7 +4330,7 @@ export default function App() {
     }
   }, [desktopEnabled, mapDesktopPointFromClient, setError]);
 
-  const onDesktopWheel = useCallback(async (event: React.WheelEvent<HTMLImageElement>) => {
+  const onDesktopWheel = useCallback(async (event: React.WheelEvent<HTMLElement>) => {
     if (!desktopEnabled) {
       return;
     }
@@ -4023,7 +4536,7 @@ export default function App() {
     });
   }, [clearDesktopDragHoldTimer, desktopEnabled, mapDesktopPointFromClient, setError]);
 
-  const onDesktopContextMenu = useCallback(async (event: React.MouseEvent<HTMLImageElement>) => {
+  const onDesktopContextMenu = useCallback(async (event: React.MouseEvent<HTMLElement>) => {
     if (!desktopEnabled) {
       return;
     }
@@ -4045,7 +4558,7 @@ export default function App() {
     }
   }, [desktopEnabled, mapDesktopPointFromClient, setError]);
 
-  const onDesktopFrameTap = useCallback(async (event: React.MouseEvent<HTMLImageElement>) => {
+  const onDesktopFrameTap = useCallback(async (event: React.MouseEvent<HTMLElement>) => {
     if (!desktopEnabled) {
       setDesktopStatus("Desktop control is disabled. Enable Desktop first.");
       return;
@@ -4404,6 +4917,60 @@ export default function App() {
   }, [activeTab, desktopFullscreen]);
 
   useEffect(() => {
+    if (typeof window === "undefined" || activeTab !== "remote") {
+      return;
+    }
+    const bridge = window.CodrexAndroidBridge;
+    if (!bridge?.openNativeRemote || !bridge?.canUseNativeRemote) {
+      return;
+    }
+    const canUseNativeRemote = Boolean(bridge.canUseNativeRemote());
+    if (!canUseNativeRemote) {
+      return;
+    }
+    const launched = bridge.openNativeRemote(window.location.origin);
+    if (launched) {
+      flushSync(() => setActiveTab("home"));
+    }
+  }, [activeTab]);
+
+  useEffect(() => {
+    const shellMode = activeTab === "remote" ? "immersive" : "standard";
+    if (typeof window === "undefined") {
+      return;
+    }
+    let cancelled = false;
+    let attempts = 0;
+    const applyShellMode = () => {
+      if (cancelled) {
+        return;
+      }
+      const shellBridge = window.CodrexAndroidBridge;
+      const nativeBridge = window.CodrexNative;
+      const setShellMode =
+        shellBridge?.setShellMode ??
+        nativeBridge?.setShellMode;
+      if (setShellMode) {
+        setShellMode(shellMode);
+        return;
+      }
+      if (attempts >= 8) {
+        return;
+      }
+      attempts += 1;
+      window.setTimeout(applyShellMode, 250);
+    };
+    applyShellMode();
+    return () => {
+      cancelled = true;
+      const resetShellMode =
+        window.CodrexAndroidBridge?.setShellMode ??
+        window.CodrexNative?.setShellMode;
+      resetShellMode?.("standard");
+    };
+  }, [activeTab]);
+
+  useEffect(() => {
     const wantsAutoPerf = activeTab === "remote" && desktopFullscreen && desktopEnabled;
     if (wantsAutoPerf && !desktopPerfActive && !desktopAutoPerfBusyRef.current) {
       const autoEnabledFromDisabledState = !desktopPerfEnabled;
@@ -4557,6 +5124,94 @@ export default function App() {
       setError(`Upload failed: ${(error as Error).message}`);
     }
   }, [setError, setStatus, wslUploadDest, wslUploadFile]);
+
+  const onUploadHostTransfer = useCallback(async (postAction: HostTransferPostAction = "none") => {
+    if (!hostTransferFile) {
+      setError("Choose a host transfer file first.");
+      return;
+    }
+    setHostTransferBusy(true);
+    try {
+      const response = await uploadHostFile(hostTransferFile, hostTransferMode, {
+        open_after: postAction === "open",
+        reveal_after: postAction === "reveal",
+      });
+      if (!response.ok) {
+        throw new Error(response.detail || response.error || "Host transfer failed.");
+      }
+      setHostTransferFile(null);
+      setLastHostTransferPath(response.saved_path || "");
+      setHostTransferStatus(response.detail || `Uploaded to ${response.target_dir || "host transfer folder"}.`);
+      await refreshSharedFiles();
+      setStatus("Host transfer uploaded.");
+    } catch (error) {
+      setHostTransferStatus("");
+      setError(`Host transfer failed: ${(error as Error).message}`);
+    } finally {
+      setHostTransferBusy(false);
+    }
+  }, [hostTransferFile, hostTransferMode, refreshSharedFiles, setError, setStatus]);
+
+  const onShareFocusedHostSelection = useCallback(async () => {
+    setHostTransferBusy(true);
+    try {
+      const response = await shareHostSelection();
+      if (!response.ok) {
+        throw new Error(response.detail || response.error || "Focused host selection share failed.");
+      }
+      setLastHostTransferPath(response.selected_path || response.shared_file?.windows_path || "");
+      setHostTransferStatus(response.detail || `Shared ${response.selected_path || "focused selection"}.`);
+      await refreshSharedFiles();
+      setStatus("Focused host selection shared.");
+    } catch (error) {
+      setError(`Focused host selection share failed: ${(error as Error).message}`);
+    } finally {
+      setHostTransferBusy(false);
+    }
+  }, [refreshSharedFiles, setError, setStatus]);
+
+  const onPickAndShareLaptopFile = useCallback(async () => {
+    setHostTransferBusy(true);
+    try {
+      const response = await pickAndShareHostFile();
+      if (!response.ok) {
+        throw new Error(response.detail || response.error || "Host file picker share failed.");
+      }
+      setLastHostTransferPath(response.selected_path || response.shared_file?.windows_path || "");
+      setHostTransferStatus(response.detail || `Shared ${response.selected_path || "host file"}.`);
+      await refreshSharedFiles();
+      setStatus("Laptop file shared to the device.");
+    } catch (error) {
+      setError(`Host file picker share failed: ${(error as Error).message}`);
+    } finally {
+      setHostTransferBusy(false);
+    }
+  }, [refreshSharedFiles, setError, setStatus]);
+  const onChooseHostTransferFile = useCallback((file: File | null) => {
+    setHostTransferFile(file);
+    if (file) {
+      setHostTransferStatus(`Ready to send ${file.name} to the host.`);
+    } else {
+      setHostTransferStatus("");
+    }
+  }, []);
+
+  const onRevealHostTransferPath = useCallback(async (path: string) => {
+    const target = path.trim();
+    if (!target) {
+      setError("Choose a host path first.");
+      return;
+    }
+    try {
+      const response = await revealHostPath(target);
+      if (!response.ok) {
+        throw new Error(response.detail || response.error || "Reveal failed.");
+      }
+      setStatus(response.detail || "Revealed host path.");
+    } catch (error) {
+      setError(`Reveal failed: ${(error as Error).message}`);
+    }
+  }, [setError, setStatus]);
 
   const onCaptureLatestShot = useCallback(() => {
     setLatestCaptureUrl(buildDesktopShotUrl(desktopStreamParams));
@@ -4714,6 +5369,13 @@ export default function App() {
   }, [createSessionWithOptions, scheduleSessionsRefresh, sessionBusy, setError, setStatus]);
 
   const renderNavIcon = useCallback((tab: MainTab) => {
+    if (tab === "home") {
+      return (
+        <svg viewBox="0 0 24 24" data-testid="nav-icon-home" aria-hidden="true">
+          <path d="M4 11.2 12 5l8 6.2V20a1 1 0 0 1-1 1h-4.8v-5.4H9.8V21H5a1 1 0 0 1-1-1v-8.8Z" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinejoin="round" />
+        </svg>
+      );
+    }
     if (tab === "sessions") {
       return (
         <svg viewBox="0 0 24 24" data-testid="nav-icon-sessions" aria-hidden="true">
@@ -4767,8 +5429,99 @@ export default function App() {
     );
   }, []);
 
+  const renderRemoteToolIcon = useCallback((kind: "windows" | "ubuntu" | "transfer" | "share" | "reveal" | "upload") => {
+    if (kind === "windows") {
+      return (
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M4 5.2 10.2 4v7H4Zm0 7.8h6.2V20L4 18.8Zm7.8-9 8.2-1.2V11h-8.2Zm0 9h8.2v8.2L11.8 20Z" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinejoin="round" />
+        </svg>
+      );
+    }
+    if (kind === "ubuntu") {
+      return (
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <circle cx="12" cy="12" r="6.8" fill="none" stroke="currentColor" strokeWidth="1.7" />
+          <circle cx="12" cy="4.8" r="1.2" fill="currentColor" />
+          <circle cx="18.6" cy="15.7" r="1.2" fill="currentColor" />
+          <circle cx="5.4" cy="15.7" r="1.2" fill="currentColor" />
+          <path d="M12 6.2v2.4m5.1 6.2-2.1-1.2M9 13.6 6.9 14.8" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" />
+        </svg>
+      );
+    }
+    if (kind === "transfer") {
+      return (
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M6 8h12m-12 8h12M8.8 5.5 6 8l2.8 2.5m6.4 3 2.8 2.5-2.8 2.5" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" />
+        </svg>
+      );
+    }
+    if (kind === "share") {
+      return (
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <circle cx="7" cy="12" r="2.1" fill="none" stroke="currentColor" strokeWidth="1.7" />
+          <circle cx="17" cy="7" r="2.1" fill="none" stroke="currentColor" strokeWidth="1.7" />
+          <circle cx="17" cy="17" r="2.1" fill="none" stroke="currentColor" strokeWidth="1.7" />
+          <path d="m8.8 11 6.1-2.8m-6.1 4.8 6.1 2.8" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" />
+        </svg>
+      );
+    }
+    if (kind === "reveal") {
+      return (
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M3.8 12s3.2-5.2 8.2-5.2 8.2 5.2 8.2 5.2-3.2 5.2-8.2 5.2S3.8 12 3.8 12Z" fill="none" stroke="currentColor" strokeWidth="1.7" />
+          <circle cx="12" cy="12" r="2.6" fill="none" stroke="currentColor" strokeWidth="1.7" />
+        </svg>
+      );
+    }
+    return (
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M12 18.5V6.2m0 0L7.6 10.5M12 6.2l4.4 4.3M5 18.5h14" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" />
+      </svg>
+    );
+  }, []);
+
+  const renderRemoteRailIcon = useCallback((kind: "keyboard" | "files" | "more" | "close") => {
+    if (kind === "keyboard") {
+      return (
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <rect x="4" y="6.5" width="16" height="11" rx="2.6" fill="none" stroke="currentColor" strokeWidth="1.7" />
+          <path d="M7.4 10.2h.01M10.2 10.2h.01m2.8 0h.01m2.8 0h.01M8.4 13.4h7.2" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" />
+        </svg>
+      );
+    }
+    if (kind === "files") {
+      return renderRemoteToolIcon("transfer");
+    }
+    if (kind === "more") {
+      return (
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <circle cx="7" cy="12" r="1.8" fill="currentColor" />
+          <circle cx="12" cy="12" r="1.8" fill="currentColor" />
+          <circle cx="17" cy="12" r="1.8" fill="currentColor" />
+        </svg>
+      );
+    }
+    return (
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M7 7l10 10M17 7 7 17" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
+      </svg>
+    );
+  }, [renderRemoteToolIcon]);
+
   const primaryActions =
-    activeTab === "sessions" ? (
+    activeTab === "home" ? (
+      <>
+        <button type="button" className="button compact" onClick={() => setActiveTab("remote")}>
+          Open Remote
+        </button>
+        <button type="button" className="button soft compact" onClick={() => setActiveTab("sessions")}>
+          Open Sessions
+        </button>
+        <button type="button" className="button soft compact" onClick={() => setActiveTab("pair")}>
+          Pair Device
+        </button>
+      </>
+    ) : activeTab === "sessions" ? (
       <>
         <button type="button" className="button compact" onClick={() => void onCreateSession()} disabled={sessionBusy}>
           New Session
@@ -4843,11 +5596,10 @@ export default function App() {
     );
 
   return (
-    <div
-      className={`app-shell${compactTranscript ? " compact-transcript" : ""}${touchComfortMode ? " touch-comfort" : ""}`}
-    >
+    <div className={appShellClassName}>
       <div className="app-bg" aria-hidden="true" />
 
+      {!isRemoteWorkspace && !hideShellChrome ? (
       <header className="app-topbar">
         <div className="brand-cluster">
           <div className="brand-mark" aria-hidden="true">
@@ -4855,14 +5607,14 @@ export default function App() {
           </div>
           <div>
             <p className="eyebrow">Codrex Remote</p>
-            <h1>Mobile Control Surface</h1>
-            <p className="subtitle">Main web app for Codex sessions, per-session notes, pairing, files, and browser-based remote control.</p>
+            <h1>Codrex</h1>
+            <p className="subtitle">Remote control for your laptop, sessions, and transfers.</p>
           </div>
         </div>
 
         <div className="row top-actions">
           <button type="button" className="button soft compact" onClick={() => void onHardRefresh()}>
-            Sync Now
+            Refresh
           </button>
           <button
             type="button"
@@ -4873,9 +5625,9 @@ export default function App() {
           >
             {installButtonLabel}
           </button>
-          <a className="button ghost" href="/legacy" target="_blank" rel="noreferrer">
-            Legacy
-          </a>
+          <button type="button" className="button ghost" onClick={() => setActiveTab("settings")}>
+            Settings
+          </button>
         </div>
         {showInstallGuide ? (
           <div className="install-guide" data-testid="install-guide">
@@ -4885,30 +5637,34 @@ export default function App() {
           </div>
         ) : null}
       </header>
+      ) : null}
 
+      {!isRemoteWorkspace && !hideShellChrome ? (
       <section className="meta-strip primary">
         <div className="meta-chip important">
-          <span>Auth</span>
-          <strong>{authSummary}</strong>
+          <span>Connection</span>
+          <strong>{homeRouteHeadline}</strong>
         </div>
         <div className="meta-chip important">
-          <span>Network</span>
-          <strong>{networkSummary}</strong>
+          <span>Origin</span>
+          <strong>{preferredOrigin || "not ready"}</strong>
         </div>
         <div className="meta-chip important">
           <span>Sessions</span>
-          <strong>{sessionCountLabel}</strong>
+          <strong>{sessionsRuntimeState}</strong>
         </div>
         <div className="meta-chip important">
           <span>Remote</span>
-          <strong>{remoteControlSummary}</strong>
+          <strong>{desktopTransportSource?.desktop_stream_transport || "fallback"}</strong>
         </div>
         <div className="meta-chip important">
           <span>Build</span>
           <strong>{appVersionLabel} / {appModeLabel}</strong>
         </div>
       </section>
+      ) : null}
 
+      {!isRemoteWorkspace && !hideShellChrome ? (
       <details className="meta-details">
         <summary>System Snapshot</summary>
         <div className="meta-strip secondary">
@@ -4917,8 +5673,8 @@ export default function App() {
             <strong>{statusSnapshotSummary}</strong>
           </div>
           <div className="meta-chip">
-            <span>Controls</span>
-            <strong>Image insert path</strong>
+            <span>Auth</span>
+            <strong>{authSummary}</strong>
           </div>
           <div className="meta-chip">
             <span>Output</span>
@@ -4934,21 +5690,26 @@ export default function App() {
           </div>
         </div>
       </details>
+      ) : null}
 
+      {!isRemoteWorkspace && (!hideShellChrome || Boolean(errorMessage)) ? (
       <section className="status-strip" aria-live="polite">
         <span className={`status-pill ${errorMessage ? "error" : ""}`}>{errorMessage || statusMessage}</span>
-        <span className="status-pill subtle">{connectivitySummary} | {outputFeedSummary}</span>
+        {!hideShellChrome ? <span className="status-pill subtle">{connectivitySummary} | {outputFeedSummary}</span> : null}
       </section>
+      ) : null}
 
       <main className="screen-shell" ref={screenShellRef} data-testid="screen-shell">
+        {!isRemoteWorkspace && !hideShellChrome && activeTab !== "home" ? (
         <section className="action-strip" data-testid={`primary-actions-${activeTab}`}>
           <div className="action-strip-head">
-            <strong>Primary Actions</strong>
-            <span className="small">Focused controls for this tab</span>
+            <strong>Actions</strong>
+            <span className="small">Use the controls that matter for this screen.</span>
           </div>
           <div className="action-strip-grid">{primaryActions}</div>
         </section>
-        {showSwipeHint ? (
+        ) : null}
+        {showSwipeHint && !isRemoteWorkspace && !hideShellChrome ? (
           <div className="swipe-hint" data-testid="swipe-hint">
             <p>
               Tip: Swipe left or right anywhere in the content area to move between tabs.
@@ -4963,19 +5724,131 @@ export default function App() {
             </button>
           </div>
         ) : null}
+        {activeTab === "home" ? (
+          <Suspense fallback={<section className={screenCardClassName} data-testid="tab-panel-home"><p className="small">Loading home...</p></section>}>
+              <HomeTab
+                screenCardClassName={screenCardClassName}
+                compactMode={hideShellChrome}
+                routeHeadline={homeRouteHeadline}
+                routeDetail={homeRouteDetail}
+                preferredOrigin={preferredOrigin}
+                sessionCountLabel={sessionCountLabel}
+              sessionsRuntimeState={sessionsRuntimeState}
+              sessionsRuntimeDetail={sessionsRuntimeDetail}
+              sessionsCanStart={sessionsCanStart}
+              sessionsCanStop={sessionsCanStop}
+                sessionsBusy={sessionsRuntimeBusy}
+                desktopSummary={remoteControlSummary}
+                desktopTransportSummary={desktopTransportSummary}
+                transferWorkspace={(
+                  <TransferWorkspace
+                    variant="home"
+                    desktopSelectedPath={desktopSelectedPath}
+                    desktopPathSummary={desktopPathSummary}
+                    desktopInteractionDisabled={desktopInteractionDisabled}
+                    hostTransferFileName={hostTransferFile?.name || ""}
+                    hostTransferMode={hostTransferMode}
+                    hostTransferBusy={hostTransferBusy}
+                    hostTransferStatus={hostTransferStatus}
+                    lastHostTransferPath={lastHostTransferPath}
+                    recentItems={recentTransferItems}
+                    onCopyFocusedPath={() => void onCopyRemoteSelectedPath()}
+                    onChooseHostTransferFile={onChooseHostTransferFile}
+                    onHostTransferModeChange={setHostTransferMode}
+                    onUploadHostTransfer={(postAction) => void onUploadHostTransfer(postAction)}
+                    onPickAndShareLaptopFile={() => void onPickAndShareLaptopFile()}
+                    onShareFocusedHostSelection={() => void onShareFocusedHostSelection()}
+                    onOpenHostPath={(path) => void openHostPath(path)}
+                    onRevealHostPath={(path) => void onRevealHostTransferPath(path)}
+                  />
+                )}
+                onOpenRemote={() => setActiveTab("remote")}
+                onOpenSessions={() => setActiveTab("sessions")}
+                onStartSessions={() => void onStartSessionsRuntime()}
+              onStopSessions={() => void onStopSessionsRuntime()}
+              onOpenPair={() => setActiveTab("pair")}
+                onOpenSettings={() => setActiveTab("settings")}
+                onOpenThreads={() => setActiveTab("threads")}
+                onOpenDebug={() => setActiveTab("debug")}
+                onOpenLegacy={() => window.open("/legacy", "_blank", "noopener,noreferrer")}
+              />
+            </Suspense>
+          ) : null}
         {activeTab === "sessions" ? (
-          <section className={screenCardClassName} data-testid="tab-panel-sessions">
-            <div className="card-head">
-              <h2>Codex Sessions</h2>
-              <div className="row">
-                <span className="badge">Output {outputFeedState}</span>
-                <span className="badge muted">{sessionCountLabel}</span>
+          <section className={`${screenCardClassName} sessions-screen${hideShellChrome ? " compact-sessions-screen" : ""}`} data-testid="tab-panel-sessions">
+            {hideShellChrome ? (
+              <div className="sessions-compact-header">
+                <p className="home-kicker">Sessions</p>
+                <h2>Ubuntu and Codex</h2>
+                <p className="sessions-compact-copy">Start the runtime, then pick the session you want to keep live.</p>
               </div>
-            </div>
+            ) : (
+              <div className="card-head">
+                <h2>Codex Sessions</h2>
+                <div className="row">
+                  <span className="badge">Output {outputFeedState}</span>
+                  <span className="badge muted">{sessionsRuntimeState}</span>
+                </div>
+              </div>
+            )}
 
-            <div className="session-layout">
+            {sessionsRuntime?.state && sessionsRuntime.state !== "running" ? (
+              <div className="empty-state panel-empty sessions-runtime-empty sessions-runtime-panel">
+                <div className="sessions-runtime-panel-copy">
+                  <p className="home-kicker">Runtime</p>
+                  <h3>Sessions are offline</h3>
+                  <p>{sessionsRuntimeDetail}</p>
+                </div>
+                <div className="row sessions-runtime-actions">
+                  <button type="button" className="button" onClick={() => void onStartSessionsRuntime()} disabled={sessionsRuntimeBusy || !sessionsCanStart}>
+                    {sessionsRuntimeBusy ? "Starting..." : "Start Ubuntu / Sessions"}
+                  </button>
+                  {sessionsCanStop ? (
+                    <button type="button" className="button soft compact" onClick={() => void onStopSessionsRuntime()} disabled={sessionsRuntimeBusy}>
+                      {sessionsRuntimeBusy ? "Stopping..." : "Stop Runtime"}
+                    </button>
+                  ) : null}
+                </div>
+              </div>
+            ) : (
+              <>
+              <div className="sessions-runtime-strip">
+                <div className="sessions-runtime-fact">
+                  <span>Runtime</span>
+                  <strong>{sessionsRuntimeState}</strong>
+                </div>
+                <div className="sessions-runtime-fact">
+                  <span>Feed</span>
+                  <strong>{outputFeedState}</strong>
+                </div>
+                <div className="sessions-runtime-fact">
+                  <span>Open</span>
+                  <strong>{visibleSessionCountLabel}</strong>
+                </div>
+                {sessionsCanStop ? (
+                  <button
+                    type="button"
+                    className="button soft compact sessions-runtime-inline-action"
+                    onClick={() => void onStopSessionsRuntime()}
+                    disabled={sessionsRuntimeBusy}
+                  >
+                    {sessionsRuntimeBusy ? "Stopping..." : "Stop Runtime"}
+                  </button>
+                ) : null}
+              </div>
+              <div className="session-layout">
+              <div className="session-list-shell">
+                {hideShellChrome ? (
+                  <div className="session-list-shell-head">
+                    <div>
+                      <p className="home-kicker">Session Menu</p>
+                      <h3>Open sessions</h3>
+                    </div>
+                    <span className="sessions-count-chip">{visibleSessionCountLabel}</span>
+                  </div>
+                ) : null}
               <div className="session-list" role="list" aria-label="Codex sessions">
-                <div className="row sticky-row">
+                <div className="row sticky-row session-create-row">
                   <input
                     type="text"
                     data-testid="new-session-input"
@@ -5008,7 +5881,7 @@ export default function App() {
                   </button>
                 </div>
 
-                <div className="row list-tools">
+                <div className="row list-tools session-filter-row">
                   <input
                     type="text"
                     data-testid="session-search-input"
@@ -5064,6 +5937,7 @@ export default function App() {
                   onReopenSession={onReopenClosedSession}
                   inferProjectFromCwd={inferProjectFromCwd}
                 />
+              </div>
               </div>
 
               <div className="session-detail" data-testid="session-detail">
@@ -5124,7 +5998,9 @@ export default function App() {
                   />
                 )}
               </div>
-            </div>
+              </div>
+              </>
+            )}
           </section>
         ) : null}
 
@@ -5446,7 +6322,7 @@ export default function App() {
                               <strong>{msg.role.toUpperCase()}</strong>
                               <span className="small">{formatClock(msg.at)}</span>
                             </div>
-                            <p>{msg.text}</p>
+                            <TranscriptMessageContent text={msg.text} onOpenPath={onOpenTranscriptPath} />
                           </div>
                         ))}
                       </div>
@@ -5499,97 +6375,94 @@ export default function App() {
         ) : null}
 
         {activeTab === "remote" ? (
-          <section className={screenCardClassName} data-testid="tab-panel-remote">
-            <div className="card-head">
-              <h2>Remote Control</h2>
-              <div className="row">
-                <span className="badge">desktop + capture</span>
-                <span className="badge muted">{desktopEnabled ? "control: on" : "control: off (view-only)"}</span>
+          <section
+            className={`${screenCardClassName}${desktopShowWebrtcVideo || desktopShowFallbackImage ? " remote-stream-live" : " remote-stream-pending"}`}
+            data-testid="tab-panel-remote"
+          >
+            <div className="remote-session-bar">
+              <div className="remote-session-headline">
+                <div>
+                  <span className="remote-session-kicker">Active Remote</span>
+                  <h2>Desktop Control</h2>
+                </div>
+                <div className="remote-session-status">
+                  <span className="badge">{desktopShowWebrtcVideo ? "webrtc live" : desktopShowFallbackImage ? "fallback live" : "connecting"}</span>
+                  <span className="badge muted">{desktopEnabled ? "control on" : "view only"}</span>
+                  <span className="badge muted">{desktopTrackpadMode ? "trackpad" : "direct"}</span>
+                </div>
+              </div>
+              <div className="remote-session-nav" role="toolbar" aria-label="Remote workspace actions">
+                <button type="button" className="button ghost compact remote-rail-button" onClick={() => setActiveTab("home")}>
+                  <span className="remote-rail-icon" aria-hidden="true">{renderNavIcon("home")}</span>
+                  <span className="btn-text">Home</span>
+                </button>
+                <button type="button" className="button ghost compact remote-rail-button" onClick={() => setActiveTab("sessions")}>
+                  <span className="remote-rail-icon" aria-hidden="true">{renderNavIcon("sessions")}</span>
+                  <span className="btn-text">Sessions</span>
+                </button>
+                <button
+                  type="button"
+                  className={`button soft compact remote-rail-button ${remoteKeyboardPanelOpen ? "active" : ""}`}
+                  onClick={() => toggleRemotePanel("keyboard")}
+                >
+                  <span className="remote-rail-icon" aria-hidden="true">{renderRemoteRailIcon("keyboard")}</span>
+                  <span className="btn-text">{remoteKeyboardLabel}</span>
+                </button>
+                <button
+                  type="button"
+                  className={`button soft compact remote-rail-button ${remoteFilesPanelOpen ? "active" : ""}`}
+                  onClick={() => toggleRemotePanel("files")}
+                >
+                  <span className="remote-rail-icon" aria-hidden="true">{renderRemoteRailIcon("files")}</span>
+                  <span className="btn-text">{remoteFilesLabel}</span>
+                </button>
+                <button
+                  type="button"
+                  className={`button soft compact remote-rail-button ${remoteAdvancedPanelOpen ? "active" : ""}`}
+                  onClick={() => toggleRemotePanel("advanced")}
+                >
+                  <span className="remote-rail-icon" aria-hidden="true">{renderRemoteRailIcon("more")}</span>
+                  <span className="btn-text">{remoteAdvancedLabel}</span>
+                </button>
               </div>
             </div>
 
             <div className="debug-layout full-width">
               <div className="debug-column">
                 <div className="debug-block">
-                  <h3>Desktop Remote</h3>
-                  <div className={`mode-banner ${desktopEnabled ? "active" : "inactive"}`}>
-                    <strong>{desktopEnabled ? "Control Enabled" : "View-only Mode"}</strong>
-                    <span>{desktopEnabled ? "Tap stream and controls to interact." : "Live stream remains active. Input is locked for safety."}</span>
+                  <div className="remote-command-rail">
+                    <div className="remote-command-main">
+                      <button type="button" className={`button ${desktopEnabled ? "warn" : ""}`} onClick={() => void onToggleDesktopMode()}>
+                        {desktopEnabled ? "Disable Control" : "Enable Control"}
+                      </button>
+                      <button
+                        type="button"
+                        className="button soft compact"
+                        data-testid="remote-fullscreen-toggle"
+                        onClick={() => void onToggleDesktopFullscreen()}
+                      >
+                        {desktopFullscreen ? "Exit Fullscreen" : "Enter Fullscreen"}
+                      </button>
+                      <button
+                        type="button"
+                        className="button soft compact"
+                        onClick={() => setDesktopTrackpadMode((current) => !current)}
+                      >
+                        {desktopTrackpadMode ? "Trackpad On" : "Direct Touch"}
+                      </button>
+                    </div>
+                    <div className="remote-command-meta">
+                      {desktopAltHeld ? <span className="badge warn">Alt held</span> : null}
+                      {desktopPerfActive ? <span className="badge active">Boost active</span> : null}
+                      <span className="remote-stage-meta">
+                        {desktopInfo?.width && desktopInfo?.height
+                          ? `${desktopInfo.width}x${desktopInfo.height}`
+                          : "Desktop unavailable"}
+                      </span>
+                    </div>
                   </div>
-                  <div className="row">
-                    <button type="button" className={`button ${desktopEnabled ? "warn" : ""}`} onClick={() => void onToggleDesktopMode()}>
-                      {desktopEnabled ? "Disable Control" : "Enable Control"}
-                    </button>
-                    <button
-                      type="button"
-                      className="button soft compact"
-                      data-testid="remote-fullscreen-toggle"
-                      onClick={() => void onToggleDesktopFullscreen()}
-                    >
-                      {desktopFullscreen ? "Exit Fullscreen" : "Enter Fullscreen"}
-                    </button>
-                    <button
-                      type="button"
-                      className="button soft compact"
-                      onClick={() => setDesktopTrackpadMode((current) => !current)}
-                    >
-                      Trackpad: {desktopTrackpadMode ? "On" : "Direct"}
-                    </button>
-                    <button
-                      type="button"
-                      className={`button soft compact ${desktopPerfEnabled ? "active" : ""}`}
-                      onClick={() => void onToggleDesktopPerfMode()}
-                    >
-                      Boost Host: {desktopPerfEnabled ? "On" : "Off"}
-                    </button>
-                    <button
-                      type="button"
-                      className={`button soft compact ${desktopAdaptiveStream ? "active" : ""}`}
-                      onClick={() => setDesktopAdaptiveStream((current) => !current)}
-                    >
-                      Adaptive Speed: {desktopAdaptiveStream ? "On" : "Off"}
-                    </button>
-                    <button
-                      type="button"
-                      className={`button soft compact ${desktopFullscreenLight ? "active" : ""}`}
-                      onClick={() => setDesktopFullscreenLight((current) => !current)}
-                    >
-                      Keyboard Light: {desktopFullscreenLight ? "On" : "Off"}
-                    </button>
-                    {desktopAltHeld ? <span className="badge warn">Alt held</span> : null}
-                    {desktopPerfActive ? <span className="badge active">Boost active</span> : null}
-                    <span className="small">
-                      {desktopInfo?.width && desktopInfo?.height
-                        ? `${desktopInfo.width}x${desktopInfo.height}`
-                        : "Desktop unavailable"}
-                    </span>
-                  </div>
-                  <label className="field">
-                    <span>Stream Profile</span>
-                    <select
-                      value={desktopProfile}
-                      onChange={(event) => setDesktopProfile(event.target.value as DesktopStreamProfile)}
-                    >
-                      <option value="responsive">Responsive</option>
-                      <option value="balanced">Balanced</option>
-                      <option value="saver">Saver</option>
-                      <option value="ultra">Ultra (readable low-data)</option>
-                      <option value="extreme">Extreme (lowest bandwidth, readable)</option>
-                    </select>
-                  </label>
-                  <p className="small">
-                    Current profile:{" "}
-                    <strong>
-                      {desktopBaseStreamSummary}
-                    </strong>
-                  </p>
-                  <p className="small">
-                    Effective stream: <strong>{desktopEffectiveStreamSummary}</strong>
-                  </p>
-                  <p className="small">{desktopAdaptiveSummary}</p>
-                  <p className="small">{desktopStatus || desktopPerfSummary || "Desktop controls are available only on Windows host."}</p>
-                  <div className="remote-workspace">
-                    <div className="remote-view-stack">
+                  <div className={`remote-workspace${desktopShowWebrtcVideo || desktopShowFallbackImage ? " remote-workspace-live" : ""}${remoteToolDrawerOpen ? " remote-tool-drawer-open" : ""}`}>
+                    <div className={`remote-view-stack${desktopShowWebrtcVideo || desktopShowFallbackImage ? " remote-view-stack-live" : ""}`}>
                       <div
                         ref={remoteStageRef}
                         className={`stream-wrap remote-stage${desktopFullscreen ? " fullscreen-active" : ""}${desktopFullscreenLight ? " fullscreen-light" : ""}`}
@@ -5670,25 +6543,64 @@ export default function App() {
                             ) : null}
                           </div>
                         </div>
-                        <img
-                          ref={desktopFrameRef}
-                          className="desktop-frame"
-                          src={desktopStreamUrl}
-                          alt="Desktop stream"
-                          decoding="async"
-                          fetchPriority="high"
-                          draggable={false}
-                          onClick={(event) => void onDesktopFrameTap(event)}
-                          onContextMenu={(event) => void onDesktopContextMenu(event)}
-                          onWheel={(event) => void onDesktopWheel(event)}
-                        />
+                        {desktopShowWebrtcVideo ? (
+                          <video
+                            ref={(node) => {
+                              desktopVideoRef.current = node;
+                              desktopFrameRef.current = node;
+                            }}
+                            className="desktop-frame"
+                            autoPlay
+                            muted
+                            playsInline
+                            onClick={(event) => void onDesktopFrameTap(event)}
+                            onContextMenu={(event) => void onDesktopContextMenu(event)}
+                            onWheel={(event) => void onDesktopWheel(event)}
+                          />
+                        ) : desktopShowFallbackImage ? (
+                          <img
+                            ref={(node) => {
+                              desktopFrameRef.current = node;
+                            }}
+                            className="desktop-frame"
+                            src={desktopStreamUrl}
+                            alt="Desktop stream"
+                            decoding="async"
+                            fetchPriority="high"
+                            draggable={false}
+                            onClick={(event) => void onDesktopFrameTap(event)}
+                            onContextMenu={(event) => void onDesktopContextMenu(event)}
+                            onWheel={(event) => void onDesktopWheel(event)}
+                          />
+                        ) : (
+                          <div className="remote-connecting-state">
+                            <strong>Connecting secure stream...</strong>
+                            <span>WebRTC is negotiating before the image fallback is allowed.</span>
+                          </div>
+                        )}
                       </div>
-                      <p className="small">
-                        Live stream stays on in both modes. Fullscreen turns the browser into a tablet-friendly remote stage. Trackpad mode moves first and taps on release; Direct mode clicks exactly where you tap.
-                      </p>
                     </div>
 
-                    <div className="remote-control-stack">
+                    {remoteToolDrawerOpen ? (
+                    <aside className="remote-control-stack remote-tool-drawer" data-testid="remote-tool-drawer">
+                      <div className="remote-tool-drawer-head">
+                        <div>
+                          <p className="remote-tool-drawer-kicker">Tool Surface</p>
+                          <h3>{remoteDrawerTitle}</h3>
+                          <p className="small">{remoteDrawerDetail}</p>
+                        </div>
+                        <button
+                          type="button"
+                          className="button ghost compact remote-tool-drawer-close"
+                          onClick={closeRemotePanels}
+                        >
+                          <span className="remote-rail-icon" aria-hidden="true">{renderRemoteRailIcon("close")}</span>
+                          <span className="btn-text">Close</span>
+                        </button>
+                      </div>
+                      <div className="remote-tool-drawer-body">
+                      {remoteAdvancedPanelOpen ? (
+                      <>
                       <div className="remote-control-group">
                         <h4>Windows Controls</h4>
                         <div className="remote-quickkeys remote-quickkeys-windows" role="group" aria-label="Remote Windows controls">
@@ -5742,6 +6654,9 @@ export default function App() {
                           </button>
                         </div>
                       </div>
+                      </>
+                      ) : null}
+                      {remoteKeyboardPanelOpen ? (
                       <div className="remote-control-group">
                         <h4>Text and Keyboard</h4>
                         <div className="row remote-text-controls">
@@ -5767,9 +6682,9 @@ export default function App() {
                             data-short="TYPE"
                             onClick={() => void onDesktopPasteClipboard()}
                             disabled={desktopInteractionDisabled || !desktopFocusPoint}
-                            title={desktopFocusPoint ? "Load clipboard text into the remote text box." : "Tap the remote desktop once to focus a target first."}
+                            title={desktopFocusPoint ? "Paste local clipboard text into the focused host app." : "Tap the remote desktop once to focus a target first."}
                           >
-                            <span className="btn-text">Paste Into Box</span>
+                            <span className="btn-text">Paste Text</span>
                           </button>
                         </div>
                         <p className="small">{desktopFocusSummary}</p>
@@ -5842,208 +6757,248 @@ export default function App() {
                           </div>
                         </div>
                       </div>
-                      <div className="remote-control-group" data-testid="remote-image-send">
-                        <div className="remote-group-head">
-                          <h4>Paste Image To Desktop App</h4>
-                          <span className="small">{remoteImageSummary}</span>
+                      ) : null}
+                      {remoteFilesPanelOpen ? (
+                      <>
+                      <div className="remote-task-grid">
+                        <div className="remote-control-group remote-task-card" data-testid="remote-image-send">
+                          <div className="remote-task-head">
+                            <span className="remote-task-icon windows">{renderRemoteToolIcon("windows")}</span>
+                            <div className="remote-group-head">
+                              <h4>Paste To Windows App</h4>
+                              <span className="small">Stage real image clipboard formats on the host, then send native Ctrl+V into the focused Windows app.</span>
+                            </div>
+                          </div>
+                          <input
+                            ref={sessionImageInputRef}
+                            type="file"
+                            accept="image/*"
+                            data-testid="remote-image-input"
+                            className="sr-only"
+                            onChange={(event) => onSessionImageFileChange(event.target.files?.[0] || null)}
+                          />
+                          <div className="remote-image-actions">
+                            <button
+                              type="button"
+                              className={`button soft compact action-chip${sessionImageFile ? " active" : ""}`}
+                              onClick={onOpenSessionImagePicker}
+                              disabled={sessionBusy}
+                            >
+                              <span className="btn-text">{sessionImageFile ? "Change Image" : "Choose Image"}</span>
+                            </button>
+                            <button
+                              type="button"
+                              className="button soft compact action-chip"
+                              onClick={() => onSessionImageFileChange(null)}
+                              disabled={sessionBusy || !sessionImageFile}
+                            >
+                              <span className="btn-text">Clear</span>
+                            </button>
+                          </div>
+                          {sessionImageFile ? <span className="mode-pill mode-ready">{sessionImageFile.name}</span> : null}
+                          <p className="small">{remoteImageSummary}</p>
+                          <div className="remote-action-grid">
+                            <button
+                              type="button"
+                              className="button compact remote-task-button"
+                              data-testid="remote-send-image"
+                              onClick={() => void onSendRemoteDesktopImage()}
+                              disabled={sessionBusy || !sessionImageFile || !desktopEnabled}
+                            >
+                              <span className="btn-glyph remote-inline-icon" aria-hidden="true">{renderRemoteToolIcon("windows")}</span>
+                              <span className="btn-text">Paste To Windows App</span>
+                            </button>
+                          </div>
                         </div>
-                        <input
-                          ref={sessionImageInputRef}
-                          type="file"
-                          accept="image/*"
-                          data-testid="remote-image-input"
-                          className="sr-only"
-                          onChange={(event) => onSessionImageFileChange(event.target.files?.[0] || null)}
-                        />
-                        <div className="remote-image-actions">
-                          <button
-                            type="button"
-                            className={`button soft compact action-chip${sessionImageFile ? " active" : ""}`}
-                            onClick={onOpenSessionImagePicker}
-                            disabled={sessionBusy}
-                          >
-                            <span className="btn-text">{sessionImageFile ? "Change Image" : "Choose Image"}</span>
-                          </button>
-                          <button
-                            type="button"
-                            className="button soft compact action-chip"
-                            onClick={() => onSessionImageFileChange(null)}
-                            disabled={sessionBusy || !sessionImageFile}
-                          >
-                            <span className="btn-text">Clear Image</span>
-                          </button>
-                        </div>
-                        {sessionImageFile ? (
+
+                        <div className="remote-control-group remote-task-card" data-testid="remote-session-image-send">
+                          <div className="remote-task-head">
+                            <span className="remote-task-icon ubuntu">{renderRemoteToolIcon("ubuntu")}</span>
+                            <div className="remote-group-head">
+                              <h4>Paste To Ubuntu Session</h4>
+                              <span className="small">Keep the existing WSL handoff for Codex sessions. This stages the image under the selected Ubuntu workspace.</span>
+                            </div>
+                          </div>
                           <div className="remote-image-panel">
-                            <span className="mode-pill mode-ready">{sessionImageFile.name}</span>
                             <input
                               type="text"
                               value={sessionImagePrompt}
                               onChange={(event) => onSessionImagePromptChange(event.target.value)}
-                              placeholder="Optional note for the session file"
+                              placeholder="Optional note for the Ubuntu session"
                               disabled={sessionBusy}
                             />
-                            <button
-                              type="button"
-                              className="button soft compact action-chip"
-                              data-testid="remote-send-image"
-                              onClick={() => void onSendRemoteDesktopImage()}
-                              disabled={sessionBusy || !sessionImageFile || !selectedSession || !desktopEnabled}
-                            >
-                              <span className="btn-text">Paste Image With Ctrl+V</span>
-                            </button>
+                            <div className="remote-action-grid">
+                              <button
+                                type="button"
+                                className="button soft compact remote-task-button"
+                                onClick={() => void onSendSessionImage()}
+                                disabled={sessionBusy || !sessionImageFile || !selectedSession}
+                              >
+                                <span className="btn-glyph remote-inline-icon" aria-hidden="true">{renderRemoteToolIcon("ubuntu")}</span>
+                                <span className="btn-text">Paste To Ubuntu Session</span>
+                              </button>
+                            </div>
                           </div>
-                        ) : null}
-                        {!selectedSession ? (
-                          <p className="small">Select a live session first so the image can be staged under that workspace.</p>
-                        ) : null}
-                      </div>
-                      <div className="remote-control-group" data-testid="remote-selected-path">
-                        <div className="remote-group-head">
-                          <h4>Focused Explorer Path</h4>
-                          <span className="small">Select a file or folder in the currently focused File Explorer window or on the host desktop, then copy its path.</span>
+                          {!selectedSession ? (
+                            <p className="small">Select a live Ubuntu session first so the image can be staged under that workspace.</p>
+                          ) : (
+                            <p className="small">Current target: {selectedSession}</p>
+                          )}
                         </div>
-                        <div className="remote-path-browser-copy">
-                          <input
-                            type="text"
-                            readOnly
-                            value={desktopSelectedPath || ""}
-                            placeholder="No Explorer selection copied yet"
-                            aria-label="Remote selected path"
-                          />
-                          <button
-                            type="button"
-                            className="button soft compact action-chip"
-                            onClick={() => void onCopyRemoteSelectedPath()}
-                            disabled={desktopInteractionDisabled}
-                          >
-                            <span className="btn-text">Copy Focused Path</span>
+
+                          <div className="remote-control-group remote-task-card" data-testid="remote-host-transfer">
+                            <TransferWorkspace
+                              variant="remote"
+                              desktopSelectedPath={desktopSelectedPath}
+                              desktopPathSummary={desktopPathSummary}
+                              desktopInteractionDisabled={desktopInteractionDisabled}
+                              hostTransferFileName={hostTransferFile?.name || ""}
+                              hostTransferMode={hostTransferMode}
+                              hostTransferBusy={hostTransferBusy}
+                              hostTransferStatus={hostTransferStatus}
+                              lastHostTransferPath={lastHostTransferPath}
+                              recentItems={recentTransferItems}
+                              onCopyFocusedPath={() => void onCopyRemoteSelectedPath()}
+                              onChooseHostTransferFile={onChooseHostTransferFile}
+                              onHostTransferModeChange={setHostTransferMode}
+                              onUploadHostTransfer={(postAction) => void onUploadHostTransfer(postAction)}
+                              onPickAndShareLaptopFile={() => void onPickAndShareLaptopFile()}
+                              onShareFocusedHostSelection={() => void onShareFocusedHostSelection()}
+                              onOpenHostPath={(path) => void openHostPath(path)}
+                              onRevealHostPath={(path) => void onRevealHostTransferPath(path)}
+                            />
+                          </div>
+                      </div>
+                      </>
+                      ) : null}
+                      {remoteAdvancedPanelOpen ? (
+                      <>
+                      <div className="remote-control-group remote-tool-card">
+                        <div className="remote-tool-section-head">
+                          <div>
+                            <h4>Screenshot Capture</h4>
+                            <p className="small">Capture one desktop frame using the current stream profile.</p>
+                          </div>
+                          <button type="button" className="button soft compact" onClick={onCaptureLatestShot}>
+                            Capture Latest
                           </button>
                         </div>
-                        <p className="small remote-path-browser-folder">
-                          {desktopPathSummary}
-                        </p>
+                        {latestCaptureUrl ? (
+                          <div className="pair-qr-wrap remote-shot-preview">
+                            <img className="desktop-frame" src={latestCaptureUrl} alt="Latest screenshot" />
+                          </div>
+                        ) : (
+                          <div className="empty-state panel-empty">
+                            <h3>No capture yet</h3>
+                            <p>Capture one frame to preview `/shot` output here.</p>
+                          </div>
+                        )}
                       </div>
-                    </div>
-                  </div>
-                </div>
-
-                <div className="debug-block">
-                  <h3>Screenshot Capture</h3>
-                  <p className="small">Capture one desktop frame using current stream profile (including low-data mode).</p>
-                  <button type="button" className="button soft compact" onClick={onCaptureLatestShot}>
-                    Capture Latest
-                  </button>
-                  {latestCaptureUrl ? (
-                    <div className="pair-qr-wrap">
-                      <img className="desktop-frame" src={latestCaptureUrl} alt="Latest screenshot" />
-                    </div>
-                  ) : (
-                    <div className="empty-state panel-empty">
-                      <h3>No capture yet</h3>
-                      <p>Tap capture to preview `/shot` output here.</p>
-                    </div>
-                  )}
-                </div>
-
-                <div className="debug-block" data-testid="power-card">
-                  <div className="session-files-head">
-                    <div>
-                      <h3>Power Control</h3>
-                      <p className="small">Shutdown controls live here. True boot-from-off is routed through the wake relay and Telegram.</p>
-                    </div>
-                    <button type="button" className="button soft compact" onClick={() => void refreshPowerStatus()} disabled={powerBusy}>
-                      Refresh Power
-                    </button>
-                  </div>
-                  <div className="row">
-                    <span className="badge">{powerStatus?.online ? "host: online" : "host: unknown"}</span>
-                    <span className="badge muted">{powerRelayBadge}</span>
-                    <span className={`badge power-readiness ${powerWakeReadiness}`}>{powerWakeBadge}</span>
-                  </div>
-                  <p className="small">{powerStatus?.relay_detail || "Wake relay diagnostics are not available yet."}</p>
-                  {powerWakeWarning && powerWakeReadiness !== "ready" ? (
-                    <div className={`power-warning-banner ${powerWakeReadiness}`} data-testid="power-warning-banner">
-                      <strong>Wake is best effort on this machine</strong>
-                      <p>{powerWakeWarning}</p>
-                    </div>
-                  ) : null}
-                  <div className="remote-power-grid">
-                    {(powerStatus?.actions || []).map((actionName) => {
-                      const powerAction = actionName as PowerActionName;
-                      return (
-                        <button
-                          key={powerAction}
-                          type="button"
-                          className={`button compact ${powerAction === "shutdown" || powerAction === "restart" ? "warn" : "soft"}`}
-                          data-testid={`power-action-${powerAction}`}
-                          onClick={() => void onRequestPowerAction(powerAction)}
-                          disabled={powerBusy}
-                        >
-                          {POWER_ACTION_LABELS[powerAction]}
-                        </button>
-                      );
-                    })}
-                  </div>
-                  {powerConfirmAction && powerConfirmToken ? (
-                    <div className="power-confirm-banner" data-testid="power-confirm-banner">
-                      <strong>Confirm {POWER_ACTION_LABELS[powerConfirmAction]}</strong>
-                      <span>This action is armed for {powerConfirmExpiresIn}s.</span>
-                      <div className="row">
-                        <button
-                          type="button"
-                          className="button warn compact"
-                          data-testid="power-confirm-accept"
-                          onClick={() => void onRequestPowerAction(powerConfirmAction, powerConfirmToken)}
-                          disabled={powerBusy}
-                        >
-                          Confirm {POWER_ACTION_LABELS[powerConfirmAction]}
-                        </button>
-                        <button
-                          type="button"
-                          className="button soft compact"
-                          data-testid="power-confirm-cancel"
-                          onClick={onCancelPowerConfirmation}
-                          disabled={powerBusy}
-                        >
-                          Cancel
-                        </button>
+                      <div className="remote-control-group remote-tool-card" data-testid="power-card">
+                        <div className="session-files-head">
+                          <div>
+                            <h4>Power Control</h4>
+                            <p className="small">Shutdown controls live here. Cold boot still routes through the wake relay.</p>
+                          </div>
+                          <button type="button" className="button soft compact" onClick={() => void refreshPowerStatus()} disabled={powerBusy}>
+                            Refresh Power
+                          </button>
+                        </div>
+                        <div className="row">
+                          <span className="badge">{powerStatus?.online ? "host: online" : "host: unknown"}</span>
+                          <span className="badge muted">{powerRelayBadge}</span>
+                          <span className={`badge power-readiness ${powerWakeReadiness}`}>{powerWakeBadge}</span>
+                        </div>
+                        <p className="small">{powerStatus?.relay_detail || "Wake relay diagnostics are not available yet."}</p>
+                        {powerWakeWarning && powerWakeReadiness !== "ready" ? (
+                          <div className={`power-warning-banner ${powerWakeReadiness}`} data-testid="power-warning-banner">
+                            <strong>Wake is best effort on this machine</strong>
+                            <p>{powerWakeWarning}</p>
+                          </div>
+                        ) : null}
+                        <div className="remote-power-grid">
+                          {(powerStatus?.actions || []).map((actionName) => {
+                            const powerAction = actionName as PowerActionName;
+                            return (
+                              <button
+                                key={powerAction}
+                                type="button"
+                                className={`button compact ${powerAction === "shutdown" || powerAction === "restart" ? "warn" : "soft"}`}
+                                data-testid={`power-action-${powerAction}`}
+                                onClick={() => void onRequestPowerAction(powerAction)}
+                                disabled={powerBusy}
+                              >
+                                {POWER_ACTION_LABELS[powerAction]}
+                              </button>
+                            );
+                          })}
+                        </div>
+                        {powerConfirmAction && powerConfirmToken ? (
+                          <div className="power-confirm-banner" data-testid="power-confirm-banner">
+                            <strong>Confirm {POWER_ACTION_LABELS[powerConfirmAction]}</strong>
+                            <span>This action is armed for {powerConfirmExpiresIn}s.</span>
+                            <div className="row">
+                              <button
+                                type="button"
+                                className="button warn compact"
+                                data-testid="power-confirm-accept"
+                                onClick={() => void onRequestPowerAction(powerConfirmAction, powerConfirmToken)}
+                                disabled={powerBusy}
+                              >
+                                Confirm {POWER_ACTION_LABELS[powerConfirmAction]}
+                              </button>
+                              <button
+                                type="button"
+                                className="button soft compact"
+                                data-testid="power-confirm-cancel"
+                                onClick={onCancelPowerConfirmation}
+                                disabled={powerBusy}
+                              >
+                                Cancel
+                              </button>
+                            </div>
+                          </div>
+                        ) : null}
+                        <div className="remote-power-diagnostics">
+                          <label className="field">
+                            <span>Wake Instruction</span>
+                            <div className="row">
+                              <input type="text" readOnly value={powerWakeInstruction} />
+                              <button
+                                type="button"
+                                className="button soft compact"
+                                onClick={() => void onCopyPowerValue(powerWakeInstruction, "Wake instruction")}
+                              >
+                                Copy
+                              </button>
+                            </div>
+                          </label>
+                          <label className="field">
+                            <span>Primary MAC</span>
+                            <div className="row">
+                              <input type="text" readOnly value={powerStatus?.primary_mac || netInfo?.primary_mac || ""} />
+                              <button
+                                type="button"
+                                className="button soft compact"
+                                onClick={() => void onCopyPowerValue(powerStatus?.primary_mac || netInfo?.primary_mac || "", "Primary MAC")}
+                              >
+                                Copy
+                              </button>
+                            </div>
+                          </label>
+                          <p className="small">
+                            Wake candidates: <strong>{(powerStatus?.wake_candidate_macs || netInfo?.wake_candidate_macs || []).join(", ") || "n/a"}</strong>
+                          </p>
+                          <p className="small">
+                            Wake surface: <strong>{powerStatus?.wake_surface || "telegram"}</strong>. Preferred transport: <strong>{powerWakeTransport}</strong>. Use <strong>{powerWakeInstruction}</strong> from the dedicated wake bot when the laptop is off.
+                          </p>
+                        </div>
                       </div>
-                    </div>
-                  ) : null}
-                  <div className="remote-power-diagnostics">
-                    <label className="field">
-                      <span>Wake Instruction</span>
-                      <div className="row">
-                        <input type="text" readOnly value={powerWakeInstruction} />
-                        <button
-                          type="button"
-                          className="button soft compact"
-                          onClick={() => void onCopyPowerValue(powerWakeInstruction, "Wake instruction")}
-                        >
-                          Copy
-                        </button>
+                      </>
+                      ) : null}
                       </div>
-                    </label>
-                    <label className="field">
-                      <span>Primary MAC</span>
-                      <div className="row">
-                        <input type="text" readOnly value={powerStatus?.primary_mac || netInfo?.primary_mac || ""} />
-                        <button
-                          type="button"
-                          className="button soft compact"
-                          onClick={() => void onCopyPowerValue(powerStatus?.primary_mac || netInfo?.primary_mac || "", "Primary MAC")}
-                        >
-                          Copy
-                        </button>
-                      </div>
-                    </label>
-                    <p className="small">
-                      Wake candidates: <strong>{(powerStatus?.wake_candidate_macs || netInfo?.wake_candidate_macs || []).join(", ") || "n/a"}</strong>
-                    </p>
-                    <p className="small">
-                      Wake surface: <strong>{powerStatus?.wake_surface || "telegram"}</strong>. Preferred transport: <strong>{powerWakeTransport}</strong>. Use <strong>{powerWakeInstruction}</strong> from the dedicated wake bot when the laptop is off.
-                    </p>
+                    </aside>
+                    ) : null}
                   </div>
                 </div>
               </div>
@@ -6141,7 +7096,17 @@ export default function App() {
         ) : null}
       </main>
 
+      {!isRemoteWorkspace ? (
       <nav className="bottom-nav" aria-label="Primary navigation">
+        <button
+          type="button"
+          data-testid="tab-home"
+          className={`nav-item ${activeTab === "home" ? "active" : ""}`}
+          onClick={() => setActiveTab("home")}
+        >
+          <span className="nav-icon">{renderNavIcon("home")}</span>
+          <span className="nav-label">Home</span>
+        </button>
         <button
           type="button"
           data-testid="tab-sessions"
@@ -6153,15 +7118,6 @@ export default function App() {
         </button>
         <button
           type="button"
-          data-testid="tab-threads"
-          className={`nav-item ${activeTab === "threads" ? "active" : ""}`}
-          onClick={() => setActiveTab("threads")}
-        >
-          <span className="nav-icon">{renderNavIcon("threads")}</span>
-          <span className="nav-label">Threads</span>
-        </button>
-        <button
-          type="button"
           data-testid="tab-remote"
           className={`nav-item ${activeTab === "remote" ? "active" : ""}`}
           onClick={() => setActiveTab("remote")}
@@ -6169,34 +7125,8 @@ export default function App() {
           <span className="nav-icon">{renderNavIcon("remote")}</span>
           <span className="nav-label">Remote</span>
         </button>
-        <button
-          type="button"
-          data-testid="tab-pair"
-          className={`nav-item ${activeTab === "pair" ? "active" : ""}`}
-          onClick={() => setActiveTab("pair")}
-        >
-          <span className="nav-icon">{renderNavIcon("pair")}</span>
-          <span className="nav-label">Pair</span>
-        </button>
-        <button
-          type="button"
-          data-testid="tab-settings"
-          className={`nav-item ${activeTab === "settings" ? "active" : ""}`}
-          onClick={() => setActiveTab("settings")}
-        >
-          <span className="nav-icon">{renderNavIcon("settings")}</span>
-          <span className="nav-label">Settings</span>
-        </button>
-        <button
-          type="button"
-          data-testid="tab-debug"
-          className={`nav-item ${activeTab === "debug" ? "active" : ""}`}
-          onClick={() => setActiveTab("debug")}
-        >
-          <span className="nav-icon">{renderNavIcon("debug")}</span>
-          <span className="nav-label">Debug</span>
-        </button>
       </nav>
+      ) : null}
     </div>
   );
 }

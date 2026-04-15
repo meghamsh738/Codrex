@@ -33,4 +33,8 @@ if exist "%LAUNCHER_DEBUG%" (
 )
 
 echo Codrex desktop launcher is not built yet. Falling back to the legacy PowerShell launcher.
-start "" powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -WindowStyle Hidden -File "%~dp0tools\windows\mobile-launcher.ps1"
+if exist "%~dp0tools\windows\powershell-hidden.vbs" (
+  start "" wscript.exe "%~dp0tools\windows\powershell-hidden.vbs" -STA -File "%~dp0tools\windows\mobile-launcher.ps1"
+) else (
+  start "" powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -WindowStyle Hidden -File "%~dp0tools\windows\mobile-launcher.ps1"
+)

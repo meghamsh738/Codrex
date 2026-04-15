@@ -2,6 +2,7 @@
 from fastapi.responses import HTMLResponse, Response, FileResponse, JSONResponse, StreamingResponse, RedirectResponse
 import asyncio
 import json
+import math
 import time
 import os
 import shutil
@@ -10,6 +11,7 @@ import socket
 import io
 import re
 import shlex
+import hashlib
 import mimetypes
 import html as html_std
 import threading
@@ -25,11 +27,80 @@ import urllib.request
 import urllib.error
 import atexit
 import base64
+import logging
+from fractions import Fraction
 
 from mss import mss
 from mss.tools import to_png
+try:
+    from PIL import Image
+    PILLOW_AVAILABLE = True
+except Exception:
+    Image = None  # type: ignore
+    PILLOW_AVAILABLE = False
+
+try:
+    import numpy as np  # type: ignore
+    from av import VideoFrame  # type: ignore
+    from aiortc import RTCPeerConnection, RTCSessionDescription, RTCRtpSender, VideoStreamTrack  # type: ignore
+    from aiortc.mediastreams import MediaStreamError  # type: ignore
+    from aiortc.sdp import candidate_from_sdp, candidate_to_sdp  # type: ignore
+    import aiortc.codecs.h264 as aiortc_h264  # type: ignore
+    import aiortc.codecs.vpx as aiortc_vpx  # type: ignore
+    import aiortc.rtcpeerconnection as aiortc_rtcpeerconnection  # type: ignore
+    AIORTC_AVAILABLE = True
+    AIORTC_IMPORT_ERROR = ""
+except Exception as _aiortc_exc:
+    np = None  # type: ignore
+    VideoFrame = None  # type: ignore
+    RTCPeerConnection = None  # type: ignore
+    RTCSessionDescription = None  # type: ignore
+    RTCRtpSender = None  # type: ignore
+    VideoStreamTrack = object  # type: ignore
+    MediaStreamError = Exception  # type: ignore
+    candidate_from_sdp = None  # type: ignore
+    candidate_to_sdp = None  # type: ignore
+    aiortc_h264 = None  # type: ignore
+    aiortc_vpx = None  # type: ignore
+    aiortc_rtcpeerconnection = None  # type: ignore
+    AIORTC_AVAILABLE = False
+    AIORTC_IMPORT_ERROR = f"{type(_aiortc_exc).__name__}: {_aiortc_exc}"
+
+
+def _patch_desktop_webrtc_codecs() -> None:
+    if not AIORTC_AVAILABLE or aiortc_h264 is None or aiortc_vpx is None:
+        return
+    try:
+        aiortc_h264.MIN_BITRATE = max(int(getattr(aiortc_h264, "MIN_BITRATE", 500000) or 500000), 1000000)
+        aiortc_h264.DEFAULT_BITRATE = max(int(getattr(aiortc_h264, "DEFAULT_BITRATE", 1000000) or 1000000), 2500000)
+        aiortc_h264.MAX_BITRATE = max(int(getattr(aiortc_h264, "MAX_BITRATE", 3000000) or 3000000), 5000000)
+        aiortc_vpx.MIN_BITRATE = max(int(getattr(aiortc_vpx, "MIN_BITRATE", 250000) or 250000), 600000)
+        aiortc_vpx.DEFAULT_BITRATE = max(int(getattr(aiortc_vpx, "DEFAULT_BITRATE", 500000) or 500000), 1800000)
+        aiortc_vpx.MAX_BITRATE = max(int(getattr(aiortc_vpx, "MAX_BITRATE", 1500000) or 1500000), 3500000)
+    except Exception:
+        pass
+
+    encoder_cls = getattr(aiortc_h264, "H264Encoder", None)
+    if encoder_cls is None or getattr(encoder_cls, "_codrex_patched", False):
+        return
+
+    original_encode = encoder_cls.encode
+
+    def _codrex_encode(self: Any, frame: Any, force_keyframe: bool = False):
+        frames_since_keyframe = int(getattr(self, "_codrex_frames_since_keyframe", 0) or 0)
+        should_force = bool(force_keyframe) or frames_since_keyframe <= 0 or frames_since_keyframe >= 12
+        result = original_encode(self, frame, should_force)
+        setattr(self, "_codrex_frames_since_keyframe", 1 if should_force else (frames_since_keyframe + 1))
+        return result
+
+    encoder_cls.encode = _codrex_encode  # type: ignore[assignment]
+    encoder_cls._codrex_patched = True  # type: ignore[attr-defined]
+
+
+_patch_desktop_webrtc_codecs()
 
 START_TIME = time.time()
+LOGGER = logging.getLogger("codrex.remote")
 app = FastAPI(title="Codrex Remote UI", version="1.5.0")
 APP_ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 UI_DIST_DIR = os.path.join(APP_ROOT_DIR, "ui", "dist")
@@ -147,6 +218,16 @@ def _default_runtime_dir() -> str:
         or os.path.join(os.path.expanduser("~"), ".local", "state")
     )
     return os.path.abspath(os.path.join(base, "codrex-remote-ui"))
+
+
+def _default_host_transfer_dir() -> str:
+    if os.name == "nt":
+        base = (
+            os.environ.get("USERPROFILE")
+            or os.path.expanduser("~")
+        )
+        return os.path.abspath(os.path.join(base, "Downloads", "Codrex Transfers"))
+    return os.path.abspath(os.path.join(os.path.expanduser("~"), "Downloads", "codrex-transfers"))
 
 
 def _desktop_perf_wallpaper_path() -> str:
@@ -279,6 +360,101 @@ def pairing_consume_code(code: str) -> bool:
         PAIRING_CODES.pop(code, None)
     return True
 
+
+def _normalize_pair_route(raw: Any) -> str:
+    value = str(raw or "").strip().lower()
+    if value in {"tailscale", "netbird", "lan", "current"}:
+        return value
+    return "tailscale"
+
+
+def _launcher_state_file_path() -> str:
+    return os.path.join(CODEX_RUNTIME_STATE_DIR, "launcher.state.json")
+
+
+def _preferred_pair_route() -> str:
+    prefs = _read_json_file(_launcher_state_file_path())
+    return _normalize_pair_route(prefs.get("preferred_pair_route"))
+
+
+def _trusted_device_token_hash(token: str) -> str:
+    return hashlib.sha256(str(token or "").encode("utf-8")).hexdigest()
+
+
+def _load_trusted_devices_unlocked() -> None:
+    global TRUSTED_DEVICES_LOADED
+    if TRUSTED_DEVICES_LOADED:
+        return
+    loaded = _read_json_file(TRUSTED_DEVICES_FILE)
+    devices = loaded.get("devices") if isinstance(loaded, dict) else None
+    TRUSTED_DEVICES_DATA["devices"] = list(devices) if isinstance(devices, list) else []
+    TRUSTED_DEVICES_LOADED = True
+
+
+def _persist_trusted_devices_unlocked() -> None:
+    devices = [
+        item for item in list(TRUSTED_DEVICES_DATA.get("devices") or [])
+        if isinstance(item, dict) and str(item.get("id") or "").strip()
+    ]
+    devices.sort(key=lambda item: float(item.get("updated_at") or item.get("created_at") or 0.0), reverse=True)
+    if TRUSTED_DEVICES_MAX_KEEP > 0:
+        devices = devices[:TRUSTED_DEVICES_MAX_KEEP]
+    TRUSTED_DEVICES_DATA["devices"] = devices
+    _write_json_file(TRUSTED_DEVICES_FILE, {"devices": devices})
+
+
+def _issue_trusted_device(name: str = "", platform: str = "", current_origin: str = "") -> Dict[str, Any]:
+    device_id = f"android_{secrets.token_urlsafe(9)}"
+    device_token = secrets.token_urlsafe(32)
+    now = time.time()
+    record = {
+        "id": device_id,
+        "token_hash": _trusted_device_token_hash(device_token),
+        "name": str(name or "").strip()[:120] or "Codrex Android",
+        "platform": str(platform or "").strip()[:48] or "android",
+        "created_at": now,
+        "updated_at": now,
+        "last_seen_at": now,
+        "last_origin": str(current_origin or "").strip(),
+    }
+    with TRUSTED_DEVICES_LOCK:
+        _load_trusted_devices_unlocked()
+        devices = [item for item in list(TRUSTED_DEVICES_DATA.get("devices") or []) if isinstance(item, dict)]
+        devices.insert(0, record)
+        TRUSTED_DEVICES_DATA["devices"] = devices
+        _persist_trusted_devices_unlocked()
+    return {
+        "device_id": device_id,
+        "device_token": device_token,
+        "device_name": record["name"],
+        "device_platform": record["platform"],
+    }
+
+
+def _resume_trusted_device(device_id: str, device_token: str, current_origin: str = "") -> Dict[str, Any]:
+    wanted_id = str(device_id or "").strip()
+    wanted_token = str(device_token or "").strip()
+    if not wanted_id or not wanted_token:
+        return {}
+    token_hash = _trusted_device_token_hash(wanted_token)
+    now = time.time()
+    with TRUSTED_DEVICES_LOCK:
+        _load_trusted_devices_unlocked()
+        devices = [item for item in list(TRUSTED_DEVICES_DATA.get("devices") or []) if isinstance(item, dict)]
+        for item in devices:
+            if str(item.get("id") or "").strip() != wanted_id:
+                continue
+            if str(item.get("token_hash") or "").strip() != token_hash:
+                return {}
+            item["last_seen_at"] = now
+            item["updated_at"] = now
+            if current_origin:
+                item["last_origin"] = str(current_origin).strip()
+            TRUSTED_DEVICES_DATA["devices"] = devices
+            _persist_trusted_devices_unlocked()
+            return dict(item)
+    return {}
+
 def _tailscale_exe_path() -> str:
     if os.name != "nt":
         return ""
@@ -320,10 +496,9 @@ def _tailscale_exe_path() -> str:
     return ""
 
 
-def _tailscale_ipv4_from_ipconfig() -> str:
+def _adapter_ipv4_from_ipconfig(adapter_keywords: List[str]) -> str:
     """
-    Best-effort fallback for Windows setups where tailscale.exe is unavailable
-    to this process (PATH/service context), but the Tailscale adapter exists.
+    Best-effort Windows adapter detection by parsing ipconfig blocks.
     """
     if os.name != "nt":
         return ""
@@ -339,7 +514,8 @@ def _tailscale_ipv4_from_ipconfig() -> str:
     except Exception:
         return ""
 
-    in_tailscale_block = False
+    wanted = [str(keyword or "").strip().lower() for keyword in adapter_keywords if str(keyword or "").strip()]
+    in_adapter_block = False
     for raw_line in out.splitlines():
         line = (raw_line or "").strip()
         low = line.lower()
@@ -347,9 +523,9 @@ def _tailscale_ipv4_from_ipconfig() -> str:
         # Adapter section headers are not indented in ipconfig output.
         is_section_header = bool(line) and line.endswith(":") and raw_line == raw_line.lstrip()
         if is_section_header:
-            in_tailscale_block = "tailscale" in low
+            in_adapter_block = any(keyword in low for keyword in wanted)
             continue
-        if not in_tailscale_block:
+        if not in_adapter_block:
             continue
 
         m = re.search(r"(\d+\.\d+\.\d+\.\d+)", line)
@@ -359,6 +535,14 @@ def _tailscale_ipv4_from_ipconfig() -> str:
         if ip and ip != "127.0.0.1" and not ip.startswith("169.254."):
             return ip
     return ""
+
+
+def _tailscale_ipv4_from_ipconfig() -> str:
+    """
+    Best-effort fallback for Windows setups where tailscale.exe is unavailable
+    to this process (PATH/service context), but the Tailscale adapter exists.
+    """
+    return _adapter_ipv4_from_ipconfig(["tailscale"])
 
 
 def get_tailscale_ipv4() -> str:
@@ -412,6 +596,17 @@ def get_tailscale_ipv4() -> str:
         pass
     return _tailscale_ipv4_from_ipconfig()
 
+
+def _netbird_ipv4_from_ipconfig() -> str:
+    return _adapter_ipv4_from_ipconfig(["netbird"])
+
+
+def get_netbird_ipv4() -> str:
+    if os.name != "nt":
+        return ""
+    return _netbird_ipv4_from_ipconfig()
+
+
 def guess_lan_ipv4() -> str:
     # Works on Windows and Linux. Doesn't actually send packets, just picks the default route.
     try:
@@ -424,12 +619,135 @@ def guess_lan_ipv4() -> str:
         return ""
 
 
+def _origin_payload(provider: str, host: str, port: int, *, private: bool = False) -> Dict[str, Any]:
+    cleaned_host = str(host or "").strip()
+    if not cleaned_host:
+        return {}
+    effective_port = int(port or 0) or 48787
+    return {
+        "provider": provider,
+        "host": cleaned_host,
+        "origin": f"http://{cleaned_host}:{effective_port}",
+        "label": provider.replace("_", " ").title(),
+        "private": bool(private),
+    }
+
+
+def _route_priority() -> List[str]:
+    # Keep Tailscale as the default private route until NetBird proves itself.
+    return ["tailscale", "netbird", "lan", "localhost"]
+
+
+def _classify_route_provider(host: str, net_info: Optional[Dict[str, Any]] = None) -> str:
+    normalized = str(host or "").strip().lower()
+    if not normalized:
+        return "unknown"
+    if normalized in {"localhost", "127.0.0.1", "::1"}:
+        return "localhost"
+    info = net_info or {}
+    netbird_ip = str(info.get("netbird_ip") or "").strip().lower()
+    tailscale_ip = str(info.get("tailscale_ip") or "").strip().lower()
+    lan_ip = str(info.get("lan_ip") or "").strip().lower()
+    if netbird_ip and normalized == netbird_ip:
+        return "netbird"
+    if tailscale_ip and normalized == tailscale_ip:
+        return "tailscale"
+    if lan_ip and normalized == lan_ip:
+        return "lan"
+    return "unknown"
+
+
+def _build_available_origins(controller_port: int, net_info: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+    info = dict(net_info or {})
+    items: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    for provider, host, private in (
+        ("tailscale", str(info.get("tailscale_ip") or "").strip(), True),
+        ("netbird", str(info.get("netbird_ip") or "").strip(), True),
+        ("lan", str(info.get("lan_ip") or "").strip(), False),
+        ("localhost", "127.0.0.1", False),
+    ):
+        payload = _origin_payload(provider, host, controller_port, private=private)
+        origin = str(payload.get("origin") or "").strip()
+        if not origin or origin in seen:
+            continue
+        seen.add(origin)
+        items.append(payload)
+    return items
+
+
+def _resolve_preferred_origin(
+    controller_port: int,
+    net_info: Optional[Dict[str, Any]] = None,
+    request_host: str = "",
+) -> Tuple[str, str, str]:
+    items = _build_available_origins(controller_port, net_info)
+    info = dict(net_info or {})
+    current_provider = _classify_route_provider(request_host, info)
+    if current_provider in {"tailscale", "netbird", "lan"}:
+        for item in items:
+            if str(item.get("provider") or "") == current_provider:
+                provider = str(item.get("provider") or "unknown")
+                return str(item.get("origin") or ""), provider, "connected"
+
+    for wanted in _route_priority():
+        for item in items:
+            if str(item.get("provider") or "") == wanted:
+                provider = str(item.get("provider") or "unknown")
+                if provider in {"tailscale", "netbird"}:
+                    return str(item.get("origin") or ""), provider, "connected"
+                if provider == "lan":
+                    return str(item.get("origin") or ""), provider, "local_only"
+                return str(item.get("origin") or ""), provider, "local_only"
+    return "", "unknown", "unavailable"
+
+
 def _compute_net_info_payload() -> Dict[str, Any]:
     mac_info = _wake_mac_info()
+    lan_ip = guess_lan_ipv4()
+    tailscale_ip = get_tailscale_ipv4()
+    netbird_ip = get_netbird_ipv4()
+    preferred_pair_route = _preferred_pair_route()
+    controller_port = 48787
+    try:
+        persisted = _read_json_file(os.path.join(APP_ROOT_DIR, "controller.config.json")) or {}
+        controller_port = int((persisted or {}).get("port") or 0) or controller_port
+    except Exception:
+        controller_port = 48787
+    available_origins = _build_available_origins(
+        controller_port,
+        {
+            "lan_ip": lan_ip,
+            "tailscale_ip": tailscale_ip,
+            "netbird_ip": netbird_ip,
+        },
+    )
+    preferred_origin, route_provider, route_state = _resolve_preferred_origin(
+        controller_port,
+        {
+            "lan_ip": lan_ip,
+            "tailscale_ip": tailscale_ip,
+            "netbird_ip": netbird_ip,
+        },
+    )
+    tailscale_available = bool(tailscale_ip)
+    tailscale_warning = (
+        "Tailscale is off on this laptop."
+        if preferred_pair_route == "tailscale" and not tailscale_available
+        else ""
+    )
     return {
         "ok": True,
-        "lan_ip": guess_lan_ipv4(),
-        "tailscale_ip": get_tailscale_ipv4(),
+        "lan_ip": lan_ip,
+        "tailscale_ip": tailscale_ip,
+        "netbird_ip": netbird_ip,
+        "preferred_pair_route": preferred_pair_route,
+        "tailscale_available": tailscale_available,
+        "tailscale_warning": tailscale_warning,
+        "available_origins": available_origins,
+        "preferred_origin": preferred_origin,
+        "route_provider": route_provider,
+        "route_state": route_state,
         "primary_mac": str(mac_info.get("primary_mac") or ""),
         "wake_candidate_macs": list(mac_info.get("wake_candidate_macs") or []),
         "wake_supported": bool(mac_info.get("wake_supported")),
@@ -762,6 +1080,10 @@ CODEX_RUNTIME_STATE_DIR = os.path.join(CODEX_RUNTIME_DIR, "state")
 CODEX_RUNTIME_LOGS_DIR = os.path.join(CODEX_RUNTIME_DIR, "logs")
 CODEX_RUNTIME_SECRETS_DIR = os.path.join(CODEX_RUNTIME_DIR, "secrets")
 CODEX_RUNTIME_TELEGRAM_DIR = os.path.join(CODEX_RUNTIME_SECRETS_DIR, "telegram")
+CODEX_HOST_TRANSFER_ROOT = os.path.abspath(
+    str(os.environ.get("CODEX_HOST_TRANSFER_ROOT") or _default_host_transfer_dir()).strip()
+)
+CODEX_HOST_PASTE_CACHE_DIR = os.path.join(CODEX_RUNTIME_DIR, "host-paste-cache")
 LEGACY_RUNTIME_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
 VALID_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
@@ -782,6 +1104,17 @@ MAX_DESKTOP_TEXT = 2000
 SHOW_CURSOR_OVERLAY = os.environ.get("CODEX_SHOW_CURSOR_OVERLAY", "1").strip().lower() not in {"0", "false", "no"}
 DESKTOP_STREAM_FPS_DEFAULT = float(os.environ.get("CODEX_DESKTOP_STREAM_FPS", "3.0") or "3.0")
 DESKTOP_STREAM_PNG_LEVEL_DEFAULT = int(os.environ.get("CODEX_DESKTOP_STREAM_PNG_LEVEL", "3") or "3")
+DESKTOP_STREAM_FORMAT_DEFAULT = str(os.environ.get("CODEX_DESKTOP_STREAM_FORMAT", "png") or "png").strip().lower()
+DESKTOP_STREAM_JPEG_QUALITY_DEFAULT = int(os.environ.get("CODEX_DESKTOP_STREAM_JPEG_QUALITY", "74") or "74")
+DESKTOP_WEBRTC_ENABLED = str(os.environ.get("CODEX_DESKTOP_WEBRTC", "1") or "1").strip().lower() in {"1", "true", "yes", "on"}
+DESKTOP_STREAM_PREFERRED_TRANSPORT = "webrtc" if (AIORTC_AVAILABLE and DESKTOP_WEBRTC_ENABLED) else "fallback"
+DESKTOP_STREAM_FALLBACK_TRANSPORT = "multipart_png"
+DESKTOP_WEBRTC_SESSION_LOCK = threading.Lock()
+DESKTOP_WEBRTC_SESSIONS: Dict[str, Dict[str, Any]] = {}
+DESKTOP_CAPTURE_TLS = threading.local()
+WINDOWS_DPI_AWARE = False
+WINDOWS_DPI_AWARE_LOCK = threading.Lock()
+DESKTOP_WEBRTC_MAX_SESSIONS = int(os.environ.get("CODEX_DESKTOP_WEBRTC_MAX_SESSIONS", "2") or "2")
 DESKTOP_MODE_LOCK = threading.Lock()
 DESKTOP_MODE_ENABLED = str(os.environ.get("CODEX_DESKTOP_MODE_DEFAULT", "1") or "1").strip().lower() not in {"0", "false", "no", "off"}
 DESKTOP_ALT_LOCK = threading.Lock()
@@ -897,6 +1230,18 @@ APP_RUNTIME_SESSION_FILE = os.path.abspath(
     )
 )
 LEGACY_APP_RUNTIME_SESSION_FILE = os.path.abspath(os.path.join(LEGACY_RUNTIME_DIR, "logs", "mobile.session.json"))
+TRUSTED_DEVICES_FILE = os.path.abspath(
+    os.environ.get(
+        "CODEX_TRUSTED_DEVICES_FILE",
+        os.path.join(CODEX_RUNTIME_STATE_DIR, "trusted-devices.json"),
+    )
+)
+TRUSTED_DEVICES_LOCK = threading.Lock()
+TRUSTED_DEVICES_MAX_KEEP = int(os.environ.get("CODEX_TRUSTED_DEVICES_MAX_KEEP", "20") or "20")
+TRUSTED_DEVICES_DATA: Dict[str, Any] = {
+    "devices": [],
+}
+TRUSTED_DEVICES_LOADED = False
 
 # -------------------------
 # Session output stream state
@@ -944,6 +1289,7 @@ for _runtime_dir in (
     CODEX_RUNTIME_LOGS_DIR,
     CODEX_RUNTIME_SECRETS_DIR,
     CODEX_RUNTIME_TELEGRAM_DIR,
+    CODEX_HOST_TRANSFER_ROOT,
 ):
     try:
         os.makedirs(_runtime_dir, exist_ok=True)
@@ -980,6 +1326,19 @@ def _read_json_file(path: str) -> Dict[str, Any]:
     except Exception:
         return {}
     return parsed if isinstance(parsed, dict) else {}
+
+
+def _write_json_file(path: str, payload: Dict[str, Any]) -> None:
+    p = str(path or "").strip()
+    if not p:
+        return
+    parent = os.path.dirname(p)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    tmp_path = f"{p}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(payload or {}, f, indent=2, ensure_ascii=True)
+    os.replace(tmp_path, p)
 
 
 def _parse_telegram_secret_text(raw: str) -> Dict[str, str]:
@@ -1526,8 +1885,12 @@ def _share_expired(item: Dict[str, Any], now_ms: Optional[int] = None) -> bool:
 def _shared_item_from_raw(raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     item_id = _clean_entity_id(raw.get("id"))
     wsl_path = str(raw.get("wsl_path") or "").strip()
+    has_wsl_path = wsl_path.startswith("/")
     file_name = str(raw.get("file_name") or "").strip()
-    if not item_id or not wsl_path.startswith("/") or not file_name:
+    windows_path = str(raw.get("windows_path") or "").strip()
+    if not item_id or not file_name:
+        return None
+    if not has_wsl_path and not windows_path:
         return None
     now_ms = _now_ms()
     created_at = _coerce_ms(raw.get("created_at"), now_ms)
@@ -1547,13 +1910,15 @@ def _shared_item_from_raw(raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     if item_kind not in {"file", "directory"}:
         item_kind = "directory" if bool(raw.get("is_directory")) else "file"
     source_kind = str(raw.get("source_kind") or "").strip().lower() or "registered"
-    windows_path = str(raw.get("windows_path") or _wsl_to_windows_path(wsl_path) or "").strip()
+    windows_path = windows_path or (_wsl_to_windows_path(wsl_path) if has_wsl_path else "")
+    if not has_wsl_path and not os.path.isabs(windows_path):
+        return None
     display_path = str(raw.get("display_path") or windows_path or wsl_path).strip()
     is_image = item_kind == "file" and (bool(raw.get("is_image")) or mime_type.startswith("image/"))
     return {
         "id": item_id,
         "title": _normalize_share_title(raw.get("title"), file_name),
-        "wsl_path": wsl_path,
+        "wsl_path": wsl_path if has_wsl_path else "",
         "file_name": file_name[:180],
         "mime_type": mime_type[:120],
         "size_bytes": size_bytes,
@@ -1737,6 +2102,115 @@ def _create_shared_outbox_item(
         "source_kind": (source_kind or "registered")[:32],
         "windows_path": _wsl_to_windows_path(wsl_abs),
         "display_path": _display_path_for_wsl(wsl_abs),
+    }
+    with SHARED_OUTBOX_LOCK:
+        _load_shared_outbox_unlocked()
+        SHARED_OUTBOX_DATA["items"].insert(0, item)
+        _persist_shared_outbox_unlocked()
+    return item
+
+
+def _normalize_host_path(path_value: str) -> str:
+    cleaned = str(path_value or "").strip().strip('"')
+    if not cleaned:
+        raise HTTPException(status_code=400, detail="path is required.")
+    normalized = os.path.normpath(os.path.abspath(cleaned))
+    if not os.path.isabs(normalized):
+        raise HTTPException(status_code=400, detail="Host path must be absolute.")
+    drive, _ = os.path.splitdrive(normalized)
+    if not drive:
+        raise HTTPException(status_code=400, detail="Host path must resolve to a local drive.")
+    return normalized
+
+
+def _host_unique_target_path(dest_dir: str, file_name: str) -> str:
+    directory = _normalize_host_path(dest_dir)
+    os.makedirs(directory, exist_ok=True)
+    base_name = os.path.basename(str(file_name or "").strip()) or "upload.bin"
+    safe_name = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "_", base_name).strip(" .") or "upload.bin"
+    stem, ext = os.path.splitext(safe_name)
+    candidate = os.path.join(directory, safe_name)
+    counter = 2
+    while os.path.exists(candidate):
+        candidate = os.path.join(directory, f"{stem} ({counter}){ext}")
+        counter += 1
+    return candidate
+
+
+def _inspect_host_share_path(path_value: str, *, allow_directory: bool = False) -> Dict[str, Any]:
+    _ensure_windows_host()
+    host_path = _normalize_host_path(path_value)
+    if not os.path.exists(host_path):
+        raise HTTPException(status_code=404, detail="Host path not found.")
+    is_directory = os.path.isdir(host_path)
+    if is_directory and not allow_directory:
+        raise HTTPException(status_code=400, detail="Host path is a directory. Provide a file path.")
+    try:
+        size_bytes = 0 if is_directory else int(os.path.getsize(host_path))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Could not stat host path: {type(exc).__name__}: {exc}")
+    max_bytes = max(1, SHARED_OUTBOX_MAX_FILE_MB) * 1024 * 1024
+    if size_bytes > max_bytes:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File too large ({size_bytes} bytes). Limit is {max_bytes} bytes.",
+        )
+    file_name = os.path.basename(host_path.rstrip("\\/")) or "shared.bin"
+    if is_directory:
+        mime_type = "inode/directory"
+    else:
+        claimed_mime = (mimetypes.guess_type(file_name)[0] or "application/octet-stream").strip() or "application/octet-stream"
+        detected_mime = ""
+        try:
+            with open(host_path, "rb") as f:
+                detected_mime = _detect_mime_from_bytes(f.read(512))
+        except Exception:
+            detected_mime = ""
+        mime_type = _choose_effective_mime_type(claimed_mime, detected_mime)
+    return {
+        "path": host_path,
+        "file_name": file_name,
+        "mime_type": mime_type,
+        "size_bytes": size_bytes,
+        "is_directory": is_directory,
+    }
+
+
+def _create_host_shared_outbox_item(
+    path_value: str,
+    *,
+    title: str = "",
+    expires_hours: Optional[int] = None,
+    created_by: str = "",
+    session: str = "",
+    allow_directory: bool = False,
+    source_kind: str = "host_transfer",
+) -> Dict[str, Any]:
+    info = _inspect_host_share_path(path_value, allow_directory=allow_directory)
+    now_ms = _now_ms()
+    expires_h = _normalize_share_expires_hours(expires_hours)
+    expires_at = now_ms + int(expires_h * 3600 * 1000)
+    normalized_session = session.strip() if isinstance(session, str) else ""
+    if not normalized_session:
+        normalized_session = _session_id_from_created_by(created_by)
+    if normalized_session and not VALID_NAME_RE.fullmatch(normalized_session):
+        raise HTTPException(status_code=400, detail="Invalid session name.")
+    item = {
+        "id": f"shr_{uuid.uuid4().hex[:12]}",
+        "title": _normalize_share_title(title, info["file_name"]),
+        "wsl_path": "",
+        "file_name": info["file_name"],
+        "mime_type": info["mime_type"],
+        "size_bytes": info["size_bytes"],
+        "created_at": now_ms,
+        "expires_at": expires_at,
+        "created_by": (created_by or "host")[:64],
+        "is_image": str(info["mime_type"]).startswith("image/"),
+        "session": normalized_session,
+        "item_kind": "directory" if info["is_directory"] else "file",
+        "source_kind": (source_kind or "host_transfer")[:32],
+        "windows_path": info["path"],
+        "display_path": info["path"],
     }
     with SHARED_OUTBOX_LOCK:
         _load_shared_outbox_unlocked()
@@ -2636,6 +3110,16 @@ def _win_send_input() -> Any:
     return user32.SendInput
 
 
+def _win_vk_key_scan() -> Any:
+    _ensure_windows_host()
+    user32 = _win_user32()
+    if not hasattr(_win_vk_key_scan, "_configured"):
+        user32.VkKeyScanW.argtypes = [wintypes.WCHAR]
+        user32.VkKeyScanW.restype = ctypes.c_short
+        _win_vk_key_scan._configured = True  # type: ignore[attr-defined]
+    return user32.VkKeyScanW
+
+
 def _send_inputs(inputs: List[INPUT]) -> None:
     send_input = _win_send_input()
     arr = (INPUT * len(inputs))(*inputs)
@@ -2690,6 +3174,32 @@ def _send_vk_combo(modifiers: List[int], vk: int, extended: bool = False) -> Non
     for mod in reversed(modifiers):
         seq.append(INPUT(type=INPUT_KEYBOARD, union=INPUT_UNION(ki=KEYBDINPUT(wVk=mod, wScan=0, dwFlags=KEYEVENTF_KEYUP, time=0, dwExtraInfo=0))))
     _send_inputs(seq)
+
+
+def _send_char_key(char: str) -> bool:
+    value = str(char or "")
+    if len(value) != 1:
+        return False
+    try:
+        scan = int(_win_vk_key_scan()(value))
+    except Exception:
+        return False
+    if scan == -1:
+        return False
+    vk = scan & 0xFF
+    shift_state = (scan >> 8) & 0xFF
+    modifiers: List[int] = []
+    if shift_state & 1:
+        modifiers.append(VK_SHIFT)
+    if shift_state & 2:
+        modifiers.append(VK_CONTROL)
+    if shift_state & 4:
+        modifiers.append(VK_MENU)
+    if modifiers:
+        _send_vk_combo(modifiers, vk)
+    else:
+        _send_vk(vk)
+    return True
 
 
 def _send_unicode_text(text: str) -> None:
@@ -2783,6 +3293,138 @@ def _wsl_executable() -> str:
     if os.path.exists(sys32_wsl):
         return sys32_wsl
     return "wsl"
+
+
+def _parse_wsl_list_output(stdout: str, distro_name: str) -> Dict[str, Any]:
+    wanted = str(distro_name or "").strip().lower()
+    lines = [str(line or "").rstrip() for line in (stdout or "").splitlines()]
+    for raw_line in lines:
+        line = raw_line.replace("\x00", "").strip()
+        if not line or line.lower().startswith("name") or set(line) <= {"-", " "}:
+            continue
+        if line.startswith("*"):
+            line = line[1:].strip()
+        parts = [part.strip() for part in re.split(r"\s{2,}", line) if part.strip()]
+        if len(parts) < 2:
+            continue
+        name = parts[0].lower()
+        if name != wanted:
+            continue
+        state = parts[1].strip().lower()
+        if state == "running":
+            return {"state": "running", "detail": f"{distro_name} is running.", "can_start": False, "can_stop": True}
+        if state == "stopped":
+            return {"state": "stopped", "detail": f"{distro_name} is stopped.", "can_start": True, "can_stop": False}
+        return {"state": "unknown", "detail": f"{distro_name} reported state '{parts[1]}'.", "can_start": False, "can_stop": False}
+    return {"state": "missing", "detail": f"{distro_name} is not installed.", "can_start": False, "can_stop": False}
+
+
+def _wsl_runtime_status_payload() -> Dict[str, Any]:
+    if os.name != "nt":
+        return {
+            "state": "running",
+            "detail": "Non-Windows host runtime assumed active.",
+            "can_start": False,
+            "can_stop": False,
+            "distro": WSL_DISTRO,
+        }
+    try:
+        result = subprocess.run(
+            [_wsl_executable(), "-l", "-v"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=8,
+            **_wsl_run_kwargs(),
+        )
+    except Exception as exc:
+        return {
+            "state": "unknown",
+            "detail": f"Could not inspect WSL runtime: {type(exc).__name__}: {exc}",
+            "can_start": False,
+            "can_stop": False,
+            "distro": WSL_DISTRO,
+        }
+    stdout = (result.stdout or "").strip()
+    stderr = (result.stderr or "").strip()
+    if result.returncode != 0 and not stdout:
+        detail = stderr or stdout or f"wsl.exe exited with {result.returncode}."
+        return {
+            "state": "unknown",
+            "detail": detail,
+            "can_start": False,
+            "can_stop": False,
+            "distro": WSL_DISTRO,
+        }
+    parsed = _parse_wsl_list_output(stdout, WSL_DISTRO)
+    parsed["distro"] = WSL_DISTRO
+    return parsed
+
+
+def _start_wsl_runtime() -> Dict[str, Any]:
+    status = _wsl_runtime_status_payload()
+    if status.get("state") == "running":
+        return {"ok": True, **status}
+    if status.get("state") == "missing":
+        return {"ok": False, **status}
+    try:
+        result = subprocess.run(
+            [_wsl_executable(), "-d", WSL_DISTRO, "--", "bash", "-lc", "tmux start-server >/dev/null 2>&1 || true; printf ready"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=20,
+            **_wsl_run_kwargs(),
+        )
+    except Exception as exc:
+        return {
+            "ok": False,
+            "state": "unknown",
+            "detail": f"Could not start WSL runtime: {type(exc).__name__}: {exc}",
+            "can_start": True,
+            "can_stop": False,
+            "distro": WSL_DISTRO,
+        }
+    fresh = _wsl_runtime_status_payload()
+    return {
+        "ok": bool(result.returncode == 0 and fresh.get("state") == "running"),
+        **fresh,
+    }
+
+
+def _stop_wsl_runtime() -> Dict[str, Any]:
+    status = _wsl_runtime_status_payload()
+    if status.get("state") == "stopped":
+        return {"ok": True, **status}
+    if status.get("state") == "missing":
+        return {"ok": False, **status}
+    try:
+        result = subprocess.run(
+            [_wsl_executable(), "--terminate", WSL_DISTRO],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=12,
+            **_wsl_run_kwargs(),
+        )
+    except Exception as exc:
+        return {
+            "ok": False,
+            "state": "unknown",
+            "detail": f"Could not stop WSL runtime: {type(exc).__name__}: {exc}",
+            "can_start": False,
+            "can_stop": True,
+            "distro": WSL_DISTRO,
+        }
+    fresh = _wsl_runtime_status_payload()
+    return {
+        "ok": bool(result.returncode == 0 and fresh.get("state") == "stopped"),
+        **fresh,
+    }
+
 
 def run_wsl_bash(command: str, timeout_s: int = 30) -> Dict[str, Any]:
     args = [_wsl_executable(), "-d", WSL_DISTRO, "--", "bash", "-lc", command]
@@ -2916,6 +3558,547 @@ def _resolve_session_access_path(user_path: str) -> str:
     if not any(_path_under_root(resolved, allowed_root) for allowed_root in allowed_roots):
         raise HTTPException(status_code=403, detail="Path is outside allowed browse roots.")
     return resolved
+
+
+def _looks_like_windows_host_path(path_value: str) -> bool:
+    candidate = str(path_value or "").strip().strip('"')
+    if not candidate:
+        return False
+    return bool(re.match(r"^[A-Za-z]:[\\/]", candidate) or candidate.startswith("\\\\"))
+
+
+def _resolve_existing_host_path(path_value: str) -> Dict[str, str]:
+    host_path = _normalize_host_path(path_value)
+    if not os.path.exists(host_path):
+        raise HTTPException(status_code=404, detail="Host path not found.")
+    item_kind = "directory" if os.path.isdir(host_path) else "file"
+    return {
+        "requested_path": path_value,
+        "normalized_path": host_path,
+        "opened_path": host_path,
+        "item_kind": item_kind,
+    }
+
+
+def _strip_path_location_suffix(path_value: str) -> str:
+    candidate = str(path_value or "").strip()
+    if not candidate:
+        return ""
+    if candidate.startswith("<") and candidate.endswith(">") and len(candidate) > 2:
+        candidate = candidate[1:-1].strip()
+    hash_match = re.search(r"#L\d+(?:C\d+)?$", candidate)
+    if hash_match:
+        candidate = candidate[:hash_match.start()].rstrip()
+    colon_match = re.search(r":\d+(?::\d+)?$", candidate)
+    if colon_match:
+        prefix = candidate[:colon_match.start()]
+        if "/" in prefix or "\\" in prefix:
+            candidate = prefix.rstrip()
+    return candidate
+
+
+def _resolve_openable_host_path(path_value: str) -> Dict[str, str]:
+    cleaned = _strip_path_location_suffix(path_value)
+    if not cleaned:
+        raise HTTPException(status_code=400, detail="path is required.")
+    if os.name == "nt" and _looks_like_windows_host_path(cleaned):
+        return _resolve_existing_host_path(cleaned)
+    resolved = _resolve_session_access_path(cleaned)
+    unc = _wsl_unc_path(resolved)
+    if not os.path.exists(unc):
+        raise HTTPException(status_code=404, detail="Path not found.")
+    item_kind = "directory" if os.path.isdir(unc) else "file"
+    windows_path = _wsl_to_windows_path(resolved)
+    launch_path = windows_path or unc
+    return {
+        "requested_path": cleaned,
+        "normalized_path": resolved,
+        "opened_path": launch_path,
+        "item_kind": item_kind,
+    }
+
+
+def _open_resolved_host_path(info: Dict[str, str]) -> Dict[str, Any]:
+    opened_path = info["opened_path"]
+    try:
+        os.startfile(opened_path)
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"Could not open path: {exc}")
+    return {
+        "ok": True,
+        "path": info["requested_path"],
+        "normalized_path": info["normalized_path"],
+        "opened_path": opened_path,
+        "item_kind": info["item_kind"],
+        "detail": f"Opened {info['item_kind']}: {opened_path}",
+    }
+
+
+def _reveal_resolved_host_path(info: Dict[str, str]) -> Dict[str, Any]:
+    opened_path = info["opened_path"]
+    if info["item_kind"] == "file":
+        try:
+            subprocess.Popen(
+                ["explorer.exe", f"/select,{opened_path}"],
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"Could not reveal path: {exc}")
+    else:
+        try:
+            os.startfile(opened_path)
+        except OSError as exc:
+            raise HTTPException(status_code=500, detail=f"Could not open directory: {exc}")
+    return {
+        "ok": True,
+        "path": info["requested_path"],
+        "normalized_path": info["normalized_path"],
+        "opened_path": opened_path,
+        "item_kind": info["item_kind"],
+        "detail": f"Revealed {info['item_kind']}: {opened_path}",
+    }
+
+
+def _desktop_stream_transport_payload() -> Dict[str, Any]:
+    detail = ""
+    if AIORTC_AVAILABLE and DESKTOP_WEBRTC_ENABLED:
+        detail = "WebRTC transport is enabled on this host."
+    elif not AIORTC_AVAILABLE:
+        detail = f"WebRTC fallback active because aiortc is unavailable ({AIORTC_IMPORT_ERROR or 'import_failed'})."
+    elif not DESKTOP_WEBRTC_ENABLED:
+        detail = "WebRTC transport is installed but disabled by CODEX_DESKTOP_WEBRTC."
+    else:
+        detail = "WebRTC fallback active."
+    return {
+        "desktop_stream_transport": DESKTOP_STREAM_PREFERRED_TRANSPORT,
+        "desktop_stream_fallback": DESKTOP_STREAM_FALLBACK_TRANSPORT,
+        "desktop_webrtc_available": bool(AIORTC_AVAILABLE),
+        "desktop_webrtc_enabled": bool(DESKTOP_WEBRTC_ENABLED and AIORTC_AVAILABLE),
+        "desktop_webrtc_detail": detail,
+    }
+
+
+def _desktop_webrtc_payload_session_id(value: Any) -> str:
+    session_id = _clean_entity_id(str(value or ""))
+    if not session_id:
+        raise HTTPException(status_code=400, detail="session_id is required.")
+    return session_id
+
+
+def _desktop_webrtc_candidate_payload(candidate: Dict[str, Any]) -> Any:
+    if not AIORTC_AVAILABLE or candidate_from_sdp is None:
+        raise HTTPException(status_code=503, detail="WebRTC support is unavailable on this host.")
+    candidate_sdp = str(candidate.get("candidate") or "").strip()
+    if not candidate_sdp:
+        return None
+    parsed = candidate_from_sdp(candidate_sdp[10:] if candidate_sdp.startswith("candidate:") else candidate_sdp)
+    parsed.sdpMid = candidate.get("sdpMid")
+    parsed.sdpMLineIndex = candidate.get("sdpMLineIndex")
+    return parsed
+
+
+def _desktop_webrtc_store_session(
+    session_id: str,
+    pc: Any,
+    track: Any,
+    sender: Any = None,
+    transceiver: Any = None,
+) -> None:
+    with DESKTOP_WEBRTC_SESSION_LOCK:
+        DESKTOP_WEBRTC_SESSIONS[session_id] = {
+            "pc": pc,
+            "track": track,
+            "sender": sender,
+            "transceiver": transceiver,
+            "created_at": time.time(),
+            "sent_local_candidate_keys": set(),
+            "local_candidates_complete": False,
+            "last_local_candidate_count": 0,
+            "local_description_ready": False,
+            "local_description_error": "",
+            "local_description_task": None,
+        }
+
+
+def _desktop_webrtc_pop_session(session_id: str) -> Optional[Dict[str, Any]]:
+    with DESKTOP_WEBRTC_SESSION_LOCK:
+        return DESKTOP_WEBRTC_SESSIONS.pop(session_id, None)
+
+
+def _desktop_webrtc_get_session(session_id: str) -> Optional[Dict[str, Any]]:
+    with DESKTOP_WEBRTC_SESSION_LOCK:
+        return DESKTOP_WEBRTC_SESSIONS.get(session_id)
+
+
+async def _desktop_webrtc_close_session(session_id: str) -> None:
+    session = _desktop_webrtc_pop_session(session_id)
+    if not session:
+        return
+    track = session.get("track")
+    pc = session.get("pc")
+    task = session.get("local_description_task")
+    if task is not None:
+        try:
+            task.cancel()
+        except Exception:
+            pass
+    try:
+        if track is not None:
+            track.stop()
+    except Exception:
+        pass
+    try:
+        if pc is not None:
+            await pc.close()
+    except Exception:
+        pass
+
+
+async def _desktop_webrtc_wait_for_ice(pc: Any, timeout_s: float = 1.5) -> None:
+    deadline = time.time() + max(0.2, timeout_s)
+    while time.time() < deadline:
+        local = getattr(pc, "localDescription", None)
+        sdp = str(getattr(local, "sdp", "") or "")
+        if getattr(pc, "iceGatheringState", "") == "complete" or "candidate:" in sdp:
+            return
+        await asyncio.sleep(0.1)
+
+
+def _desktop_webrtc_iter_media_contexts(pc: Any) -> List[Tuple[int, Any, Any, Any]]:
+    contexts: List[Tuple[int, Any, Any, Any]] = []
+    transceivers = list(getattr(pc, "_RTCPeerConnection__transceivers", []) or [])
+    for index, transceiver in enumerate(transceivers):
+        if getattr(transceiver, "kind", "") not in {"audio", "video"}:
+            continue
+        try:
+            dtls_transport = transceiver.receiver.transport
+            ice_transport = dtls_transport.transport
+            gatherer = ice_transport.iceGatherer
+        except Exception:
+            continue
+        contexts.append((index, transceiver, dtls_transport, gatherer))
+    return contexts
+
+
+def _desktop_webrtc_preferred_local_host(value: Any) -> str:
+    try:
+        ip_value = ipaddress.ip_address(str(value or "").strip())
+    except Exception:
+        return ""
+    if ip_value.version != 4 or ip_value.is_loopback:
+        return ""
+    return str(ip_value)
+
+
+def _desktop_webrtc_constrain_local_gathering(pc: Any, preferred_host: Any) -> str:
+    host = _desktop_webrtc_preferred_local_host(preferred_host)
+    if not host:
+        return ""
+    for _index, _transceiver, _dtls_transport, gatherer in _desktop_webrtc_iter_media_contexts(pc):
+        connection = getattr(gatherer, "_connection", None)
+        if connection is None:
+            continue
+        try:
+            connection._use_ipv4 = True
+            connection._use_ipv6 = False
+            if getattr(connection, "_local_candidates_start", False):
+                continue
+
+            async def _gather_candidates_with_preferred(
+                _connection: Any = connection,
+                _preferred_host: str = host,
+            ) -> None:
+                if _connection._local_candidates_start:
+                    return
+                _connection._local_candidates_start = True
+                coros = [
+                    _connection.get_component_candidates(component=component, addresses=[_preferred_host])
+                    for component in _connection._components
+                ]
+                for candidates in await asyncio.gather(*coros):
+                    _connection._local_candidates += candidates
+                _connection._local_candidates_end = True
+
+            connection.gather_candidates = _gather_candidates_with_preferred
+        except Exception:
+            continue
+    return host
+
+
+async def _desktop_webrtc_wait_for_first_candidate(
+    pc: Any,
+    timeout_s: float = 0.35,
+    gather_task: Optional[asyncio.Task] = None,
+) -> bool:
+    deadline = time.time() + max(0.05, timeout_s)
+    while time.time() < deadline:
+        for _index, _transceiver, _dtls_transport, gatherer in _desktop_webrtc_iter_media_contexts(pc):
+            try:
+                if list(gatherer.getLocalCandidates() or []):
+                    return True
+                if getattr(gatherer, "state", "") == "completed":
+                    return True
+            except Exception:
+                continue
+        if gather_task is not None and gather_task.done():
+            return True
+        await asyncio.sleep(0.03)
+    return False
+
+
+def _desktop_webrtc_collect_local_candidates(session: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], bool]:
+    if not AIORTC_AVAILABLE or candidate_to_sdp is None:
+        return [], True
+    pc = session.get("pc")
+    if pc is None:
+        return [], True
+    items: List[Dict[str, Any]] = []
+    seen: set[Tuple[str, str, int]] = set()
+    complete = True
+    for index, transceiver, _dtls_transport, gatherer in _desktop_webrtc_iter_media_contexts(pc):
+        mid = str(getattr(transceiver, "mid", "") or "")
+        state = str(getattr(gatherer, "state", "") or "")
+        if state != "completed":
+            complete = False
+        try:
+            local_candidates = list(gatherer.getLocalCandidates() or [])
+        except Exception:
+            local_candidates = []
+        for candidate in local_candidates:
+            try:
+                candidate_sdp = "candidate:" + candidate_to_sdp(candidate)
+            except Exception:
+                continue
+            key = (candidate_sdp, mid, index)
+            if key in seen:
+                continue
+            seen.add(key)
+            items.append(
+                {
+                    "candidate": candidate_sdp,
+                    "sdpMid": mid or None,
+                    "sdpMLineIndex": index,
+                }
+            )
+    return items, complete
+
+
+def _desktop_webrtc_drain_local_candidates(session: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], bool]:
+    items, complete = _desktop_webrtc_collect_local_candidates(session)
+    sent = session.setdefault("sent_local_candidate_keys", set())
+    pending: List[Dict[str, Any]] = []
+    for item in items:
+        key = (
+            str(item.get("candidate") or ""),
+            str(item.get("sdpMid") or ""),
+            int(item.get("sdpMLineIndex") or 0),
+        )
+        if key in sent:
+            continue
+        sent.add(key)
+        pending.append(item)
+    session["local_candidates_complete"] = complete
+    session["last_local_candidate_count"] = len(items)
+    return pending, complete
+
+
+async def _desktop_webrtc_set_local_answer_fast(
+    session_id: str,
+    pc: Any,
+    answer: Any,
+) -> Any:
+    if not AIORTC_AVAILABLE or aiortc_rtcpeerconnection is None:
+        await pc.setLocalDescription(answer)
+        return pc.localDescription
+
+    started_at = time.perf_counter()
+    try:
+        description = aiortc_rtcpeerconnection.sdp.SessionDescription.parse(answer.sdp)
+        description.type = answer.type
+        pc._RTCPeerConnection__validate_description(description, is_local=True)
+        pc._RTCPeerConnection__setSignalingState("stable")
+
+        for index, media in enumerate(description.media):
+            mid = media.rtp.muxId
+            pc._RTCPeerConnection__seenMids.add(mid)
+            if media.kind in ["audio", "video"]:
+                transceiver = pc._RTCPeerConnection__getTransceiverByMLineIndex(index)
+                transceiver._set_mid(mid)
+            elif media.kind == "application" and getattr(pc, "_RTCPeerConnection__sctp", None) is not None:
+                pc._RTCPeerConnection__sctp.mid = mid
+
+        for index, media in enumerate(description.media):
+            if media.kind in ["audio", "video"]:
+                transceiver = pc._RTCPeerConnection__getTransceiverByMLineIndex(index)
+                transceiver.receiver.transport._set_role(media.dtls.role)
+            elif media.kind == "application" and getattr(pc, "_RTCPeerConnection__sctp", None) is not None:
+                pc._RTCPeerConnection__sctp.transport._set_role(media.dtls.role)
+
+        for transceiver in list(getattr(pc, "_RTCPeerConnection__transceivers", []) or []):
+            transceiver._setCurrentDirection(
+                aiortc_rtcpeerconnection.and_direction(transceiver.direction, transceiver._offerDirection)
+            )
+
+        gather_task = asyncio.create_task(pc._RTCPeerConnection__gather())
+        first_candidate_ready = await _desktop_webrtc_wait_for_first_candidate(
+            pc,
+            timeout_s=0.35,
+            gather_task=gather_task,
+        )
+
+        for index, media in enumerate(description.media):
+            if media.kind in ["audio", "video"]:
+                transceiver = pc._RTCPeerConnection__getTransceiverByMLineIndex(index)
+                aiortc_rtcpeerconnection.add_transport_description(media, transceiver.receiver.transport)
+            elif media.kind == "application" and getattr(pc, "_RTCPeerConnection__sctp", None) is not None:
+                aiortc_rtcpeerconnection.add_transport_description(media, pc._RTCPeerConnection__sctp.transport)
+
+        pc._RTCPeerConnection__currentLocalDescription = description
+        pc._RTCPeerConnection__pendingLocalDescription = None
+        asyncio.ensure_future(pc._RTCPeerConnection__connect())
+
+        session = _desktop_webrtc_get_session(session_id)
+        if session is not None:
+            session["local_description_ready"] = bool(first_candidate_ready)
+
+        async def _finish_local_answer() -> None:
+            try:
+                await gather_task
+                for index, media in enumerate(description.media):
+                    if media.kind in ["audio", "video"]:
+                        transceiver = pc._RTCPeerConnection__getTransceiverByMLineIndex(index)
+                        aiortc_rtcpeerconnection.add_transport_description(media, transceiver.receiver.transport)
+                    elif media.kind == "application" and getattr(pc, "_RTCPeerConnection__sctp", None) is not None:
+                        aiortc_rtcpeerconnection.add_transport_description(media, pc._RTCPeerConnection__sctp.transport)
+                pc._RTCPeerConnection__currentLocalDescription = description
+                asyncio.ensure_future(pc._RTCPeerConnection__connect())
+                finished_session = _desktop_webrtc_get_session(session_id)
+                if finished_session is not None:
+                    finished_session["local_description_ready"] = True
+                    finished_session["local_description_error"] = ""
+                print(
+                    "Desktop WebRTC session="
+                    f"{session_id} local gather completed in {(time.perf_counter() - started_at) * 1000.0:.0f} ms",
+                    flush=True,
+                )
+            except Exception as gather_exc:
+                failed_session = _desktop_webrtc_get_session(session_id)
+                if failed_session is not None:
+                    failed_session["local_description_error"] = f"{type(gather_exc).__name__}: {gather_exc}"
+                print(
+                    f"Desktop WebRTC session={session_id} local gather failed: {type(gather_exc).__name__}: {gather_exc}",
+                    flush=True,
+                )
+
+        session = _desktop_webrtc_get_session(session_id)
+        if session is not None:
+            session["local_description_task"] = asyncio.create_task(_finish_local_answer())
+            session["local_description_error"] = ""
+        return RTCSessionDescription(sdp=str(description), type=description.type)
+    except Exception as exc:
+        print(
+            f"Desktop WebRTC session={session_id} fast local answer failed; using aiortc default: {type(exc).__name__}: {exc}",
+            flush=True,
+        )
+        await pc.setLocalDescription(answer)
+        return pc.localDescription
+
+
+def _desktop_webrtc_preferred_video_codecs() -> List[Any]:
+    if RTCRtpSender is None:
+        return []
+    try:
+        capabilities = RTCRtpSender.getCapabilities("video")
+        codecs = list(getattr(capabilities, "codecs", []) or [])
+    except Exception:
+        return []
+    preferred_h264: List[Any] = []
+    preferred_vp8: List[Any] = []
+    fallbacks: List[Any] = []
+    for codec in codecs:
+        mime = str(getattr(codec, "mimeType", "") or "").lower()
+        if not mime.startswith("video/"):
+            continue
+        if mime == "video/rtx":
+            continue
+        if mime == "video/h264":
+            packetization_mode = str(getattr(codec, "parameters", {}).get("packetization-mode", "") or "")
+            if packetization_mode == "1":
+                preferred_h264.append(codec)
+            else:
+                fallbacks.append(codec)
+        elif mime == "video/vp8":
+            preferred_vp8.append(codec)
+        else:
+            fallbacks.append(codec)
+    return preferred_h264 + preferred_vp8 + fallbacks
+
+
+def _desktop_webrtc_log_sender_state(session_id: str, sender: Any) -> None:
+    if sender is None:
+        print(f"Desktop WebRTC session={session_id} sender missing", flush=True)
+        return
+    track = getattr(sender, "track", None)
+    started = getattr(sender, "_RTCRtpSender__started", None)
+    rtp_task = getattr(sender, "_RTCRtpSender__rtp_task", None)
+    rtcp_task = getattr(sender, "_RTCRtpSender__rtcp_task", None)
+    print(
+        "Desktop WebRTC session="
+        f"{session_id} sender_state started={started}"
+        f" track_kind={getattr(track, 'kind', None)}"
+        f" track_id={getattr(track, 'id', None)}"
+        f" rtp_task={'yes' if rtp_task is not None else 'no'}"
+        f" rtcp_task={'yes' if rtcp_task is not None else 'no'}",
+        flush=True,
+    )
+    if rtp_task is not None and getattr(rtp_task, "done", lambda: False)():
+        exc = None
+        try:
+            exc = rtp_task.exception()
+        except Exception as task_exc:
+            exc = task_exc
+        print(
+            f"Desktop WebRTC session={session_id} rtp_task_done exception={type(exc).__name__ if exc else 'None'}:{exc}",
+            flush=True,
+        )
+
+
+def _desktop_webrtc_sdp_video_summary(sdp: str) -> str:
+    lines = []
+    for raw in str(sdp or "").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if line.startswith("m=video") or line.startswith("a=rtpmap:") or line.startswith("a=fmtp:") or line.startswith("a=send") or line.startswith("a=recv"):
+            lines.append(line)
+    return " | ".join(lines[:18])
+
+
+def _resolve_host_transfer_destination(mode: str = "default") -> Dict[str, Any]:
+    _ensure_windows_host()
+    normalized_mode = str(mode or "default").strip().lower() or "default"
+    if normalized_mode in {"default", "downloads"}:
+        dest_dir = _normalize_host_path(CODEX_HOST_TRANSFER_ROOT)
+        os.makedirs(dest_dir, exist_ok=True)
+        return {
+            "mode": "default",
+            "directory": dest_dir,
+            "selected_path": "",
+        }
+    if normalized_mode not in {"focused", "send-here", "send_here"}:
+        raise HTTPException(status_code=400, detail="Unsupported host transfer destination.")
+    selection = _desktop_selected_paths()
+    selected_path = _normalize_host_path(str(selection.get("path") or ""))
+    dest_dir = selected_path if os.path.isdir(selected_path) else os.path.dirname(selected_path)
+    if not dest_dir:
+        raise HTTPException(status_code=400, detail="Focused Explorer selection does not resolve to a directory.")
+    dest_dir = _normalize_host_path(dest_dir)
+    os.makedirs(dest_dir, exist_ok=True)
+    return {
+        "mode": "focused",
+        "directory": dest_dir,
+        "selected_path": selected_path,
+    }
 
 
 def _resolve_browser_root(root_id: str) -> Dict[str, str]:
@@ -3360,7 +4543,27 @@ def _sync_desktop_perf_mode(enabled: bool) -> Dict[str, Any]:
     return _restore_desktop_perf_mode()
 
 
+def _close_desktop_webrtc_sessions_sync() -> None:
+    with DESKTOP_WEBRTC_SESSION_LOCK:
+        sessions = list(DESKTOP_WEBRTC_SESSIONS.values())
+        DESKTOP_WEBRTC_SESSIONS.clear()
+    for session in sessions:
+        try:
+            track = session.get("track")
+            if track is not None:
+                track.stop()
+        except Exception:
+            pass
+        try:
+            pc = session.get("pc")
+            if pc is not None:
+                asyncio.run(pc.close())
+        except Exception:
+            pass
+
+
 atexit.register(_restore_desktop_perf_mode)
+atexit.register(_close_desktop_webrtc_sessions_sync)
 
 
 def _set_desktop_global_enabled(enabled: bool) -> bool:
@@ -3471,7 +4674,9 @@ async def auth_middleware(request: Request, call_next):
         "/auth/logout",
         "/auth/status",
         "/net/info",
+        "/codex/runtime/status",
         "/auth/pair/exchange",
+        "/auth/device/resume",
         "/auth/pair/consume",
         "/auth/pair/qr.svg",
         "/auth/pair/qr.png",
@@ -3529,6 +4734,22 @@ def app_runtime(request: Request):
             controller_port = int((persisted or {}).get("port") or 0) or None
         except Exception:
             controller_port = None
+    effective_port = int(controller_port or 48787)
+    net_info = _get_cached_net_info()
+    preferred_pair_route = _normalize_pair_route((net_info or {}).get("preferred_pair_route"))
+    tailscale_available = bool((net_info or {}).get("tailscale_ip"))
+    tailscale_warning = (
+        str((net_info or {}).get("tailscale_warning") or "").strip()
+        or ("Tailscale is off on this laptop." if preferred_pair_route == "tailscale" and not tailscale_available else "")
+    )
+    request_host = str(getattr(getattr(request, "url", None), "hostname", "") or "").strip()
+    available_origins = _build_available_origins(effective_port, net_info)
+    preferred_origin, route_provider, route_state = _resolve_preferred_origin(
+        effective_port,
+        net_info,
+        request_host=request_host,
+    )
+    sessions_runtime = _wsl_runtime_status_payload()
 
     return {
         **payload,
@@ -3543,8 +4764,22 @@ def app_runtime(request: Request):
         "session": session if isinstance(session, dict) and session else None,
         "controller_port": controller_port,
         "controller_origin": _mobile_ui_target_url(request).rstrip("/"),
+        "preferred_pair_route": preferred_pair_route,
+        "tailscale_available": tailscale_available,
+        "tailscale_warning": tailscale_warning,
+        "available_origins": available_origins,
+        "preferred_origin": preferred_origin,
+        "route_provider": route_provider,
+        "route_state": route_state,
+        "controller_mode": "sessions-running" if sessions_runtime.get("state") == "running" else "controller-only",
+        "sessions_runtime_state": sessions_runtime.get("state"),
+        "sessions_runtime_detail": sessions_runtime.get("detail"),
+        "sessions_runtime_distro": sessions_runtime.get("distro"),
+        "sessions_runtime_can_start": bool(sessions_runtime.get("can_start")),
+        "sessions_runtime_can_stop": bool(sessions_runtime.get("can_stop")),
         "config_port": (persisted or {}).get("port"),
         "runtime_token_present": bool(str((local_cfg or {}).get("token") or "").strip()),
+        **_desktop_stream_transport_payload(),
     }
 
 
@@ -3590,6 +4825,50 @@ def mobile_entry():
 def _ensure_windows_host() -> None:
     if os.name != "nt":
         raise HTTPException(status_code=400, detail="Desktop control is only supported on Windows hosts.")
+    _ensure_windows_dpi_awareness()
+
+
+def _ensure_windows_dpi_awareness() -> None:
+    global WINDOWS_DPI_AWARE
+    if os.name != "nt" or WINDOWS_DPI_AWARE:
+        return
+    with WINDOWS_DPI_AWARE_LOCK:
+        if WINDOWS_DPI_AWARE:
+            return
+        try:
+            user32 = ctypes.windll.user32
+            awareness_set = False
+
+            try:
+                # Per-monitor v2 awareness keeps cursor/input coordinates in physical pixels.
+                dpi_context = ctypes.c_void_p(-4 & ((1 << (ctypes.sizeof(ctypes.c_void_p) * 8)) - 1))
+                awareness_set = bool(user32.SetProcessDpiAwarenessContext(dpi_context))
+            except Exception:
+                awareness_set = False
+
+            if not awareness_set:
+                try:
+                    shcore = ctypes.windll.shcore
+                    result = int(shcore.SetProcessDpiAwareness(2))
+                    awareness_set = result in {0, 0x80070005}
+                except Exception:
+                    awareness_set = False
+
+            if not awareness_set:
+                try:
+                    awareness_set = bool(user32.SetProcessDPIAware())
+                except Exception:
+                    awareness_set = False
+
+            metrics = (int(user32.GetSystemMetrics(0)), int(user32.GetSystemMetrics(1)))
+            print(
+                f"Windows DPI awareness active={awareness_set} metrics={metrics[0]}x{metrics[1]}",
+                flush=True,
+            )
+            WINDOWS_DPI_AWARE = True
+        except Exception as exc:
+            print(f"Windows DPI awareness setup failed: {type(exc).__name__}: {exc}", flush=True)
+            WINDOWS_DPI_AWARE = True
 
 def _desktop_monitor() -> Dict[str, int]:
     with mss() as sct:
@@ -3611,6 +4890,39 @@ def _parse_stream_scale(raw: Any, default: int = 1) -> int:
     except Exception:
         value = int(default)
     return _clamp(value, 1, 6)
+
+
+def _parse_stream_aspect(raw: Any) -> Optional[float]:
+    try:
+        value = float(raw)
+    except Exception:
+        return None
+    if not math.isfinite(value):
+        return None
+    return max(0.5, min(value, 3.0))
+
+
+def _parse_stream_layout_mode(raw: Any) -> str:
+    candidate = str(raw or "").strip().lower()
+    if candidate in {"stretch", "fill", "crop", "fit"}:
+        return candidate
+    return "fit"
+
+
+def _parse_stream_target_size(raw_width: Any, raw_height: Any) -> Optional[Tuple[int, int]]:
+    try:
+        width = int(raw_width)
+        height = int(raw_height)
+    except Exception:
+        return None
+    if width <= 0 or height <= 0:
+        return None
+    max_edge = max(width, height)
+    if max_edge > 1920:
+        scale = 1920.0 / float(max_edge)
+        width = max(320, int(round(width * scale)))
+        height = max(240, int(round(height * scale)))
+    return (width, height)
 
 
 def _downsample_rgb_nearest(rgb_bytes: bytes, size: Tuple[int, int], factor: int) -> Tuple[bytes, Tuple[int, int]]:
@@ -3647,6 +4959,231 @@ def _rgb_to_grayscale(rgb_bytes: bytes) -> bytes:
         out[i + 1] = lum
         out[i + 2] = lum
     return bytes(out)
+
+
+def _crop_rgb_region(
+    rgb_bytes: bytes,
+    size: Tuple[int, int],
+    left: int,
+    top: int,
+    crop_w: int,
+    crop_h: int,
+) -> Tuple[bytes, Tuple[int, int]]:
+    src_w, src_h = int(size[0]), int(size[1])
+    left = _clamp(int(left), 0, max(0, src_w - 1))
+    top = _clamp(int(top), 0, max(0, src_h - 1))
+    crop_w = max(1, min(int(crop_w), src_w - left))
+    crop_h = max(1, min(int(crop_h), src_h - top))
+    if left == 0 and top == 0 and crop_w == src_w and crop_h == src_h:
+        return rgb_bytes, (src_w, src_h)
+    row_stride = src_w * 3
+    out_stride = crop_w * 3
+    src = memoryview(rgb_bytes)
+    out = bytearray(crop_h * out_stride)
+    for row in range(crop_h):
+        src_start = ((top + row) * row_stride) + (left * 3)
+        src_end = src_start + out_stride
+        dst_start = row * out_stride
+        out[dst_start : dst_start + out_stride] = src[src_start:src_end]
+    return bytes(out), (crop_w, crop_h)
+
+
+def _crop_rgb_to_aspect(
+    rgb_bytes: bytes,
+    size: Tuple[int, int],
+    aspect_ratio: Optional[float],
+) -> Tuple[bytes, Tuple[int, int]]:
+    target_aspect = _parse_stream_aspect(aspect_ratio)
+    src_w, src_h = int(size[0]), int(size[1])
+    if not target_aspect or src_w <= 0 or src_h <= 0:
+        return rgb_bytes, (src_w, src_h)
+    source_aspect = float(src_w) / float(src_h)
+    if abs(source_aspect - target_aspect) <= 0.01:
+        return rgb_bytes, (src_w, src_h)
+    if target_aspect < source_aspect:
+        crop_w = max(1, min(src_w, int(round(src_h * target_aspect))))
+        crop_h = src_h
+        left = max(0, (src_w - crop_w) // 2)
+        top = 0
+    else:
+        crop_w = src_w
+        crop_h = max(1, min(src_h, int(round(src_w / target_aspect))))
+        left = 0
+        top = max(0, (src_h - crop_h) // 2)
+    return _crop_rgb_region(rgb_bytes, (src_w, src_h), left, top, crop_w, crop_h)
+
+
+def _resize_rgb_to_target(
+    rgb_bytes: bytes,
+    size: Tuple[int, int],
+    target_size: Optional[Tuple[int, int]],
+) -> Tuple[bytes, Tuple[int, int]]:
+    if not target_size or not PILLOW_AVAILABLE:
+        return rgb_bytes, size
+    src_w, src_h = int(size[0]), int(size[1])
+    target_w, target_h = int(target_size[0]), int(target_size[1])
+    if src_w <= 0 or src_h <= 0 or target_w <= 0 or target_h <= 0:
+        return rgb_bytes, size
+    if src_w == target_w and src_h == target_h:
+        return rgb_bytes, size
+    image = Image.frombytes("RGB", (src_w, src_h), rgb_bytes)
+    resample = getattr(Image, "Resampling", Image).BILINEAR
+    resized = image.resize((target_w, target_h), resample=resample)
+    return resized.tobytes(), (target_w, target_h)
+
+
+def _desktop_capture_rgb(
+    scale_factor: int = 1,
+    grayscale: bool = False,
+    sct_instance: Optional[Any] = None,
+    aspect_ratio: Optional[float] = None,
+    layout_mode: str = "fit",
+    target_size: Optional[Tuple[int, int]] = None,
+) -> Tuple[bytes, Tuple[int, int]]:
+    def _capture(sct: Any) -> Tuple[bytes, Tuple[int, int]]:
+        mon = sct.monitors[1] if len(sct.monitors) > 1 else sct.monitors[0]
+        img = sct.grab(mon)
+        rgb = img.rgb
+        if SHOW_CURSOR_OVERLAY:
+            cur = _desktop_cursor_pos()
+            if cur:
+                left = int(mon.get("left", 0))
+                top = int(mon.get("top", 0))
+                rel_x = int(cur[0]) - left
+                rel_y = int(cur[1]) - top
+                rgb = _overlay_cursor_rgb(rgb, img.size, rel_x, rel_y)
+        out_size = img.size
+        mode = _parse_stream_layout_mode(layout_mode)
+        if mode == "stretch" and target_size:
+            rgb, out_size = _resize_rgb_to_target(rgb, out_size, target_size)
+        else:
+            crop_aspect = aspect_ratio if mode in {"crop", "fill"} else None
+            rgb, out_size = _crop_rgb_to_aspect(rgb, out_size, crop_aspect)
+            if scale_factor > 1:
+                rgb, out_size = _downsample_rgb_nearest(rgb, out_size, scale_factor)
+        if grayscale:
+            rgb = _rgb_to_grayscale(rgb)
+        return rgb, out_size
+
+    if sct_instance is not None:
+        return _capture(sct_instance)
+
+    thread_local_sct = getattr(DESKTOP_CAPTURE_TLS, "sct", None)
+    if thread_local_sct is None:
+        thread_local_sct = mss()
+        DESKTOP_CAPTURE_TLS.sct = thread_local_sct
+    return _capture(thread_local_sct)
+
+
+def _desktop_stream_format(value: Optional[str]) -> str:
+    candidate = str(value or DESKTOP_STREAM_FORMAT_DEFAULT or "png").strip().lower()
+    if candidate in {"jpg", "jpeg", "mjpeg"} and PILLOW_AVAILABLE:
+        return "jpeg"
+    return "png"
+
+
+def _desktop_stream_quality(value: Optional[int]) -> int:
+    try:
+        numeric = int(value if value is not None else DESKTOP_STREAM_JPEG_QUALITY_DEFAULT)
+    except Exception:
+        numeric = DESKTOP_STREAM_JPEG_QUALITY_DEFAULT
+    return _clamp(numeric, 40, 95)
+
+
+def _desktop_encode_frame(
+    rgb: bytes,
+    out_size: Tuple[int, int],
+    stream_format: str,
+    png_level: int,
+    jpeg_quality: int,
+) -> Tuple[bytes, str]:
+    if stream_format == "jpeg":
+        image = Image.frombytes("RGB", (int(out_size[0]), int(out_size[1])), rgb)
+        buffer = io.BytesIO()
+        image.save(
+            buffer,
+            format="JPEG",
+            quality=jpeg_quality,
+            optimize=False,
+            progressive=False,
+            subsampling=0,
+        )
+        return buffer.getvalue(), "image/jpeg"
+    return to_png(rgb, out_size, level=png_level), "image/png"
+
+
+if AIORTC_AVAILABLE:
+    class DesktopVideoTrack(VideoStreamTrack):
+        def __init__(
+            self,
+            fps: float,
+            scale_factor: int,
+            grayscale: bool,
+            aspect_ratio: Optional[float] = None,
+            layout_mode: str = "fit",
+            target_size: Optional[Tuple[int, int]] = None,
+        ):
+            super().__init__()
+            self._fps = max(1.0, min(float(fps or 8.0), 30.0))
+            self._scale_factor = _parse_stream_scale(scale_factor, default=1)
+            self._grayscale = bool(grayscale)
+            self._aspect_ratio = _parse_stream_aspect(aspect_ratio)
+            self._layout_mode = _parse_stream_layout_mode(layout_mode)
+            self._target_size = target_size
+            self._frames_sent = 0
+            self._clock_rate = 90000
+            self._time_base = Fraction(1, self._clock_rate)
+            self._timestamp_step = max(1, int(round(self._clock_rate / self._fps)))
+            self._started_at: Optional[float] = None
+            self._timestamp = 0
+
+        async def _next_frame_timestamp(self) -> Tuple[int, Fraction]:
+            if self._started_at is None:
+                self._started_at = time.time()
+                self._timestamp = 0
+                return 0, self._time_base
+            self._timestamp += self._timestamp_step
+            target_time = self._started_at + (self._timestamp / self._clock_rate)
+            delay = target_time - time.time()
+            if delay > 0:
+                await asyncio.sleep(delay)
+            return self._timestamp, self._time_base
+
+        async def recv(self):
+            if self.readyState != "live":
+                raise MediaStreamError
+
+            pts, time_base = await self._next_frame_timestamp()
+            capture_started = time.perf_counter()
+            rgb, out_size = await asyncio.to_thread(
+                _desktop_capture_rgb,
+                self._scale_factor,
+                self._grayscale,
+                None,
+                self._aspect_ratio,
+                self._layout_mode,
+                self._target_size,
+            )
+            capture_ms = (time.perf_counter() - capture_started) * 1000.0
+            frame_array = np.frombuffer(rgb, dtype=np.uint8).reshape((int(out_size[1]), int(out_size[0]), 3))
+            frame = VideoFrame.from_ndarray(frame_array, format="rgb24")
+            frame.pts = pts
+            frame.time_base = time_base
+            self._frames_sent += 1
+            if self._frames_sent in {1, 10} or self._frames_sent % 60 == 0:
+                print(
+                    "Desktop WebRTC track produced frame"
+                    f" {self._frames_sent} at {int(out_size[0])}x{int(out_size[1])}"
+                    f" fps={self._fps:.1f} scale={self._scale_factor}"
+                    f" bw={self._grayscale} aspect={self._aspect_ratio or 0:.4f}"
+                    f" mode={self._layout_mode} target={self._target_size}"
+                    f" capture_ms={capture_ms:.1f}",
+                    flush=True,
+                )
+            return frame
+
+        def stop(self) -> None:
+            super().stop()
 
 
 def _desktop_point(x: int, y: int) -> Dict[str, int]:
@@ -3848,29 +5385,395 @@ def _desktop_send_text(text: str) -> Dict[str, Any]:
         "$txt = @'\n"
         + text
         + "\n'@; "
-        "Set-Clipboard -Value $txt; "
-        "[System.Windows.Forms.SendKeys]::SendWait('^v')"
+        "Set-Clipboard -Value $txt"
     )
-    return _run_powershell(script, timeout_s=10)
+    result = _run_powershell(script, timeout_s=10, sta=True)
+    if result.get("exit_code") == 0:
+        time.sleep(0.12)
+        _send_vk_combo([VK_CONTROL], 0x56)
+        time.sleep(0.08)
+        result["mode"] = "clipboard_native_paste"
+    return result
 
 
-def _desktop_paste_image_file(path_for_windows: str) -> Dict[str, Any]:
-    quoted_path = _ps_single_quote(path_for_windows)
+def _desktop_paste_target_family(process_name: str, window_title: str) -> str:
+    proc = str(process_name or "").strip().lower()
+    title = str(window_title or "").strip().lower()
+    if proc in {"powerpnt", "pptview"}:
+        return "powerpoint"
+    if proc in {"winword"}:
+        return "word"
+    if proc in {"onenote"}:
+        return "onenote"
+    if proc in {"wps", "wpp"}:
+        if any(token in title for token in {"presentation", ".ppt", ".pptx", "slides"}):
+            return "wps_presentation"
+        if any(token in title for token in {"document", ".doc", ".docx", ".rtf", "writer"}):
+            return "wps_document"
+    return ""
+
+
+def _desktop_paste_target_label(target_family: str, process_name: str, window_title: str) -> str:
+    family = str(target_family or "").strip().lower()
+    if family == "powerpoint":
+        return "PowerPoint"
+    if family == "word":
+        return "Word"
+    if family == "onenote":
+        return "OneNote"
+    if family == "wps_presentation":
+        return "WPS Presentation"
+    if family == "wps_document":
+        return "WPS Document"
+    title = str(window_title or "").strip()
+    if title:
+        return title[:120]
+    proc = str(process_name or "").strip()
+    return proc or "Windows app"
+
+
+def _desktop_foreground_target_info() -> Dict[str, Any]:
+    _ensure_windows_host()
+    user32 = _win_user32()
+    if not hasattr(user32.GetWindowThreadProcessId, "_codrex_configured"):
+        user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+        user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+        user32.GetWindowThreadProcessId._codrex_configured = True  # type: ignore[attr-defined]
+    if not hasattr(user32.GetWindowTextLengthW, "_codrex_configured"):
+        user32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
+        user32.GetWindowTextLengthW.restype = ctypes.c_int
+        user32.GetWindowTextLengthW._codrex_configured = True  # type: ignore[attr-defined]
+    if not hasattr(user32.GetWindowTextW, "_codrex_configured"):
+        user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+        user32.GetWindowTextW.restype = ctypes.c_int
+        user32.GetWindowTextW._codrex_configured = True  # type: ignore[attr-defined]
+    hwnd = int(user32.GetForegroundWindow() or 0)
+    if hwnd <= 0:
+        return {"hwnd": 0, "pid": 0, "process_name": "", "window_title": "", "target_family": "", "target_label": ""}
+    title = ""
+    try:
+        text_len = int(user32.GetWindowTextLengthW(wintypes.HWND(hwnd)) or 0)
+        if text_len > 0:
+            buf = ctypes.create_unicode_buffer(text_len + 1)
+            user32.GetWindowTextW(wintypes.HWND(hwnd), buf, text_len + 1)
+            title = str(buf.value or "").strip()
+    except Exception:
+        title = ""
+    pid = wintypes.DWORD(0)
+    try:
+        user32.GetWindowThreadProcessId(wintypes.HWND(hwnd), ctypes.byref(pid))
+    except Exception:
+        return {"hwnd": hwnd, "pid": 0, "process_name": "", "window_title": title, "target_family": "", "target_label": _desktop_paste_target_label("", "", title)}
+    if int(pid.value or 0) <= 0:
+        return {"hwnd": hwnd, "pid": 0, "process_name": "", "window_title": title, "target_family": "", "target_label": _desktop_paste_target_label("", "", title)}
+    process_name = ""
+    try:
+        result = subprocess.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-Command",
+                f"$p = Get-Process -Id {int(pid.value)} -ErrorAction SilentlyContinue; if ($p) {{ $p.ProcessName }}",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=4,
+            encoding="utf-8",
+            errors="replace",
+        )
+    except Exception:
+        result = None
+    if result and result.returncode == 0:
+        process_name = str(result.stdout or "").strip().lower()
+    target_family = _desktop_paste_target_family(process_name, title)
+    return {
+        "hwnd": hwnd,
+        "pid": int(pid.value or 0),
+        "process_name": process_name,
+        "window_title": title,
+        "target_family": target_family,
+        "target_label": _desktop_paste_target_label(target_family, process_name, title),
+    }
+
+
+def _desktop_restore_foreground_window(hwnd: int) -> bool:
+    try:
+        target_hwnd = int(hwnd or 0)
+    except Exception:
+        target_hwnd = 0
+    if target_hwnd <= 0:
+        return False
+    user32 = _win_user32()
+    if not hasattr(user32.IsWindow, "_codrex_configured"):
+        user32.IsWindow.argtypes = [wintypes.HWND]
+        user32.IsWindow.restype = wintypes.BOOL
+        user32.IsWindow._codrex_configured = True  # type: ignore[attr-defined]
+    if not hasattr(user32.IsIconic, "_codrex_configured"):
+        user32.IsIconic.argtypes = [wintypes.HWND]
+        user32.IsIconic.restype = wintypes.BOOL
+        user32.IsIconic._codrex_configured = True  # type: ignore[attr-defined]
+    if not hasattr(user32.ShowWindow, "_codrex_configured"):
+        user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+        user32.ShowWindow.restype = wintypes.BOOL
+        user32.ShowWindow._codrex_configured = True  # type: ignore[attr-defined]
+    if not hasattr(user32.SetForegroundWindow, "_codrex_configured"):
+        user32.SetForegroundWindow.argtypes = [wintypes.HWND]
+        user32.SetForegroundWindow.restype = wintypes.BOOL
+        user32.SetForegroundWindow._codrex_configured = True  # type: ignore[attr-defined]
+    hwnd_handle = wintypes.HWND(target_hwnd)
+    try:
+        if not bool(user32.IsWindow(hwnd_handle)):
+            return False
+        if bool(user32.IsIconic(hwnd_handle)):
+            user32.ShowWindow(hwnd_handle, 9)
+            time.sleep(0.05)
+        user32.ShowWindow(hwnd_handle, 5)
+        time.sleep(0.04)
+        return bool(user32.SetForegroundWindow(hwnd_handle))
+    except Exception:
+        return False
+
+
+def _desktop_foreground_process_name() -> str:
+    info = _desktop_foreground_target_info()
+    return str(info.get("process_name") or "").strip().lower()
+
+
+def _desktop_prepare_clipboard_image_file(path_for_windows: str) -> str:
+    host_path = _normalize_host_path(path_for_windows)
+    if not PILLOW_AVAILABLE or Image is None:
+        return host_path
+    ext = os.path.splitext(host_path)[1].lower()
+    if ext == ".bmp":
+        return host_path
+    os.makedirs(CODEX_HOST_PASTE_CACHE_DIR, exist_ok=True)
+    target_name = (os.path.splitext(os.path.basename(host_path))[0] or "clipboard-image") + ".bmp"
+    prepared_path = _host_unique_target_path(CODEX_HOST_PASTE_CACHE_DIR, target_name)
+    with Image.open(host_path) as image:
+        converted = image.convert("RGB")
+        converted.save(prepared_path, format="BMP")
+    return prepared_path
+
+
+def _desktop_clipboard_set_image_file(path_for_windows: str) -> Dict[str, Any]:
+    prepared_path = _desktop_prepare_clipboard_image_file(path_for_windows)
+    quoted_path = _ps_single_quote(prepared_path)
     script = (
         "Add-Type -AssemblyName System.Windows.Forms; "
         "Add-Type -AssemblyName System.Drawing; "
         "$path = " + quoted_path + "; "
         "if (!(Test-Path -LiteralPath $path)) { throw 'image_not_found' }; "
-        "$img = [System.Drawing.Image]::FromFile($path); "
+        "$source = New-Object System.Drawing.Bitmap $path; "
         "try { "
-        "[System.Windows.Forms.Clipboard]::SetImage($img); "
-        "[System.Windows.Forms.SendKeys]::SendWait('^v') "
-        "} finally { $img.Dispose() }"
+        "$bmp = New-Object System.Drawing.Bitmap $source; "
+        "$pngStream = New-Object System.IO.MemoryStream; "
+        "try { "
+        "$bmp.Save($pngStream, [System.Drawing.Imaging.ImageFormat]::Png); "
+        "$pngBytes = $pngStream.ToArray(); "
+        "$pngData = New-Object System.IO.MemoryStream(,$pngBytes); "
+        "try { "
+        "$files = New-Object System.Collections.Specialized.StringCollection; "
+        "[void]$files.Add($path); "
+        "$data = New-Object System.Windows.Forms.DataObject; "
+        "$data.SetData([System.Windows.Forms.DataFormats]::Bitmap, $true, $bmp); "
+        "$data.SetData('PNG', $false, $pngData); "
+        "$data.SetFileDropList($files); "
+        "[System.Windows.Forms.Clipboard]::Clear(); "
+        "[System.Windows.Forms.Clipboard]::SetDataObject($data, $true, 8, 120); "
+        "Start-Sleep -Milliseconds 140 "
+        "} finally { $pngData.Dispose() } "
+        "} finally { $pngStream.Dispose(); $bmp.Dispose() } "
+        "} finally { $source.Dispose() }"
     )
     return _run_powershell(script, timeout_s=12, sta=True)
 
+
+def _desktop_try_office_image_paste(target_info: Dict[str, Any]) -> Dict[str, Any]:
+    family = str((target_info or {}).get("target_family") or "").strip().lower()
+    if family == "powerpoint":
+        script = r"""
+$ErrorActionPreference = 'SilentlyContinue'
+$ok = $false
+try { $app = [System.Runtime.InteropServices.Marshal]::GetActiveObject('PowerPoint.Application') } catch { $app = $null }
+if ($app -and $app.ActiveWindow) {
+  try {
+    if ($app.CommandBars) {
+      $app.CommandBars.ExecuteMso('Paste')
+      $ok = $true
+    }
+  } catch {}
+  if (-not $ok) {
+    try {
+      [void]$app.ActiveWindow.View.Paste()
+      $ok = $true
+    } catch {}
+  }
+}
+if ($ok) {
+  @{ ok = $true; mode = 'powerpoint_com_paste' } | ConvertTo-Json -Compress
+  exit 0
+}
+@{ ok = $false; detail = 'powerpoint_com_paste_failed' } | ConvertTo-Json -Compress
+exit 3
+"""
+    elif family == "word":
+        script = r"""
+$ErrorActionPreference = 'SilentlyContinue'
+$ok = $false
+try { $app = [System.Runtime.InteropServices.Marshal]::GetActiveObject('Word.Application') } catch { $app = $null }
+if ($app) {
+  try {
+    if ($app.Selection) {
+      $app.Selection.Paste()
+      $ok = $true
+    }
+  } catch {}
+  if (-not $ok) {
+    try {
+      if ($app.CommandBars) {
+        $app.CommandBars.ExecuteMso('Paste')
+        $ok = $true
+      }
+    } catch {}
+  }
+}
+if ($ok) {
+  @{ ok = $true; mode = 'word_com_paste' } | ConvertTo-Json -Compress
+  exit 0
+}
+@{ ok = $false; detail = 'word_com_paste_failed' } | ConvertTo-Json -Compress
+exit 3
+"""
+    else:
+        return {"exit_code": 3, "stdout": "", "stderr": "office_com_paste_unavailable"}
+    result = _run_powershell(script, timeout_s=8, sta=True)
+    raw = str(result.get("stdout") or "").strip()
+    if raw:
+        try:
+            payload = json.loads(raw)
+        except Exception:
+            payload = {}
+        if isinstance(payload, dict):
+            if payload.get("mode"):
+                result["mode"] = str(payload.get("mode") or "").strip()
+            if payload.get("detail"):
+                result["detail"] = str(payload.get("detail") or "").strip()
+    return result
+
+
+def _desktop_try_sendkeys_image_paste(target_info: Dict[str, Any], mode_name: str) -> Dict[str, Any]:
+    window_title = str((target_info or {}).get("window_title") or "").strip()
+    if not window_title:
+        return {"exit_code": 3, "stdout": "", "stderr": "window_sendkeys_paste_unavailable"}
+    quoted_title = _ps_single_quote(window_title)
+    quoted_mode = _ps_single_quote(mode_name)
+    script = (
+        "Add-Type -AssemblyName System.Windows.Forms; "
+        "$wshell = New-Object -ComObject WScript.Shell; "
+        f"$title = {quoted_title}; "
+        f"$mode = {quoted_mode}; "
+        "$ok = $false; "
+        "try { $ok = [bool]$wshell.AppActivate($title) } catch { $ok = $false }; "
+        "if ($ok) { "
+        "Start-Sleep -Milliseconds 180; "
+        "try { [System.Windows.Forms.SendKeys]::SendWait('^v'); $ok = $true } catch { $ok = $false } "
+        "} "
+        "if ($ok) { "
+        "@{ ok = $true; mode = $mode } | ConvertTo-Json -Compress; exit 0 "
+        "} "
+        "@{ ok = $false; detail = 'window_sendkeys_paste_failed' } | ConvertTo-Json -Compress; exit 3"
+    )
+    result = _run_powershell(script, timeout_s=8, sta=True)
+    raw = str(result.get("stdout") or "").strip()
+    if raw:
+        try:
+            payload = json.loads(raw)
+        except Exception:
+            payload = {}
+        if isinstance(payload, dict):
+            if payload.get("mode"):
+                result["mode"] = str(payload.get("mode") or "").strip()
+            if payload.get("detail"):
+                result["detail"] = str(payload.get("detail") or "").strip()
+    return result
+
+
+def _desktop_paste_image_file(path_for_windows: str) -> Dict[str, Any]:
+    target_info = _desktop_foreground_target_info()
+    target_process = str(target_info.get("process_name") or "").strip().lower()
+    result = _desktop_clipboard_set_image_file(path_for_windows)
+    result["target_process"] = target_process
+    result["target_family"] = str(target_info.get("target_family") or "").strip()
+    result["target_label"] = str(target_info.get("target_label") or "").strip()
+    if result.get("exit_code") != 0:
+        return result
+    _desktop_restore_foreground_window(int(target_info.get("hwnd") or 0))
+    _desktop_release_alt_if_held()
+    time.sleep(0.18)
+    if str(target_info.get("target_family") or "") in {"powerpoint", "word"}:
+        office_result = _desktop_try_office_image_paste(target_info)
+        office_result["target_process"] = target_process
+        office_result["target_family"] = str(target_info.get("target_family") or "").strip()
+        office_result["target_label"] = str(target_info.get("target_label") or "").strip()
+        if office_result.get("exit_code") == 0:
+            return office_result
+    if str(target_info.get("target_family") or "") in {"wps_presentation", "wps_document", "onenote"}:
+        sendkeys_mode = {
+            "wps_presentation": "wps_sendkeys_paste",
+            "wps_document": "wps_sendkeys_paste",
+            "onenote": "onenote_sendkeys_paste",
+        }.get(str(target_info.get("target_family") or ""), "window_sendkeys_paste")
+        sendkeys_result = _desktop_try_sendkeys_image_paste(target_info, sendkeys_mode)
+        sendkeys_result["target_process"] = target_process
+        sendkeys_result["target_family"] = str(target_info.get("target_family") or "").strip()
+        sendkeys_result["target_label"] = str(target_info.get("target_label") or "").strip()
+        if sendkeys_result.get("exit_code") == 0:
+            return sendkeys_result
+        _desktop_restore_foreground_window(int(target_info.get("hwnd") or 0))
+        time.sleep(0.12)
+    _send_vk_combo([VK_CONTROL], 0x56)
+    time.sleep(0.1)
+    result["mode"] = "clipboard_native_paste"
+    return result
+
+
+def _desktop_pick_shareable_host_file() -> str:
+    _ensure_windows_host()
+    script = r"""
+Add-Type -AssemblyName System.Windows.Forms
+$dialog = New-Object System.Windows.Forms.OpenFileDialog
+$dialog.Title = 'Choose a host file to send'
+$dialog.CheckFileExists = $true
+$dialog.Multiselect = $false
+$dialog.RestoreDirectory = $true
+$desktop = [Environment]::GetFolderPath('Desktop')
+if (-not [string]::IsNullOrWhiteSpace($desktop) -and (Test-Path -LiteralPath $desktop)) {
+  $dialog.InitialDirectory = $desktop
+}
+$picked = $dialog.ShowDialog()
+if ($picked -ne [System.Windows.Forms.DialogResult]::OK -or [string]::IsNullOrWhiteSpace($dialog.FileName)) {
+  @{ ok = $false; detail = 'cancelled' } | ConvertTo-Json -Compress
+  exit 0
+}
+@{ ok = $true; path = [string]$dialog.FileName } | ConvertTo-Json -Compress
+"""
+    result = _run_powershell(script, timeout_s=60, sta=True)
+    raw = str(result.get("stdout") or "").strip()
+    try:
+        payload = json.loads(raw) if raw else {}
+    except Exception:
+        detail = (result.get("stderr") or raw or "host_file_picker_failed").strip()
+        raise HTTPException(status_code=500, detail=detail)
+    if not payload.get("ok"):
+        raise HTTPException(status_code=400, detail=str(payload.get("detail") or "cancelled"))
+    picked_path = _normalize_host_path(str(payload.get("path") or ""))
+    if not os.path.isfile(picked_path):
+        raise HTTPException(status_code=404, detail="Selected host file no longer exists.")
+    return picked_path
+
 def _desktop_send_key(key: str) -> Dict[str, Any]:
-    k = (key or "").strip().lower()
+    raw_key = (key or "").strip()
+    k = raw_key.lower()
     if k == "alt+release":
         try:
             _send_vk_up(VK_MENU)
@@ -3917,6 +5820,7 @@ def _desktop_send_key(key: str) -> Dict[str, Any]:
         "alt+tab": ([VK_MENU], VK_TAB),
         "alt+shift+tab": ([VK_MENU, VK_SHIFT], VK_TAB),
         "win": ([VK_LWIN], 0x20),
+        "win+d": ([VK_LWIN], 0x44),
         "win+left": ([VK_LWIN], VK_LEFT),
         "win+right": ([VK_LWIN], VK_RIGHT),
         "win+tab": ([VK_LWIN], VK_TAB),
@@ -3925,6 +5829,10 @@ def _desktop_send_key(key: str) -> Dict[str, Any]:
         mods, vk = native_combos[k]
         _send_vk_combo(mods, vk, extended=(k in {"alt+tab", "alt+shift+tab", "win+left", "win+right", "win+tab"}))
         return {"exit_code": 0, "stdout": "", "stderr": "", "mode": "native_combo", "key": k, "alt_held": False}
+
+    if len(raw_key) == 1 and 32 <= ord(raw_key) <= 126:
+        if _send_char_key(raw_key):
+            return {"exit_code": 0, "stdout": "", "stderr": "", "mode": "native_char", "key": raw_key, "alt_held": False}
 
     if k == "alt+tab-hold":
         if not _desktop_alt_held():
@@ -7460,8 +9368,47 @@ def _power_status_payload() -> Dict[str, Any]:
 
 @app.get("/net/info")
 def net_info():
-    # Helper for UI to suggest reachable base URLs (LAN vs Tailscale).
+    # Helper for UI to suggest reachable base URLs and private routes.
     return _get_cached_net_info()
+
+
+@app.get("/codex/runtime/status")
+def codex_runtime_status():
+    status = _wsl_runtime_status_payload()
+    return {
+        "ok": True,
+        "state": status.get("state"),
+        "detail": status.get("detail"),
+        "distro": status.get("distro"),
+        "can_start": bool(status.get("can_start")),
+        "can_stop": bool(status.get("can_stop")),
+    }
+
+
+@app.post("/codex/runtime/start")
+def codex_runtime_start():
+    status = _start_wsl_runtime()
+    return {
+        "ok": bool(status.get("ok")),
+        "state": status.get("state"),
+        "detail": status.get("detail"),
+        "distro": status.get("distro"),
+        "can_start": bool(status.get("can_start")),
+        "can_stop": bool(status.get("can_stop")),
+    }
+
+
+@app.post("/codex/runtime/stop")
+def codex_runtime_stop():
+    status = _stop_wsl_runtime()
+    return {
+        "ok": bool(status.get("ok")),
+        "state": status.get("state"),
+        "detail": status.get("detail"),
+        "distro": status.get("distro"),
+        "can_start": bool(status.get("can_start")),
+        "can_stop": bool(status.get("can_stop")),
+    }
 
 
 @app.post("/auth/pair/create")
@@ -7484,7 +9431,20 @@ def auth_pair_exchange(request: Request, payload: Dict[str, Any] = Body(...)):
     if not pairing_consume_code(code):
         return {"ok": False, "error": "unauthorized", "detail": "Invalid or expired pairing code."}
 
-    resp = JSONResponse({"ok": True, "auth_required": CODEX_AUTH_REQUIRED})
+    response_payload: Dict[str, Any] = {"ok": True, "auth_required": CODEX_AUTH_REQUIRED}
+    if bool(payload.get("issue_device_token")):
+        response_payload.update(
+            _issue_trusted_device(
+                name=str(payload.get("device_name") or payload.get("device_label") or "").strip(),
+                platform=str(payload.get("device_platform") or "android").strip(),
+                current_origin=str(getattr(request.url, "scheme", "http") or "http")
+                + "://"
+                + str(getattr(request.url, "hostname", "") or "").strip()
+                + (f":{int(getattr(request.url, 'port', 0) or 0)}" if int(getattr(request.url, "port", 0) or 0) else ""),
+            ),
+        )
+
+    resp = JSONResponse(response_payload)
     # Exchange does not reveal CODEX_AUTH_TOKEN to the browser; it only sets the auth cookie.
     resp.set_cookie(
         key=CODEX_AUTH_COOKIE,
@@ -7493,6 +9453,44 @@ def auth_pair_exchange(request: Request, payload: Dict[str, Any] = Body(...)):
         secure=_cookie_secure_for_request(request),
         samesite="lax",
         max_age=60 * 60 * 12,
+    )
+    return resp
+
+
+@app.post("/auth/device/resume")
+def auth_device_resume(request: Request, payload: Dict[str, Any] = Body(...)):
+    if not CODEX_AUTH_REQUIRED:
+        return {"ok": True, "auth_required": False}
+
+    device_id = str(payload.get("device_id") or "").strip()
+    device_token = str(payload.get("device_token") or "").strip()
+    current_origin = (
+        str(getattr(request.url, "scheme", "http") or "http")
+        + "://"
+        + str(getattr(request.url, "hostname", "") or "").strip()
+        + (f":{int(getattr(request.url, 'port', 0) or 0)}" if int(getattr(request.url, "port", 0) or 0) else "")
+    )
+    trusted = _resume_trusted_device(device_id, device_token, current_origin=current_origin)
+    if not trusted:
+        return {"ok": False, "error": "unauthorized", "detail": "Trusted device token is invalid."}
+
+    resp = JSONResponse(
+        {
+            "ok": True,
+            "auth_required": CODEX_AUTH_REQUIRED,
+            "trusted_device": True,
+            "device_id": str(trusted.get("id") or ""),
+            "device_name": str(trusted.get("name") or ""),
+            "device_platform": str(trusted.get("platform") or ""),
+        }
+    )
+    resp.set_cookie(
+        key=CODEX_AUTH_COOKIE,
+        value=CODEX_AUTH_TOKEN,
+        httponly=True,
+        secure=_cookie_secure_for_request(request),
+        samesite="lax",
+        max_age=60 * 60 * 24 * 30,
     )
     return resp
 
@@ -7733,38 +9731,62 @@ def desktop_info(request: Request):
         "alt_held": _desktop_alt_held(),
         "perf_mode_enabled": _desktop_perf_snapshot().get("enabled", False),
         "perf_mode_active": _desktop_perf_snapshot().get("active", False),
+        **_desktop_stream_transport_payload(),
         **mon,
     }
 
+
+@app.get("/desktop/stream/capabilities")
+def desktop_stream_capabilities():
+    _ensure_windows_host()
+    payload = _desktop_stream_transport_payload()
+    return {
+        "ok": True,
+        "preferred_transport": payload["desktop_stream_transport"],
+        "fallback_transport": payload["desktop_stream_fallback"],
+        "webrtc_available": payload["desktop_webrtc_available"],
+        "webrtc_enabled": payload["desktop_webrtc_enabled"],
+        "webrtc_detail": payload["desktop_webrtc_detail"],
+        "fallback_formats": ["png", "jpeg"],
+        "default_fallback_format": _desktop_stream_format(None),
+        "default_jpeg_quality": _desktop_stream_quality(None),
+    }
+
 @app.get("/desktop/shot")
-def desktop_shot(request: Request, level: Optional[int] = None, scale: Optional[int] = None, bw: Optional[str] = None):
+def desktop_shot(
+    request: Request,
+    level: Optional[int] = None,
+    scale: Optional[int] = None,
+    bw: Optional[str] = None,
+    format: Optional[str] = None,
+    quality: Optional[int] = None,
+    aspect: Optional[float] = None,
+    layout_mode: Optional[str] = None,
+    target_width: Optional[int] = None,
+    target_height: Optional[int] = None,
+):
     _ensure_windows_host()
     png_level = _clamp(int(level if level is not None else DESKTOP_STREAM_PNG_LEVEL_DEFAULT), 0, 9)
     scale_factor = _parse_stream_scale(scale, default=1)
     grayscale = _truthy_flag(bw)
-    with mss() as sct:
-        mon = sct.monitors[1] if len(sct.monitors) > 1 else sct.monitors[0]
-        img = sct.grab(mon)
-        rgb = img.rgb
-        if SHOW_CURSOR_OVERLAY:
-            cur = _desktop_cursor_pos()
-            if cur:
-                left = int(mon.get("left", 0))
-                top = int(mon.get("top", 0))
-                rel_x = int(cur[0]) - left
-                rel_y = int(cur[1]) - top
-                rgb = _overlay_cursor_rgb(rgb, img.size, rel_x, rel_y)
-        out_size = img.size
-        if scale_factor > 1:
-            rgb, out_size = _downsample_rgb_nearest(rgb, img.size, scale_factor)
-        if grayscale:
-            rgb = _rgb_to_grayscale(rgb)
-        png_bytes = to_png(rgb, out_size, level=png_level)
-        return Response(
-            content=png_bytes,
-            media_type="image/png",
-            headers={"Cache-Control": "no-store"},
-        )
+    stream_format = _desktop_stream_format(format)
+    jpeg_quality = _desktop_stream_quality(quality)
+    aspect_ratio = _parse_stream_aspect(aspect)
+    resolved_layout_mode = _parse_stream_layout_mode(layout_mode)
+    target_size = _parse_stream_target_size(target_width, target_height)
+    rgb, out_size = _desktop_capture_rgb(
+        scale_factor=scale_factor,
+        grayscale=grayscale,
+        aspect_ratio=aspect_ratio,
+        layout_mode=resolved_layout_mode,
+        target_size=target_size,
+    )
+    frame_bytes, media_type = _desktop_encode_frame(rgb, out_size, stream_format, png_level, jpeg_quality)
+    return Response(
+        content=frame_bytes,
+        media_type=media_type,
+        headers={"Cache-Control": "no-store"},
+    )
 
 @app.get("/desktop/stream")
 async def desktop_stream(
@@ -7773,6 +9795,12 @@ async def desktop_stream(
     level: Optional[int] = None,
     scale: Optional[int] = None,
     bw: Optional[str] = None,
+    format: Optional[str] = None,
+    quality: Optional[int] = None,
+    aspect: Optional[float] = None,
+    layout_mode: Optional[str] = None,
+    target_width: Optional[int] = None,
+    target_height: Optional[int] = None,
 ):
     """
     Continuous desktop stream using multipart/x-mixed-replace.
@@ -7783,41 +9811,45 @@ async def desktop_stream(
         fps_val = float(fps if fps is not None else DESKTOP_STREAM_FPS_DEFAULT)
     except Exception:
         fps_val = float(DESKTOP_STREAM_FPS_DEFAULT)
-    fps_val = max(0.5, min(fps_val, 12.0))
+    stream_format = _desktop_stream_format(format)
+    fps_cap = 20.0 if stream_format == "jpeg" else 12.0
+    fps_val = max(0.5, min(fps_val, fps_cap))
     png_level = _clamp(int(level if level is not None else DESKTOP_STREAM_PNG_LEVEL_DEFAULT), 0, 9)
+    jpeg_quality = _desktop_stream_quality(quality)
     scale_factor = _parse_stream_scale(scale, default=1)
     grayscale = _truthy_flag(bw)
+    aspect_ratio = _parse_stream_aspect(aspect)
+    resolved_layout_mode = _parse_stream_layout_mode(layout_mode)
+    target_size = _parse_stream_target_size(target_width, target_height)
     frame_delay = 1.0 / fps_val
     boundary = "frame"
 
     async def _gen():
         with mss() as sct:
-            mon = sct.monitors[1] if len(sct.monitors) > 1 else sct.monitors[0]
             while True:
                 if await request.is_disconnected():
                     break
-                img = sct.grab(mon)
-                rgb = img.rgb
-                if SHOW_CURSOR_OVERLAY:
-                    cur = _desktop_cursor_pos()
-                    if cur:
-                        left = int(mon.get("left", 0))
-                        top = int(mon.get("top", 0))
-                        rel_x = int(cur[0]) - left
-                        rel_y = int(cur[1]) - top
-                        rgb = _overlay_cursor_rgb(rgb, img.size, rel_x, rel_y)
-                out_size = img.size
-                if scale_factor > 1:
-                    rgb, out_size = _downsample_rgb_nearest(rgb, img.size, scale_factor)
-                if grayscale:
-                    rgb = _rgb_to_grayscale(rgb)
-                png_bytes = to_png(rgb, out_size, level=png_level)
+                rgb, out_size = _desktop_capture_rgb(
+                    scale_factor=scale_factor,
+                    grayscale=grayscale,
+                    sct_instance=sct,
+                    aspect_ratio=aspect_ratio,
+                    layout_mode=resolved_layout_mode,
+                    target_size=target_size,
+                )
+                frame_bytes, media_type = _desktop_encode_frame(
+                    rgb,
+                    out_size,
+                    stream_format,
+                    png_level,
+                    jpeg_quality,
+                )
                 chunk = (
                     f"--{boundary}\r\n"
-                    "Content-Type: image/png\r\n"
+                    f"Content-Type: {media_type}\r\n"
                     "Cache-Control: no-store\r\n"
-                    f"Content-Length: {len(png_bytes)}\r\n\r\n"
-                ).encode("utf-8") + png_bytes + b"\r\n"
+                    f"Content-Length: {len(frame_bytes)}\r\n\r\n"
+                ).encode("utf-8") + frame_bytes + b"\r\n"
                 yield chunk
                 await asyncio.sleep(frame_delay)
 
@@ -7983,6 +10015,188 @@ def desktop_selection_path(request: Request):
         raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"selected_path_internal_error: {type(exc).__name__}: {exc}")
+
+
+@app.post("/desktop/webrtc/offer")
+async def desktop_webrtc_offer(request: Request, payload: Optional[Dict[str, Any]] = Body(default=None)):
+    _ensure_windows_host()
+    payload = payload or {}
+    offer = payload.get("offer")
+    if not isinstance(offer, dict) or not str(offer.get("sdp") or "").strip():
+        raise HTTPException(status_code=400, detail="offer is required.")
+    transport = _desktop_stream_transport_payload()
+    if not transport["desktop_webrtc_enabled"]:
+        raise HTTPException(status_code=503, detail=transport["desktop_webrtc_detail"])
+    if len(DESKTOP_WEBRTC_SESSIONS) >= DESKTOP_WEBRTC_MAX_SESSIONS:
+        raise HTTPException(status_code=429, detail="Too many active WebRTC desktop sessions.")
+
+    session_id = uuid.uuid4().hex
+    fps = float((payload.get("fps") or DESKTOP_STREAM_FPS_DEFAULT) or DESKTOP_STREAM_FPS_DEFAULT)
+    scale_factor = _parse_stream_scale(payload.get("scale"), default=1)
+    grayscale = _truthy_flag(payload.get("bw"))
+    aspect_ratio = _parse_stream_aspect(payload.get("aspect"))
+    layout_mode = _parse_stream_layout_mode(payload.get("layout_mode"))
+    target_size = _parse_stream_target_size(payload.get("target_width"), payload.get("target_height"))
+    pc = RTCPeerConnection()
+    track = DesktopVideoTrack(
+        fps=fps,
+        scale_factor=scale_factor,
+        grayscale=grayscale,
+        aspect_ratio=aspect_ratio,
+        layout_mode=layout_mode,
+        target_size=target_size,
+    )
+    transceiver = pc.addTransceiver(track, direction="sendonly")
+    sender = transceiver.sender
+    preferred_codecs = _desktop_webrtc_preferred_video_codecs()
+    if preferred_codecs:
+        try:
+            transceiver.setCodecPreferences(preferred_codecs)
+            print(
+                "Desktop WebRTC session="
+                f"{session_id} codec preference="
+                f"{','.join(str(getattr(codec, 'mimeType', '') or '') for codec in preferred_codecs)}",
+                flush=True,
+            )
+        except Exception as codec_exc:
+            print(
+                f"Desktop WebRTC session={session_id} codec preference failed: {type(codec_exc).__name__}: {codec_exc}",
+                flush=True,
+            )
+    _desktop_webrtc_store_session(session_id, pc, track, sender=sender, transceiver=transceiver)
+    preferred_host = _desktop_webrtc_constrain_local_gathering(pc, getattr(request.url, "hostname", ""))
+    print(
+        "Desktop WebRTC offer session="
+        f"{session_id} created fps={fps:.1f} scale={scale_factor}"
+        f" bw={grayscale} aspect={aspect_ratio or 0:.4f}"
+        f" mode={layout_mode} target={target_size}",
+        flush=True,
+    )
+    if preferred_host:
+        print(
+            f"Desktop WebRTC session={session_id} constrained ICE gathering to {preferred_host}",
+            flush=True,
+        )
+    print(
+        f"Desktop WebRTC session={session_id} remote SDP { _desktop_webrtc_sdp_video_summary(str(offer.get('sdp') or '')) }",
+        flush=True,
+    )
+
+    @pc.on("connectionstatechange")
+    async def _on_connectionstatechange():
+        _desktop_webrtc_log_sender_state(session_id, sender)
+        print(
+            "Desktop WebRTC session="
+            f"{session_id} connectionState={getattr(pc, 'connectionState', '')}"
+            f" iceGathering={getattr(pc, 'iceGatheringState', '')}"
+            f" iceConnection={getattr(pc, 'iceConnectionState', '')}",
+            flush=True,
+        )
+        if pc.connectionState in {"failed", "closed", "disconnected"}:
+            await _desktop_webrtc_close_session(session_id)
+
+    try:
+        negotiation_started = time.perf_counter()
+        print(f"Desktop WebRTC session={session_id} applying remote offer", flush=True)
+        await pc.setRemoteDescription(
+            RTCSessionDescription(
+                sdp=str(offer.get("sdp") or "").strip(),
+                type=str(offer.get("type") or "offer").strip() or "offer",
+            )
+        )
+        remote_applied_ms = (time.perf_counter() - negotiation_started) * 1000.0
+        print(
+            f"Desktop WebRTC session={session_id} remote offer applied in {remote_applied_ms:.0f} ms",
+            flush=True,
+        )
+        print(f"Desktop WebRTC session={session_id} creating answer", flush=True)
+        answer_started = time.perf_counter()
+        answer = await pc.createAnswer()
+        answer_created_ms = (time.perf_counter() - answer_started) * 1000.0
+        print(
+            f"Desktop WebRTC session={session_id} answer created in {answer_created_ms:.0f} ms",
+            flush=True,
+        )
+        local = await _desktop_webrtc_set_local_answer_fast(session_id, pc, answer)
+        _desktop_webrtc_log_sender_state(session_id, sender)
+        if local is None or not str(local.sdp or "").strip():
+            raise HTTPException(status_code=500, detail="Could not generate WebRTC answer.")
+        answer_return_ms = (time.perf_counter() - negotiation_started) * 1000.0
+        print(
+            "Desktop WebRTC session="
+            f"{session_id} returning answer in {answer_return_ms:.0f} ms"
+            f" iceGathering={getattr(pc, 'iceGatheringState', '')}"
+            f" iceConnection={getattr(pc, 'iceConnectionState', '')}",
+            flush=True,
+        )
+        print(
+            f"Desktop WebRTC session={session_id} local SDP { _desktop_webrtc_sdp_video_summary(str(local.sdp or '')) }",
+            flush=True,
+        )
+        return {
+            "ok": True,
+            "session_id": session_id,
+            "answer": {
+                "type": local.type,
+                "sdp": local.sdp,
+            },
+            "transport": "webrtc",
+            "fallback": DESKTOP_STREAM_FALLBACK_TRANSPORT,
+            "trickle_ice": True,
+        }
+    except HTTPException:
+        await _desktop_webrtc_close_session(session_id)
+        raise
+    except Exception as exc:
+        await _desktop_webrtc_close_session(session_id)
+        raise HTTPException(status_code=500, detail=f"WebRTC negotiation failed: {type(exc).__name__}: {exc}")
+
+
+@app.get("/desktop/webrtc/session/{session_id}/ice")
+async def desktop_webrtc_local_ice(session_id: str):
+    _ensure_windows_host()
+    cleaned = _desktop_webrtc_payload_session_id(session_id)
+    session = _desktop_webrtc_get_session(cleaned)
+    if not session:
+        raise HTTPException(status_code=404, detail="WebRTC desktop session not found.")
+    pending, complete = _desktop_webrtc_drain_local_candidates(session)
+    return {
+        "ok": True,
+        "session_id": cleaned,
+        "candidates": pending,
+        "complete": bool(complete),
+        "ready": bool(session.get("local_description_ready")),
+        "error": str(session.get("local_description_error") or ""),
+    }
+
+
+@app.post("/desktop/webrtc/ice")
+async def desktop_webrtc_ice(payload: Optional[Dict[str, Any]] = Body(default=None)):
+    _ensure_windows_host()
+    payload = payload or {}
+    candidate = payload.get("candidate")
+    if not isinstance(candidate, dict):
+        raise HTTPException(status_code=400, detail="candidate is required.")
+    transport = _desktop_stream_transport_payload()
+    if not transport["desktop_webrtc_enabled"]:
+        raise HTTPException(status_code=503, detail=transport["desktop_webrtc_detail"])
+    session_id = _desktop_webrtc_payload_session_id(payload.get("session_id"))
+    session = _desktop_webrtc_get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="WebRTC desktop session not found.")
+    try:
+        await session["pc"].addIceCandidate(_desktop_webrtc_candidate_payload(candidate))
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Could not add ICE candidate: {type(exc).__name__}: {exc}")
+    return {"ok": True, "session_id": session_id}
+
+
+@app.delete("/desktop/webrtc/session/{session_id}")
+async def desktop_webrtc_close(session_id: str):
+    _ensure_windows_host()
+    cleaned = _desktop_webrtc_payload_session_id(session_id)
+    await _desktop_webrtc_close_session(cleaned)
+    return {"ok": True, "session_id": cleaned}
 
 
 @app.get("/power/status")
@@ -9288,6 +11502,77 @@ async def codex_session_image(
     return out
 
 
+@app.post("/desktop/paste/image")
+async def desktop_paste_image(
+    request: Request,
+    file: UploadFile = File(...),
+):
+    _ensure_windows_host()
+    _require_desktop_enabled(request)
+    os.makedirs(CODEX_HOST_PASTE_CACHE_DIR, exist_ok=True)
+    file_name = file.filename or "image.png"
+    target_path = _host_unique_target_path(CODEX_HOST_PASTE_CACHE_DIR, file_name)
+    try:
+        with open(target_path, "wb") as f:
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                f.write(chunk)
+    except Exception as exc:
+        try:
+            if os.path.exists(target_path):
+                os.remove(target_path)
+        except Exception:
+            pass
+        raise HTTPException(status_code=500, detail=f"Failed to stage desktop image paste: {type(exc).__name__}: {exc}")
+    pasted = _desktop_paste_image_file(target_path)
+    if pasted.get("exit_code") != 0:
+        return {
+            "ok": False,
+            "error": "desktop_image_paste_failed",
+            "saved_path": target_path,
+            "detail": (pasted.get("stderr") or pasted.get("stdout") or "desktop_image_paste_failed").strip(),
+            "paste_ok": False,
+            "target_process": str(pasted.get("target_process") or "").strip(),
+            "target_family": str(pasted.get("target_family") or "").strip(),
+            "target_label": str(pasted.get("target_label") or "").strip(),
+            "paste_strategy": str(pasted.get("mode") or "").strip(),
+        }
+    target_process = str(pasted.get("target_process") or "").strip()
+    target_family = str(pasted.get("target_family") or "").strip().lower()
+    target_label = str(pasted.get("target_label") or "").strip()
+    paste_strategy = str(pasted.get("mode") or "clipboard_native_paste").strip()
+    if paste_strategy == "powerpoint_com_paste":
+        detail = "Image copied to the Windows clipboard and pasted into PowerPoint using the Office automation fallback."
+    elif paste_strategy == "word_com_paste":
+        detail = "Image copied to the Windows clipboard and pasted into Word using the Office automation fallback."
+    elif paste_strategy == "wps_sendkeys_paste":
+        detail = f"Image copied to the Windows clipboard and pasted into {target_label or 'the focused WPS window'} using the WPS-compatible paste path."
+    elif paste_strategy == "onenote_sendkeys_paste":
+        detail = "Image copied to the Windows clipboard and pasted into the focused OneNote window using the compatibility paste path."
+    elif target_family == "onenote":
+        detail = "Image copied to the Windows clipboard and pasted into the focused OneNote window."
+    elif target_family == "wps_presentation":
+        detail = "Image copied to the Windows clipboard and pasted into the focused WPS presentation window."
+    elif target_family == "wps_document":
+        detail = "Image copied to the Windows clipboard and pasted into the focused WPS document window."
+    elif target_label:
+        detail = f"Image copied to the Windows clipboard and pasted into {target_label}."
+    else:
+        detail = "Image copied to the Windows clipboard and pasted into the focused host app."
+    return {
+        "ok": True,
+        "saved_path": target_path,
+        "paste_ok": True,
+        "detail": detail,
+        "target_process": target_process,
+        "target_family": target_family,
+        "target_label": target_label,
+        "paste_strategy": paste_strategy,
+    }
+
+
 @app.get("/fs/list")
 def fs_list(root: str = "workspace", path: str = ""):
     return _list_browser_entries(root, path)
@@ -10220,14 +12505,22 @@ def share_file_download(share_id: str):
         if _share_expired(item):
             raise HTTPException(status_code=410, detail="Share has expired.")
         wsl_path = str(item.get("wsl_path") or "")
-    wsl_abs = _resolve_session_access_path(wsl_path)
-    unc = _wsl_unc_path(wsl_abs)
-    if not os.path.exists(unc):
-        raise HTTPException(status_code=404, detail="Shared file is no longer available.")
-    if os.path.isdir(unc):
+        windows_path = str(item.get("windows_path") or "")
+    filename = str(item.get("file_name") or "download.bin")
+    if wsl_path.startswith("/"):
+        wsl_abs = _resolve_session_access_path(wsl_path)
+        unc = _wsl_unc_path(wsl_abs)
+        if not os.path.exists(unc):
+            raise HTTPException(status_code=404, detail="Shared file is no longer available.")
+        if os.path.isdir(unc):
+            raise HTTPException(status_code=400, detail="Shared path is a directory.")
+        return FileResponse(unc, filename=filename or os.path.basename(wsl_abs.rstrip("/")) or "download.bin")
+    host_path = _normalize_host_path(windows_path)
+    if not os.path.exists(host_path):
+        raise HTTPException(status_code=404, detail="Shared host file is no longer available.")
+    if os.path.isdir(host_path):
         raise HTTPException(status_code=400, detail="Shared path is a directory.")
-    filename = str(item.get("file_name") or os.path.basename(wsl_abs.rstrip("/")) or "download.bin")
-    return FileResponse(unc, filename=filename)
+    return FileResponse(host_path, filename=filename or os.path.basename(host_path.rstrip("\\/")) or "download.bin")
 
 
 @app.get("/wsl/file")
@@ -10243,6 +12536,127 @@ def wsl_file(path: str):
     # Stream the file via UNC path (supports binary)
     filename = os.path.basename(wsl_abs.rstrip("/"))
     return FileResponse(unc, filename=filename)
+
+
+@app.post("/host/open-path")
+def host_open_path(payload: Optional[Dict[str, Any]] = Body(default=None)):
+    _ensure_windows_host()
+    payload = payload or {}
+    info = _resolve_openable_host_path(str(payload.get("path") or ""))
+    return _open_resolved_host_path(info)
+
+
+@app.post("/host/reveal-path")
+def host_reveal_path(payload: Optional[Dict[str, Any]] = Body(default=None)):
+    _ensure_windows_host()
+    payload = payload or {}
+    info = _resolve_openable_host_path(str(payload.get("path") or ""))
+    return _reveal_resolved_host_path(info)
+
+
+@app.post("/host/files/upload")
+async def host_upload(
+    file: UploadFile = File(...),
+    destination: str = Form("default"),
+    open_after: str = Form("0"),
+    reveal_after: str = Form("0"),
+):
+    _ensure_windows_host()
+    destination_info = _resolve_host_transfer_destination(destination)
+    should_open = _truthy_flag(open_after)
+    should_reveal = _truthy_flag(reveal_after)
+    file_name = file.filename or "upload.bin"
+    target_path = _host_unique_target_path(destination_info["directory"], file_name)
+    try:
+        with open(target_path, "wb") as f:
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                f.write(chunk)
+    except Exception as exc:
+        try:
+            if os.path.exists(target_path):
+                os.remove(target_path)
+        except Exception:
+            pass
+        raise HTTPException(status_code=500, detail=f"Failed to write host file: {type(exc).__name__}: {exc}")
+    item = _create_host_shared_outbox_item(
+        target_path,
+        created_by="host_upload",
+        source_kind="host_transfer",
+    )
+    detail = (
+        f"Uploaded to {destination_info['directory']}"
+        if destination_info["mode"] == "focused"
+        else f"Uploaded to {CODEX_HOST_TRANSFER_ROOT}"
+    )
+    post_action = ""
+    post_action_detail = ""
+    if should_reveal:
+        reveal_result = _reveal_resolved_host_path(_resolve_openable_host_path(target_path))
+        post_action = "reveal"
+        post_action_detail = str(reveal_result.get("detail") or "").strip()
+    elif should_open:
+        open_result = _open_resolved_host_path(_resolve_openable_host_path(target_path))
+        post_action = "open"
+        post_action_detail = str(open_result.get("detail") or "").strip()
+    if post_action_detail:
+        detail = f"{detail}. {post_action_detail}"
+    return {
+        "ok": True,
+        "saved_path": target_path,
+        "target_dir": destination_info["directory"],
+        "destination_mode": destination_info["mode"],
+        "focused_path": destination_info["selected_path"],
+        "post_action": post_action,
+        "shared_file": _public_shared_item(item),
+        "detail": detail,
+    }
+
+
+@app.post("/host/files/pick-share")
+def host_pick_share(payload: Optional[Dict[str, Any]] = Body(default=None)):
+    _ensure_windows_host()
+    payload = payload or {}
+    picked_path = _desktop_pick_shareable_host_file()
+    item = _create_host_shared_outbox_item(
+        picked_path,
+        title=str(payload.get("title") or "").strip(),
+        expires_hours=payload.get("expires_hours"),
+        created_by="host_picker",
+        source_kind="host_picker",
+    )
+    return {
+        "ok": True,
+        "selected_path": picked_path,
+        "shared_file": _public_shared_item(item),
+        "detail": f"Shared host file: {picked_path}",
+    }
+
+
+@app.post("/host/files/share-selection")
+def host_share_selection(payload: Optional[Dict[str, Any]] = Body(default=None)):
+    _ensure_windows_host()
+    payload = payload or {}
+    allow_directory = _truthy_flag(payload.get("allow_directory"))
+    selection = _desktop_selected_paths()
+    selected_path = _normalize_host_path(str(selection.get("path") or ""))
+    item = _create_host_shared_outbox_item(
+        selected_path,
+        title=str(payload.get("title") or "").strip(),
+        expires_hours=payload.get("expires_hours"),
+        allow_directory=allow_directory,
+        created_by="host_selection",
+        source_kind="host_selection",
+    )
+    return {
+        "ok": True,
+        "selected_path": selected_path,
+        "shared_file": _public_shared_item(item),
+        "detail": f"Shared host selection: {selected_path}",
+    }
+
 
 @app.post("/wsl/upload")
 async def wsl_upload(file: UploadFile = File(...), dest: str = Form("")):

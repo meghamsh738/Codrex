@@ -6,10 +6,13 @@ namespace Codrex.Launcher;
 public sealed class LauncherPreferences
 {
     [JsonPropertyName("preferred_pair_route")]
-    public string PreferredPairRoute { get; set; } = "lan";
+    public string PreferredPairRoute { get; set; } = "tailscale";
 
     [JsonPropertyName("advanced_visible")]
     public bool AdvancedVisible { get; set; }
+
+    [JsonPropertyName("minimize_to_tray")]
+    public bool MinimizeToTray { get; set; } = true;
 }
 
 public sealed class RuntimeActionResult
@@ -59,6 +62,12 @@ public sealed class RuntimeActionResult
     [JsonPropertyName("network_url")]
     public string NetworkUrl { get; set; } = "";
 
+    [JsonPropertyName("controller_mode")]
+    public string ControllerMode { get; set; } = "";
+
+    [JsonPropertyName("sessions_runtime_state")]
+    public string SessionsRuntimeState { get; set; } = "";
+
     [JsonPropertyName("action_id")]
     public string ActionId { get; set; } = "";
 
@@ -72,6 +81,21 @@ public sealed class RuntimeActionResult
     public string LastErrorPath { get; set; } = "";
 }
 
+public sealed class RouteOriginPayload
+{
+    [JsonPropertyName("provider")]
+    public string Provider { get; set; } = "";
+
+    [JsonPropertyName("host")]
+    public string Host { get; set; } = "";
+
+    [JsonPropertyName("origin")]
+    public string Origin { get; set; } = "";
+
+    [JsonPropertyName("label")]
+    public string Label { get; set; } = "";
+}
+
 public sealed class NetInfoPayload
 {
     [JsonPropertyName("ok")]
@@ -82,6 +106,21 @@ public sealed class NetInfoPayload
 
     [JsonPropertyName("tailscale_ip")]
     public string TailscaleIp { get; set; } = "";
+
+    [JsonPropertyName("netbird_ip")]
+    public string NetbirdIp { get; set; } = "";
+
+    [JsonPropertyName("preferred_origin")]
+    public string PreferredOrigin { get; set; } = "";
+
+    [JsonPropertyName("route_provider")]
+    public string RouteProvider { get; set; } = "";
+
+    [JsonPropertyName("route_state")]
+    public string RouteState { get; set; } = "";
+
+    [JsonPropertyName("available_origins")]
+    public List<RouteOriginPayload> AvailableOrigins { get; set; } = new();
 }
 
 public sealed class PairCreatePayload

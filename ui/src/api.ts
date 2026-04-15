@@ -4,13 +4,19 @@ import type {
   BasicResult,
   BrowserListResult,
   CodexOptionsResult,
+  CodexRuntimeStatusResult,
   CodexExecStartResult,
   CodexRunDetail,
   CodexRunsResult,
+  DesktopStreamCapabilitiesResult,
+  DesktopWebrtcOfferResult,
   DesktopInfoResult,
   DesktopInputResult,
+  DesktopPasteImageResult,
   DesktopModeResult,
+  HostTransferResult,
   NetInfo,
+  OpenPathResult,
   PairCreateResult,
   PowerActionResult,
   PowerStatusResult,
@@ -221,11 +227,31 @@ export function buildSuggestedControllerUrl(
   hostname: string,
   port: number,
   netInfo: NetInfo | null,
-  route: "lan" | "tailscale" | "current",
+  route: "preferred" | "lan" | "tailscale" | "netbird" | "current",
 ): string {
+  if (route === "preferred" && netInfo?.preferred_origin) {
+    return netInfo.preferred_origin;
+  }
+  if (route === "netbird") {
+    if (netInfo?.netbird_ip) {
+      return `http://${netInfo.netbird_ip}:${port}`;
+    }
+    if (netInfo?.preferred_origin) {
+      try {
+        const preferred = new URL(netInfo.preferred_origin);
+        if (preferred.hostname && preferred.hostname !== "127.0.0.1" && preferred.hostname !== "localhost") {
+          return netInfo.preferred_origin;
+        }
+      } catch {
+      }
+    }
+  }
   if (route === "lan") {
     if (netInfo?.lan_ip) {
       return `http://${netInfo.lan_ip}:${port}`;
+    }
+    if (netInfo?.netbird_ip) {
+      return `http://${netInfo.netbird_ip}:${port}`;
     }
     if (netInfo?.tailscale_ip) {
       return `http://${netInfo.tailscale_ip}:${port}`;
@@ -234,6 +260,9 @@ export function buildSuggestedControllerUrl(
   if (route === "tailscale") {
     if (netInfo?.tailscale_ip) {
       return `http://${netInfo.tailscale_ip}:${port}`;
+    }
+    if (netInfo?.netbird_ip) {
+      return `http://${netInfo.netbird_ip}:${port}`;
     }
   }
   return `http://${hostname}:${port}`;
@@ -289,6 +318,26 @@ export function logout(): Promise<BasicResult> {
 
 export function getNetInfo(): Promise<NetInfo> {
   return requestJson<NetInfo>("/net/info");
+}
+
+export function getCodexRuntimeStatus(): Promise<CodexRuntimeStatusResult> {
+  return requestJson<CodexRuntimeStatusResult>("/codex/runtime/status");
+}
+
+export function startCodexRuntime(): Promise<CodexRuntimeStatusResult> {
+  return requestJson<CodexRuntimeStatusResult>("/codex/runtime/start", {
+    method: "POST",
+    headers: JSON_HEADERS,
+    body: JSON.stringify({}),
+  });
+}
+
+export function stopCodexRuntime(): Promise<CodexRuntimeStatusResult> {
+  return requestJson<CodexRuntimeStatusResult>("/codex/runtime/stop", {
+    method: "POST",
+    headers: JSON_HEADERS,
+    body: JSON.stringify({}),
+  });
 }
 
 export function createPairCode(): Promise<PairCreateResult> {
@@ -698,6 +747,40 @@ export function getDesktopInfo(): Promise<DesktopInfoResult> {
   return requestJson<DesktopInfoResult>("/desktop/info");
 }
 
+export function getDesktopStreamCapabilities(): Promise<DesktopStreamCapabilitiesResult> {
+  return requestJson<DesktopStreamCapabilitiesResult>("/desktop/stream/capabilities");
+}
+
+export function createDesktopWebrtcOffer(payload: {
+  offer: { type: string; sdp: string };
+  fps?: number;
+  scale?: number;
+  bw?: boolean;
+}): Promise<DesktopWebrtcOfferResult> {
+  return requestJson<DesktopWebrtcOfferResult>("/desktop/webrtc/offer", {
+    method: "POST",
+    headers: JSON_HEADERS,
+    body: JSON.stringify(payload),
+  });
+}
+
+export function sendDesktopWebrtcIce(payload: {
+  session_id: string;
+  candidate: { candidate?: string; sdpMid?: string | null; sdpMLineIndex?: number | null };
+}): Promise<BasicResult> {
+  return requestJson<BasicResult>("/desktop/webrtc/ice", {
+    method: "POST",
+    headers: JSON_HEADERS,
+    body: JSON.stringify(payload),
+  });
+}
+
+export function closeDesktopWebrtcSession(sessionId: string): Promise<BasicResult> {
+  return requestJson<BasicResult>(`/desktop/webrtc/session/${encodeURIComponent(sessionId)}`, {
+    method: "DELETE",
+  });
+}
+
 export function getPowerStatus(): Promise<PowerStatusResult> {
   return requestJson<PowerStatusResult>("/power/status");
 }
@@ -794,7 +877,14 @@ export function desktopGetSelectedPath(): Promise<DesktopInputResult> {
   });
 }
 
-export function buildDesktopStreamUrl(params?: { fps?: number; level?: number; scale?: number; bw?: boolean }): string {
+export function buildDesktopStreamUrl(params?: {
+  fps?: number;
+  level?: number;
+  scale?: number;
+  bw?: boolean;
+  format?: "png" | "jpeg";
+  quality?: number;
+}): string {
   const query = new URLSearchParams();
   if (typeof params?.fps === "number" && Number.isFinite(params.fps)) {
     query.set("fps", String(params.fps));
@@ -807,6 +897,12 @@ export function buildDesktopStreamUrl(params?: { fps?: number; level?: number; s
   }
   if (params?.bw) {
     query.set("bw", "1");
+  }
+  if (params?.format === "jpeg" || params?.format === "png") {
+    query.set("format", params.format);
+  }
+  if (typeof params?.quality === "number" && Number.isFinite(params.quality)) {
+    query.set("quality", String(params.quality));
   }
   const suffix = query.toString();
   return suffix ? `/desktop/stream?${suffix}` : "/desktop/stream";
@@ -846,5 +942,90 @@ export function uploadWslFile(file: File, dest: string): Promise<WslUploadResult
   return requestJson<WslUploadResult>("/wsl/upload", {
     method: "POST",
     body: formData,
+  });
+}
+
+export function uploadHostFile(
+  file: File,
+  destination = "default",
+  options?: { open_after?: boolean; reveal_after?: boolean },
+): Promise<HostTransferResult> {
+  const formData = new FormData();
+  formData.append("file", file);
+  formData.append("destination", destination.trim() || "default");
+  if (typeof options?.open_after === "boolean") {
+    formData.append("open_after", options.open_after ? "1" : "0");
+  }
+  if (typeof options?.reveal_after === "boolean") {
+    formData.append("reveal_after", options.reveal_after ? "1" : "0");
+  }
+  return requestJson<HostTransferResult>("/host/files/upload", {
+    method: "POST",
+    body: formData,
+  });
+}
+
+export function pasteDesktopImage(file: File): Promise<DesktopPasteImageResult> {
+  const formData = new FormData();
+  formData.append("file", file);
+  return requestJson<DesktopPasteImageResult>("/desktop/paste/image", {
+    method: "POST",
+    body: formData,
+  });
+}
+
+export function shareHostSelection(options?: {
+  title?: string;
+  expires_hours?: number;
+  allow_directory?: boolean;
+}): Promise<HostTransferResult> {
+  const payload: Record<string, string | number | boolean> = {};
+  if (options?.title?.trim()) {
+    payload.title = options.title.trim();
+  }
+  if (typeof options?.expires_hours === "number" && Number.isFinite(options.expires_hours)) {
+    payload.expires_hours = options.expires_hours;
+  }
+  if (typeof options?.allow_directory === "boolean") {
+    payload.allow_directory = options.allow_directory;
+  }
+  return requestJson<HostTransferResult>("/host/files/share-selection", {
+    method: "POST",
+    headers: JSON_HEADERS,
+    body: JSON.stringify(payload),
+  });
+}
+
+export function pickAndShareHostFile(options?: {
+  title?: string;
+  expires_hours?: number;
+}): Promise<HostTransferResult> {
+  const payload: Record<string, string | number> = {};
+  if (options?.title?.trim()) {
+    payload.title = options.title.trim();
+  }
+  if (typeof options?.expires_hours === "number" && Number.isFinite(options.expires_hours)) {
+    payload.expires_hours = options.expires_hours;
+  }
+  return requestJson<HostTransferResult>("/host/files/pick-share", {
+    method: "POST",
+    headers: JSON_HEADERS,
+    body: JSON.stringify(payload),
+  });
+}
+
+export function openHostPath(path: string): Promise<OpenPathResult> {
+  return requestJson<OpenPathResult>("/host/open-path", {
+    method: "POST",
+    headers: JSON_HEADERS,
+    body: JSON.stringify({ path }),
+  });
+}
+
+export function revealHostPath(path: string): Promise<OpenPathResult> {
+  return requestJson<OpenPathResult>("/host/reveal-path", {
+    method: "POST",
+    headers: JSON_HEADERS,
+    body: JSON.stringify({ path }),
   });
 }

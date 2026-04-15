@@ -15,11 +15,13 @@ import {
   getSessionNotes,
   getTelegramStatus,
   listSharedFiles,
+  shareHostSelection,
   saveSessionNotes,
   sendPowerAction,
   sendSessionKey,
   sendTelegramText,
   sendSharedFileToTelegram,
+  uploadHostFile,
 } from "../api";
 
 describe("pairing URL helpers", () => {
@@ -368,7 +370,7 @@ describe("shared files API", () => {
     fetchMock.mockResolvedValue({
       ok: true,
       status: 200,
-      text: async () => JSON.stringify({ ok: true, version: "1.5.0", ui_mode: "built" }),
+      text: async () => JSON.stringify({ ok: true, version: "1.5.0", ui_mode: "built", desktop_stream_transport: "fallback" }),
     });
     const out = await getAppRuntime();
     expect(out.ok).toBe(true);
@@ -376,6 +378,44 @@ describe("shared files API", () => {
       "/app/runtime",
       expect.objectContaining({
         credentials: "include",
+      }),
+    );
+  });
+
+  it("uploads host transfer files with multipart form data", async () => {
+    fetchMock.mockResolvedValue({
+      ok: true,
+      status: 200,
+      text: async () => JSON.stringify({ ok: true, saved_path: "C:\\Users\\megha\\Downloads\\Codrex Transfers\\demo.txt" }),
+    });
+    const out = await uploadHostFile(new File(["demo"], "demo.txt", { type: "text/plain" }), "focused");
+    expect(out.ok).toBe(true);
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/host/files/upload",
+      expect.objectContaining({
+        method: "POST",
+        credentials: "include",
+        body: expect.any(FormData),
+      }),
+    );
+  });
+
+  it("shares the focused host selection", async () => {
+    fetchMock.mockResolvedValue({
+      ok: true,
+      status: 200,
+      text: async () => JSON.stringify({ ok: true, selected_path: "D:\\Reports\\result.png" }),
+    });
+    const out = await shareHostSelection({ allow_directory: false });
+    expect(out.ok).toBe(true);
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/host/files/share-selection",
+      expect.objectContaining({
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ allow_directory: false }),
       }),
     );
   });

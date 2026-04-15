@@ -59,6 +59,7 @@ public sealed class LauncherStateStore
         {
             PreferredPairRoute = NormalizeRoute(preferences.PreferredPairRoute),
             AdvancedVisible = preferences.AdvancedVisible,
+            MinimizeToTray = preferences.MinimizeToTray,
         };
         File.WriteAllText(PreferencesPath, JsonSerializer.Serialize(normalized, JsonOptions));
     }
@@ -83,6 +84,13 @@ public sealed class LauncherStateStore
     private static string NormalizeRoute(string raw)
     {
         var value = (raw ?? string.Empty).Trim().ToLowerInvariant();
-        return value == "tailscale" ? "tailscale" : "lan";
+        return value switch
+        {
+            "tailscale" => "tailscale",
+            "netbird" => "netbird",
+            "lan" => "lan",
+            "current" => "current",
+            _ => "tailscale",
+        };
     }
 }

@@ -1,6 +1,6 @@
 import type { NetInfo } from "../types";
 
-type RouteHint = "lan" | "tailscale" | "current";
+type RouteHint = "preferred" | "lan" | "tailscale" | "netbird" | "current";
 
 interface PairTabProps {
   screenCardClassName: string;
@@ -58,7 +58,7 @@ export default function PairTab({
       <div className="pair-layout">
         <div className="stack">
           <p className="small">
-            Keep using Tailscale + token auth. QR exchange only grants this device the existing backend token context.
+            Pair over the best private route available. QR exchange only grants this device the existing backend token context.
           </p>
 
           <div className="step-card">
@@ -67,13 +67,15 @@ export default function PairTab({
               <h3>Choose Route</h3>
             </div>
             <label className="field">
-              <span>Route Hint</span>
+              <span>Preferred Route</span>
               <select
                 data-testid="pair-route-hint-select"
                 value={routeHint}
                 onChange={(event) => onRouteHintChange(event.target.value as RouteHint)}
               >
-                <option value="tailscale">{prettyRouteLabel("tailscale")} (default)</option>
+                <option value="preferred">{prettyRouteLabel("preferred")} (default)</option>
+                <option value="tailscale">{prettyRouteLabel("tailscale")}</option>
+                <option value="netbird">{prettyRouteLabel("netbird")}</option>
                 <option value="lan" disabled={!isLocalBrowser}>
                   {prettyRouteLabel("lan")}{!isLocalBrowser ? " (localhost only)" : ""}
                 </option>
@@ -97,10 +99,10 @@ export default function PairTab({
               />
             </label>
             <p className="small">
-              LAN: <strong>{netInfo?.lan_ip || "n/a"}</strong> | Tailscale: <strong>{netInfo?.tailscale_ip || "n/a"}</strong>
+              LAN: <strong>{netInfo?.lan_ip || "n/a"}</strong> | Tailscale: <strong>{netInfo?.tailscale_ip || "n/a"}</strong> | NetBird: <strong>{netInfo?.netbird_ip || "n/a"}</strong>
             </p>
             {tailscaleRouteUnavailable ? (
-              <p className="small warn">Tailscale route is selected but no Tailscale IP is detected.</p>
+              <p className="small warn">The selected private route is unavailable on this laptop.</p>
             ) : null}
           </div>
 

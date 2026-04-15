@@ -70,11 +70,67 @@ function Get-CodrexSelectedRouteFromState {
     }
     $payload = Get-Content -Path $statePath -Raw | ConvertFrom-Json
     $route = ([string]$payload.preferred_pair_route).Trim().ToLowerInvariant()
-    if ($route -in @("lan", "tailscale")) {
+    if ($route -in @("lan", "tailscale", "netbird")) {
       return $route
     }
   } catch {}
   return ""
+}
+
+function Get-CodrexAdapterIPv4ByKeyword {
+  param(
+    [string[]]$Keywords
+  )
+  $normalizedKeywords = @($Keywords | Where-Object { $_ } | ForEach-Object { ([string]$_).Trim().ToLowerInvariant() } | Where-Object { $_ })
+  if ($normalizedKeywords.Count -eq 0) {
+    return ""
+  }
+  try {
+    $adapters = @(Get-NetAdapter -ErrorAction Stop | Where-Object { $_.Status -ne "Disabled" })
+    foreach ($adapter in $adapters) {
+      $haystack = ("{0} {1}" -f [string]$adapter.Name, [string]$adapter.InterfaceDescription).Trim().ToLowerInvariant()
+      if (-not $haystack) {
+        continue
+      }
+      $matched = $false
+      foreach ($keyword in $normalizedKeywords) {
+        if ($haystack -like "*$keyword*") {
+          $matched = $true
+          break
+        }
+      }
+      if (-not $matched) {
+        continue
+      }
+      $ip = Get-NetIPAddress -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+        Where-Object { $_.IPAddress -and $_.IPAddress -notlike "169.254*" -and $_.IPAddress -ne "127.0.0.1" } |
+        Select-Object -First 1 -ExpandProperty IPAddress
+      if ($ip) {
+        return [string]$ip
+      }
+    }
+  } catch {}
+  return ""
+}
+
+function Get-CodrexTailscaleIPv4 {
+  $ip = Get-CodrexAdapterIPv4ByKeyword -Keywords @("tailscale")
+  if ($ip) {
+    return $ip
+  }
+  try {
+    $matches = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction Stop |
+      Where-Object { $_.IPAddress -like "100.*" } |
+      Select-Object -First 1 -ExpandProperty IPAddress
+    if ($matches) {
+      return [string]$matches
+    }
+  } catch {}
+  return ""
+}
+
+function Get-CodrexNetbirdIPv4 {
+  return (Get-CodrexAdapterIPv4ByKeyword -Keywords @("netbird"))
 }
 
 function Get-CodrexStringTail {
@@ -129,6 +185,43 @@ function Get-CodrexPrimaryIPv4 {
   } catch {}
 
   return "127.0.0.1"
+}
+
+function Get-CodrexPublishedNetworkInfo {
+  param(
+    [string]$RuntimeDir,
+    [int]$Port
+  )
+  $route = Get-CodrexSelectedRouteFromState -RuntimeDir $RuntimeDir
+  if (-not $route) {
+    $route = "tailscale"
+  }
+  $lan = Get-CodrexPrimaryIPv4
+  $tailscale = Get-CodrexTailscaleIPv4
+  $netbird = Get-CodrexNetbirdIPv4
+  $chosen = ""
+  switch ($route) {
+    "tailscale" {
+      if ($tailscale) { $chosen = $tailscale } elseif ($lan -and $lan -ne "127.0.0.1") { $chosen = $lan }
+    }
+    "netbird" {
+      if ($netbird) { $chosen = $netbird } elseif ($lan -and $lan -ne "127.0.0.1") { $chosen = $lan }
+    }
+    "lan" {
+      if ($lan -and $lan -ne "127.0.0.1") { $chosen = $lan }
+    }
+    default {
+      if ($tailscale) { $chosen = $tailscale } elseif ($netbird) { $chosen = $netbird } elseif ($lan -and $lan -ne "127.0.0.1") { $chosen = $lan }
+    }
+  }
+  return [ordered]@{
+    selected_pair_route = $route
+    lan_ip = $lan
+    tailscale_ip = $tailscale
+    netbird_ip = $netbird
+    local_url = if ($Port -gt 0) { ("http://127.0.0.1:{0}/" -f $Port) } else { "" }
+    network_url = if ($chosen -and $Port -gt 0) { ("http://{0}:{1}/" -f $chosen, $Port) } else { "" }
+  }
 }
 
 function Get-CodrexListeningTcpRows {

@@ -6,6 +6,17 @@ export interface AuthStatus {
   authenticated: boolean;
 }
 
+export type RouteProvider = "preferred" | "tailscale" | "netbird" | "lan" | "localhost" | "current" | "unknown";
+export type RouteState = "connected" | "local_only" | "unavailable" | "unknown";
+
+export interface RouteOriginInfo {
+  provider: Exclude<RouteProvider, "preferred" | "current" | "unknown">;
+  host: string;
+  origin: string;
+  label?: string;
+  private?: boolean;
+}
+
 export type AppRuntimeResult = Omit<BasicResult, "session_file"> & {
   version?: string;
   launcher_mode?: string;
@@ -19,6 +30,21 @@ export type AppRuntimeResult = Omit<BasicResult, "session_file"> & {
   controller_origin?: string;
   ui_mode?: string;
   build_present?: boolean;
+  desktop_stream_transport?: string;
+  desktop_stream_fallback?: string;
+  desktop_webrtc_available?: boolean;
+  desktop_webrtc_enabled?: boolean;
+  desktop_webrtc_detail?: string;
+  available_origins?: RouteOriginInfo[];
+  preferred_origin?: string;
+  route_provider?: RouteProvider;
+  route_state?: RouteState;
+  controller_mode?: "controller-only" | "sessions-running";
+  sessions_runtime_state?: "running" | "stopped" | "missing" | "unknown";
+  sessions_runtime_detail?: string;
+  sessions_runtime_distro?: string;
+  sessions_runtime_can_start?: boolean;
+  sessions_runtime_can_stop?: boolean;
 };
 
 export interface SharedFileInfo {
@@ -78,9 +104,22 @@ export interface NetInfo {
   ok: boolean;
   lan_ip: string;
   tailscale_ip: string;
+  netbird_ip?: string;
+  available_origins?: RouteOriginInfo[];
+  preferred_origin?: string;
+  route_provider?: RouteProvider;
+  route_state?: RouteState;
   primary_mac?: string;
   wake_candidate_macs?: string[];
   wake_supported?: boolean;
+}
+
+export interface CodexRuntimeStatusResult extends BasicResult {
+  state?: "running" | "stopped" | "missing" | "unknown";
+  detail?: string;
+  distro?: string;
+  can_start?: boolean;
+  can_stop?: boolean;
 }
 
 export interface PairCreateResult extends BasicResult {
@@ -154,6 +193,15 @@ export interface SessionImageResult extends BasicResult {
   delivery_mode?: "desktop_clipboard" | "session_path" | "insert_path";
 }
 
+export interface DesktopPasteImageResult extends BasicResult {
+  saved_path?: string;
+  paste_ok?: boolean;
+  target_process?: string;
+  target_family?: string;
+  target_label?: string;
+  paste_strategy?: string;
+}
+
 export interface SessionScreenResult extends BasicResult {
   session?: string;
   pane_id?: string;
@@ -201,6 +249,31 @@ export interface DesktopInfoResult extends BasicResult {
   alt_held?: boolean;
   perf_mode_enabled?: boolean;
   perf_mode_active?: boolean;
+  desktop_stream_transport?: string;
+  desktop_stream_fallback?: string;
+  desktop_webrtc_available?: boolean;
+  desktop_webrtc_enabled?: boolean;
+  desktop_webrtc_detail?: string;
+}
+
+export interface DesktopStreamCapabilitiesResult extends BasicResult {
+  preferred_transport?: string;
+  fallback_transport?: string;
+  webrtc_available?: boolean;
+  webrtc_enabled?: boolean;
+  webrtc_detail?: string;
+}
+
+export interface DesktopWebrtcSessionDescription {
+  type: string;
+  sdp: string;
+}
+
+export interface DesktopWebrtcOfferResult extends BasicResult {
+  session_id?: string;
+  answer?: DesktopWebrtcSessionDescription;
+  transport?: string;
+  fallback?: string;
 }
 
 export interface DesktopModeResult extends BasicResult {
@@ -253,6 +326,22 @@ export interface PowerActionResult extends BasicResult {
 
 export interface WslUploadResult extends BasicResult {
   saved_path?: string;
+}
+
+export interface HostTransferResult extends BasicResult {
+  saved_path?: string;
+  target_dir?: string;
+  destination_mode?: string;
+  focused_path?: string;
+  selected_path?: string;
+  post_action?: "open" | "reveal" | "";
+}
+
+export interface OpenPathResult extends BasicResult {
+  path?: string;
+  normalized_path?: string;
+  opened_path?: string;
+  item_kind?: "file" | "directory";
 }
 
 export interface SessionFilesResult extends BasicResult {
