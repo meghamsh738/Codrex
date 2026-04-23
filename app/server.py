@@ -1,6 +1,8 @@
 ﻿from fastapi import FastAPI, HTTPException, Body, UploadFile, File, Form, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, Response, FileResponse, JSONResponse, StreamingResponse, RedirectResponse
 import asyncio
+import gc
+import glob
 import json
 import math
 import time
@@ -21,23 +23,49 @@ import secrets
 import ctypes
 import ipaddress
 from ctypes import wintypes
-from typing import List, Dict, Any, Optional, Tuple
-from urllib.parse import quote, urlparse
+from typing import List, Dict, Any, Optional, Tuple, Callable, Set
+from urllib.parse import quote, urlparse, unquote
 import urllib.request
 import urllib.error
 import atexit
 import base64
 import logging
+import sqlite3
+import traceback
 from fractions import Fraction
 
 from mss import mss
 from mss.tools import to_png
+try:
+    import dxcam  # type: ignore
+    DXCAM_AVAILABLE = os.name == "nt"
+    DXCAM_IMPORT_ERROR = ""
+except Exception as _dxcam_exc:
+    dxcam = None  # type: ignore
+    DXCAM_AVAILABLE = False
+    DXCAM_IMPORT_ERROR = f"{type(_dxcam_exc).__name__}: {_dxcam_exc}"
 try:
     from PIL import Image
     PILLOW_AVAILABLE = True
 except Exception:
     Image = None  # type: ignore
     PILLOW_AVAILABLE = False
+try:
+    from winpty import PtyProcess  # type: ignore
+    WINPTY_AVAILABLE = os.name == "nt"
+    WINPTY_IMPORT_ERROR = ""
+except Exception as _winpty_exc:
+    PtyProcess = None  # type: ignore
+    WINPTY_AVAILABLE = False
+    WINPTY_IMPORT_ERROR = f"{type(_winpty_exc).__name__}: {_winpty_exc}"
+try:
+    import websockets  # type: ignore
+    WEBSOCKETS_AVAILABLE = True
+    WEBSOCKETS_IMPORT_ERROR = ""
+except Exception as _websockets_exc:
+    websockets = None  # type: ignore
+    WEBSOCKETS_AVAILABLE = False
+    WEBSOCKETS_IMPORT_ERROR = f"{type(_websockets_exc).__name__}: {_websockets_exc}"
 
 try:
     import numpy as np  # type: ignore
@@ -109,6 +137,10 @@ UI_DIST_ASSETS_DIR = os.path.join(UI_DIST_DIR, "assets")
 WSL_DISTRO = os.environ.get("CODEX_WSL_DISTRO", "Ubuntu")
 WSL_EXE = os.environ.get("CODEX_WSL_EXE", "wsl")
 CODEX_WORKDIR = os.environ.get("CODEX_WORKDIR", "/home/megha/codrex-work")
+CODEX_WINDOWS_WORKDIR = os.path.abspath(
+    os.environ.get("CODEX_WINDOWS_WORKDIR", os.path.abspath(os.path.join(APP_ROOT_DIR, "..")))
+)
+CODEX_WINDOWS_CLI = os.environ.get("CODEX_WINDOWS_CLI", "codex").strip() or "codex"
 CODEX_AUTH_TOKEN = os.environ.get("CODEX_AUTH_TOKEN", "").strip()
 CODEX_AUTH_COOKIE = os.environ.get("CODEX_AUTH_COOKIE", "codrex_remote_auth").strip() or "codrex_remote_auth"
 CODEX_DESKTOP_MODE_COOKIE = os.environ.get("CODEX_DESKTOP_MODE_COOKIE", "codrex_remote_desktop_mode").strip() or "codrex_remote_desktop_mode"
@@ -118,6 +150,7 @@ DEFAULT_CODEX_MODELS = ["gpt-5-codex", "gpt-5", "gpt-5-mini", "gpt-4.1", "o4-min
 DEFAULT_REASONING_EFFORTS = ["minimal", "low", "medium", "high", "xhigh"]
 BUILT_UI_ROOT_FILES = {
     "apple-touch-icon.png",
+    "codrex-logo-hero.png",
     "icon-192.png",
     "icon-512.png",
     "icon-maskable-192.png",
@@ -127,6 +160,53 @@ BUILT_UI_ROOT_FILES = {
     "manifest.webmanifest",
     "sw.js",
 }
+HOST_KEEP_AWAKE_ENABLED = str(os.environ.get("CODEX_HOST_KEEP_AWAKE", "1") or "1").strip().lower() not in {
+    "0",
+    "false",
+    "no",
+    "off",
+}
+HOST_KEEP_AWAKE_MIN_INTERVAL_S = max(5.0, float(os.environ.get("CODEX_HOST_KEEP_AWAKE_MIN_INTERVAL_S", "15") or "15"))
+HOST_KEEP_AWAKE_LOCK = threading.Lock()
+HOST_KEEP_AWAKE_LAST_PULSE = 0.0
+ES_SYSTEM_REQUIRED = 0x00000001
+ES_DISPLAY_REQUIRED = 0x00000002
+ES_CONTINUOUS = 0x80000000
+
+
+def _host_keep_awake_available() -> bool:
+    return bool(HOST_KEEP_AWAKE_ENABLED and os.name == "nt" and getattr(ctypes, "windll", None))
+
+
+def _host_keep_awake_pulse(*, force: bool = False, display_required: bool = True) -> None:
+    global HOST_KEEP_AWAKE_LAST_PULSE
+    if not _host_keep_awake_available():
+        return
+    now = time.time()
+    with HOST_KEEP_AWAKE_LOCK:
+        if not force and now - HOST_KEEP_AWAKE_LAST_PULSE < HOST_KEEP_AWAKE_MIN_INTERVAL_S:
+            return
+        flags = ES_CONTINUOUS | ES_SYSTEM_REQUIRED
+        if display_required:
+            flags |= ES_DISPLAY_REQUIRED
+        try:
+            result = int(ctypes.windll.kernel32.SetThreadExecutionState(flags))  # type: ignore[attr-defined]
+        except Exception:
+            return
+        if result:
+            HOST_KEEP_AWAKE_LAST_PULSE = now
+
+
+def _host_keep_awake_release() -> None:
+    global HOST_KEEP_AWAKE_LAST_PULSE
+    if not _host_keep_awake_available():
+        return
+    with HOST_KEEP_AWAKE_LOCK:
+        try:
+            ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS)  # type: ignore[attr-defined]
+        except Exception:
+            return
+        HOST_KEEP_AWAKE_LAST_PULSE = 0.0
 
 
 def _built_ui_index_path() -> str:
@@ -431,6 +511,42 @@ def _issue_trusted_device(name: str = "", platform: str = "", current_origin: st
     }
 
 
+def _reissue_trusted_device(
+    device_id: str = "",
+    name: str = "",
+    platform: str = "",
+    current_origin: str = "",
+) -> Dict[str, Any]:
+    wanted_id = str(device_id or "").strip()
+    if not wanted_id:
+        return _issue_trusted_device(name=name, platform=platform, current_origin=current_origin)
+
+    device_token = secrets.token_urlsafe(32)
+    now = time.time()
+    with TRUSTED_DEVICES_LOCK:
+        _load_trusted_devices_unlocked()
+        devices = [item for item in list(TRUSTED_DEVICES_DATA.get("devices") or []) if isinstance(item, dict)]
+        for item in devices:
+            if str(item.get("id") or "").strip() != wanted_id:
+                continue
+            item["token_hash"] = _trusted_device_token_hash(device_token)
+            item["name"] = str(name or item.get("name") or "").strip()[:120] or "Codrex Android"
+            item["platform"] = str(platform or item.get("platform") or "").strip()[:48] or "android"
+            item["updated_at"] = now
+            item["last_seen_at"] = now
+            if current_origin:
+                item["last_origin"] = str(current_origin).strip()
+            TRUSTED_DEVICES_DATA["devices"] = devices
+            _persist_trusted_devices_unlocked()
+            return {
+                "device_id": str(item.get("id") or "").strip(),
+                "device_token": device_token,
+                "device_name": str(item.get("name") or "").strip(),
+                "device_platform": str(item.get("platform") or "").strip(),
+            }
+    return _issue_trusted_device(name=name, platform=platform, current_origin=current_origin)
+
+
 def _resume_trusted_device(device_id: str, device_token: str, current_origin: str = "") -> Dict[str, Any]:
     wanted_id = str(device_id or "").strip()
     wanted_token = str(device_token or "").strip()
@@ -454,183 +570,6 @@ def _resume_trusted_device(device_id: str, device_token: str, current_origin: st
             _persist_trusted_devices_unlocked()
             return dict(item)
     return {}
-
-
-def _privacy_lock_default_config() -> Dict[str, Any]:
-    return {
-        "pin_configured": False,
-        "pin_salt_b64": "",
-        "pin_hash_b64": "",
-        "pin_iterations": PRIVACY_LOCK_PIN_ITERATIONS,
-        "updated_at": 0.0,
-    }
-
-
-def _privacy_lock_default_state() -> Dict[str, Any]:
-    return {
-        "active": False,
-        "mode": "hard",
-        "display_scope": "all",
-        "owner_device_id": "",
-        "owner_device_name": "",
-        "locked_at": 0.0,
-        "updated_at": 0.0,
-        "lock_id": "",
-        "callback_token": "",
-        "controller_port": 0,
-        "helper_pid": 0,
-        "helper_ready": False,
-        "helper_error": "",
-        "last_unlock_source": "",
-    }
-
-
-def _load_privacy_lock_config_unlocked() -> None:
-    global PRIVACY_LOCK_CONFIG_LOADED
-    if PRIVACY_LOCK_CONFIG_LOADED:
-        return
-    loaded = _read_json_file(PRIVACY_LOCK_CONFIG_FILE)
-    config = _privacy_lock_default_config()
-    if loaded:
-        config.update({
-            "pin_configured": bool(loaded.get("pin_configured")),
-            "pin_salt_b64": str(loaded.get("pin_salt_b64") or "").strip(),
-            "pin_hash_b64": str(loaded.get("pin_hash_b64") or "").strip(),
-            "pin_iterations": max(int(loaded.get("pin_iterations") or PRIVACY_LOCK_PIN_ITERATIONS), 1000),
-            "updated_at": float(loaded.get("updated_at") or 0.0),
-        })
-    PRIVACY_LOCK_CONFIG_DATA.clear()
-    PRIVACY_LOCK_CONFIG_DATA.update(config)
-    PRIVACY_LOCK_CONFIG_LOADED = True
-
-
-def _load_privacy_lock_state_unlocked() -> None:
-    global PRIVACY_LOCK_STATE_LOADED
-    if PRIVACY_LOCK_STATE_LOADED:
-        return
-    loaded = _read_json_file(PRIVACY_LOCK_STATE_FILE)
-    state = _privacy_lock_default_state()
-    if loaded:
-        state.update({
-            "active": bool(loaded.get("active")),
-            "mode": str(loaded.get("mode") or "hard").strip() or "hard",
-            "display_scope": str(loaded.get("display_scope") or "all").strip() or "all",
-            "owner_device_id": str(loaded.get("owner_device_id") or "").strip(),
-            "owner_device_name": str(loaded.get("owner_device_name") or "").strip(),
-            "locked_at": float(loaded.get("locked_at") or 0.0),
-            "updated_at": float(loaded.get("updated_at") or 0.0),
-            "lock_id": str(loaded.get("lock_id") or "").strip(),
-            "callback_token": str(loaded.get("callback_token") or "").strip(),
-            "controller_port": int(loaded.get("controller_port") or 0),
-            "helper_pid": int(loaded.get("helper_pid") or 0),
-            "helper_ready": bool(loaded.get("helper_ready")),
-            "helper_error": str(loaded.get("helper_error") or "").strip(),
-            "last_unlock_source": str(loaded.get("last_unlock_source") or "").strip(),
-        })
-    PRIVACY_LOCK_STATE_DATA.clear()
-    PRIVACY_LOCK_STATE_DATA.update(state)
-    PRIVACY_LOCK_STATE_LOADED = True
-
-
-def _persist_privacy_lock_config_unlocked() -> None:
-    config = dict(PRIVACY_LOCK_CONFIG_DATA or {})
-    _write_json_file(PRIVACY_LOCK_CONFIG_FILE, {
-        "pin_configured": bool(config.get("pin_configured")),
-        "pin_salt_b64": str(config.get("pin_salt_b64") or "").strip(),
-        "pin_hash_b64": str(config.get("pin_hash_b64") or "").strip(),
-        "pin_iterations": max(int(config.get("pin_iterations") or PRIVACY_LOCK_PIN_ITERATIONS), 1000),
-        "updated_at": float(config.get("updated_at") or 0.0),
-    })
-
-
-def _persist_privacy_lock_state_unlocked() -> None:
-    state = dict(PRIVACY_LOCK_STATE_DATA or {})
-    _write_json_file(PRIVACY_LOCK_STATE_FILE, {
-        "active": bool(state.get("active")),
-        "mode": str(state.get("mode") or "hard").strip() or "hard",
-        "display_scope": str(state.get("display_scope") or "all").strip() or "all",
-        "owner_device_id": str(state.get("owner_device_id") or "").strip(),
-        "owner_device_name": str(state.get("owner_device_name") or "").strip(),
-        "locked_at": float(state.get("locked_at") or 0.0),
-        "updated_at": float(state.get("updated_at") or 0.0),
-        "lock_id": str(state.get("lock_id") or "").strip(),
-        "callback_token": str(state.get("callback_token") or "").strip(),
-        "controller_port": int(state.get("controller_port") or 0),
-        "helper_pid": int(state.get("helper_pid") or 0),
-        "helper_ready": bool(state.get("helper_ready")),
-        "helper_error": str(state.get("helper_error") or "").strip(),
-        "last_unlock_source": str(state.get("last_unlock_source") or "").strip(),
-    })
-
-
-def _privacy_lock_pbkdf2(pin: str, salt_bytes: bytes, iterations: int) -> bytes:
-    return hashlib.pbkdf2_hmac(
-        "sha256",
-        str(pin or "").encode("utf-8"),
-        salt_bytes,
-        max(int(iterations or PRIVACY_LOCK_PIN_ITERATIONS), 1000),
-    )
-
-
-def _privacy_lock_validate_pin_format(pin: str) -> str:
-    candidate = str(pin or "").strip()
-    if not re.fullmatch(rf"\d{{{PRIVACY_LOCK_PIN_MIN_LENGTH},{PRIVACY_LOCK_PIN_MAX_LENGTH}}}", candidate):
-        raise HTTPException(
-            status_code=400,
-            detail=f"PIN must be {PRIVACY_LOCK_PIN_MIN_LENGTH}-{PRIVACY_LOCK_PIN_MAX_LENGTH} digits.",
-        )
-    return candidate
-
-
-def _privacy_lock_set_pin_unlocked(pin: str) -> None:
-    candidate = _privacy_lock_validate_pin_format(pin)
-    salt_bytes = secrets.token_bytes(16)
-    digest = _privacy_lock_pbkdf2(candidate, salt_bytes, PRIVACY_LOCK_PIN_ITERATIONS)
-    PRIVACY_LOCK_CONFIG_DATA.update({
-        "pin_configured": True,
-        "pin_salt_b64": base64.b64encode(salt_bytes).decode("ascii"),
-        "pin_hash_b64": base64.b64encode(digest).decode("ascii"),
-        "pin_iterations": PRIVACY_LOCK_PIN_ITERATIONS,
-        "updated_at": time.time(),
-    })
-    _persist_privacy_lock_config_unlocked()
-
-
-def _privacy_lock_clear_pin_unlocked() -> None:
-    PRIVACY_LOCK_CONFIG_DATA.clear()
-    PRIVACY_LOCK_CONFIG_DATA.update(_privacy_lock_default_config())
-    PRIVACY_LOCK_CONFIG_DATA["updated_at"] = time.time()
-    _persist_privacy_lock_config_unlocked()
-
-
-def _privacy_lock_verify_pin_unlocked(pin: str) -> bool:
-    if not bool(PRIVACY_LOCK_CONFIG_DATA.get("pin_configured")):
-        return False
-    salt_b64 = str(PRIVACY_LOCK_CONFIG_DATA.get("pin_salt_b64") or "").strip()
-    hash_b64 = str(PRIVACY_LOCK_CONFIG_DATA.get("pin_hash_b64") or "").strip()
-    iterations = max(int(PRIVACY_LOCK_CONFIG_DATA.get("pin_iterations") or PRIVACY_LOCK_PIN_ITERATIONS), 1000)
-    if not salt_b64 or not hash_b64:
-        return False
-    try:
-        salt_bytes = base64.b64decode(salt_b64)
-        wanted = base64.b64decode(hash_b64)
-    except Exception:
-        return False
-    actual = _privacy_lock_pbkdf2(str(pin or "").strip(), salt_bytes, iterations)
-    return secrets.compare_digest(actual, wanted)
-
-
-def _privacy_lock_launcher_exe_path() -> str:
-    return os.path.join(APP_ROOT_DIR, "launcher", "Codrex.Launcher", "bin", "current", "Codrex.Launcher.exe")
-
-
-def _privacy_lock_support_snapshot_unlocked() -> Dict[str, Any]:
-    if os.name != "nt":
-        return {"supported": False, "detail": "Privacy lock is only available on Windows hosts."}
-    helper_path = _privacy_lock_launcher_exe_path()
-    if not os.path.isfile(helper_path):
-        return {"supported": False, "detail": "Privacy lock helper is missing. Rebuild the launcher first."}
-    return {"supported": True, "detail": ""}
 
 
 def _win_kernel32():
@@ -663,71 +602,97 @@ def _is_windows_pid_running(pid: int) -> bool:
             pass
 
 
-def _privacy_lock_reconcile_unlocked() -> None:
-    if not bool(PRIVACY_LOCK_STATE_DATA.get("active")):
-        return
-    helper_pid = int(PRIVACY_LOCK_STATE_DATA.get("helper_pid") or 0)
-    if helper_pid > 0 and _is_windows_pid_running(helper_pid):
-        return
-    if not bool(PRIVACY_LOCK_STATE_DATA.get("helper_ready")):
-        started_at = max(
-            float(PRIVACY_LOCK_STATE_DATA.get("updated_at") or 0.0),
-            float(PRIVACY_LOCK_STATE_DATA.get("locked_at") or 0.0),
+def _terminate_windows_pid(pid: int) -> bool:
+    wanted_pid = int(pid or 0)
+    if os.name != "nt" or wanted_pid <= 0:
+        return True
+    if not _is_windows_pid_running(wanted_pid):
+        return True
+    try:
+        result = subprocess.run(
+            ["taskkill", "/PID", str(wanted_pid), "/T", "/F"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            encoding="utf-8",
+            errors="replace",
         )
-        if started_at > 0 and (time.time() - started_at) < max(PRIVACY_LOCK_HELPER_START_TIMEOUT_S + 1.0, 3.0):
-            return
-    PRIVACY_LOCK_STATE_DATA.update({
-        "active": False,
-        "owner_device_id": "",
-        "owner_device_name": "",
-        "lock_id": "",
-        "callback_token": "",
-        "controller_port": 0,
-        "helper_pid": 0,
-        "helper_ready": False,
-        "helper_error": "",
-        "updated_at": time.time(),
-    })
-    _persist_privacy_lock_state_unlocked()
+        output = (str(getattr(result, "stdout", "") or "") + "\n" + str(getattr(result, "stderr", "") or "")).lower()
+        if int(getattr(result, "returncode", 1) or 1) == 0:
+            if not _is_windows_pid_running(wanted_pid):
+                return True
+        elif "not found" in output or "no running instance" in output:
+            return True
+    except Exception:
+        pass
+    try:
+        os.kill(wanted_pid, signal.SIGTERM)
+    except Exception:
+        pass
+    time.sleep(0.05)
+    return not _is_windows_pid_running(wanted_pid)
 
 
-def _privacy_lock_status_payload_unlocked() -> Dict[str, Any]:
-    _load_privacy_lock_config_unlocked()
-    _load_privacy_lock_state_unlocked()
-    _privacy_lock_reconcile_unlocked()
-    support = _privacy_lock_support_snapshot_unlocked()
-    return {
-        "ok": True,
-        "supported": bool(support.get("supported")),
-        "detail": str(support.get("detail") or "").strip(),
-        "pin_configured": bool(PRIVACY_LOCK_CONFIG_DATA.get("pin_configured")),
-        "active": bool(PRIVACY_LOCK_STATE_DATA.get("active")),
-        "mode": str(PRIVACY_LOCK_STATE_DATA.get("mode") or "hard"),
-        "display_scope": str(PRIVACY_LOCK_STATE_DATA.get("display_scope") or "all"),
-        "owner_device_id": str(PRIVACY_LOCK_STATE_DATA.get("owner_device_id") or "").strip(),
-        "owner_device_name": str(PRIVACY_LOCK_STATE_DATA.get("owner_device_name") or "").strip(),
-        "locked_at": float(PRIVACY_LOCK_STATE_DATA.get("locked_at") or 0.0),
-        "updated_at": float(PRIVACY_LOCK_STATE_DATA.get("updated_at") or 0.0),
-        "helper_ready": bool(PRIVACY_LOCK_STATE_DATA.get("helper_ready")),
-        "helper_error": str(PRIVACY_LOCK_STATE_DATA.get("helper_error") or "").strip(),
-        "last_unlock_source": str(PRIVACY_LOCK_STATE_DATA.get("last_unlock_source") or "").strip(),
-    }
+def _legacy_privacy_lock_helper_pids() -> List[int]:
+    if os.name != "nt":
+        return []
+    try:
+        result = subprocess.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                (
+                    "$items = Get-CimInstance Win32_Process | "
+                    "Where-Object { $_.Name -eq 'Codrex.Launcher.exe' -and $_.CommandLine -like '*--privacy-lock-helper*' } | "
+                    "Select-Object -ExpandProperty ProcessId; "
+                    "if ($items -eq $null) { '[]' } else { $items | ConvertTo-Json -Compress }"
+                ),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=8,
+            encoding="utf-8",
+            errors="replace",
+        )
+    except Exception:
+        return []
+    if int(getattr(result, "returncode", 1) or 1) != 0:
+        return []
+    raw = str(getattr(result, "stdout", "") or "").strip()
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(raw)
+    except Exception:
+        return []
+    if isinstance(parsed, int):
+        return [int(parsed)]
+    if not isinstance(parsed, list):
+        return []
+    output: List[int] = []
+    for item in parsed:
+        try:
+            output.append(int(item))
+        except Exception:
+            continue
+    return output
 
 
-def _privacy_lock_mark_unlocked_unlocked(source: str) -> None:
-    PRIVACY_LOCK_STATE_DATA.update({
-        "active": False,
-        "owner_device_id": "",
-        "owner_device_name": "",
-        "lock_id": "",
-        "callback_token": "",
-        "controller_port": 0,
-        "helper_ready": False,
-        "helper_error": "",
-        "updated_at": time.time(),
-        "last_unlock_source": str(source or "").strip() or "unknown",
-    })
-    _persist_privacy_lock_state_unlocked()
+def _cleanup_legacy_privacy_lock_state() -> None:
+    helper_pids = sorted({pid for pid in _legacy_privacy_lock_helper_pids() if int(pid or 0) > 0})
+    for pid in helper_pids:
+        try:
+            _terminate_windows_pid(pid)
+        except Exception:
+            pass
+    for path in (LEGACY_PRIVACY_LOCK_STATE_FILE, LEGACY_PRIVACY_LOCK_CONFIG_FILE):
+        try:
+            if os.path.isfile(path):
+                os.remove(path)
+        except Exception:
+            pass
 
 
 def _tailscale_exe_path() -> str:
@@ -1387,9 +1352,18 @@ DESKTOP_STREAM_FALLBACK_TRANSPORT = "multipart_png"
 DESKTOP_WEBRTC_SESSION_LOCK = threading.Lock()
 DESKTOP_WEBRTC_SESSIONS: Dict[str, Dict[str, Any]] = {}
 DESKTOP_CAPTURE_TLS = threading.local()
+DESKTOP_TARGET_LOCK = threading.Lock()
+DESKTOP_DXCAM_LOCK = threading.RLock()
+DESKTOP_CAPTURE_GENERATION = 0
+DESKTOP_DXCAM_CAMERA = None
+DESKTOP_DXCAM_OUTPUT_IDX = None
+DESKTOP_DXCAM_GENERATION = -1
+DESKTOP_TARGET_VIRTUAL_HINT = str(os.environ.get("CODEX_DESKTOP_VIRTUAL_TARGET_ID", "") or "").strip().lower()
+DESKTOP_TARGET_SELECTED_ID = ""
 WINDOWS_DPI_AWARE = False
 WINDOWS_DPI_AWARE_LOCK = threading.Lock()
 DESKTOP_WEBRTC_MAX_SESSIONS = int(os.environ.get("CODEX_DESKTOP_WEBRTC_MAX_SESSIONS", "2") or "2")
+DESKTOP_CAPTURE_BACKEND_DEFAULT = str(os.environ.get("CODEX_DESKTOP_CAPTURE_BACKEND", "auto") or "auto").strip().lower()
 DESKTOP_MODE_LOCK = threading.Lock()
 DESKTOP_MODE_ENABLED = str(os.environ.get("CODEX_DESKTOP_MODE_DEFAULT", "1") or "1").strip().lower() not in {"0", "false", "no", "off"}
 DESKTOP_ALT_LOCK = threading.Lock()
@@ -1411,6 +1385,97 @@ CODEX_POWER_CONFIRM_TTL_SECONDS = int(os.environ.get("CODEX_POWER_CONFIRM_TTL_SE
 CODEX_POWER_ACTION_DELAY_SECONDS = max(0.5, float(os.environ.get("CODEX_POWER_ACTION_DELAY_SECONDS", "2.0") or "2.0"))
 POWER_CONFIRM_LOCK = threading.Lock()
 POWER_CONFIRMATIONS: Dict[str, Dict[str, Any]] = {}
+
+DISPLAY_DEVICE_ATTACHED_TO_DESKTOP = 0x00000001
+DISPLAY_DEVICE_PRIMARY_DEVICE = 0x00000004
+DISPLAY_DEVICE_MIRRORING_DRIVER = 0x00000008
+ENUM_CURRENT_SETTINGS = -1
+CDS_UPDATEREGISTRY = 0x00000001
+CDS_TEST = 0x00000002
+CDS_SET_PRIMARY = 0x00000010
+CDS_NORESET = 0x10000000
+DISP_CHANGE_SUCCESSFUL = 0
+DM_BITSPERPEL = 0x00040000
+DM_POSITION = 0x00000020
+DM_PELSWIDTH = 0x00080000
+DM_PELSHEIGHT = 0x00100000
+DM_DISPLAYFREQUENCY = 0x00400000
+
+
+class RECT(ctypes.Structure):
+    _fields_ = [
+        ("left", wintypes.LONG),
+        ("top", wintypes.LONG),
+        ("right", wintypes.LONG),
+        ("bottom", wintypes.LONG),
+    ]
+
+
+class WINDOWPLACEMENT(ctypes.Structure):
+    _fields_ = [
+        ("length", wintypes.UINT),
+        ("flags", wintypes.UINT),
+        ("showCmd", wintypes.UINT),
+        ("ptMinPosition", wintypes.POINT),
+        ("ptMaxPosition", wintypes.POINT),
+        ("rcNormalPosition", RECT),
+    ]
+
+
+class DEVMODEW(ctypes.Structure):
+    _fields_ = [
+        ("dmDeviceName", wintypes.WCHAR * 32),
+        ("dmSpecVersion", wintypes.WORD),
+        ("dmDriverVersion", wintypes.WORD),
+        ("dmSize", wintypes.WORD),
+        ("dmDriverExtra", wintypes.WORD),
+        ("dmFields", wintypes.DWORD),
+        ("dmPositionX", ctypes.c_long),
+        ("dmPositionY", ctypes.c_long),
+        ("dmDisplayOrientation", wintypes.DWORD),
+        ("dmDisplayFixedOutput", wintypes.DWORD),
+        ("dmColor", wintypes.WORD),
+        ("dmDuplex", wintypes.WORD),
+        ("dmYResolution", wintypes.WORD),
+        ("dmTTOption", wintypes.WORD),
+        ("dmCollate", wintypes.WORD),
+        ("dmFormName", wintypes.WCHAR * 32),
+        ("dmLogPixels", wintypes.WORD),
+        ("dmBitsPerPel", wintypes.DWORD),
+        ("dmPelsWidth", wintypes.DWORD),
+        ("dmPelsHeight", wintypes.DWORD),
+        ("dmDisplayFlags", wintypes.DWORD),
+        ("dmDisplayFrequency", wintypes.DWORD),
+        ("dmICMMethod", wintypes.DWORD),
+        ("dmICMIntent", wintypes.DWORD),
+        ("dmMediaType", wintypes.DWORD),
+        ("dmDitherType", wintypes.DWORD),
+        ("dmReserved1", wintypes.DWORD),
+        ("dmReserved2", wintypes.DWORD),
+        ("dmPanningWidth", wintypes.DWORD),
+        ("dmPanningHeight", wintypes.DWORD),
+    ]
+
+
+class MONITORINFOEXW(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wintypes.DWORD),
+        ("rcMonitor", RECT),
+        ("rcWork", RECT),
+        ("dwFlags", wintypes.DWORD),
+        ("szDevice", wintypes.WCHAR * 32),
+    ]
+
+
+class DISPLAY_DEVICEW(ctypes.Structure):
+    _fields_ = [
+        ("cb", wintypes.DWORD),
+        ("DeviceName", wintypes.WCHAR * 32),
+        ("DeviceString", wintypes.WCHAR * 128),
+        ("StateFlags", wintypes.DWORD),
+        ("DeviceID", wintypes.WCHAR * 128),
+        ("DeviceKey", wintypes.WCHAR * 128),
+    ]
 
 # -------------------------
 # Thread transcript store
@@ -1498,6 +1563,85 @@ SESSION_HISTORY_MAX_KEEP = int(os.environ.get("CODEX_SESSION_HISTORY_MAX_KEEP", 
 SESSION_HISTORY_DATA: Dict[str, Any] = {
     "items": [],
 }
+DEFAULT_LOOP_CONTROL_FILE = os.path.abspath(
+    os.environ.get(
+        "CODEX_LOOP_CONTROL_FILE",
+        os.path.join(CODEX_RUNTIME_STATE_DIR, "loop-control.json"),
+    )
+)
+LOOP_CONTROL_FILE = DEFAULT_LOOP_CONTROL_FILE
+LOOP_CONTROL_LOCK = threading.Lock()
+LOOP_CONTROL_LOADED = False
+LOOP_CONTROL_POLL_INTERVAL_S = float(os.environ.get("CODEX_LOOP_CONTROL_POLL_INTERVAL_S", "3.0") or "3.0")
+LOOP_CONTROL_TELEGRAM_POLL_INTERVAL_S = float(
+    os.environ.get("CODEX_LOOP_CONTROL_TELEGRAM_POLL_INTERVAL_S", "5.0") or "5.0"
+)
+LOOP_CONTROL_CHECK_TIMEOUT_S = float(os.environ.get("CODEX_LOOP_CONTROL_CHECK_TIMEOUT_S", "900") or "900")
+LOOP_PRESET_VALUES = (
+    "infinite",
+    "await-reply",
+    "completion-checks",
+    "max-turns-1",
+    "max-turns-2",
+    "max-turns-3",
+)
+LOOP_OVERRIDE_MODE_VALUES = ("inherit", "off") + LOOP_PRESET_VALUES
+LOOP_TERMINAL_STATES = {"done", "error"}
+LOOP_WAITING_STATES = {"waiting"}
+LOOP_CONTROL_DEFAULT_PROMPT = str(
+    os.environ.get(
+        "CODEX_LOOP_DEFAULT_PROMPT",
+        (
+            "Continue working until the task is actually done. "
+            "Run the relevant verification before stopping, and only stop when the work is complete "
+            "or you need a concrete decision from me."
+        ),
+    )
+    or ""
+).strip()
+if not LOOP_CONTROL_DEFAULT_PROMPT:
+    LOOP_CONTROL_DEFAULT_PROMPT = (
+        "Continue working until the task is actually done. "
+        "Run the relevant verification before stopping."
+    )
+TELEGRAM_WINDOWS_MIRROR_ENABLED_DEFAULT = str(
+    os.environ.get("CODEX_TELEGRAM_WINDOWS_MIRROR_ENABLED", "0") or "0"
+).strip().lower() in {"1", "true", "yes", "on"}
+TELEGRAM_WINDOWS_MIRROR_MAX_CHARS = max(
+    800,
+    int(os.environ.get("CODEX_TELEGRAM_WINDOWS_MIRROR_MAX_CHARS", "3200") or "3200"),
+)
+TELEGRAM_WINDOWS_MIRROR_SNAPSHOT_TAIL_CHARS = max(
+    800,
+    int(os.environ.get("CODEX_TELEGRAM_WINDOWS_MIRROR_SNAPSHOT_TAIL_CHARS", "3200") or "3200"),
+)
+TELEGRAM_WINDOWS_MIRROR_MAX_PARTS = max(
+    1,
+    int(os.environ.get("CODEX_TELEGRAM_WINDOWS_MIRROR_MAX_PARTS", "4") or "4"),
+)
+ANSI_ESCAPE_RE = re.compile(
+    r"(?:\x1B[@-Z\\-_]|\x1B\[[0-?]*[ -/]*[@-~]|\x1B\][^\x07]*(?:\x07|\x1B\\))"
+)
+CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+LOOP_CONTROL_DATA: Dict[str, Any] = {
+    "settings": {
+        "default_prompt": LOOP_CONTROL_DEFAULT_PROMPT,
+        "global_preset": "",
+        "completion_checks": [],
+        "telegram_update_offset": 0,
+        "telegram_windows_mirror_enabled": TELEGRAM_WINDOWS_MIRROR_ENABLED_DEFAULT,
+        "updated_at": 0,
+    },
+    "sessions": {},
+    "worker": {
+        "alive": False,
+        "last_cycle_at": 0,
+        "last_telegram_poll_at": 0,
+        "last_error": "",
+        "last_error_at": 0,
+    },
+}
+LOOP_CONTROL_WORKER_THREAD: Optional[threading.Thread] = None
 APP_RUNTIME_SESSION_FILE = os.path.abspath(
     os.environ.get(
         "CODEX_APP_RUNTIME_SESSION_FILE",
@@ -1517,49 +1661,19 @@ TRUSTED_DEVICES_DATA: Dict[str, Any] = {
     "devices": [],
 }
 TRUSTED_DEVICES_LOADED = False
-PRIVACY_LOCK_CONFIG_FILE = os.path.abspath(
+LEGACY_PRIVACY_LOCK_CONFIG_FILE = os.path.abspath(
     os.environ.get(
         "CODEX_PRIVACY_LOCK_CONFIG_FILE",
         os.path.join(CODEX_RUNTIME_STATE_DIR, "privacy-lock.config.json"),
     )
 )
-PRIVACY_LOCK_STATE_FILE = os.path.abspath(
+LEGACY_PRIVACY_LOCK_STATE_FILE = os.path.abspath(
     os.environ.get(
         "CODEX_PRIVACY_LOCK_STATE_FILE",
         os.path.join(CODEX_RUNTIME_STATE_DIR, "privacy-lock.state.json"),
     )
 )
-PRIVACY_LOCK_LOCK = threading.Lock()
-PRIVACY_LOCK_PIN_MIN_LENGTH = int(os.environ.get("CODEX_PRIVACY_LOCK_PIN_MIN_LENGTH", "4") or "4")
-PRIVACY_LOCK_PIN_MAX_LENGTH = int(os.environ.get("CODEX_PRIVACY_LOCK_PIN_MAX_LENGTH", "12") or "12")
-PRIVACY_LOCK_PIN_ITERATIONS = int(os.environ.get("CODEX_PRIVACY_LOCK_PIN_ITERATIONS", "200000") or "200000")
-PRIVACY_LOCK_HELPER_START_TIMEOUT_S = float(os.environ.get("CODEX_PRIVACY_LOCK_HELPER_START_TIMEOUT_S", "5") or "5")
-PRIVACY_LOCK_CONFIG_LOADED = False
-PRIVACY_LOCK_STATE_LOADED = False
-PRIVACY_LOCK_CONFIG_DATA: Dict[str, Any] = {
-    "pin_configured": False,
-    "pin_salt_b64": "",
-    "pin_hash_b64": "",
-    "pin_iterations": PRIVACY_LOCK_PIN_ITERATIONS,
-    "updated_at": 0.0,
-}
-PRIVACY_LOCK_STATE_DATA: Dict[str, Any] = {
-    "active": False,
-    "mode": "hard",
-    "display_scope": "all",
-    "owner_device_id": "",
-    "owner_device_name": "",
-    "locked_at": 0.0,
-    "updated_at": 0.0,
-    "lock_id": "",
-    "callback_token": "",
-    "controller_port": 0,
-    "helper_pid": 0,
-    "helper_ready": False,
-    "helper_error": "",
-    "last_unlock_source": "",
-}
-
+_cleanup_legacy_privacy_lock_state()
 # -------------------------
 # Session output stream state
 # -------------------------
@@ -1619,7 +1733,7 @@ def _read_text_file(path: str) -> str:
     if not p:
         return ""
     try:
-        with open(p, "r", encoding="utf-8") as f:
+        with open(p, "r", encoding="utf-8-sig") as f:
             return f.read()
     except Exception:
         return ""
@@ -1637,12 +1751,24 @@ def _read_json_file(path: str) -> Dict[str, Any]:
     p = str(path or "").strip()
     if not p:
         return {}
-    try:
-        with open(p, "r", encoding="utf-8") as f:
-            parsed = json.load(f)
-    except Exception:
-        return {}
-    return parsed if isinstance(parsed, dict) else {}
+    last_error: Optional[Exception] = None
+    for attempt in range(12):
+        try:
+            with open(p, "r", encoding="utf-8-sig") as f:
+                parsed = json.load(f)
+            return parsed if isinstance(parsed, dict) else {}
+        except FileNotFoundError:
+            return {}
+        except json.JSONDecodeError as exc:
+            last_error = exc
+        except PermissionError as exc:
+            last_error = exc
+        except OSError as exc:
+            last_error = exc
+        time.sleep(0.05 * (attempt + 1))
+    if last_error is not None:
+        print(f"JSON read retry exhausted path={p} error={type(last_error).__name__}: {last_error}", flush=True)
+    return {}
 
 
 def _write_json_file(path: str, payload: Dict[str, Any]) -> None:
@@ -1652,10 +1778,29 @@ def _write_json_file(path: str, payload: Dict[str, Any]) -> None:
     parent = os.path.dirname(p)
     if parent:
         os.makedirs(parent, exist_ok=True)
-    tmp_path = f"{p}.tmp"
-    with open(tmp_path, "w", encoding="utf-8") as f:
-        json.dump(payload or {}, f, indent=2, ensure_ascii=True)
-    os.replace(tmp_path, p)
+    last_error: Optional[Exception] = None
+    for attempt in range(12):
+        tmp_path = f"{p}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(payload or {}, f, indent=2, ensure_ascii=True)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, p)
+            return
+        except PermissionError as exc:
+            last_error = exc
+        except OSError as exc:
+            last_error = exc
+        finally:
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except OSError:
+                pass
+        time.sleep(0.05 * (attempt + 1))
+    if last_error is not None:
+        raise last_error
 
 
 def _parse_telegram_secret_text(raw: str) -> Dict[str, str]:
@@ -1740,6 +1885,255 @@ def _coerce_ms(raw: Any, fallback: int) -> int:
     if value <= 0:
         return fallback
     return value
+
+
+def _normalize_loop_preset(raw: Any) -> str:
+    value = str(raw or "").strip().lower()
+    return value if value in LOOP_PRESET_VALUES else ""
+
+
+def _normalize_loop_override_mode(raw: Any) -> str:
+    value = str(raw or "").strip().lower()
+    return value if value in LOOP_OVERRIDE_MODE_VALUES else "inherit"
+
+
+def _loop_budget_for_preset(preset: str) -> Optional[int]:
+    if preset == "max-turns-1":
+        return 1
+    if preset == "max-turns-2":
+        return 2
+    if preset == "max-turns-3":
+        return 3
+    return None
+
+
+def _loop_limit_text(text: str, max_chars: int = 1400) -> str:
+    value = str(text or "").strip()
+    if len(value) <= max_chars:
+        return value
+    return value[: max(0, max_chars - 1)].rstrip() + "…"
+
+
+def _default_loop_settings() -> Dict[str, Any]:
+    return {
+        "default_prompt": LOOP_CONTROL_DEFAULT_PROMPT,
+        "global_preset": "",
+        "completion_checks": [],
+        "telegram_update_offset": 0,
+        "telegram_windows_mirror_enabled": TELEGRAM_WINDOWS_MIRROR_ENABLED_DEFAULT,
+        "updated_at": 0,
+    }
+
+
+def _default_loop_session_state(session: str) -> Dict[str, Any]:
+    session_id = _validate_session_name(session)
+    return {
+        "session": session_id,
+        "override_mode": "inherit",
+        "remaining_turns": None,
+        "awaiting_reply": False,
+        "last_terminal_state": "",
+        "last_terminal_at": 0,
+        "last_action": "",
+        "last_action_detail": "",
+        "last_action_at": 0,
+        "last_notification_at": 0,
+        "last_continue_at": 0,
+        "last_reply_at": 0,
+        "last_telegram_message_id": 0,
+        "last_prompt_at": 0,
+        "last_auto_prompt_at": 0,
+        "last_handled_fingerprint": "",
+        "last_snapshot": "",
+        "windows_mirror_last_seq": 0,
+        "windows_mirror_last_sent_at": 0,
+        "windows_mirror_last_status": "",
+    }
+
+
+def _normalize_loop_commands(raw: Any) -> List[str]:
+    values = raw if isinstance(raw, list) else []
+    commands: List[str] = []
+    for item in values:
+        text = str(item or "").strip()
+        if text:
+            commands.append(text)
+    return commands[:12]
+
+
+def _normalize_loop_settings(raw: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    data = raw or {}
+    default_prompt = str(data.get("default_prompt") or LOOP_CONTROL_DEFAULT_PROMPT).strip()
+    if not default_prompt:
+        default_prompt = LOOP_CONTROL_DEFAULT_PROMPT
+    updated_at = _coerce_ms(data.get("updated_at"), _now_ms())
+    return {
+        "default_prompt": default_prompt,
+        "global_preset": _normalize_loop_preset(data.get("global_preset")),
+        "completion_checks": _normalize_loop_commands(data.get("completion_checks")),
+        "telegram_update_offset": max(0, int(data.get("telegram_update_offset") or 0)),
+        "telegram_windows_mirror_enabled": bool(
+            data.get("telegram_windows_mirror_enabled", TELEGRAM_WINDOWS_MIRROR_ENABLED_DEFAULT)
+        ),
+        "updated_at": updated_at,
+    }
+
+
+def _normalize_loop_session_state(raw: Optional[Dict[str, Any]], session: str) -> Dict[str, Any]:
+    base = _default_loop_session_state(session)
+    data = raw or {}
+    base["override_mode"] = _normalize_loop_override_mode(data.get("override_mode"))
+    remaining_turns = data.get("remaining_turns")
+    if remaining_turns is None or str(remaining_turns).strip() == "":
+        base["remaining_turns"] = None
+    else:
+        try:
+            base["remaining_turns"] = max(0, int(remaining_turns))
+        except Exception:
+            base["remaining_turns"] = None
+    base["awaiting_reply"] = bool(data.get("awaiting_reply"))
+    base["last_terminal_state"] = str(data.get("last_terminal_state") or "").strip().lower()
+    base["last_terminal_at"] = _coerce_ms(data.get("last_terminal_at"), 0)
+    base["last_action"] = str(data.get("last_action") or "").strip()[:64]
+    base["last_action_detail"] = str(data.get("last_action_detail") or "").strip()[:4000]
+    base["last_action_at"] = _coerce_ms(data.get("last_action_at"), 0)
+    base["last_notification_at"] = _coerce_ms(data.get("last_notification_at"), 0)
+    base["last_continue_at"] = _coerce_ms(data.get("last_continue_at"), 0)
+    base["last_reply_at"] = _coerce_ms(data.get("last_reply_at"), 0)
+    base["last_telegram_message_id"] = max(0, int(data.get("last_telegram_message_id") or 0))
+    base["last_prompt_at"] = _coerce_ms(data.get("last_prompt_at"), 0)
+    base["last_auto_prompt_at"] = _coerce_ms(data.get("last_auto_prompt_at"), 0)
+    base["last_handled_fingerprint"] = str(data.get("last_handled_fingerprint") or "").strip()[:128]
+    base["last_snapshot"] = _loop_limit_text(str(data.get("last_snapshot") or ""), 2000)
+    try:
+        base["windows_mirror_last_seq"] = max(0, int(data.get("windows_mirror_last_seq") or 0))
+    except Exception:
+        base["windows_mirror_last_seq"] = 0
+    base["windows_mirror_last_sent_at"] = _coerce_ms(data.get("windows_mirror_last_sent_at"), 0)
+    base["windows_mirror_last_status"] = str(data.get("windows_mirror_last_status") or "").strip()[:64]
+    return base
+
+
+def _sort_and_trim_loop_control_unlocked() -> None:
+    LOOP_CONTROL_DATA["settings"] = _normalize_loop_settings(
+        LOOP_CONTROL_DATA.get("settings") if isinstance(LOOP_CONTROL_DATA.get("settings"), dict) else {},
+    )
+    sessions_raw = LOOP_CONTROL_DATA.get("sessions")
+    normalized_sessions: Dict[str, Dict[str, Any]] = {}
+    if isinstance(sessions_raw, dict):
+        for key, value in sessions_raw.items():
+            try:
+                session_id = _validate_session_name(key)
+            except Exception:
+                continue
+            normalized_sessions[session_id] = _normalize_loop_session_state(
+                value if isinstance(value, dict) else {},
+                session_id,
+            )
+    LOOP_CONTROL_DATA["sessions"] = normalized_sessions
+    worker_raw = LOOP_CONTROL_DATA.get("worker")
+    worker_data = worker_raw if isinstance(worker_raw, dict) else {}
+    LOOP_CONTROL_DATA["worker"] = {
+        "alive": bool(worker_data.get("alive")),
+        "last_cycle_at": _coerce_ms(worker_data.get("last_cycle_at"), 0),
+        "last_telegram_poll_at": _coerce_ms(worker_data.get("last_telegram_poll_at"), 0),
+        "last_error": str(worker_data.get("last_error") or "").strip()[:4000],
+        "last_error_at": _coerce_ms(worker_data.get("last_error_at"), 0),
+    }
+
+
+def _persist_loop_control_unlocked() -> None:
+    _sort_and_trim_loop_control_unlocked()
+    payload = {
+        "settings": LOOP_CONTROL_DATA.get("settings") or _default_loop_settings(),
+        "sessions": LOOP_CONTROL_DATA.get("sessions") or {},
+    }
+    _write_json_file(LOOP_CONTROL_FILE, payload)
+
+
+def _load_loop_control_unlocked() -> None:
+    global LOOP_CONTROL_LOADED
+    if LOOP_CONTROL_LOADED:
+        return
+    LOOP_CONTROL_LOADED = True
+    LOOP_CONTROL_DATA["settings"] = _default_loop_settings()
+    LOOP_CONTROL_DATA["sessions"] = {}
+    raw = _read_json_file(LOOP_CONTROL_FILE)
+    if isinstance(raw, dict):
+        if isinstance(raw.get("settings"), dict):
+            LOOP_CONTROL_DATA["settings"] = raw.get("settings") or {}
+        if isinstance(raw.get("sessions"), dict):
+            LOOP_CONTROL_DATA["sessions"] = raw.get("sessions") or {}
+    _sort_and_trim_loop_control_unlocked()
+
+
+def _get_loop_settings_unlocked() -> Dict[str, Any]:
+    _load_loop_control_unlocked()
+    return LOOP_CONTROL_DATA.get("settings") or _default_loop_settings()
+
+
+def _get_loop_session_unlocked(session: str) -> Dict[str, Any]:
+    _load_loop_control_unlocked()
+    session_id = _validate_session_name(session)
+    sessions = LOOP_CONTROL_DATA.setdefault("sessions", {})
+    if not isinstance(sessions, dict):
+        sessions = {}
+        LOOP_CONTROL_DATA["sessions"] = sessions
+    existing = sessions.get(session_id)
+    normalized = _normalize_loop_session_state(existing if isinstance(existing, dict) else {}, session_id)
+    sessions[session_id] = normalized
+    return normalized
+
+
+def _effective_loop_preset_unlocked(session: str) -> str:
+    settings = _get_loop_settings_unlocked()
+    session_state = _get_loop_session_unlocked(session)
+    override_mode = str(session_state.get("override_mode") or "inherit")
+    if override_mode == "off":
+        return ""
+    if override_mode in LOOP_PRESET_VALUES:
+        return override_mode
+    return _normalize_loop_preset(settings.get("global_preset"))
+
+
+def _public_loop_settings_unlocked() -> Dict[str, Any]:
+    settings = _get_loop_settings_unlocked()
+    return {
+        "default_prompt": str(settings.get("default_prompt") or LOOP_CONTROL_DEFAULT_PROMPT),
+        "global_preset": _normalize_loop_preset(settings.get("global_preset")) or None,
+        "completion_checks": list(settings.get("completion_checks") or []),
+        "telegram_configured": bool(_telegram_enabled()),
+        "telegram_windows_mirror_enabled": bool(settings.get("telegram_windows_mirror_enabled")),
+    }
+
+
+def _public_loop_session_state_unlocked(session: str) -> Dict[str, Any]:
+    state = _get_loop_session_unlocked(session)
+    effective_preset = _effective_loop_preset_unlocked(session)
+    return {
+        "override_mode": str(state.get("override_mode") or "inherit"),
+        "effective_preset": effective_preset or None,
+        "remaining_turns": state.get("remaining_turns"),
+        "awaiting_reply": bool(state.get("awaiting_reply")),
+        "last_terminal_state": str(state.get("last_terminal_state") or ""),
+        "last_terminal_at": int(state.get("last_terminal_at") or 0),
+        "last_action": str(state.get("last_action") or ""),
+        "last_action_detail": str(state.get("last_action_detail") or ""),
+        "last_action_at": int(state.get("last_action_at") or 0),
+        "last_notification_at": int(state.get("last_notification_at") or 0),
+        "last_continue_at": int(state.get("last_continue_at") or 0),
+        "last_reply_at": int(state.get("last_reply_at") or 0),
+        "last_prompt_at": int(state.get("last_prompt_at") or 0),
+        "last_snapshot": str(state.get("last_snapshot") or ""),
+    }
+
+
+def _loop_snapshot_text_from_session_record(session_record: Optional[Dict[str, Any]]) -> str:
+    record = session_record or {}
+    snapshot = _compact_assistant_snapshot_text(str(record.get("last_text") or ""))
+    if snapshot:
+        return snapshot
+    return _compact_assistant_snapshot_text(str(record.get("snippet") or ""))
 
 
 def _build_thread_record(raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -2836,8 +3230,14 @@ def _append_session_note_snapshot_unlocked(session: str, snapshot: str) -> Dict[
     return _save_session_note_unlocked(session, next_content, compact)
 
 
-def _telegram_get_updates(token: str) -> Dict[str, Any]:
-    endpoint = f"{TELEGRAM_API_BASE.rstrip('/')}/bot{token}/getUpdates?limit=20"
+def _telegram_get_updates(token: str, offset: Optional[int] = None, limit: int = 20) -> Dict[str, Any]:
+    query_parts = [f"limit={max(1, min(int(limit or 20), 100))}"]
+    if offset is not None:
+        try:
+            query_parts.append(f"offset={int(offset)}")
+        except Exception:
+            pass
+    endpoint = f"{TELEGRAM_API_BASE.rstrip('/')}/bot{token}/getUpdates?{'&'.join(query_parts)}"
     req = urllib.request.Request(
         endpoint,
         method="GET",
@@ -3282,6 +3682,1109 @@ def _telegram_send_text(text: str) -> Dict[str, Any]:
     }
 
 
+def _loop_extract_telegram_message(update: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    if not isinstance(update, dict):
+        return None
+    for key in ("message", "edited_message", "channel_post", "edited_channel_post"):
+        raw = update.get(key)
+        if not isinstance(raw, dict):
+            continue
+        chat = raw.get("chat") if isinstance(raw.get("chat"), dict) else {}
+        reply_to = raw.get("reply_to_message") if isinstance(raw.get("reply_to_message"), dict) else {}
+        text = str(raw.get("text") or raw.get("caption") or "").strip()
+        return {
+            "update_id": int(update.get("update_id") or 0),
+            "message_id": int(raw.get("message_id") or 0),
+            "chat_id": str(chat.get("id") or "").strip(),
+            "text": text,
+            "reply_to_message_id": int(reply_to.get("message_id") or 0),
+        }
+    return None
+
+
+def _format_loop_preset_label(preset: str) -> str:
+    if preset == "await-reply":
+        return "Await Reply"
+    if preset == "completion-checks":
+        return "Completion Checks"
+    if preset == "max-turns-1":
+        return "Max Turns 1"
+    if preset == "max-turns-2":
+        return "Max Turns 2"
+    if preset == "max-turns-3":
+        return "Max Turns 3"
+    if preset == "infinite":
+        return "Infinite"
+    return "Off"
+
+
+def _telegram_windows_mirror_enabled_unlocked() -> bool:
+    settings = _get_loop_settings_unlocked()
+    return bool(settings.get("telegram_windows_mirror_enabled"))
+
+
+def _telegram_windows_mirror_clean_text(text: str) -> str:
+    value = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
+    if not value:
+        return ""
+    value = ANSI_ESCAPE_RE.sub("", value)
+    value = CONTROL_CHAR_RE.sub("", value)
+    value = re.sub(r"\n{3,}", "\n\n", value)
+    if not value.strip():
+        return ""
+    return value.strip("\n")
+
+
+def _telegram_windows_mirror_split_text(text: str, max_chars: int) -> List[str]:
+    value = str(text or "")
+    limit = max(200, int(max_chars or 0))
+    if len(value) <= limit:
+        return [value] if value else []
+    chunks: List[str] = []
+    remaining = value
+    while remaining and len(chunks) < TELEGRAM_WINDOWS_MIRROR_MAX_PARTS:
+        if len(remaining) <= limit:
+            chunks.append(remaining)
+            remaining = ""
+            break
+        split_at = remaining.rfind("\n", 0, limit)
+        if split_at < max(80, limit // 3):
+            split_at = limit
+        chunk = remaining[:split_at].rstrip("\n")
+        if chunk:
+            chunks.append(chunk)
+        remaining = remaining[split_at:].lstrip("\n")
+    if remaining:
+        notice = "\n\n[Telegram mirror truncated.]"
+        if chunks:
+            tail_limit = max(40, limit - len(notice))
+            chunks[-1] = chunks[-1][:tail_limit].rstrip() + notice
+        else:
+            chunks.append("[Telegram mirror truncated.]")
+    return chunks
+
+
+def _telegram_windows_mirror_header(
+    session: str,
+    kind: str,
+    *,
+    state: str = "",
+    current_command: str = "",
+    part_index: int = 0,
+    part_total: int = 0,
+) -> str:
+    label = "Codrex Windows mirror"
+    if kind == "prompt":
+        label = "Codrex Windows prompt"
+    elif kind == "status":
+        label = "Codrex Windows status"
+    elif kind == "snapshot":
+        label = "Codrex Windows snapshot"
+    lines = [f"{label} for {session}"]
+    if state:
+        lines.append(f"State: {state}")
+    if current_command:
+        lines.append(f"Command: {current_command}")
+    if part_total > 1 and part_index > 0:
+        lines.append(f"Part: {part_index}/{part_total}")
+    return "\n".join(lines)
+
+
+def _telegram_windows_mirror_send_text(
+    session: str,
+    text: str,
+    *,
+    kind: str,
+    state: str = "",
+    current_command: str = "",
+) -> bool:
+    cleaned = _telegram_windows_mirror_clean_text(text)
+    if not cleaned:
+        return True
+    if kind in {"snapshot", "replace"} and len(cleaned) > TELEGRAM_WINDOWS_MIRROR_SNAPSHOT_TAIL_CHARS:
+        cleaned = cleaned[-TELEGRAM_WINDOWS_MIRROR_SNAPSHOT_TAIL_CHARS:].lstrip()
+        cleaned = f"[Showing the latest snapshot tail]\n\n{cleaned}"
+    chunks = _telegram_windows_mirror_split_text(cleaned, TELEGRAM_WINDOWS_MIRROR_MAX_CHARS)
+    total = len(chunks)
+    for index, chunk in enumerate(chunks, start=1):
+        header = _telegram_windows_mirror_header(
+            session,
+            kind,
+            state=state,
+            current_command=current_command,
+            part_index=index,
+            part_total=total,
+        )
+        message = f"{header}\n\n{chunk}" if chunk else header
+        result = _telegram_send_text(message)
+        if not result.get("ok"):
+            return False
+    return True
+
+
+def _telegram_windows_mirror_send_status(
+    session: str,
+    *,
+    state: str = "",
+    current_command: str = "",
+    detail: str = "",
+) -> bool:
+    header = _telegram_windows_mirror_header(
+        session,
+        "status",
+        state=state,
+        current_command=current_command,
+    )
+    lines = [header]
+    if detail:
+        lines.append("")
+        lines.append(detail)
+    result = _telegram_send_text("\n".join(lines))
+    return bool(result.get("ok"))
+
+
+def _telegram_windows_mirror_session_snapshots() -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Dict[str, Any]]]:
+    session_meta: Dict[str, Dict[str, Any]] = {}
+    stream_meta: Dict[str, Dict[str, Any]] = {}
+    with WINDOWS_SESSIONS_LOCK:
+        for session_id, raw in WINDOWS_SESSIONS.items():
+            if str((raw or {}).get("profile") or "").strip().lower() != "codex":
+                continue
+            session_meta[session_id] = _windows_session_public_record(raw)
+        for raw in WINDOWS_RECENT_CLOSED:
+            if not isinstance(raw, dict):
+                continue
+            session_id = str(raw.get("session") or "").strip()
+            if not session_id:
+                continue
+            if str(raw.get("profile") or "").strip().lower() != "codex":
+                continue
+            session_meta.setdefault(session_id, dict(raw))
+    with WINDOWS_SESSION_STREAM_LOCK:
+        for session_id in list(session_meta.keys()):
+            raw = WINDOWS_SESSION_STREAM_STATES.get(session_id)
+            if not isinstance(raw, dict):
+                continue
+            stream_meta[session_id] = {
+                "seq": int(raw.get("seq") or 0),
+                "last_text": str(raw.get("last_text") or ""),
+                "events": [dict(item) for item in list(raw.get("events") or []) if isinstance(item, dict)],
+                "updated_at": float(raw.get("updated_at") or 0.0),
+            }
+    return session_meta, stream_meta
+
+
+def _telegram_windows_mirror_collect_events(
+    session: str,
+    stream_state: Dict[str, Any],
+    session_state: Dict[str, Any],
+    session_record: Dict[str, Any],
+) -> Tuple[List[Dict[str, Any]], int]:
+    current_seq = max(0, int(stream_state.get("seq") or 0))
+    last_seq = max(0, int(session_state.get("windows_mirror_last_seq") or 0))
+    if current_seq <= 0 or current_seq <= last_seq:
+        return [], last_seq
+    events = [dict(item) for item in list(stream_state.get("events") or []) if isinstance(item, dict)]
+    oldest_seq = int(events[0].get("seq") or 0) if events else 0
+    if last_seq <= 0 or not events or oldest_seq > last_seq + 1:
+        return [
+            {
+                "session": session,
+                "seq": current_seq,
+                "type": "snapshot",
+                "text": str(stream_state.get("last_text") or ""),
+                "state": str(session_record.get("state") or ""),
+                "current_command": str(session_record.get("current_command") or ""),
+            }
+        ], current_seq
+    replay = [event for event in events if int(event.get("seq") or 0) > last_seq]
+    return replay, current_seq
+
+
+def _telegram_windows_mirror_sync_session(
+    session: str,
+    stream_state: Dict[str, Any],
+    session_state: Dict[str, Any],
+    session_record: Dict[str, Any],
+) -> Tuple[bool, int, str]:
+    events, target_seq = _telegram_windows_mirror_collect_events(session, stream_state, session_state, session_record)
+    if target_seq <= int(session_state.get("windows_mirror_last_seq") or 0):
+        return True, int(session_state.get("windows_mirror_last_seq") or 0), ""
+    if not events:
+        return True, target_seq, ""
+    aggregate_kind = ""
+    aggregate_state = str(session_record.get("state") or "")
+    aggregate_command = str(session_record.get("current_command") or "")
+    aggregate_text = ""
+    last_status = ""
+    for event in events:
+        event_type = str(event.get("type") or "").strip().lower()
+        event_state = str(event.get("state") or aggregate_state or "").strip().lower()
+        event_command = str(event.get("current_command") or aggregate_command or "").strip()
+        if event_type == "status":
+            if aggregate_text:
+                ok = _telegram_windows_mirror_send_text(
+                    session,
+                    aggregate_text,
+                    kind=aggregate_kind or "append",
+                    state=aggregate_state,
+                    current_command=aggregate_command,
+                )
+                if not ok:
+                    return False, int(session_state.get("windows_mirror_last_seq") or 0), last_status
+                aggregate_text = ""
+                aggregate_kind = ""
+            detail = str(event.get("detail") or "").strip()
+            if detail or event_state:
+                ok = _telegram_windows_mirror_send_status(
+                    session,
+                    state=event_state,
+                    current_command=event_command,
+                    detail=detail or "Session status changed.",
+                )
+                if not ok:
+                    return False, int(session_state.get("windows_mirror_last_seq") or 0), last_status
+                last_status = detail[:64]
+            continue
+        clean_text = _telegram_windows_mirror_clean_text(str(event.get("text") or ""))
+        if event_type in {"snapshot", "replace"}:
+            aggregate_kind = event_type
+            aggregate_text = clean_text
+            aggregate_state = event_state or aggregate_state
+            aggregate_command = event_command or aggregate_command
+            continue
+        if event_type == "append" and clean_text:
+            if aggregate_kind not in {"snapshot", "replace", "append"}:
+                aggregate_kind = "append"
+            aggregate_text += clean_text
+            aggregate_state = event_state or aggregate_state
+            aggregate_command = event_command or aggregate_command
+    if aggregate_text:
+        ok = _telegram_windows_mirror_send_text(
+            session,
+            aggregate_text,
+            kind=aggregate_kind or "append",
+            state=aggregate_state,
+            current_command=aggregate_command,
+        )
+        if not ok:
+            return False, int(session_state.get("windows_mirror_last_seq") or 0), last_status
+    return True, target_seq, last_status
+
+
+def _telegram_windows_mirror_send_prompt(session: str, prompt_text: str, current_command: str = "") -> None:
+    with LOOP_CONTROL_LOCK:
+        enabled = _telegram_windows_mirror_enabled_unlocked()
+    if not enabled:
+        return
+    try:
+        _telegram_windows_mirror_send_text(
+            session,
+            prompt_text,
+            kind="prompt",
+            state="sent",
+            current_command=current_command or "codex",
+        )
+    except Exception:
+        return
+
+
+def _telegram_windows_mirror_once() -> None:
+    with LOOP_CONTROL_LOCK:
+        enabled = _telegram_windows_mirror_enabled_unlocked()
+    if not enabled or not _telegram_enabled():
+        return
+    session_meta, stream_meta = _telegram_windows_mirror_session_snapshots()
+    if not session_meta:
+        return
+    progress_updates: List[Tuple[str, int, str]] = []
+    for session, session_record in session_meta.items():
+        stream_state = stream_meta.get(session)
+        if not stream_state:
+            continue
+        with LOOP_CONTROL_LOCK:
+            loop_state = _get_loop_session_unlocked(session)
+            prior_seq = int(loop_state.get("windows_mirror_last_seq") or 0)
+        ok, next_seq, last_status = _telegram_windows_mirror_sync_session(
+            session,
+            stream_state,
+            loop_state,
+            session_record,
+        )
+        if ok and next_seq > prior_seq:
+            progress_updates.append((session, next_seq, last_status))
+    if not progress_updates:
+        return
+    with LOOP_CONTROL_LOCK:
+        dirty = False
+        for session, next_seq, last_status in progress_updates:
+            loop_state = _get_loop_session_unlocked(session)
+            prior_seq = int(loop_state.get("windows_mirror_last_seq") or 0)
+            if next_seq <= prior_seq:
+                continue
+            loop_state["windows_mirror_last_seq"] = next_seq
+            loop_state["windows_mirror_last_sent_at"] = _now_ms()
+            if last_status:
+                loop_state["windows_mirror_last_status"] = last_status[:64]
+            _loop_commit_session_state_unlocked(session, loop_state)
+            dirty = True
+        if dirty:
+            _persist_loop_control_unlocked()
+
+
+def _loop_build_help_text() -> str:
+    return "\n".join(
+        [
+            "Codrex loop controls:",
+            "/help - show this help",
+            "/list - list active Codex sessions and loop modes",
+            "/status - show global loop settings",
+            "/mode global infinite|await|checks|max1|max2|max3|off",
+            "/mode <session> infinite|await|checks|max1|max2|max3|off|inherit",
+            "/reply <session> <message> - send a prompt to one session",
+            "Reply directly to a loop notification to continue that session.",
+        ]
+    )
+
+
+def _loop_build_list_text() -> str:
+    response = codex_sessions_live()
+    sessions = response.get("sessions") if isinstance(response, dict) else []
+    if not isinstance(sessions, list) or not sessions:
+        return "No active Codex sessions."
+    lines = ["Active Codex sessions:"]
+    for raw in sessions[:24]:
+        if not isinstance(raw, dict):
+            continue
+        session = str(raw.get("session") or "").strip()
+        if not session:
+            continue
+        state = str(raw.get("state") or "").strip() or "unknown"
+        loop_info = raw.get("loop") if isinstance(raw.get("loop"), dict) else {}
+        preset = str(loop_info.get("effective_preset") or "").strip()
+        awaiting = bool(loop_info.get("awaiting_reply"))
+        mode_label = _format_loop_preset_label(preset) if preset else "Off"
+        if awaiting:
+            mode_label += " / waiting for reply"
+        lines.append(f"- {session}: {state} | {mode_label}")
+    return "\n".join(lines[:40])
+
+
+def _loop_build_status_text() -> str:
+    with LOOP_CONTROL_LOCK:
+        settings = _public_loop_settings_unlocked()
+        worker = dict(LOOP_CONTROL_DATA.get("worker") or {})
+    global_label = _format_loop_preset_label(str(settings.get("global_preset") or ""))
+    checks = settings.get("completion_checks") or []
+    return "\n".join(
+        [
+            f"Global mode: {global_label}",
+            f"Telegram configured: {'Yes' if settings.get('telegram_configured') else 'No'}",
+            f"Windows mirror: {'On' if settings.get('telegram_windows_mirror_enabled') else 'Off'}",
+            f"Completion checks: {len(checks)} command(s)",
+            f"Worker alive: {'Yes' if worker.get('alive') else 'No'}",
+            f"Default prompt: {_loop_limit_text(str(settings.get('default_prompt') or ''), 220)}",
+        ]
+    )
+
+
+def _parse_loop_mode_token(raw: str) -> Optional[str]:
+    value = str(raw or "").strip().lower()
+    aliases = {
+        "off": "off",
+        "inherit": "inherit",
+        "global": "inherit",
+        "infinite": "infinite",
+        "await": "await-reply",
+        "await-reply": "await-reply",
+        "checks": "completion-checks",
+        "completion-checks": "completion-checks",
+        "max1": "max-turns-1",
+        "max2": "max-turns-2",
+        "max3": "max-turns-3",
+        "max-turns-1": "max-turns-1",
+        "max-turns-2": "max-turns-2",
+        "max-turns-3": "max-turns-3",
+    }
+    return aliases.get(value)
+
+
+def _parse_loop_reply_command(text: str) -> Optional[Tuple[str, str]]:
+    match = re.match(r"^/reply(?:@\w+)?\s+(\S+)\s+([\s\S]+)$", str(text or "").strip(), re.IGNORECASE)
+    if not match:
+        return None
+    session = str(match.group(1) or "").strip()
+    prompt_text = str(match.group(2) or "").strip()
+    if not session or not prompt_text:
+        return None
+    return session, prompt_text
+
+
+def _parse_loop_mode_command(text: str) -> Optional[Tuple[str, str]]:
+    match = re.match(r"^/mode(?:@\w+)?\s+(\S+)\s+(\S+)$", str(text or "").strip(), re.IGNORECASE)
+    if not match:
+        return None
+    target = str(match.group(1) or "").strip()
+    mode = _parse_loop_mode_token(match.group(2) or "")
+    if not target or mode is None:
+        return None
+    return target, mode
+
+
+def _loop_build_notification_text(
+    session: str,
+    state: str,
+    mode_label: str,
+    snapshot: str,
+    detail: str = "",
+    include_reply_hint: bool = False,
+) -> str:
+    parts = [
+        f"Codrex loop update for {session}",
+        f"State: {state}",
+        f"Mode: {mode_label}",
+    ]
+    if detail:
+        parts.append(detail)
+    compact_snapshot = _loop_limit_text(snapshot, 2000)
+    if compact_snapshot:
+        parts.extend(["", compact_snapshot])
+    if include_reply_hint:
+        parts.extend(["", "Reply to this message to continue the session."])
+    return _loop_limit_text("\n".join(parts).strip(), 3800)
+
+
+def _loop_build_continue_prompt(default_prompt: str, extra_detail: str = "") -> str:
+    base = str(default_prompt or LOOP_CONTROL_DEFAULT_PROMPT).strip() or LOOP_CONTROL_DEFAULT_PROMPT
+    extra = str(extra_detail or "").strip()
+    if not extra:
+        return base
+    return f"{base}\n\n{extra}".strip()
+
+
+def _loop_build_error_prompt(snapshot: str, default_prompt: str, state: str) -> str:
+    extra_parts = [
+        f"The session stopped in state '{state}'. Continue working from here.",
+    ]
+    compact_snapshot = _loop_limit_text(snapshot, 1800)
+    if compact_snapshot:
+        extra_parts.extend(["Latest terminal output:", compact_snapshot])
+    return _loop_build_continue_prompt(default_prompt, "\n".join(extra_parts))
+
+
+def _loop_run_completion_checks(cwd: str, commands: List[str]) -> Tuple[bool, List[Dict[str, Any]]]:
+    clean_cwd = str(cwd or "").strip()
+    if not clean_cwd.startswith("/"):
+        return False, [{"command": "", "exit_code": -1, "output": "", "detail": "Session cwd is unavailable."}]
+    results: List[Dict[str, Any]] = []
+    all_passed = True
+    for command in commands:
+        wrapped = f"cd {_bash_quote(clean_cwd)} && {command}"
+        run = run_wsl_bash(wrapped, timeout_s=LOOP_CONTROL_CHECK_TIMEOUT_S)
+        output = str(run.get("stdout") or "")
+        stderr = str(run.get("stderr") or "")
+        detail_parts = []
+        if output.strip():
+            detail_parts.append(output.strip())
+        if stderr.strip():
+            detail_parts.append(stderr.strip())
+        combined = _loop_limit_text("\n\n".join(detail_parts), 1800)
+        exit_code = int(run.get("exit_code") or 0)
+        if exit_code != 0:
+            all_passed = False
+        results.append(
+            {
+                "command": command,
+                "exit_code": exit_code,
+                "output": combined,
+                "detail": str(run.get("error") or "").strip(),
+            }
+        )
+    return all_passed, results
+
+
+def _loop_build_failed_checks_prompt(
+    default_prompt: str,
+    cwd: str,
+    results: List[Dict[str, Any]],
+) -> str:
+    lines = [
+        f"Completion checks failed in {cwd}. Fix the issues and rerun these commands until they all pass:",
+    ]
+    for item in results:
+        command = str(item.get("command") or "").strip()
+        exit_code = int(item.get("exit_code") or 0)
+        if exit_code == 0:
+            continue
+        lines.append(f"- {command} (exit {exit_code})")
+        output = str(item.get("output") or "").strip()
+        if output:
+            lines.append(_loop_limit_text(output, 800))
+    return _loop_build_continue_prompt(default_prompt, "\n".join(lines))
+
+
+def _loop_commit_session_state_unlocked(session: str, state: Dict[str, Any]) -> Dict[str, Any]:
+    session_id = _validate_session_name(session)
+    normalized = _normalize_loop_session_state(state, session_id)
+    sessions = LOOP_CONTROL_DATA.setdefault("sessions", {})
+    if not isinstance(sessions, dict):
+        sessions = {}
+        LOOP_CONTROL_DATA["sessions"] = sessions
+    sessions[session_id] = normalized
+    return normalized
+
+
+def _loop_set_session_action_unlocked(
+    session: str,
+    state: Dict[str, Any],
+    action: str,
+    detail: str,
+    *,
+    snapshot: str = "",
+    persist: bool = True,
+) -> Dict[str, Any]:
+    now_ms = _now_ms()
+    state["last_action"] = str(action or "").strip()[:64]
+    state["last_action_detail"] = _loop_limit_text(detail, 4000)
+    state["last_action_at"] = now_ms
+    if snapshot:
+        state["last_snapshot"] = _loop_limit_text(snapshot, 2000)
+    normalized = _loop_commit_session_state_unlocked(session, state)
+    if persist:
+        _persist_loop_control_unlocked()
+    return normalized
+
+
+def _loop_set_global_preset_unlocked(preset: str) -> None:
+    settings = _get_loop_settings_unlocked()
+    next_preset = _normalize_loop_preset(preset)
+    settings["global_preset"] = next_preset
+    settings["updated_at"] = _now_ms()
+    sessions = LOOP_CONTROL_DATA.get("sessions") if isinstance(LOOP_CONTROL_DATA.get("sessions"), dict) else {}
+    for session, raw_state in list(sessions.items()):
+        if not isinstance(raw_state, dict):
+            continue
+        state = _normalize_loop_session_state(raw_state, session)
+        if state.get("override_mode") != "inherit":
+            continue
+        state["awaiting_reply"] = False
+        state["last_handled_fingerprint"] = ""
+        budget = _loop_budget_for_preset(next_preset)
+        state["remaining_turns"] = budget if budget is not None else None
+        _loop_commit_session_state_unlocked(session, state)
+    _persist_loop_control_unlocked()
+
+
+def _loop_set_session_override_unlocked(session: str, override_mode: str) -> Dict[str, Any]:
+    state = _get_loop_session_unlocked(session)
+    next_mode = _normalize_loop_override_mode(override_mode)
+    state["override_mode"] = next_mode
+    state["awaiting_reply"] = False
+    state["last_handled_fingerprint"] = ""
+    budget = _loop_budget_for_preset(next_mode)
+    state["remaining_turns"] = budget if budget is not None else None
+    state["last_action"] = ""
+    state["last_action_detail"] = ""
+    normalized = _loop_commit_session_state_unlocked(session, state)
+    _persist_loop_control_unlocked()
+    return normalized
+
+
+def _loop_find_waiting_session_by_message_unlocked(message_id: int) -> str:
+    if message_id <= 0:
+        return ""
+    sessions = LOOP_CONTROL_DATA.get("sessions") if isinstance(LOOP_CONTROL_DATA.get("sessions"), dict) else {}
+    winner = ""
+    newest = 0
+    for session, raw_state in sessions.items():
+        if not isinstance(raw_state, dict):
+            continue
+        state = _normalize_loop_session_state(raw_state, session)
+        if not state.get("awaiting_reply"):
+            continue
+        if int(state.get("last_telegram_message_id") or 0) != int(message_id):
+            continue
+        at = int(state.get("last_notification_at") or 0)
+        if at >= newest:
+            newest = at
+            winner = session
+    return winner
+
+
+def _loop_find_latest_waiting_session_unlocked() -> str:
+    sessions = LOOP_CONTROL_DATA.get("sessions") if isinstance(LOOP_CONTROL_DATA.get("sessions"), dict) else {}
+    winner = ""
+    newest = 0
+    for session, raw_state in sessions.items():
+        if not isinstance(raw_state, dict):
+            continue
+        state = _normalize_loop_session_state(raw_state, session)
+        if not state.get("awaiting_reply"):
+            continue
+        at = int(state.get("last_notification_at") or 0)
+        if at >= newest:
+            newest = at
+            winner = session
+    return winner
+
+
+def _loop_send_prompt_to_session(session: str, prompt_text: str, *, auto_prompt: bool) -> Dict[str, Any]:
+    result = codex_session_send(session, prompt_text)
+    with LOOP_CONTROL_LOCK:
+        state = _get_loop_session_unlocked(session)
+        now_ms = _now_ms()
+        state["awaiting_reply"] = False
+        state["last_prompt_at"] = now_ms
+        if auto_prompt:
+            state["last_auto_prompt_at"] = now_ms
+        _loop_commit_session_state_unlocked(session, state)
+        _persist_loop_control_unlocked()
+    return result
+
+
+def _loop_process_reply_message(session: str, prompt_text: str, source_label: str) -> Dict[str, Any]:
+    try:
+        session_id = _validate_session_name(session)
+    except HTTPException:
+        return {"ok": False, "detail": f"Unknown session '{session}'."}
+    prompt = str(prompt_text or "").strip()
+    if not prompt:
+        return {"ok": False, "detail": "Reply text is empty."}
+    result = _loop_send_prompt_to_session(session_id, prompt, auto_prompt=False)
+    with LOOP_CONTROL_LOCK:
+        state = _get_loop_session_unlocked(session_id)
+        state["awaiting_reply"] = False
+        state["last_reply_at"] = _now_ms()
+        state["last_handled_fingerprint"] = ""
+        _loop_set_session_action_unlocked(
+            session_id,
+            state,
+            "reply_received",
+            f"Sent reply from {source_label}.",
+            snapshot=prompt,
+            persist=True,
+        )
+    return result
+
+
+def _loop_handle_telegram_message(message: Dict[str, Any]) -> None:
+    text = str(message.get("text") or "").strip()
+    if not text:
+        return
+
+    command_name = ""
+    if text.startswith("/"):
+        match = re.match(r"^/([a-z0-9_]+)(?:@\w+)?", text, re.IGNORECASE)
+        command_name = str(match.group(1) if match else "").strip().lower()
+
+    if command_name == "help":
+        _telegram_send_text(_loop_build_help_text())
+        return
+    if command_name == "list":
+        _telegram_send_text(_loop_build_list_text())
+        return
+    if command_name == "status":
+        _telegram_send_text(_loop_build_status_text())
+        return
+
+    mode_command = _parse_loop_mode_command(text)
+    if mode_command:
+        target, mode = mode_command
+        with LOOP_CONTROL_LOCK:
+            _load_loop_control_unlocked()
+            if target.lower() == "global":
+                _loop_set_global_preset_unlocked("" if mode == "off" else mode)
+                response = _loop_build_status_text()
+            else:
+                try:
+                    session_id = _validate_session_name(target)
+                except HTTPException:
+                    session_id = ""
+                if not session_id:
+                    response = f"Unknown session '{target}'."
+                else:
+                    override_mode = "inherit" if mode == "inherit" else ("off" if mode == "off" else mode)
+                    _loop_set_session_override_unlocked(session_id, override_mode)
+                    public = _public_loop_session_state_unlocked(session_id)
+                    effective = str(public.get("effective_preset") or "")
+                    mode_label = _format_loop_preset_label(effective) if effective else "Off"
+                    response = f"{session_id}: override={public.get('override_mode')} effective={mode_label}"
+        _telegram_send_text(_loop_limit_text(response, 3500))
+        return
+
+    reply_command = _parse_loop_reply_command(text)
+    if reply_command:
+        session, prompt_text = reply_command
+        result = _loop_process_reply_message(session, prompt_text, "Telegram command")
+        detail = "Reply sent." if result.get("ok") else (result.get("detail") or result.get("error") or "Reply failed.")
+        _telegram_send_text(_loop_limit_text(detail, 3500))
+        return
+
+    target_session = ""
+    with LOOP_CONTROL_LOCK:
+        _load_loop_control_unlocked()
+        reply_to_message_id = int(message.get("reply_to_message_id") or 0)
+        if reply_to_message_id > 0:
+            target_session = _loop_find_waiting_session_by_message_unlocked(reply_to_message_id)
+        if not target_session:
+            target_session = _loop_find_latest_waiting_session_unlocked()
+    if not target_session:
+        _telegram_send_text("No Codex session is currently waiting for a Telegram reply.")
+        return
+    result = _loop_process_reply_message(target_session, text, "Telegram reply")
+    detail = (
+        f"Sent reply to {target_session}."
+        if result.get("ok")
+        else (result.get("detail") or result.get("error") or f"Reply to {target_session} failed.")
+    )
+    _telegram_send_text(_loop_limit_text(detail, 3500))
+
+
+def _loop_poll_telegram_once() -> None:
+    token = str(TELEGRAM_BOT_TOKEN or "").strip()
+    chat_id = _telegram_resolve_chat_id(allow_discovery=True) if token else ""
+    if not token or not chat_id:
+        with LOOP_CONTROL_LOCK:
+            _load_loop_control_unlocked()
+            worker = LOOP_CONTROL_DATA.setdefault("worker", {})
+            worker["last_telegram_poll_at"] = _now_ms()
+        return
+
+    with LOOP_CONTROL_LOCK:
+        settings = _get_loop_settings_unlocked()
+        offset = int(settings.get("telegram_update_offset") or 0)
+
+    if offset <= 0:
+        parsed = _telegram_get_updates(token, limit=20)
+        items = parsed.get("result") if isinstance(parsed, dict) else []
+        newest = 0
+        if isinstance(items, list):
+            for raw in items:
+                if isinstance(raw, dict):
+                    newest = max(newest, int(raw.get("update_id") or 0))
+        with LOOP_CONTROL_LOCK:
+            settings = _get_loop_settings_unlocked()
+            settings["telegram_update_offset"] = newest
+            worker = LOOP_CONTROL_DATA.setdefault("worker", {})
+            worker["last_telegram_poll_at"] = _now_ms()
+            _persist_loop_control_unlocked()
+        return
+
+    parsed = _telegram_get_updates(token, offset=offset + 1, limit=20)
+    items = parsed.get("result") if isinstance(parsed, dict) else []
+    newest = offset
+    if isinstance(items, list):
+        for raw in items:
+            if not isinstance(raw, dict):
+                continue
+            newest = max(newest, int(raw.get("update_id") or 0))
+            message = _loop_extract_telegram_message(raw)
+            if not message:
+                continue
+            if str(message.get("chat_id") or "").strip() != chat_id:
+                continue
+            _loop_handle_telegram_message(message)
+    with LOOP_CONTROL_LOCK:
+        settings = _get_loop_settings_unlocked()
+        settings["telegram_update_offset"] = newest
+        worker = LOOP_CONTROL_DATA.setdefault("worker", {})
+        worker["last_telegram_poll_at"] = _now_ms()
+        _persist_loop_control_unlocked()
+
+
+def _loop_sync_budget_unlocked(session: str, state: Dict[str, Any], effective_preset: str, session_prompt_at_ms: int) -> None:
+    budget = _loop_budget_for_preset(effective_preset)
+    if budget is None:
+        state["remaining_turns"] = None
+        state["last_prompt_at"] = session_prompt_at_ms
+        _loop_commit_session_state_unlocked(session, state)
+        return
+    previous_prompt_at = int(state.get("last_prompt_at") or 0)
+    last_auto_prompt_at = int(state.get("last_auto_prompt_at") or 0)
+    if state.get("remaining_turns") is None:
+        state["remaining_turns"] = budget
+    if session_prompt_at_ms > 0 and session_prompt_at_ms != previous_prompt_at and session_prompt_at_ms != last_auto_prompt_at:
+        state["remaining_turns"] = budget
+    state["last_prompt_at"] = session_prompt_at_ms
+    _loop_commit_session_state_unlocked(session, state)
+
+
+def _loop_handle_terminal_session(session_item: Dict[str, Any], session_record: Dict[str, Any]) -> None:
+    session = _validate_session_name(session_item.get("session"))
+    state_name = str(session_item.get("state") or "").strip().lower()
+    snapshot = _loop_snapshot_text_from_session_record(session_record)
+    session_prompt_at_ms = 0
+    try:
+        session_prompt_at_ms = int(float(session_record.get("last_prompt_at") or 0) * 1000)
+    except Exception:
+        session_prompt_at_ms = 0
+
+    with LOOP_CONTROL_LOCK:
+        loop_state = _get_loop_session_unlocked(session)
+        effective_preset = _effective_loop_preset_unlocked(session)
+        _loop_sync_budget_unlocked(session, loop_state, effective_preset, session_prompt_at_ms)
+        fingerprint_source = "\n".join([session, state_name, snapshot, str(session_prompt_at_ms), effective_preset])
+        fingerprint = hashlib.sha1(fingerprint_source.encode("utf-8", errors="ignore")).hexdigest()
+        if fingerprint == str(loop_state.get("last_handled_fingerprint") or ""):
+            return
+        loop_state["last_terminal_state"] = state_name
+        loop_state["last_terminal_at"] = _now_ms()
+        loop_state["last_snapshot"] = _loop_limit_text(snapshot, 2000)
+        loop_state["last_handled_fingerprint"] = fingerprint
+        settings = _get_loop_settings_unlocked()
+        default_prompt = str(settings.get("default_prompt") or LOOP_CONTROL_DEFAULT_PROMPT)
+        completion_checks = list(settings.get("completion_checks") or [])
+        _loop_commit_session_state_unlocked(session, loop_state)
+        _persist_loop_control_unlocked()
+
+    if state_name in LOOP_WAITING_STATES or effective_preset == "await-reply":
+        telegram_result = _telegram_send_text(
+            _loop_build_notification_text(
+                session,
+                state_name or "waiting",
+                _format_loop_preset_label(effective_preset),
+                snapshot,
+                (
+                    "Codex is waiting for your reply."
+                    if state_name in LOOP_WAITING_STATES
+                    else "Codex stopped and is waiting for your next instruction."
+                ),
+                include_reply_hint=True,
+            )
+        )
+        with LOOP_CONTROL_LOCK:
+            loop_state = _get_loop_session_unlocked(session)
+            loop_state["awaiting_reply"] = bool(telegram_result.get("ok"))
+            if telegram_result.get("ok"):
+                loop_state["last_notification_at"] = _now_ms()
+                loop_state["last_telegram_message_id"] = int(telegram_result.get("message_id") or 0)
+            _loop_set_session_action_unlocked(
+                session,
+                loop_state,
+                "awaiting_reply",
+                (
+                    "Waiting for a Telegram reply."
+                    if telegram_result.get("ok")
+                    else (telegram_result.get("detail") or telegram_result.get("error") or "Telegram notification failed.")
+                ),
+                snapshot=snapshot,
+                persist=True,
+            )
+        return
+
+    if state_name not in LOOP_TERMINAL_STATES:
+        return
+
+    if not effective_preset:
+        with LOOP_CONTROL_LOCK:
+            loop_state = _get_loop_session_unlocked(session)
+            loop_state["awaiting_reply"] = False
+            _loop_set_session_action_unlocked(
+                session,
+                loop_state,
+                "stopped",
+                "Loop mode is off for this session.",
+                snapshot=snapshot,
+                persist=True,
+            )
+        return
+
+    if state_name == "error":
+        prompt = _loop_build_error_prompt(snapshot, default_prompt, state_name)
+        send_result = _loop_send_prompt_to_session(session, prompt, auto_prompt=True)
+        with LOOP_CONTROL_LOCK:
+            loop_state = _get_loop_session_unlocked(session)
+            if send_result.get("ok"):
+                loop_state["last_continue_at"] = _now_ms()
+            _loop_set_session_action_unlocked(
+                session,
+                loop_state,
+                "auto_continue_error",
+                "Continued after an error state." if send_result.get("ok") else (send_result.get("detail") or send_result.get("error") or "Auto-continue failed."),
+                snapshot=snapshot,
+                persist=True,
+            )
+        return
+
+    if effective_preset == "completion-checks":
+        all_passed, results = _loop_run_completion_checks(str(session_item.get("cwd") or session_record.get("cwd") or ""), completion_checks)
+        if completion_checks and all_passed:
+            telegram_result = _telegram_send_text(
+                _loop_build_notification_text(
+                    session,
+                    state_name,
+                    _format_loop_preset_label(effective_preset),
+                    snapshot,
+                    "Completion checks passed.",
+                    include_reply_hint=False,
+                )
+            )
+            with LOOP_CONTROL_LOCK:
+                loop_state = _get_loop_session_unlocked(session)
+                if telegram_result.get("ok"):
+                    loop_state["last_notification_at"] = _now_ms()
+                _loop_set_session_action_unlocked(
+                    session,
+                    loop_state,
+                    "completion_checks_passed",
+                    "Completion checks passed.",
+                    snapshot=snapshot,
+                    persist=True,
+                )
+            return
+        if not completion_checks:
+            prompt = _loop_build_continue_prompt(
+                default_prompt,
+                "Completion checks mode is enabled, but no commands are configured yet. Continue and finish the task before stopping.",
+            )
+        else:
+            prompt = _loop_build_failed_checks_prompt(
+                default_prompt,
+                str(session_item.get("cwd") or session_record.get("cwd") or ""),
+                results,
+            )
+        send_result = _loop_send_prompt_to_session(session, prompt, auto_prompt=True)
+        with LOOP_CONTROL_LOCK:
+            loop_state = _get_loop_session_unlocked(session)
+            if send_result.get("ok"):
+                loop_state["last_continue_at"] = _now_ms()
+            _loop_set_session_action_unlocked(
+                session,
+                loop_state,
+                "completion_checks_continue",
+                (
+                    "Completion checks failed; sent follow-up prompt."
+                    if completion_checks
+                    else "Completion checks are not configured; sent follow-up prompt."
+                )
+                if send_result.get("ok")
+                else (send_result.get("detail") or send_result.get("error") or "Follow-up prompt failed."),
+                snapshot=snapshot,
+                persist=True,
+            )
+        return
+
+    if effective_preset.startswith("max-turns-"):
+        with LOOP_CONTROL_LOCK:
+            loop_state = _get_loop_session_unlocked(session)
+            try:
+                remaining_turns = int(loop_state.get("remaining_turns") or 0)
+            except Exception:
+                remaining_turns = 0
+        if remaining_turns <= 0:
+            telegram_result = _telegram_send_text(
+                _loop_build_notification_text(
+                    session,
+                    state_name,
+                    _format_loop_preset_label(effective_preset),
+                    snapshot,
+                    "Max-turns budget is exhausted.",
+                    include_reply_hint=False,
+                )
+            )
+            with LOOP_CONTROL_LOCK:
+                loop_state = _get_loop_session_unlocked(session)
+                if telegram_result.get("ok"):
+                    loop_state["last_notification_at"] = _now_ms()
+                _loop_set_session_action_unlocked(
+                    session,
+                    loop_state,
+                    "max_turns_exhausted",
+                    "Max-turns budget is exhausted.",
+                    snapshot=snapshot,
+                    persist=True,
+                )
+            return
+        send_result = _loop_send_prompt_to_session(session, default_prompt, auto_prompt=True)
+        with LOOP_CONTROL_LOCK:
+            loop_state = _get_loop_session_unlocked(session)
+            if send_result.get("ok"):
+                loop_state["remaining_turns"] = max(0, remaining_turns - 1)
+                loop_state["last_continue_at"] = _now_ms()
+            _loop_set_session_action_unlocked(
+                session,
+                loop_state,
+                "auto_continue",
+                (
+                    f"Sent follow-up prompt. Remaining turns: {loop_state.get('remaining_turns')}"
+                    if send_result.get("ok")
+                    else (send_result.get("detail") or send_result.get("error") or "Auto-continue failed.")
+                ),
+                snapshot=snapshot,
+                persist=True,
+            )
+        return
+
+    send_result = _loop_send_prompt_to_session(session, default_prompt, auto_prompt=True)
+    with LOOP_CONTROL_LOCK:
+        loop_state = _get_loop_session_unlocked(session)
+        if send_result.get("ok"):
+            loop_state["last_continue_at"] = _now_ms()
+        _loop_set_session_action_unlocked(
+            session,
+            loop_state,
+            "auto_continue",
+            "Sent follow-up prompt." if send_result.get("ok") else (send_result.get("detail") or send_result.get("error") or "Auto-continue failed."),
+            snapshot=snapshot,
+            persist=True,
+        )
+
+
+def _loop_control_worker() -> None:
+    while True:
+        try:
+            _loop_poll_telegram_once()
+            _telegram_windows_mirror_once()
+            response = codex_sessions_live()
+            sessions = response.get("sessions") if isinstance(response, dict) else []
+            session_records: Dict[str, Dict[str, Any]] = {}
+            with SESSIONS_LOCK:
+                for item in sessions if isinstance(sessions, list) else []:
+                    if not isinstance(item, dict):
+                        continue
+                    session = str(item.get("session") or "").strip()
+                    if not session:
+                        continue
+                    session_records[session] = dict(SESSIONS.get(session, {}))
+            for item in sessions if isinstance(sessions, list) else []:
+                if not isinstance(item, dict):
+                    continue
+                session = str(item.get("session") or "").strip()
+                if not session:
+                    continue
+                _loop_handle_terminal_session(item, session_records.get(session, {}))
+            with LOOP_CONTROL_LOCK:
+                _load_loop_control_unlocked()
+                worker = LOOP_CONTROL_DATA.setdefault("worker", {})
+                worker["alive"] = True
+                worker["last_cycle_at"] = _now_ms()
+                worker["last_error"] = ""
+                worker["last_error_at"] = 0
+        except Exception as exc:
+            with LOOP_CONTROL_LOCK:
+                _load_loop_control_unlocked()
+                worker = LOOP_CONTROL_DATA.setdefault("worker", {})
+                worker["alive"] = True
+                worker["last_cycle_at"] = _now_ms()
+                worker["last_error"] = f"{type(exc).__name__}: {exc}"
+                worker["last_error_at"] = _now_ms()
+        time.sleep(max(1.0, LOOP_CONTROL_POLL_INTERVAL_S))
+
+
+def _ensure_loop_control_worker() -> None:
+    global LOOP_CONTROL_WORKER_THREAD
+    existing = LOOP_CONTROL_WORKER_THREAD
+    if existing and existing.is_alive():
+        return
+    worker = threading.Thread(
+        target=_loop_control_worker,
+        name="codrex-loop-control",
+        daemon=True,
+    )
+    LOOP_CONTROL_WORKER_THREAD = worker
+    worker.start()
+
+
 def _overlay_cursor_rgb(rgb_bytes: bytes, size: Tuple[int, int], x: int, y: int) -> bytes:
     """
     MSS screenshots typically do not include the OS cursor. For mobile remote control,
@@ -3341,11 +4844,80 @@ def _desktop_cursor_pos() -> Optional[Tuple[int, int]]:
         return None
 
 
+def _desktop_capture_probe(scale_factor: int = 6) -> Dict[str, Any]:
+    try:
+        rgb, out_size = _desktop_capture_rgb(scale_factor=scale_factor, grayscale=True)
+        if not rgb:
+            return {
+                "ok": True,
+                "width": int(out_size[0]),
+                "height": int(out_size[1]),
+                "avg_luma": 0.0,
+                "non_black": False,
+            }
+        step = max(1, len(rgb) // 2048)
+        sample = rgb[::step]
+        avg_luma = (float(sum(sample)) / float(len(sample))) if sample else 0.0
+        non_black = any(int(value) > 12 for value in sample)
+        return {
+            "ok": True,
+            "width": int(out_size[0]),
+            "height": int(out_size[1]),
+            "avg_luma": round(avg_luma, 2),
+            "non_black": bool(non_black),
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+
+
+def _desktop_run_remote_action(
+    action_name: str,
+    callback: Callable[[], Any],
+    *,
+    capture_probe: bool = False,
+) -> Tuple[Any, Dict[str, Any]]:
+    active_target_id = ""
+    try:
+        active_target_id = str(_desktop_targets_payload().get("active_target", {}).get("id") or "").strip()
+    except Exception:
+        active_target_id = ""
+    diagnostics: Dict[str, Any] = {
+        "action": str(action_name or "").strip() or "desktop_action",
+        "capture_backend": _desktop_capture_backend(),
+        "active_target_id": active_target_id,
+    }
+    try:
+        result = callback()
+        if capture_probe:
+            diagnostics["capture_probe"] = _desktop_capture_probe()
+        return result, diagnostics
+    finally:
+        if capture_probe:
+            print(
+                f"Desktop remote action={diagnostics.get('action')} diag={json.dumps(diagnostics, ensure_ascii=False)}",
+                flush=True,
+            )
+
 ULONG_PTR = getattr(wintypes, "ULONG_PTR", ctypes.c_size_t)
 
 INPUT_MOUSE = 0
 INPUT_KEYBOARD = 1
 INPUT_HARDWARE = 2
+
+MOUSEEVENTF_LEFTDOWN = 0x0002
+MOUSEEVENTF_LEFTUP = 0x0004
+MOUSEEVENTF_RIGHTDOWN = 0x0008
+MOUSEEVENTF_RIGHTUP = 0x0010
+MOUSEEVENTF_MIDDLEDOWN = 0x0020
+MOUSEEVENTF_MIDDLEUP = 0x0040
+MOUSEEVENTF_MOVE = 0x0001
+MOUSEEVENTF_WHEEL = 0x0800
+MOUSEEVENTF_VIRTUALDESK = 0x4000
+MOUSEEVENTF_ABSOLUTE = 0x8000
+REMOTE_MOUSE_EXTRA_INFO = 0x434F445245584D31
 
 KEYEVENTF_EXTENDEDKEY = 0x0001
 KEYEVENTF_KEYUP = 0x0002
@@ -3371,6 +4943,42 @@ VK_UP = 0x26
 VK_RIGHT = 0x27
 VK_DOWN = 0x28
 VK_F5 = 0x74
+
+WM_MOUSEMOVE = 0x0200
+WM_LBUTTONDOWN = 0x0201
+WM_LBUTTONUP = 0x0202
+WM_RBUTTONDOWN = 0x0204
+WM_RBUTTONUP = 0x0205
+WM_MBUTTONDOWN = 0x0207
+WM_MBUTTONUP = 0x0208
+WM_NCHITTEST = 0x0084
+WM_NCLBUTTONDOWN = 0x00A1
+WM_NCLBUTTONUP = 0x00A2
+WM_NCRBUTTONDOWN = 0x00A4
+WM_NCRBUTTONUP = 0x00A5
+WM_NCMBUTTONDOWN = 0x00A7
+WM_NCMBUTTONUP = 0x00A8
+WM_SYSCOMMAND = 0x0112
+
+MK_LBUTTON = 0x0001
+MK_RBUTTON = 0x0002
+MK_MBUTTON = 0x0010
+
+HTNOWHERE = 0
+HTCLIENT = 1
+HTCAPTION = 2
+HTMINBUTTON = 8
+HTMAXBUTTON = 9
+HTCLOSE = 20
+
+SC_MINIMIZE = 0xF020
+SC_MAXIMIZE = 0xF030
+SC_RESTORE = 0xF120
+SC_CLOSE = 0xF060
+
+GA_ROOT = 2
+GW_HWNDNEXT = 2
+DWMWA_CLOAKED = 14
 
 
 class MOUSEINPUT(ctypes.Structure):
@@ -3493,16 +5101,16 @@ def _send_vk_combo(modifiers: List[int], vk: int, extended: bool = False) -> Non
     _send_inputs(seq)
 
 
-def _send_char_key(char: str) -> bool:
+def _resolve_char_key(char: str) -> Optional[Tuple[int, List[int]]]:
     value = str(char or "")
     if len(value) != 1:
-        return False
+        return None
     try:
         scan = int(_win_vk_key_scan()(value))
     except Exception:
-        return False
+        return None
     if scan == -1:
-        return False
+        return None
     vk = scan & 0xFF
     shift_state = (scan >> 8) & 0xFF
     modifiers: List[int] = []
@@ -3512,6 +5120,14 @@ def _send_char_key(char: str) -> bool:
         modifiers.append(VK_CONTROL)
     if shift_state & 4:
         modifiers.append(VK_MENU)
+    return vk, modifiers
+
+
+def _send_char_key(char: str) -> bool:
+    resolved = _resolve_char_key(char)
+    if resolved is None:
+        return False
+    vk, modifiers = resolved
     if modifiers:
         _send_vk_combo(modifiers, vk)
     else:
@@ -3547,11 +5163,107 @@ def _send_unicode_text_chunked(text: str, chunk_size: int = 240) -> int:
         sent += len(chunk)
     return sent
 
+
+def _send_text_native_first(text: str, unicode_chunk_size: int = 240) -> int:
+    """
+    Prefer native VK-based key events for text so the input behaves like real typing.
+    Fall back to Unicode injection only for characters that cannot be mapped by VkKeyScanW.
+    This keeps remote typing close to real keyboard behavior for desktop apps and shell UI.
+    """
+    value = str(text or "")
+    if not value:
+        return 0
+
+    sent = 0
+    unicode_buffer: List[str] = []
+
+    def flush_unicode_buffer() -> None:
+        nonlocal sent
+        if not unicode_buffer:
+            return
+        chunk = "".join(unicode_buffer)
+        sent += _send_unicode_text_chunked(chunk, chunk_size=unicode_chunk_size)
+        unicode_buffer.clear()
+
+    for char in value:
+        resolved = _resolve_char_key(char)
+        if resolved is not None:
+            flush_unicode_buffer()
+            vk, modifiers = resolved
+            if modifiers:
+                _send_vk_combo(modifiers, vk)
+            else:
+                _send_vk(vk)
+            sent += 1
+        else:
+            unicode_buffer.append(char)
+
+    flush_unicode_buffer()
+    return sent
+
 # -------------------------
 # Live codex session state
 # -------------------------
 SESSIONS_LOCK = threading.Lock()
 SESSIONS: Dict[str, Dict[str, Any]] = {}
+WINDOWS_RUNTIME_LOCK = threading.Lock()
+WINDOWS_RUNTIME_ACTIVE = bool(WINPTY_AVAILABLE and os.name == "nt")
+WINDOWS_SUPPORTED_PROFILES = {"codex", "powershell", "cmd"}
+WINDOWS_CODEX_PROFILE_LOCK = threading.Lock()
+WINDOWS_CODEX_PROFILE_STATUS: Dict[str, Any] = {
+    "supported": None,
+    "detail": "",
+    "checked_at": 0.0,
+}
+WINDOWS_SESSION_BACKGROUND_MODE = "selected_only"
+WINDOWS_SESSION_OUTPUT_MAX_CHARS = int(os.environ.get("CODEX_WINDOWS_SESSION_OUTPUT_MAX_CHARS", "60000") or "60000")
+WINDOWS_SESSION_STREAM_REPLAY_MAX = int(os.environ.get("CODEX_WINDOWS_SESSION_STREAM_REPLAY_MAX", "240") or "240")
+WINDOWS_SESSION_RECENT_CLOSED_MAX = int(os.environ.get("CODEX_WINDOWS_SESSION_RECENT_CLOSED_MAX", "24") or "24")
+WINDOWS_SESSIONS_LOCK = threading.Lock()
+WINDOWS_SESSIONS: Dict[str, Dict[str, Any]] = {}
+WINDOWS_RECENT_CLOSED: List[Dict[str, Any]] = []
+WINDOWS_SESSION_STREAM_LOCK = threading.Lock()
+WINDOWS_SESSION_STREAM_STATES: Dict[str, Dict[str, Any]] = {}
+DESKTOP_CODEX_HOME = os.path.join(os.path.expanduser("~"), ".codex")
+DESKTOP_CODEX_STATE_DB = os.path.join(DESKTOP_CODEX_HOME, "state_5.sqlite")
+DESKTOP_CODEX_TRANSCRIPT_MAX_CHARS = int(
+    os.environ.get("CODEX_DESKTOP_TRANSCRIPT_MAX_CHARS", "140000") or "140000"
+)
+DESKTOP_CODEX_ROLLOUT_TAIL_BYTES = int(
+    os.environ.get("CODEX_DESKTOP_ROLLOUT_TAIL_BYTES", "32768") or "32768"
+)
+DESKTOP_CODEX_STALE_BUSY_SECONDS = max(
+    15.0,
+    float(os.environ.get("CODEX_DESKTOP_STALE_BUSY_SECONDS", "120") or "120"),
+)
+DESKTOP_CODEX_STREAM_POLL_SECONDS = max(
+    0.4,
+    float(os.environ.get("CODEX_DESKTOP_STREAM_POLL_SECONDS", "1.2") or "1.2"),
+)
+DESKTOP_CODEX_WSL_REAL_CODEX = str(
+    os.environ.get("CODEX_DESKTOP_WSL_REAL_CODEX") or "/home/megha/.local/nodejs/v22.22.0/bin/codex"
+).strip()
+DESKTOP_CODEX_WSL_NODE_BIN = str(
+    os.environ.get("CODEX_DESKTOP_WSL_NODE_BIN") or os.path.dirname(DESKTOP_CODEX_WSL_REAL_CODEX)
+).strip()
+DESKTOP_CODEX_WINDOWS_APPS_GLOB = os.environ.get(
+    "CODEX_DESKTOP_WINDOWS_APPS_GLOB",
+    r"C:\Program Files\WindowsApps\OpenAI.Codex_*_x64__2p2nqsd0c76g0\app\resources\codex.exe",
+).strip()
+DESKTOP_CODEX_WINDOWS_CLI_CACHE_DIR = os.path.join(CODEX_RUNTIME_DIR, "desktop-codex-win-cli")
+DESKTOP_CODEX_WINDOWS_CLI_CACHE_PATH = os.path.join(DESKTOP_CODEX_WINDOWS_CLI_CACHE_DIR, "codex-app-server.exe")
+DESKTOP_CODEX_APP_SERVER_START_TIMEOUT_SECONDS = max(
+    4.0,
+    float(os.environ.get("CODEX_DESKTOP_APP_SERVER_START_TIMEOUT_SECONDS", "15") or "15"),
+)
+DESKTOP_CODEX_APP_SERVER_RPC_TIMEOUT_SECONDS = max(
+    3.0,
+    float(os.environ.get("CODEX_DESKTOP_APP_SERVER_RPC_TIMEOUT_SECONDS", "45") or "45"),
+)
+DESKTOP_CODEX_JOB_LOCK = threading.Lock()
+DESKTOP_CODEX_JOBS: Dict[str, Dict[str, Any]] = {}
+DESKTOP_CODEX_APP_SERVER_LOCK = threading.Lock()
+DESKTOP_CODEX_APP_SERVER: Dict[str, Any] = {}
 
 def _validate_session_name(name: str) -> str:
     if not VALID_NAME_RE.fullmatch(name or ""):
@@ -3565,6 +5277,1752 @@ def _validate_pane_id(pane_id: str) -> str:
 
 def _bash_quote(s: str) -> str:
     return "'" + s.replace("'", "'\"'\"'") + "'"
+
+
+def _windows_runtime_supported() -> bool:
+    return bool(os.name == "nt" and WINPTY_AVAILABLE and PtyProcess is not None)
+
+
+def _desktop_codex_available() -> bool:
+    return os.path.isfile(DESKTOP_CODEX_STATE_DB)
+
+
+def _desktop_codex_windows_cli_source_candidates() -> List[str]:
+    candidates: List[str] = []
+    env_cli = str(os.environ.get("CODEX_DESKTOP_WINDOWS_CLI_SOURCE") or "").strip()
+    if env_cli and os.path.isfile(env_cli):
+        candidates.append(os.path.abspath(env_cli))
+    configured_cli = str(CODEX_WINDOWS_CLI or "").strip()
+    if configured_cli:
+        configured_abs = configured_cli if os.path.isabs(configured_cli) else os.path.abspath(configured_cli)
+        if os.path.isfile(configured_abs):
+            candidates.append(configured_abs)
+    for matched in sorted(glob.glob(DESKTOP_CODEX_WINDOWS_APPS_GLOB), reverse=True):
+        if os.path.isfile(matched):
+            candidates.append(os.path.abspath(matched))
+    seen: set[str] = set()
+    unique: List[str] = []
+    for candidate in candidates:
+        lowered = candidate.lower()
+        if lowered in seen:
+            continue
+        seen.add(lowered)
+        unique.append(candidate)
+    return unique
+
+
+def _desktop_codex_app_server_supported() -> bool:
+    return bool(
+        os.name == "nt"
+        and WEBSOCKETS_AVAILABLE
+        and (_desktop_codex_windows_cli_source_candidates() or os.path.isfile(DESKTOP_CODEX_WINDOWS_CLI_CACHE_PATH))
+    )
+
+
+def _desktop_codex_write_supported() -> bool:
+    return _desktop_codex_app_server_supported()
+
+
+def _desktop_codex_prepare_windows_cli_copy() -> str:
+    if os.name != "nt":
+        raise HTTPException(status_code=501, detail="Desktop Codex write-back is only supported on Windows hosts.")
+    cached = os.path.abspath(DESKTOP_CODEX_WINDOWS_CLI_CACHE_PATH)
+    if os.path.isfile(cached):
+        return cached
+    source_candidates = _desktop_codex_windows_cli_source_candidates()
+    if not source_candidates:
+        raise HTTPException(
+            status_code=500,
+            detail="Could not locate a Windows Codex CLI binary to start the desktop app-server.",
+        )
+    os.makedirs(DESKTOP_CODEX_WINDOWS_CLI_CACHE_DIR, exist_ok=True)
+    for source in source_candidates:
+        temp_target = f"{cached}.{uuid.uuid4().hex}.tmp"
+        try:
+            shutil.copy2(source, temp_target)
+            os.replace(temp_target, cached)
+            return cached
+        except Exception as exc:
+            LOGGER.warning("Failed to copy Windows Codex CLI from %s: %s", source, exc)
+            try:
+                if os.path.exists(temp_target):
+                    os.remove(temp_target)
+            except Exception:
+                pass
+    raise HTTPException(
+        status_code=500,
+        detail="Could not stage a runnable Windows Codex CLI binary for desktop app-server transport.",
+    )
+
+
+def _desktop_codex_find_free_loopback_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as handle:
+        handle.bind(("127.0.0.1", 0))
+        return int(handle.getsockname()[1])
+
+
+def _desktop_codex_app_server_ready(port: int, timeout: float = 1.5) -> bool:
+    url = f"http://127.0.0.1:{int(port)}/readyz"
+    try:
+        with urllib.request.urlopen(url, timeout=max(0.2, timeout)) as response:
+            return int(getattr(response, "status", 0) or 0) == 200
+    except Exception:
+        return False
+
+
+def _desktop_codex_terminate_app_server_state(state: Optional[Dict[str, Any]]) -> None:
+    process = state.get("process") if isinstance(state, dict) else None
+    if not process:
+        return
+    try:
+        if process.poll() is None:
+            process.terminate()
+            process.wait(timeout=4)
+    except Exception:
+        try:
+            if process.poll() is None:
+                process.kill()
+        except Exception:
+            LOGGER.debug("Failed to terminate private Desktop Codex app-server", exc_info=True)
+
+
+def _desktop_codex_app_server_state() -> Dict[str, Any]:
+    with DESKTOP_CODEX_APP_SERVER_LOCK:
+        return dict(DESKTOP_CODEX_APP_SERVER)
+
+
+def _desktop_codex_shutdown_app_server() -> None:
+    with DESKTOP_CODEX_APP_SERVER_LOCK:
+        state = dict(DESKTOP_CODEX_APP_SERVER)
+        DESKTOP_CODEX_APP_SERVER.clear()
+    if state:
+        _desktop_codex_terminate_app_server_state(state)
+
+
+def _desktop_codex_ensure_app_server() -> Dict[str, Any]:
+    if not _desktop_codex_write_supported():
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Desktop Codex write-back is unavailable on this host. "
+                + (
+                    f"websockets import failed: {WEBSOCKETS_IMPORT_ERROR}"
+                    if not WEBSOCKETS_AVAILABLE
+                    else "Windows Codex CLI could not be located."
+                )
+            ),
+        )
+    with DESKTOP_CODEX_APP_SERVER_LOCK:
+        existing = dict(DESKTOP_CODEX_APP_SERVER)
+        existing_port = int(existing.get("port") or 0)
+        existing_process = existing.get("process")
+        if existing_process and existing_process.poll() is None and existing_port and _desktop_codex_app_server_ready(existing_port):
+            return existing
+
+        if existing:
+            _desktop_codex_terminate_app_server_state(existing)
+            DESKTOP_CODEX_APP_SERVER.clear()
+
+        cli_path = _desktop_codex_prepare_windows_cli_copy()
+        port = _desktop_codex_find_free_loopback_port()
+        url = f"ws://127.0.0.1:{port}"
+        stdout_log = os.path.join(CODEX_RUNTIME_LOGS_DIR, f"desktop-codex-app-server-{port}.stdout.log")
+        stderr_log = os.path.join(CODEX_RUNTIME_LOGS_DIR, f"desktop-codex-app-server-{port}.stderr.log")
+        os.makedirs(CODEX_RUNTIME_LOGS_DIR, exist_ok=True)
+        stdout_handle = open(stdout_log, "ab")
+        stderr_handle = open(stderr_log, "ab")
+        process = subprocess.Popen(
+            [cli_path, "app-server", "--listen", url],
+            cwd=DESKTOP_CODEX_WINDOWS_CLI_CACHE_DIR,
+            stdout=stdout_handle,
+            stderr=stderr_handle,
+            stdin=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0,
+        )
+        try:
+            stdout_handle.close()
+        except Exception:
+            pass
+        try:
+            stderr_handle.close()
+        except Exception:
+            pass
+        started = time.time()
+        ready = False
+        while time.time() - started < DESKTOP_CODEX_APP_SERVER_START_TIMEOUT_SECONDS:
+            if process.poll() is not None:
+                break
+            if _desktop_codex_app_server_ready(port):
+                ready = True
+                break
+            time.sleep(0.25)
+        if not ready:
+            _desktop_codex_terminate_app_server_state({"process": process})
+            try:
+                stdout_handle.flush()
+                stderr_handle.flush()
+            except Exception:
+                pass
+            detail = "Desktop Codex app-server failed to start."
+            try:
+                with open(stderr_log, "rb") as handle:
+                    tail = handle.read()[-4000:].decode("utf-8", errors="ignore").strip()
+                if tail:
+                    detail = f"{detail} {tail}"
+            except Exception:
+                pass
+            raise HTTPException(status_code=500, detail=detail)
+
+        DESKTOP_CODEX_APP_SERVER.update(
+            {
+                "process": process,
+                "port": port,
+                "url": url,
+                "stdout_log": stdout_log,
+                "stderr_log": stderr_log,
+                "started_at": time.time(),
+                "cli_path": cli_path,
+            }
+        )
+        return dict(DESKTOP_CODEX_APP_SERVER)
+
+
+def _desktop_codex_runtime_status_payload() -> Dict[str, Any]:
+    if not _desktop_codex_available():
+        return {
+            "ok": False,
+            "state": "missing",
+            "detail": f"Codex Desktop thread store was not found at {DESKTOP_CODEX_STATE_DB}.",
+            "can_start": False,
+            "can_stop": False,
+            "cwd": DESKTOP_CODEX_HOME,
+            "read_only": True,
+        }
+    write_supported = _desktop_codex_write_supported()
+    return {
+        "ok": True,
+        "state": "running",
+        "detail": (
+            "Attached to the shared Codex Desktop thread history under ~/.codex. "
+            + (
+                "Prompts are sent through a private Windows app-server against the same thread store."
+                if write_supported
+                else "This mirror is read-only on this host because desktop app-server transport is unavailable."
+            )
+        ),
+        "can_start": False,
+        "can_stop": False,
+        "cwd": DESKTOP_CODEX_HOME,
+        "read_only": not write_supported,
+    }
+
+
+def _desktop_codex_sessions_detail() -> str:
+    if _desktop_codex_write_supported():
+        return "Attached to the shared Codex Desktop thread history under ~/.codex. Prompts are sent through a private Windows app-server against the same thread store."
+    return "Read-only mirror of Codex Desktop threads."
+
+
+def _desktop_codex_normalize_windows_path(value: str) -> str:
+    text = str(value or "").strip()
+    if text.startswith("\\\\?\\"):
+        text = text[4:]
+    return text
+
+
+def _desktop_codex_windows_to_wsl_path(value: str) -> str:
+    text = _desktop_codex_normalize_windows_path(value)
+    match = re.match(r"^([A-Za-z]):\\(.*)$", text)
+    if not match:
+        return text.replace("\\", "/")
+    drive = match.group(1).lower()
+    rest = match.group(2).replace("\\", "/")
+    return f"/mnt/{drive}/{rest}"
+
+
+def _desktop_codex_compact_text(value: Any, max_length: int = 140) -> str:
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    if len(text) <= max_length:
+        return text
+    return text[: max(0, max_length - 3)].rstrip() + "..."
+
+
+def _desktop_codex_decode_path_value(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    try:
+        text = unquote(text)
+    except Exception:
+        pass
+    text = _desktop_codex_normalize_windows_path(text).replace("\\", "/")
+    text = re.sub(r"/{2,}", "/", text)
+    windows_mnt_match = re.match(r"^([A-Za-z]):/mnt/([A-Za-z])(?:/|$)", text)
+    if windows_mnt_match:
+        rest = text[windows_mnt_match.end():].lstrip("/")
+        return f"{windows_mnt_match.group(2).upper()}:/{rest}".rstrip("/")
+    return text.rstrip("/")
+
+
+def _desktop_codex_split_path(value: Any) -> Tuple[str, List[str]]:
+    normalized = _desktop_codex_decode_path_value(value)
+    if not normalized:
+        return "", []
+    drive_match = re.match(r"^([A-Za-z]):(?:/|$)", normalized)
+    if drive_match:
+        return f"{drive_match.group(1).upper()}:", [part for part in normalized[2:].split("/") if part]
+    mnt_match = re.match(r"^/mnt/([A-Za-z])(?:/|$)", normalized)
+    if mnt_match:
+        trimmed = re.sub(r"^/mnt/[A-Za-z](?:/|$)", "", normalized)
+        return f"{mnt_match.group(1).upper()}:", [part for part in trimmed.split("/") if part]
+    return "", [part for part in normalized.split("/") if part]
+
+
+def _desktop_codex_is_home_like_cwd(value: Any) -> bool:
+    normalized = _desktop_codex_decode_path_value(value).lower()
+    if not normalized:
+        return True
+    return bool(
+        re.fullmatch(r"[a-z]:/users/[^/]+/?", normalized)
+        or re.fullmatch(r"/users/[^/]+/?", normalized)
+        or re.fullmatch(r"/home/[^/]+/?", normalized)
+    )
+
+
+def _desktop_codex_strip_common_user_prefixes(parts: List[str]) -> List[str]:
+    if len(parts) >= 2 and parts[0].lower() == "users":
+        trimmed = parts[2:]
+        if trimmed and trimmed[0].lower() in {"desktop", "documents", "downloads", "onedrive"}:
+            return trimmed[1:]
+        return trimmed
+    if len(parts) >= 2 and parts[0].lower() == "home":
+        return parts[2:]
+    return parts
+
+
+def _desktop_codex_compact_display_path(value: Any, tail_count: int = 2) -> str:
+    drive, parts = _desktop_codex_split_path(value)
+    if not parts:
+        return drive
+    tail = parts[-tail_count:]
+    if len(parts) <= tail_count:
+        return f"{drive} / {' / '.join(tail)}" if drive else " / ".join(tail)
+    return f"{drive} / ... / {' / '.join(tail)}" if drive else f"... / {' / '.join(tail)}"
+
+
+def _desktop_codex_launch_issue_path(raw_title: Any, first_user_message: Any = "") -> str:
+    haystack = f"{raw_title or ''}\n{first_user_message or ''}"
+    match = re.search(r'could not access starting directory\s+"([^"]+)"', haystack, flags=re.IGNORECASE)
+    if not match:
+        return ""
+    return _desktop_codex_decode_path_value(match.group(1))
+
+
+def _desktop_codex_launch_issue_title(raw_title: Any, first_user_message: Any = "") -> str:
+    haystack = f"{raw_title or ''}\n{first_user_message or ''}"
+    return "could not access starting directory" in haystack.lower() or "0x8007010b" in haystack.lower()
+
+
+def _desktop_codex_source_label(value: Any) -> str:
+    source = str(value or "").strip().lower()
+    if source == "vscode":
+        return "VS Code"
+    if source == "cli":
+        return "CLI"
+    if source == "desktop":
+        return "Desktop"
+    return source.title() if source else "Desktop"
+
+
+def _desktop_codex_first_meaningful_line(value: Any) -> str:
+    for raw_line in str(value or "").splitlines():
+        line = _desktop_codex_compact_text(raw_line, 240)
+        if line:
+            return line
+    return ""
+
+
+def _desktop_codex_title_seed(raw_title: Any, first_user_message: Any = "") -> str:
+    for source in (raw_title, first_user_message):
+        lines: List[str] = []
+        for raw_line in str(source or "").splitlines():
+            line = _desktop_codex_compact_text(raw_line, 240)
+            if not line:
+                continue
+            lines.append(line)
+            if len(lines) >= 3:
+                break
+        if lines:
+            return " ".join(lines)
+    return ""
+
+
+def _desktop_codex_display_title(raw_title: Any, first_user_message: Any = "") -> str:
+    candidate = _desktop_codex_title_seed(raw_title, first_user_message)
+    if not candidate:
+        return "Untitled chat"
+
+    path_heavy = bool(
+        candidate.count('"') >= 2
+        or re.search(r'[A-Za-z]:[\\/][^"\n]{10,}', candidate)
+        or re.search(r'/mnt/[A-Za-z]/[^"\n]{10,}', candidate)
+    )
+    if path_heavy:
+        candidate = re.split(r'\s+"(?:[A-Za-z]:[\\/]|/mnt/[A-Za-z]/)', candidate, maxsplit=1)[0]
+        candidate = re.sub(
+            r"^(?:in this path|in this folder|in this directory|from this path|from this folder)\s*,\s*",
+            "",
+            candidate,
+            flags=re.IGNORECASE,
+        )
+        candidate = re.sub(
+            r"\s*(?:as per(?: to)? .*|like the example provided.*)$",
+            "",
+            candidate,
+            flags=re.IGNORECASE,
+        )
+        candidate = candidate.strip(" -,:")
+    if candidate and candidate[0].islower():
+        candidate = candidate[0].upper() + candidate[1:]
+    return _desktop_codex_compact_text(candidate, 72) or "Untitled chat"
+
+
+def _desktop_codex_workspace_meta(cwd: Any) -> Dict[str, str]:
+    normalized = _desktop_codex_decode_path_value(cwd)
+    drive, parts = _desktop_codex_split_path(normalized)
+    meaningful = _desktop_codex_strip_common_user_prefixes(parts)
+    root = meaningful[0] if meaningful else (parts[0] if parts else drive or "Unknown")
+    group_label = drive or root or "Other"
+    group_hint = ""
+    if drive and root and root != drive:
+        group_hint = root
+    elif len(meaningful) > 1:
+        group_hint = " / ".join(meaningful[:2])
+    workspace_label = root or drive or "Unknown"
+    workspace_hint = " / ".join(meaningful[1:3]) if len(meaningful) > 1 else ""
+    group_id = f"{(drive or 'root').lower()}::{(root or 'unknown').lower()}"
+    return {
+        "group_id": group_id,
+        "group_label": group_label,
+        "group_hint": group_hint,
+        "workspace_label": workspace_label,
+        "workspace_hint": workspace_hint,
+        "workspace_path": normalized,
+    }
+
+
+def _desktop_codex_thread_display_meta(
+    *,
+    cwd: Any,
+    title: Any,
+    first_user_message: Any,
+    snippet: Any,
+    source: Any,
+    git_branch: Any,
+    git_origin_url: Any,
+    agent_nickname: Any,
+    agent_role: Any,
+) -> Dict[str, Any]:
+    raw_title = str(title or "").strip()
+    first_prompt = str(first_user_message or "").strip()
+    launch_issue = _desktop_codex_launch_issue_title(raw_title, first_prompt)
+    launch_path = _desktop_codex_launch_issue_path(raw_title, first_prompt) if launch_issue else ""
+    workspace = _desktop_codex_workspace_meta(cwd)
+    kind = "chat" if _desktop_codex_is_home_like_cwd(cwd) else "project"
+
+    display_title = _desktop_codex_display_title(raw_title, first_prompt)
+    details = ""
+    preview = _desktop_codex_compact_text(snippet or first_prompt, 120)
+    if launch_issue:
+        display_title = "Fix Codex launch error"
+        subject = workspace.get("workspace_label") or ""
+        if launch_path:
+            _drive, launch_parts = _desktop_codex_split_path(launch_path)
+            subject = launch_parts[-1] if launch_parts else subject
+            details = f"Working directory unavailable: {_desktop_codex_compact_display_path(launch_path, 3)}"
+            preview = f"Launch issue in {subject}" if subject else "Launch issue"
+        else:
+            details = "Working directory unavailable."
+            preview = "Launch issue"
+    elif not preview:
+        preview = _desktop_codex_compact_text(first_prompt or raw_title, 120)
+
+    return {
+        "kind": kind,
+        "source_label": _desktop_codex_source_label(source),
+        "group_id": "chats" if kind == "chat" else workspace["group_id"],
+        "group_label": "Chats" if kind == "chat" else workspace["group_label"],
+        "group_hint": "" if kind == "chat" else workspace["group_hint"],
+        "workspace_label": workspace["workspace_label"],
+        "workspace_hint": workspace["workspace_hint"],
+        "workspace_path": workspace["workspace_path"],
+        "display_title": display_title,
+        "full_title": raw_title or first_prompt or "Untitled chat",
+        "preview": preview,
+        "details": details,
+        "git_branch": str(git_branch or "").strip(),
+        "git_origin_url": str(git_origin_url or "").strip(),
+        "agent_nickname": str(agent_nickname or "").strip(),
+        "agent_role": str(agent_role or "").strip(),
+        "launch_issue": {
+            "active": launch_issue,
+            "path": launch_path,
+            "path_label": _desktop_codex_compact_display_path(launch_path, 3) if launch_path else "",
+        },
+    }
+
+
+def _desktop_codex_is_job_active(job: Optional[Dict[str, Any]]) -> bool:
+    if isinstance(job, dict) and str(job.get("transport") or "").strip() == "app_server":
+        return bool(job.get("active"))
+    process = job.get("process") if isinstance(job, dict) else None
+    return bool(process and process.poll() is None)
+
+
+def _desktop_codex_prune_jobs() -> None:
+    stale_sessions: List[str] = []
+    with DESKTOP_CODEX_JOB_LOCK:
+        for session_id, job in DESKTOP_CODEX_JOBS.items():
+            if not _desktop_codex_is_job_active(job) and float(job.get("finished_at") or 0) > 0:
+                stale_sessions.append(session_id)
+        for session_id in stale_sessions:
+            DESKTOP_CODEX_JOBS.pop(session_id, None)
+
+
+def _desktop_codex_job_snapshot(session: str) -> Optional[Dict[str, Any]]:
+    _desktop_codex_prune_jobs()
+    with DESKTOP_CODEX_JOB_LOCK:
+        job = DESKTOP_CODEX_JOBS.get(session)
+        if not job:
+            return None
+        return dict(job)
+
+
+def _desktop_codex_wait_for_job(session: str, process: subprocess.Popen[Any], log_handle: Any) -> None:
+    exit_code = process.wait()
+    try:
+        log_handle.flush()
+        log_handle.close()
+    except Exception:
+        pass
+    script_path = ""
+    with DESKTOP_CODEX_JOB_LOCK:
+        job = DESKTOP_CODEX_JOBS.get(session)
+        if job and job.get("process") is process:
+            job["exit_code"] = exit_code
+            job["finished_at"] = time.time()
+            job["active"] = False
+            script_path = str(job.get("script_path") or "").strip()
+    if script_path:
+        try:
+            os.remove(script_path)
+        except FileNotFoundError:
+            pass
+        except Exception:
+            LOGGER.debug("Failed to remove Desktop Codex sidecar wrapper: %s", script_path, exc_info=True)
+
+
+async def _desktop_codex_app_server_request_async(
+    ws: Any,
+    request_id: int,
+    method: str,
+    params: Optional[Dict[str, Any]] = None,
+    *,
+    timeout_seconds: Optional[float] = None,
+) -> Dict[str, Any]:
+    if websockets is None:
+        raise RuntimeError("websockets is unavailable")
+    await ws.send(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "method": method,
+                "params": params or {},
+            }
+        )
+    )
+    deadline = time.time() + max(1.0, float(timeout_seconds or DESKTOP_CODEX_APP_SERVER_RPC_TIMEOUT_SECONDS))
+    while True:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            raise TimeoutError(f"Timed out waiting for app-server response to {method}.")
+        raw_message = await asyncio.wait_for(ws.recv(), timeout=remaining)
+        message = json.loads(raw_message)
+        if int(message.get("id") or 0) != request_id:
+            continue
+        error_payload = message.get("error")
+        if isinstance(error_payload, dict):
+            error_text = str(error_payload.get("message") or method).strip() or method
+            raise RuntimeError(f"{method} failed: {error_text}")
+        result = message.get("result")
+        return result if isinstance(result, dict) else {}
+
+
+async def _desktop_codex_with_app_server_async(
+    operation: Callable[[Any], "asyncio.Future[Dict[str, Any]] | Any"],
+) -> Dict[str, Any]:
+    if websockets is None:
+        raise RuntimeError("websockets is unavailable")
+    server = _desktop_codex_ensure_app_server()
+    url = str(server.get("url") or "").strip()
+    if not url:
+        raise RuntimeError("Desktop Codex app-server URL is missing.")
+    async with websockets.connect(url, max_size=None, open_timeout=10) as ws:  # type: ignore[attr-defined]
+        await _desktop_codex_app_server_request_async(
+            ws,
+            1,
+            "initialize",
+            {
+                "protocolVersion": 2,
+                "clientInfo": {
+                    "name": "codrex-remote-ui",
+                    "version": "1.0.0",
+                },
+            },
+            timeout_seconds=5.0,
+        )
+        result = operation(ws)
+        if asyncio.iscoroutine(result):
+            result = await result
+        return result if isinstance(result, dict) else {}
+
+
+def _desktop_codex_run_app_server_rpc(
+    operation: Callable[[Any], "asyncio.Future[Dict[str, Any]] | Any"],
+) -> Dict[str, Any]:
+    try:
+        return asyncio.run(_desktop_codex_with_app_server_async(operation))
+    except HTTPException:
+        raise
+    except TimeoutError as exc:
+        raise HTTPException(status_code=504, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Desktop Codex app-server request failed: {exc}") from exc
+
+
+def _desktop_codex_find_turn(thread_payload: Dict[str, Any], turn_id: str) -> Optional[Dict[str, Any]]:
+    thread = thread_payload.get("thread") if isinstance(thread_payload, dict) else {}
+    turns = thread.get("turns") if isinstance(thread, dict) else []
+    if not isinstance(turns, list):
+        return None
+    target = str(turn_id or "").strip()
+    for turn in turns:
+        if isinstance(turn, dict) and str(turn.get("id") or "").strip() == target:
+            return turn
+    return None
+
+
+def _desktop_codex_start_app_server_resume(session_entry: Dict[str, Any], prompt: str) -> Dict[str, Any]:
+    if not _desktop_codex_write_supported():
+        raise HTTPException(status_code=400, detail="Desktop Codex write-back is unavailable on this host.")
+    text = str(prompt or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Prompt is required.")
+    session_id = str(session_entry.get("session") or "").strip()
+    cwd = str(session_entry.get("cwd") or "").strip() or None
+    if not session_id:
+        raise HTTPException(status_code=400, detail="Desktop Codex thread metadata is incomplete.")
+
+    with DESKTOP_CODEX_JOB_LOCK:
+        existing = DESKTOP_CODEX_JOBS.get(session_id)
+        if _desktop_codex_is_job_active(existing):
+            raise HTTPException(status_code=409, detail="This desktop thread already has an active app-server turn.")
+
+    async def _operation(ws: Any) -> Dict[str, Any]:
+        await _desktop_codex_app_server_request_async(
+            ws,
+            2,
+            "thread/resume",
+            {
+                "threadId": session_id,
+                "cwd": cwd,
+            },
+        )
+        turn_started = await _desktop_codex_app_server_request_async(
+            ws,
+            3,
+            "turn/start",
+            {
+                "threadId": session_id,
+                "cwd": cwd,
+                "input": [
+                    {
+                        "type": "text",
+                        "text": text,
+                    }
+                ],
+            },
+            timeout_seconds=max(8.0, DESKTOP_CODEX_APP_SERVER_RPC_TIMEOUT_SECONDS),
+        )
+        return turn_started
+
+    started = _desktop_codex_run_app_server_rpc(_operation)
+    turn_payload = started.get("turn") if isinstance(started, dict) else {}
+    turn_id = str(turn_payload.get("id") or "").strip() if isinstance(turn_payload, dict) else ""
+    if not turn_id:
+        raise HTTPException(status_code=502, detail="Desktop Codex app-server did not return a turn id.")
+
+    with DESKTOP_CODEX_JOB_LOCK:
+        DESKTOP_CODEX_JOBS[session_id] = {
+            "session": session_id,
+            "transport": "app_server",
+            "turn_id": turn_id,
+            "prompt_preview": " ".join(text.split())[:200],
+            "started_at": time.time(),
+            "finished_at": 0.0,
+            "exit_code": None,
+            "active": True,
+        }
+
+    watcher = threading.Thread(
+        target=_desktop_codex_wait_for_app_server_turn,
+        args=(session_id, turn_id, cwd),
+        daemon=True,
+    )
+    watcher.start()
+    return {
+        "session": session_id,
+        "turn_id": turn_id,
+        "started_at": time.time(),
+    }
+
+
+def _desktop_codex_wait_for_app_server_turn(session: str, turn_id: str, cwd: Optional[str]) -> None:
+    while True:
+        time.sleep(1.0)
+        job = _desktop_codex_job_snapshot(session)
+        if not _desktop_codex_is_job_active(job):
+            return
+
+        async def _operation(ws: Any) -> Dict[str, Any]:
+            thread_payload = await _desktop_codex_app_server_request_async(
+                ws,
+                2,
+                "thread/read",
+                {"threadId": session},
+            )
+            target_turn = _desktop_codex_find_turn(thread_payload, turn_id)
+            if target_turn:
+                return target_turn
+            resumed = await _desktop_codex_app_server_request_async(
+                ws,
+                3,
+                "thread/resume",
+                {
+                    "threadId": session,
+                    "cwd": cwd,
+                },
+            )
+            return _desktop_codex_find_turn(resumed, turn_id) or {}
+
+        try:
+            turn_state = _desktop_codex_run_app_server_rpc(_operation)
+        except HTTPException:
+            continue
+        status = str(turn_state.get("status") or "").strip().lower()
+        if status in {"inprogress", "pending"}:
+            continue
+        with DESKTOP_CODEX_JOB_LOCK:
+            job = DESKTOP_CODEX_JOBS.get(session)
+            if job and str(job.get("turn_id") or "").strip() == str(turn_id or "").strip():
+                job["active"] = False
+                job["finished_at"] = time.time()
+                job["exit_code"] = 0 if status == "completed" else 1
+        return
+
+
+def _desktop_codex_start_sidecar_resume(session_entry: Dict[str, Any], prompt: str) -> Dict[str, Any]:
+    if not _desktop_codex_write_supported():
+        raise HTTPException(status_code=400, detail="Desktop Codex write-back requires WSL on this host.")
+    text = str(prompt or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Prompt is required.")
+    session_id = str(session_entry.get("session") or "").strip()
+    rollout_alias = _desktop_codex_normalize_windows_path(str(session_entry.get("rollout_path") or "").strip())
+    rollout_target = _desktop_codex_windows_to_wsl_path(rollout_alias)
+    codex_home_wsl = _desktop_codex_windows_to_wsl_path(DESKTOP_CODEX_HOME)
+    if not session_id or not rollout_alias or not rollout_target:
+        raise HTTPException(status_code=400, detail="Desktop Codex thread metadata is incomplete.")
+    baseline_size = os.path.getsize(rollout_alias) if os.path.isfile(rollout_alias) else 0
+    baseline_mtime = os.path.getmtime(rollout_alias) if os.path.isfile(rollout_alias) else 0.0
+
+    with DESKTOP_CODEX_JOB_LOCK:
+        existing = DESKTOP_CODEX_JOBS.get(session_id)
+        if _desktop_codex_is_job_active(existing):
+            raise HTTPException(status_code=409, detail="This desktop thread already has an active sidecar turn.")
+
+        log_path = os.path.join(CODEX_RUNTIME_LOGS_DIR, f"desktop-codex-sidecar-{session_id}.log")
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        log_handle = open(log_path, "wb")
+        rollout_target_b64 = base64.b64encode(rollout_target.encode("utf-8")).decode("ascii")
+        rollout_alias_b64 = base64.b64encode(rollout_alias.encode("utf-8")).decode("ascii")
+        script_path = os.path.join(
+            CODEX_RUNTIME_LOGS_DIR,
+            f"desktop-codex-sidecar-{session_id}-{uuid.uuid4().hex}.py",
+        )
+        script_wsl_path = _desktop_codex_windows_to_wsl_path(script_path)
+        script_source = "\n".join(
+            [
+                "import base64",
+                "import os",
+                "import shutil",
+                "import subprocess",
+                "import sys",
+                "import tempfile",
+                "",
+                "rollout_target = base64.b64decode(sys.argv[1]).decode('utf-8')",
+                "rollout_alias = base64.b64decode(sys.argv[2]).decode('utf-8')",
+                "codex_home = sys.argv[3]",
+                "node_bin = sys.argv[4]",
+                "real_codex = sys.argv[5]",
+                "session_id = sys.argv[6]",
+                "",
+                "shim = tempfile.mkdtemp(prefix='codrex-desktop-codex-')",
+                "try:",
+                "    os.symlink(rollout_target, os.path.join(shim, rollout_alias))",
+                "    prompt = sys.stdin.read()",
+                "    env = os.environ.copy()",
+                "    env['CODEX_HOME'] = codex_home",
+                "    env['PATH'] = node_bin + os.pathsep + env.get('PATH', '')",
+                "    os.chdir(shim)",
+                "    completed = subprocess.run(",
+                "        [real_codex, 'exec', 'resume', '--skip-git-repo-check', session_id, '-', '--json'],",
+                "        env=env,",
+                "        input=prompt,",
+                "        text=True,",
+                "        stderr=subprocess.STDOUT,",
+                "        check=False,",
+                "    )",
+                "    raise SystemExit(int(completed.returncode or 0))",
+                "finally:",
+                "    shutil.rmtree(shim, ignore_errors=True)",
+                "",
+            ]
+        )
+        with open(script_path, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(script_source)
+        process = subprocess.Popen(
+            [
+                "wsl.exe",
+                "python3",
+                script_wsl_path,
+                rollout_target_b64,
+                rollout_alias_b64,
+                codex_home_wsl,
+                DESKTOP_CODEX_WSL_NODE_BIN,
+                DESKTOP_CODEX_WSL_REAL_CODEX,
+                session_id,
+            ],
+            stdin=subprocess.PIPE,
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        assert process.stdin is not None
+        process.stdin.write(text)
+        if not text.endswith("\n"):
+            process.stdin.write("\n")
+        process.stdin.close()
+
+        time.sleep(0.15)
+        early_exit = process.poll()
+        if early_exit is not None:
+            try:
+                log_handle.flush()
+                log_handle.close()
+            except Exception:
+                pass
+            try:
+                os.remove(script_path)
+            except FileNotFoundError:
+                pass
+            except Exception:
+                LOGGER.debug("Failed to remove failed Desktop Codex sidecar wrapper: %s", script_path, exc_info=True)
+            detail = f"Desktop Codex sidecar exited early with code {early_exit}."
+            try:
+                with open(log_path, "rb") as handle:
+                    tail = handle.read()[-2000:].decode("utf-8", errors="ignore").strip()
+                if tail:
+                    detail = f"{detail} {tail}"
+            except Exception:
+                pass
+            raise HTTPException(status_code=500, detail=detail)
+
+        accepted = _desktop_codex_wait_for_prompt_enqueue(
+            rollout_alias,
+            text,
+            baseline_size,
+            baseline_mtime,
+            process,
+        )
+        if not accepted:
+            try:
+                process.terminate()
+            except Exception:
+                LOGGER.debug("Failed to terminate unaccepted Desktop Codex sidecar turn for %s", session_id, exc_info=True)
+            try:
+                process.wait(timeout=3)
+            except Exception:
+                try:
+                    process.kill()
+                except Exception:
+                    LOGGER.debug("Failed to kill unaccepted Desktop Codex sidecar turn for %s", session_id, exc_info=True)
+            try:
+                log_handle.flush()
+                log_handle.close()
+            except Exception:
+                pass
+            try:
+                os.remove(script_path)
+            except FileNotFoundError:
+                pass
+            except Exception:
+                LOGGER.debug("Failed to remove rejected Desktop Codex sidecar wrapper: %s", script_path, exc_info=True)
+            detail = (
+                "Desktop thread did not accept the prompt. "
+                "If this chat is already active in Codex Desktop, finish that turn or switch to another thread before sending from SSH."
+            )
+            try:
+                with open(log_path, "rb") as handle:
+                    tail = handle.read()[-2000:].decode("utf-8", errors="ignore").strip()
+                if tail:
+                    detail = f"{detail} {tail}"
+            except Exception:
+                pass
+            raise HTTPException(status_code=409, detail=detail)
+
+        DESKTOP_CODEX_JOBS[session_id] = {
+            "session": session_id,
+            "process": process,
+            "prompt_preview": " ".join(text.split())[:200],
+            "started_at": time.time(),
+            "finished_at": 0.0,
+            "exit_code": None,
+            "active": True,
+            "log_path": log_path,
+            "script_path": script_path,
+        }
+
+    watcher = threading.Thread(
+        target=_desktop_codex_wait_for_job,
+        args=(session_id, process, log_handle),
+        daemon=True,
+    )
+    watcher.start()
+    return {
+        "session": session_id,
+        "started_at": time.time(),
+        "log_path": log_path,
+    }
+
+
+def _desktop_codex_interrupt_sidecar_resume(session: str) -> bool:
+    session_id = _validate_session_name(session)
+    job = _desktop_codex_job_snapshot(session_id)
+    if not _desktop_codex_is_job_active(job):
+        return False
+    if str(job.get("transport") or "").strip() == "app_server":
+        turn_id = str(job.get("turn_id") or "").strip()
+        if not turn_id:
+            return False
+
+        async def _operation(ws: Any) -> Dict[str, Any]:
+            await _desktop_codex_app_server_request_async(
+                ws,
+                2,
+                "turn/interrupt",
+                {
+                    "threadId": session_id,
+                    "turnId": turn_id,
+                },
+            )
+            return {"ok": True}
+
+        _desktop_codex_run_app_server_rpc(_operation)
+        with DESKTOP_CODEX_JOB_LOCK:
+            latest = DESKTOP_CODEX_JOBS.get(session_id)
+            if latest and str(latest.get("turn_id") or "").strip() == turn_id:
+                latest["active"] = False
+                latest["finished_at"] = time.time()
+                latest["exit_code"] = 130
+        return True
+
+    with DESKTOP_CODEX_JOB_LOCK:
+        latest = DESKTOP_CODEX_JOBS.get(session_id)
+        process = latest.get("process") if isinstance(latest, dict) else None
+        if not process or process.poll() is not None:
+            return False
+        try:
+            process.terminate()
+        except Exception:
+            return False
+        latest["active"] = False
+        latest["finished_at"] = time.time()
+        return True
+
+
+def _desktop_codex_open_deeplink(url: str) -> None:
+    if os.name != "nt":
+        raise HTTPException(status_code=501, detail="Codex desktop deeplinks are only supported on Windows hosts.")
+    target = str(url or "").strip()
+    if not target:
+        raise HTTPException(status_code=400, detail="Codex desktop deeplink is required.")
+    try:
+        os.startfile(target)  # type: ignore[attr-defined]
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Could not open Codex desktop deeplink: {exc}") from exc
+
+
+def _desktop_codex_open_thread(session: str) -> None:
+    session_id = _validate_session_name(session)
+    _desktop_codex_open_deeplink(f"codex://threads/{session_id}")
+
+
+def _desktop_codex_refresh_thread(session: str) -> None:
+    session_id = _validate_session_name(session)
+    _desktop_codex_open_deeplink("codex://settings")
+    time.sleep(0.35)
+    _desktop_codex_open_deeplink(f"codex://threads/{session_id}")
+
+
+def _desktop_codex_extract_message_text(message_payload: Dict[str, Any]) -> Tuple[str, str]:
+    role = str(message_payload.get("role") or "").strip().lower()
+    parts: List[str] = []
+    for item in message_payload.get("content") or []:
+        if not isinstance(item, dict):
+            continue
+        item_type = str(item.get("type") or "").strip().lower()
+        if item_type in {"input_text", "output_text"}:
+            text = str(item.get("text") or "").strip()
+            if text:
+                parts.append(text)
+        elif item_type == "local_image":
+            path = str(item.get("path") or "").strip()
+            parts.append(f"[local image] {path}" if path else "[local image]")
+        elif item_type == "image":
+            parts.append("[image]")
+    return role, "\n".join(part for part in parts if part).strip()
+
+
+def _desktop_codex_rollout_tail_lines(rollout_path: str, max_bytes: int = DESKTOP_CODEX_ROLLOUT_TAIL_BYTES) -> List[str]:
+    path = _desktop_codex_normalize_windows_path(rollout_path)
+    if not path or not os.path.isfile(path):
+        return []
+    with open(path, "rb") as handle:
+        handle.seek(0, os.SEEK_END)
+        size = handle.tell()
+        start = max(0, size - max_bytes)
+        handle.seek(start, os.SEEK_SET)
+        data = handle.read()
+    if start > 0:
+        first_newline = data.find(b"\n")
+        if first_newline >= 0:
+            data = data[first_newline + 1 :]
+    return [line.decode("utf-8", errors="ignore") for line in data.splitlines() if line.strip()]
+
+
+def _desktop_codex_rollout_has_prompt(rollout_path: str, prompt: str) -> bool:
+    target = " ".join(str(prompt or "").split()).strip().lower()
+    if not target:
+        return False
+    for raw_line in _desktop_codex_rollout_tail_lines(rollout_path, max_bytes=max(DESKTOP_CODEX_ROLLOUT_TAIL_BYTES, 65536)):
+        try:
+            event = json.loads(raw_line)
+        except Exception:
+            continue
+        event_type = str(event.get("type") or "").strip()
+        payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+        message_text = ""
+        if event_type == "event_msg" and str(payload.get("type") or "").strip() == "user_message":
+            message_text = str(payload.get("message") or "")
+        elif event_type == "response_item" and str(payload.get("type") or "").strip() == "message":
+            role, message_text = _desktop_codex_extract_message_text(payload)
+            if role != "user":
+                message_text = ""
+        compact = " ".join(message_text.split()).strip().lower()
+        if compact == target:
+            return True
+    return False
+
+
+def _desktop_codex_wait_for_prompt_enqueue(
+    rollout_path: str,
+    prompt: str,
+    baseline_size: int,
+    baseline_mtime: float,
+    process: subprocess.Popen[Any],
+    timeout_seconds: float = 6.0,
+) -> bool:
+    deadline = time.time() + max(0.5, timeout_seconds)
+    while time.time() < deadline:
+        if process.poll() is not None:
+            return _desktop_codex_rollout_has_prompt(rollout_path, prompt)
+        try:
+            stat = os.stat(rollout_path)
+            changed = stat.st_size > baseline_size or stat.st_mtime > baseline_mtime
+        except Exception:
+            changed = False
+        if changed and _desktop_codex_rollout_has_prompt(rollout_path, prompt):
+            return True
+        time.sleep(0.2)
+    return _desktop_codex_rollout_has_prompt(rollout_path, prompt)
+
+
+def _desktop_codex_resolve_busy_state(rollout_path: str, busy: bool) -> bool:
+    if not busy:
+        return False
+    path = _desktop_codex_normalize_windows_path(rollout_path)
+    if not path or not os.path.isfile(path):
+        return busy
+    try:
+        modified_at = os.path.getmtime(path)
+    except Exception:
+        return busy
+    return (time.time() - modified_at) < DESKTOP_CODEX_STALE_BUSY_SECONDS
+
+
+def _desktop_codex_rollout_summary(rollout_path: str) -> Dict[str, Any]:
+    lines = _desktop_codex_rollout_tail_lines(rollout_path)
+    busy = False
+    last_role = ""
+    last_text = ""
+    for raw_line in lines:
+        try:
+            event = json.loads(raw_line)
+        except Exception:
+            continue
+        event_type = str(event.get("type") or "").strip()
+        payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+        if event_type == "event_msg":
+            inner_type = str(payload.get("type") or "").strip()
+            if inner_type == "task_started":
+                busy = True
+            elif inner_type == "task_complete":
+                busy = False
+        elif event_type == "response_item" and str(payload.get("type") or "").strip() == "message":
+            role, text = _desktop_codex_extract_message_text(payload)
+            if role in {"user", "assistant"} and text:
+                last_role = role
+                last_text = text
+    busy = _desktop_codex_resolve_busy_state(rollout_path, busy)
+    if not last_text:
+        return {
+            "state": "busy" if busy else "idle",
+            "snippet": "",
+            "last_role": "",
+            "last_text": "",
+        }
+    compact = " ".join(last_text.split())
+    if last_role:
+        compact = f"{last_role.title()}: {compact}"
+    if len(compact) > 200:
+        compact = f"{compact[:200].rstrip()}..."
+    return {
+        "state": "busy" if busy else "idle",
+        "snippet": compact,
+        "last_role": last_role,
+        "last_text": last_text,
+    }
+
+
+def _desktop_codex_render_transcript(rollout_path: str) -> Dict[str, Any]:
+    path = _desktop_codex_normalize_windows_path(rollout_path)
+    if not path or not os.path.isfile(path):
+        raise HTTPException(status_code=404, detail="Codex Desktop rollout file was not found.")
+    rendered: List[str] = []
+    busy = False
+    with open(path, "r", encoding="utf-8", errors="ignore") as handle:
+        for raw_line in handle:
+            raw_line = raw_line.strip()
+            if not raw_line:
+                continue
+            try:
+                event = json.loads(raw_line)
+            except Exception:
+                continue
+            event_type = str(event.get("type") or "").strip()
+            payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+            if event_type == "event_msg":
+                inner_type = str(payload.get("type") or "").strip()
+                if inner_type == "task_started":
+                    busy = True
+                elif inner_type == "task_complete":
+                    busy = False
+                continue
+            if event_type != "response_item" or str(payload.get("type") or "").strip() != "message":
+                continue
+            role, text = _desktop_codex_extract_message_text(payload)
+            if role not in {"user", "assistant"} or not text:
+                continue
+            rendered.append(f"{role.title()}:\n{text.strip()}")
+    busy = _desktop_codex_resolve_busy_state(path, busy)
+    transcript = "\n\n".join(part for part in rendered if part).strip()
+    if not transcript:
+        transcript = "No visible user or assistant messages were found in this Codex Desktop thread yet."
+    if len(transcript) > DESKTOP_CODEX_TRANSCRIPT_MAX_CHARS:
+        transcript = transcript[-DESKTOP_CODEX_TRANSCRIPT_MAX_CHARS :]
+        transcript = transcript.lstrip()
+    return {
+        "state": "busy" if busy else "idle",
+        "text": transcript,
+    }
+
+
+def _desktop_codex_fetch_sessions() -> List[Dict[str, Any]]:
+    if not _desktop_codex_available():
+        return []
+    _desktop_codex_prune_jobs()
+    rows: List[Dict[str, Any]] = []
+    conn = sqlite3.connect(DESKTOP_CODEX_STATE_DB)
+    conn.row_factory = sqlite3.Row
+    try:
+        cursor = conn.execute(
+            """
+            SELECT
+              id,
+              rollout_path,
+              cwd,
+              title,
+              source,
+              first_user_message,
+              git_branch,
+              git_origin_url,
+              agent_nickname,
+              agent_role,
+              model,
+              COALESCE(updated_at_ms, updated_at * 1000) AS updated_ms,
+              COALESCE(created_at_ms, created_at * 1000) AS created_ms
+            FROM threads
+            WHERE archived = 0
+            ORDER BY COALESCE(updated_at_ms, updated_at * 1000) DESC
+            LIMIT 200
+            """
+        )
+        rows = [dict(row) for row in cursor.fetchall()]
+    except sqlite3.Error as exc:
+        raise HTTPException(status_code=500, detail=f"Could not read Codex Desktop threads: {exc}") from exc
+    finally:
+        conn.close()
+    sessions: List[Dict[str, Any]] = []
+    for row in rows:
+        session_id = str(row.get("id") or "").strip()
+        if not session_id:
+            continue
+        rollout_path = _desktop_codex_normalize_windows_path(str(row.get("rollout_path") or "").strip())
+        summary = _desktop_codex_rollout_summary(rollout_path) if rollout_path else {
+            "state": "error",
+            "snippet": "",
+            "last_role": "",
+            "last_text": "",
+        }
+        title = str(row.get("title") or "").strip() or session_id
+        cwd = _desktop_codex_normalize_windows_path(str(row.get("cwd") or "").strip())
+        desktop_meta = _desktop_codex_thread_display_meta(
+            cwd=cwd,
+            title=title,
+            first_user_message=row.get("first_user_message"),
+            snippet=summary.get("snippet") or "",
+            source=row.get("source"),
+            git_branch=row.get("git_branch"),
+            git_origin_url=row.get("git_origin_url"),
+            agent_nickname=row.get("agent_nickname"),
+            agent_role=row.get("agent_role"),
+        )
+        updated_at = float(row.get("updated_ms") or 0) / 1000.0
+        created_at = float(row.get("created_ms") or 0) / 1000.0
+        active_job = _desktop_codex_job_snapshot(session_id)
+        state = str(summary.get("state") or "idle")
+        busy_source = "desktop" if state == "busy" else "idle"
+        if _desktop_codex_is_job_active(active_job):
+            state = "busy"
+            busy_source = str(active_job.get("transport") or "app_server")
+        sessions.append({
+            "session": session_id,
+            "pane_id": session_id,
+            "current_command": "Codex Desktop",
+            "cwd": cwd,
+            "state": state,
+            "busy_source": busy_source,
+            "updated_at": updated_at or created_at or time.time(),
+            "last_seen_at": updated_at or created_at or time.time(),
+            "snippet": desktop_meta.get("preview") or summary.get("snippet") or title,
+            "model": str(row.get("model") or "").strip() or "gpt-5.4",
+            "reasoning_effort": "desktop",
+            "active": state == "busy",
+            "closed_at": None,
+            "can_resume": False,
+            "resume_id": session_id,
+            "title": desktop_meta.get("display_title") or title,
+            "raw_title": title,
+            "raw_snippet": summary.get("snippet") or "",
+            "source": "desktop_codex",
+            "read_only": not _desktop_codex_write_supported(),
+            "rollout_path": rollout_path,
+            "log_path": str(active_job.get("log_path") or "") if active_job else "",
+            "desktop_codex_meta": desktop_meta,
+        })
+    return sessions
+
+
+def _desktop_codex_session_entry(session: str) -> Dict[str, Any]:
+    session_id = _validate_session_name(session)
+    for entry in _desktop_codex_fetch_sessions():
+        if entry.get("session") == session_id:
+            return entry
+    raise HTTPException(status_code=404, detail=f"Codex Desktop thread '{session_id}' was not found.")
+
+
+def _windows_codex_profile_status(force: bool = False) -> Dict[str, Any]:
+    with WINDOWS_CODEX_PROFILE_LOCK:
+        cached = dict(WINDOWS_CODEX_PROFILE_STATUS)
+        checked_at = float(cached.get("checked_at") or 0.0)
+        if not force and checked_at > 0 and (time.time() - checked_at) < 60.0:
+            return cached
+    supported = False
+    detail = ""
+    try:
+        result = subprocess.run(
+            [CODEX_WINDOWS_CLI, "--version"],
+            cwd=CODEX_WINDOWS_WORKDIR,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=8,
+            creationflags=(
+                getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                if os.name == "nt"
+                else 0
+            ),
+        )
+        supported = result.returncode == 0
+        if not supported:
+            stderr = (result.stderr or "").strip()
+            detail = stderr or f"Codex exited with status {result.returncode}."
+    except PermissionError as exc:
+        detail = f"Windows Codex CLI is installed but cannot be launched from this host process: {exc}"
+    except FileNotFoundError:
+        detail = "Windows Codex CLI is not available on PATH."
+    except subprocess.TimeoutExpired:
+        detail = "Windows Codex CLI did not respond in time."
+    except Exception as exc:
+        detail = f"{type(exc).__name__}: {exc}"
+    payload = {
+        "supported": bool(supported),
+        "detail": str(detail or ""),
+        "checked_at": time.time(),
+    }
+    with WINDOWS_CODEX_PROFILE_LOCK:
+        WINDOWS_CODEX_PROFILE_STATUS.update(payload)
+        return dict(WINDOWS_CODEX_PROFILE_STATUS)
+
+
+def _windows_available_profiles() -> List[str]:
+    profiles = {"powershell", "cmd"}
+    if _windows_codex_profile_status().get("supported"):
+        profiles.add("codex")
+    return sorted(profiles)
+
+
+def _windows_default_profile() -> str:
+    return "codex" if _windows_codex_profile_status().get("supported") else "powershell"
+
+
+def _windows_runtime_status_payload() -> Dict[str, Any]:
+    supported = _windows_runtime_supported()
+    profiles = _windows_available_profiles() if supported else sorted({"powershell", "cmd"})
+    default_profile = _windows_default_profile() if supported else "powershell"
+    codex_status = _windows_codex_profile_status() if supported else {"supported": False, "detail": ""}
+    with WINDOWS_RUNTIME_LOCK:
+        active = bool(WINDOWS_RUNTIME_ACTIVE and supported)
+    if not supported:
+        detail = (
+            "Windows ConPTY support is only available on Windows hosts."
+            if os.name != "nt"
+            else f"Windows ConPTY runtime is unavailable: {WINPTY_IMPORT_ERROR or 'pywinpty is missing.'}"
+        )
+        return {
+            "ok": False,
+            "state": "missing",
+            "detail": detail,
+            "can_start": False,
+            "can_stop": False,
+            "profiles": profiles,
+            "default_profile": default_profile,
+            "cwd": CODEX_WINDOWS_WORKDIR,
+        }
+    detail = "Windows terminal runtime ready."
+    if not codex_status.get("supported") and codex_status.get("detail"):
+        detail = f"{detail} Windows Codex profile unavailable: {codex_status['detail']}"
+    return {
+        "ok": active,
+        "state": "running" if active else "stopped",
+        "detail": detail if active else detail.replace("ready.", "is stopped."),
+        "can_start": not active,
+        "can_stop": active,
+        "profiles": profiles,
+        "default_profile": default_profile,
+        "cwd": CODEX_WINDOWS_WORKDIR,
+    }
+
+
+def _windows_session_profile(raw: Any) -> str:
+    profile = str(raw or _windows_default_profile()).strip().lower()
+    if profile not in WINDOWS_SUPPORTED_PROFILES:
+        raise HTTPException(status_code=400, detail="Unsupported Windows session profile. Use: codex, powershell, cmd.")
+    if profile == "codex":
+        codex_status = _windows_codex_profile_status()
+        if not codex_status.get("supported"):
+            raise HTTPException(
+                status_code=409,
+                detail=str(codex_status.get("detail") or "Windows Codex CLI is unavailable on this host."),
+            )
+    return profile
+
+
+def _windows_session_stream_state_unlocked(session: str) -> Dict[str, Any]:
+    session_id = _validate_session_name(session)
+    state = WINDOWS_SESSION_STREAM_STATES.get(session_id)
+    if state is None:
+        state = {
+            "seq": 0,
+            "last_text": "",
+            "events": [],
+            "updated_at": time.time(),
+        }
+        WINDOWS_SESSION_STREAM_STATES[session_id] = state
+    return state
+
+
+def _windows_session_stream_event_payload(
+    *,
+    session: str,
+    seq: int,
+    event_type: str,
+    text: str,
+    profile: str = "",
+    detail: str = "",
+    state: str = "",
+    current_command: str = "",
+) -> Dict[str, Any]:
+    payload = {
+        "session": session,
+        "pane_id": "winpty",
+        "seq": seq,
+        "type": event_type,
+        "text": text,
+        "detail": detail,
+        "ts": time.time(),
+    }
+    if profile:
+        payload["profile"] = profile
+    if state:
+        payload["state"] = state
+    if current_command:
+        payload["current_command"] = current_command
+    return payload
+
+
+def _publish_windows_session_stream_snapshot(
+    session: str,
+    text: str,
+    *,
+    screen_state: str = "",
+    current_command: str = "",
+) -> Optional[Dict[str, Any]]:
+    session_id = _validate_session_name(session)
+    with WINDOWS_SESSION_STREAM_LOCK:
+        stream_state = _windows_session_stream_state_unlocked(session_id)
+        previous = str(stream_state.get("last_text") or "")
+        if text == previous:
+            return None
+        if stream_state["seq"] == 0:
+            event_type = "snapshot"
+            payload_text = text
+        elif text.startswith(previous):
+            event_type = "append"
+            payload_text = text[len(previous):]
+        else:
+            event_type = "replace"
+            payload_text = text
+        stream_state["seq"] = int(stream_state.get("seq") or 0) + 1
+        event = _windows_session_stream_event_payload(
+            session=session_id,
+            seq=stream_state["seq"],
+            event_type=event_type,
+            text=payload_text,
+            state=screen_state,
+            current_command=current_command,
+        )
+        stream_state["last_text"] = text
+        stream_state["updated_at"] = time.time()
+        stream_state["events"].append(event)
+        if len(stream_state["events"]) > WINDOWS_SESSION_STREAM_REPLAY_MAX:
+            stream_state["events"] = stream_state["events"][-WINDOWS_SESSION_STREAM_REPLAY_MAX:]
+        return dict(event)
+
+
+def _windows_session_stream_replay(session: str, since_seq: int) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    with WINDOWS_SESSION_STREAM_LOCK:
+        state = _windows_session_stream_state_unlocked(session)
+        events = list(state.get("events") or [])
+        if since_seq <= 0:
+            return [], None
+        replay = [dict(event) for event in events if int(event.get("seq") or 0) > since_seq]
+        if replay:
+            oldest = int(replay[0].get("seq") or 0)
+            if oldest <= since_seq + 1:
+                return replay, None
+        if int(state.get("seq") or 0) <= 0:
+            return [], None
+        snapshot = _windows_session_stream_event_payload(
+            session=session,
+            seq=int(state.get("seq") or 0),
+            event_type="snapshot",
+            text=str(state.get("last_text") or ""),
+        )
+        return [], snapshot
+
+
+def _windows_session_output_trim(text: str) -> str:
+    value = str(text or "")
+    if len(value) <= WINDOWS_SESSION_OUTPUT_MAX_CHARS:
+        return value
+    return value[-WINDOWS_SESSION_OUTPUT_MAX_CHARS:]
+
+
+def _windows_session_snippet(text: str) -> str:
+    value = str(text or "").strip()
+    if not value:
+        return ""
+    return value.splitlines()[-1][:240]
+
+
+def _windows_session_public_record(raw: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    item = dict(raw or {})
+    profile = str(item.get("profile") or "codex").strip().lower() or "codex"
+    return {
+        "session": str(item.get("session") or "").strip(),
+        "pane_id": "winpty",
+        "current_command": str(item.get("current_command") or profile).strip() or profile,
+        "cwd": str(item.get("cwd") or CODEX_WINDOWS_WORKDIR).strip() or CODEX_WINDOWS_WORKDIR,
+        "state": str(item.get("state") or "starting").strip().lower() or "starting",
+        "updated_at": float(item.get("updated_at") or time.time()),
+        "last_seen_at": float(item.get("last_seen_at") or item.get("updated_at") or time.time()),
+        "snippet": str(item.get("snippet") or ""),
+        "model": str(item.get("model") or profile).strip() or profile,
+        "reasoning_effort": str(item.get("reasoning_effort") or ""),
+        "profile": profile,
+        "closed_at": item.get("closed_at"),
+        "can_resume": False,
+    }
+
+
+def _windows_recent_closed_push_unlocked(record: Dict[str, Any]) -> None:
+    session_id = str(record.get("session") or "").strip()
+    if not session_id:
+        return
+    next_items = [
+        dict(item)
+        for item in WINDOWS_RECENT_CLOSED
+        if str(item.get("session") or "").strip() != session_id
+    ]
+    next_items.insert(0, dict(record))
+    del next_items[WINDOWS_SESSION_RECENT_CLOSED_MAX:]
+    WINDOWS_RECENT_CLOSED[:] = next_items
+
+
+def _windows_normalize_cwd(raw: Any) -> str:
+    candidate = str(raw or "").strip()
+    if not candidate:
+        candidate = CODEX_WINDOWS_WORKDIR
+    elif candidate.startswith("/"):
+        candidate = _wsl_to_windows_path(candidate) or candidate
+    candidate = os.path.abspath(os.path.expandvars(os.path.expanduser(candidate)))
+    if not os.path.isdir(candidate):
+        raise HTTPException(status_code=400, detail=f"Windows cwd does not exist: {candidate}")
+    return candidate
+
+
+def _windows_session_command_label(profile: str) -> str:
+    if profile == "powershell":
+        return "powershell.exe"
+    if profile == "cmd":
+        return "cmd.exe"
+    return "codex"
+
+
+def _windows_codex_argv(model: str, reasoning_effort: str) -> List[str]:
+    argv = [CODEX_WINDOWS_CLI]
+    if model:
+        argv.extend(["--model", model])
+    if reasoning_effort:
+        argv.extend(["--reasoning-effort", reasoning_effort])
+    return argv
+
+
+def _windows_session_spawn_argv(profile: str, model: str, reasoning_effort: str) -> List[str]:
+    if profile == "powershell":
+        return ["powershell.exe", "-NoLogo"]
+    if profile == "cmd":
+        return ["cmd.exe"]
+    return _windows_codex_argv(model, reasoning_effort)
+
+
+def _windows_session_entry(session: str) -> Dict[str, Any]:
+    session_id = _validate_session_name(session)
+    with WINDOWS_SESSIONS_LOCK:
+        entry = WINDOWS_SESSIONS.get(session_id)
+        if not entry:
+            raise HTTPException(status_code=404, detail=f"Windows session '{session_id}' was not found.")
+        return entry
+
+
+def _windows_session_finalize(session: str, reason: str = "closed") -> Optional[Dict[str, Any]]:
+    session_id = _validate_session_name(session)
+    now = time.time()
+    with WINDOWS_SESSIONS_LOCK:
+        entry = WINDOWS_SESSIONS.pop(session_id, None)
+        if not entry:
+            return None
+        process = entry.get("process")
+        exit_code = None
+        try:
+            if process is not None:
+                exit_code = process.exitstatus
+        except Exception:
+            exit_code = None
+        if reason in {"spawn_failed", "reader_error", "exited_error"}:
+            final_state = "error"
+        elif isinstance(exit_code, int) and exit_code not in {0, None}:
+            final_state = "error"
+        elif reason in {"closed", "stopped", "remote_stop"}:
+            final_state = "done"
+        else:
+            final_state = str(entry.get("state") or "done").strip().lower() or "done"
+        closed_record = _windows_session_public_record({
+            **entry,
+            "session": session_id,
+            "state": final_state,
+            "updated_at": now,
+            "last_seen_at": now,
+            "closed_at": now,
+            "snippet": _windows_session_snippet(str(entry.get("last_text") or entry.get("snippet") or "")),
+        })
+        _windows_recent_closed_push_unlocked(closed_record)
+    with WINDOWS_SESSION_STREAM_LOCK:
+        stream_state = _windows_session_stream_state_unlocked(session_id)
+        stream_state["seq"] = int(stream_state.get("seq") or 0) + 1
+        event = _windows_session_stream_event_payload(
+            session=session_id,
+            seq=stream_state["seq"],
+            event_type="status",
+            text="",
+            detail=reason,
+            state=str(closed_record.get("state") or ""),
+            current_command=str(closed_record.get("current_command") or ""),
+        )
+        stream_state["updated_at"] = now
+        stream_state["events"].append(event)
+        if len(stream_state["events"]) > WINDOWS_SESSION_STREAM_REPLAY_MAX:
+            stream_state["events"] = stream_state["events"][-WINDOWS_SESSION_STREAM_REPLAY_MAX:]
+    return closed_record
+
+
+def _windows_session_reader(session: str) -> None:
+    session_id = _validate_session_name(session)
+    while True:
+        try:
+            entry = _windows_session_entry(session_id)
+        except HTTPException:
+            return
+        process = entry.get("process")
+        if process is None:
+            _windows_session_finalize(session_id, "reader_error")
+            return
+        try:
+            chunk = process.read(4096)
+        except EOFError:
+            try:
+                if process.isalive():
+                    time.sleep(0.05)
+                    continue
+            except Exception:
+                pass
+            break
+        except Exception:
+            _windows_session_finalize(session_id, "reader_error")
+            return
+        if not chunk:
+            try:
+                if not process.isalive():
+                    break
+            except Exception:
+                break
+            continue
+        _host_keep_awake_pulse()
+        with WINDOWS_SESSIONS_LOCK:
+            live_entry = WINDOWS_SESSIONS.get(session_id)
+            if not live_entry:
+                return
+            next_text = _windows_session_output_trim(str(live_entry.get("last_text") or "") + str(chunk))
+            current_command = str(live_entry.get("current_command") or _windows_session_command_label(str(live_entry.get("profile") or "")))
+            current_state = (
+                _infer_progress_state(next_text, current_command)
+                if str(live_entry.get("profile") or "") == "codex"
+                else "running"
+            )
+            live_entry.update({
+                "last_text": next_text,
+                "snippet": _windows_session_snippet(next_text),
+                "state": current_state,
+                "updated_at": time.time(),
+                "last_seen_at": time.time(),
+            })
+        _publish_windows_session_stream_snapshot(
+            session_id,
+            next_text,
+            screen_state=current_state,
+            current_command=current_command,
+        )
+    _windows_session_finalize(session_id, "exited")
+
+
+def _windows_session_write(session: str, text: str) -> None:
+    entry = _windows_session_entry(session)
+    process = entry.get("process")
+    if process is None:
+        raise HTTPException(status_code=409, detail=f"Windows session '{session}' is not writable.")
+    io_lock = entry.get("io_lock")
+    if io_lock is None:
+        io_lock = threading.Lock()
+        with WINDOWS_SESSIONS_LOCK:
+            current = WINDOWS_SESSIONS.get(session)
+            if current is not None:
+                current["io_lock"] = io_lock
+    with io_lock:
+        try:
+            process.write(text)
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"Could not write to Windows session: {type(exc).__name__}: {exc}")
+
+
+def _windows_runtime_stop_all_sessions(reason: str = "stopped") -> None:
+    with WINDOWS_SESSIONS_LOCK:
+        session_ids = list(WINDOWS_SESSIONS.keys())
+    for session_id in session_ids:
+        entry = None
+        with WINDOWS_SESSIONS_LOCK:
+            entry = WINDOWS_SESSIONS.get(session_id)
+        process = (entry or {}).get("process")
+        try:
+            if process is not None:
+                process.terminate(force=True)
+        except Exception:
+            pass
+        _windows_session_finalize(session_id, reason)
 
 def _tmux_server_running(stderr: str) -> bool:
     s = (stderr or "").lower()
@@ -4047,8 +7505,46 @@ def _desktop_webrtc_get_session(session_id: str) -> Optional[Dict[str, Any]]:
         return DESKTOP_WEBRTC_SESSIONS.get(session_id)
 
 
-async def _desktop_webrtc_close_session(session_id: str) -> None:
-    session = _desktop_webrtc_pop_session(session_id)
+def _desktop_webrtc_session_connection_state(session: Optional[Dict[str, Any]]) -> str:
+    if not isinstance(session, dict):
+        return ""
+    try:
+        pc = session.get("pc")
+        return str(getattr(pc, "connectionState", "") or "").strip().lower()
+    except Exception:
+        return ""
+
+
+def _desktop_webrtc_collect_evictable_session_ids_for_new_offer() -> List[str]:
+    with DESKTOP_WEBRTC_SESSION_LOCK:
+        snapshot = list(DESKTOP_WEBRTC_SESSIONS.items())
+    if len(snapshot) < DESKTOP_WEBRTC_MAX_SESSIONS:
+        return []
+
+    stale_candidates: List[Tuple[int, float, str]] = []
+    now = time.time()
+    for session_id, session in snapshot:
+        created_at = float((session or {}).get("created_at") or 0.0)
+        age_s = max(0.0, now - created_at)
+        ready = bool((session or {}).get("local_description_ready"))
+        state = _desktop_webrtc_session_connection_state(session)
+        if state in {"closed", "failed", "disconnected"}:
+            stale_candidates.append((0, created_at, session_id))
+            continue
+        if state in {"", "new", "connecting"} and age_s >= 2.0:
+            priority = 1 if not ready else 2
+            stale_candidates.append((priority, created_at, session_id))
+
+    if not stale_candidates:
+        return []
+
+    keep_limit = max(0, DESKTOP_WEBRTC_MAX_SESSIONS - 1)
+    needed = max(1, len(snapshot) - keep_limit)
+    stale_candidates.sort(key=lambda item: (item[0], item[1], item[2]))
+    return [session_id for _priority, _created_at, session_id in stale_candidates[:needed]]
+
+
+async def _desktop_webrtc_shutdown_session_resources(session: Optional[Dict[str, Any]], session_id: str = "") -> None:
     if not session:
         return
     track = session.get("track")
@@ -4066,9 +7562,50 @@ async def _desktop_webrtc_close_session(session_id: str) -> None:
         pass
     try:
         if pc is not None:
-            await pc.close()
-    except Exception:
-        pass
+            await asyncio.wait_for(pc.close(), timeout=1.5)
+    except Exception as exc:
+        if session_id:
+            print(
+                "Desktop WebRTC session="
+                f"{session_id} close timed out or failed: {type(exc).__name__}: {exc}",
+                flush=True,
+            )
+    return
+
+
+async def _desktop_webrtc_close_session(session_id: str) -> None:
+    session = _desktop_webrtc_pop_session(session_id)
+    await _desktop_webrtc_shutdown_session_resources(session, session_id=session_id)
+
+
+async def _desktop_webrtc_close_all_sessions() -> int:
+    with DESKTOP_WEBRTC_SESSION_LOCK:
+        sessions = list(DESKTOP_WEBRTC_SESSIONS.items())
+        DESKTOP_WEBRTC_SESSIONS.clear()
+    for session_id, session in sessions:
+        await _desktop_webrtc_shutdown_session_resources(session, session_id=session_id)
+    return len(sessions)
+
+
+async def _desktop_webrtc_evict_stale_sessions_for_new_offer() -> int:
+    session_ids = _desktop_webrtc_collect_evictable_session_ids_for_new_offer()
+    if not session_ids:
+        return 0
+    evicted: List[Tuple[str, Dict[str, Any]]] = []
+    with DESKTOP_WEBRTC_SESSION_LOCK:
+        for session_id in session_ids:
+            session = DESKTOP_WEBRTC_SESSIONS.pop(session_id, None)
+            if session is not None:
+                evicted.append((session_id, session))
+    for session_id, session in evicted:
+        await _desktop_webrtc_shutdown_session_resources(session, session_id=session_id)
+    if evicted:
+        print(
+            "Desktop WebRTC evicted stale sessions before new offer: "
+            + ",".join(session_id for session_id, _session in evicted),
+            flush=True,
+        )
+    return len(evicted)
 
 
 async def _desktop_webrtc_wait_for_ice(pc: Any, timeout_s: float = 1.5) -> None:
@@ -4259,7 +7796,7 @@ async def _desktop_webrtc_set_local_answer_fast(
         gather_task = asyncio.create_task(pc._RTCPeerConnection__gather())
         first_candidate_ready = await _desktop_webrtc_wait_for_first_candidate(
             pc,
-            timeout_s=0.35,
+            timeout_s=0.9,
             gather_task=gather_task,
         )
 
@@ -4329,8 +7866,8 @@ def _desktop_webrtc_preferred_video_codecs() -> List[Any]:
         codecs = list(getattr(capabilities, "codecs", []) or [])
     except Exception:
         return []
-    preferred_h264: List[Any] = []
     preferred_vp8: List[Any] = []
+    preferred_h264: List[Any] = []
     fallbacks: List[Any] = []
     for codec in codecs:
         mime = str(getattr(codec, "mimeType", "") or "").lower()
@@ -4348,7 +7885,10 @@ def _desktop_webrtc_preferred_video_codecs() -> List[Any]:
             preferred_vp8.append(codec)
         else:
             fallbacks.append(codec)
-    return preferred_h264 + preferred_vp8 + fallbacks
+    # Android tablets on this project have been significantly smoother with VP8
+    # than with the currently negotiated H264 desktop stream. Keep H264 as a
+    # fallback, but prefer VP8 first for the live remote session.
+    return preferred_vp8 + preferred_h264 + fallbacks
 
 
 def _desktop_webrtc_log_sender_state(session_id: str, sender: Any) -> None:
@@ -4544,22 +8084,6 @@ def _require_local_client_request(request: Request) -> None:
     if _is_local_client_request(request):
         return
     raise HTTPException(status_code=403, detail="This action is only available from the local laptop.")
-
-
-def _privacy_lock_require_trusted_device(request: Request, payload: Dict[str, Any]) -> Dict[str, Any]:
-    _require_authenticated_request(request)
-    device_id = str(payload.get("device_id") or "").strip()
-    device_token = str(payload.get("device_token") or "").strip()
-    current_origin = (
-        str(getattr(request.url, "scheme", "http") or "http")
-        + "://"
-        + str(getattr(request.url, "hostname", "") or "").strip()
-        + (f":{int(getattr(request.url, 'port', 0) or 0)}" if int(getattr(request.url, "port", 0) or 0) else "")
-    )
-    trusted = _resume_trusted_device(device_id, device_token, current_origin=current_origin)
-    if trusted:
-        return trusted
-    raise HTTPException(status_code=401, detail="Trusted device token is invalid.")
 
 
 def _is_localhost_label(host: str) -> bool:
@@ -4917,6 +8441,8 @@ def _close_desktop_webrtc_sessions_sync() -> None:
 
 atexit.register(_restore_desktop_perf_mode)
 atexit.register(_close_desktop_webrtc_sessions_sync)
+atexit.register(_host_keep_awake_release)
+atexit.register(_desktop_codex_shutdown_app_server)
 
 
 def _set_desktop_global_enabled(enabled: bool) -> bool:
@@ -5016,6 +8542,7 @@ async def auth_middleware(request: Request, call_next):
         "/manifest.webmanifest",
         "/sw.js",
         "/apple-touch-icon.png",
+        "/codrex-logo-hero.png",
         "/icon.svg",
         "/icon-192.png",
         "/icon-512.png",
@@ -5151,6 +8678,7 @@ def app_asset(asset_path: str):
 @app.get("/manifest.webmanifest")
 @app.get("/sw.js")
 @app.get("/apple-touch-icon.png")
+@app.get("/codrex-logo-hero.png")
 @app.get("/icon.svg")
 @app.get("/icon-192.png")
 @app.get("/icon-512.png")
@@ -5223,15 +8751,761 @@ def _ensure_windows_dpi_awareness() -> None:
             print(f"Windows DPI awareness setup failed: {type(exc).__name__}: {exc}", flush=True)
             WINDOWS_DPI_AWARE = True
 
+
+def _desktop_windows_display_virtual_hint(
+    adapter_name: str,
+    adapter_id: str,
+    monitor_name: str,
+    monitor_id: str,
+) -> bool:
+    adapter_id_norm = str(adapter_id or "").strip().upper()
+    monitor_id_norm = str(monitor_id or "").strip().upper()
+    text = " ".join([
+        str(adapter_name or "").strip(),
+        str(adapter_id or "").strip(),
+        str(monitor_name or "").strip(),
+        str(monitor_id or "").strip(),
+    ]).upper()
+    for token in (
+        "VIRTUAL",
+        "INDIRECT",
+        "IDD",
+        "IDDSAMPLE",
+        "PARSEC",
+        "RUSTDESK",
+        "MTTVDD",
+        "DUMMY",
+        "HEADLESS",
+    ):
+        if token in text:
+            return True
+    for prefix in (
+        "ROOT\\DISPLAY",
+        "ROOT\\MTTVDD",
+        "ROOT\\IDD",
+        "ROOT\\VIRTUAL",
+        "SWD\\DISPLAY",
+        "SWD\\INDIRECTDISPLAY",
+        "INDIRECTDISPLAY\\",
+        "INDIRECTDISPLAY#",
+    ):
+        if adapter_id_norm.startswith(prefix) or monitor_id_norm.startswith(prefix):
+            return True
+    return False
+
+
+def _desktop_windows_display_info() -> List[Dict[str, Any]]:
+    if os.name != "nt" or not getattr(ctypes, "windll", None):
+        return []
+    try:
+        user32 = ctypes.windll.user32  # type: ignore[attr-defined]
+        EnumDisplayDevicesW = user32.EnumDisplayDevicesW
+        EnumDisplayDevicesW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, ctypes.POINTER(DISPLAY_DEVICEW), wintypes.DWORD]
+        EnumDisplayDevicesW.restype = wintypes.BOOL
+        EnumDisplayMonitors = user32.EnumDisplayMonitors
+        EnumDisplayMonitors.argtypes = [wintypes.HDC, ctypes.POINTER(RECT), ctypes.c_void_p, wintypes.LPARAM]
+        EnumDisplayMonitors.restype = wintypes.BOOL
+        GetMonitorInfoW = user32.GetMonitorInfoW
+        GetMonitorInfoW.argtypes = [wintypes.HANDLE, ctypes.POINTER(MONITORINFOEXW)]
+        GetMonitorInfoW.restype = wintypes.BOOL
+
+        adapters_by_name: Dict[str, Dict[str, Any]] = {}
+        adapter_index = 0
+        while True:
+            adapter = DISPLAY_DEVICEW()
+            adapter.cb = ctypes.sizeof(DISPLAY_DEVICEW)
+            if not EnumDisplayDevicesW(None, adapter_index, ctypes.byref(adapter), 0):
+                break
+            adapter_index += 1
+            device_name = str(adapter.DeviceName or "").strip()
+            if not device_name:
+                continue
+            state_flags = int(adapter.StateFlags or 0)
+            if state_flags & DISPLAY_DEVICE_MIRRORING_DRIVER:
+                continue
+            if not (state_flags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP):
+                continue
+            monitor_name = ""
+            monitor_id = ""
+            monitor_index = 0
+            while True:
+                monitor = DISPLAY_DEVICEW()
+                monitor.cb = ctypes.sizeof(DISPLAY_DEVICEW)
+                if not EnumDisplayDevicesW(device_name, monitor_index, ctypes.byref(monitor), 0):
+                    break
+                monitor_index += 1
+                monitor_state = int(monitor.StateFlags or 0)
+                if monitor_state and not (monitor_state & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP):
+                    continue
+                monitor_name = str(monitor.DeviceString or "").strip()
+                monitor_id = str(monitor.DeviceID or "").strip()
+                break
+            adapters_by_name[device_name.upper()] = {
+                "device_name": device_name,
+                "adapter_name": str(adapter.DeviceString or "").strip(),
+                "adapter_id": str(adapter.DeviceID or "").strip(),
+                "monitor_name": monitor_name,
+                "monitor_id": monitor_id,
+                "primary": bool(state_flags & DISPLAY_DEVICE_PRIMARY_DEVICE),
+            }
+
+        if not adapters_by_name:
+            return []
+
+        callback_records: List[Dict[str, Any]] = []
+
+        MonitorEnumProc = ctypes.WINFUNCTYPE(
+            wintypes.BOOL,
+            wintypes.HANDLE,
+            wintypes.HDC,
+            ctypes.POINTER(RECT),
+            wintypes.LPARAM,
+        )
+
+        @MonitorEnumProc
+        def _enum_monitor_proc(hmonitor: wintypes.HANDLE, hdc: wintypes.HDC, lprc: ctypes.POINTER(RECT), lparam: wintypes.LPARAM) -> wintypes.BOOL:
+            info = MONITORINFOEXW()
+            info.cbSize = ctypes.sizeof(MONITORINFOEXW)
+            if not GetMonitorInfoW(hmonitor, ctypes.byref(info)):
+                return True
+            bounds = info.rcMonitor
+            callback_records.append({
+                "device_name": str(info.szDevice or "").strip(),
+                "left": int(bounds.left),
+                "top": int(bounds.top),
+                "width": int(bounds.right - bounds.left),
+                "height": int(bounds.bottom - bounds.top),
+            })
+            return True
+
+        if not EnumDisplayMonitors(None, None, _enum_monitor_proc, 0):
+            return []
+
+        enriched: List[Dict[str, Any]] = []
+        for record in callback_records:
+            adapter = adapters_by_name.get(str(record.get("device_name") or "").strip().upper(), {})
+            adapter_name = str(adapter.get("adapter_name") or "").strip()
+            adapter_id = str(adapter.get("adapter_id") or "").strip()
+            monitor_name = str(adapter.get("monitor_name") or "").strip()
+            monitor_id = str(adapter.get("monitor_id") or "").strip()
+            enriched.append({
+                **record,
+                "primary": bool(adapter.get("primary")),
+                "adapter_name": adapter_name,
+                "adapter_id": adapter_id,
+                "monitor_name": monitor_name,
+                "monitor_id": monitor_id,
+                "virtual": _desktop_windows_display_virtual_hint(adapter_name, adapter_id, monitor_name, monitor_id),
+            })
+        enriched.sort(key=lambda item: (0 if item.get("primary") else 1, int(item.get("top", 0)), int(item.get("left", 0)), str(item.get("device_name") or "")))
+        return enriched
+    except Exception:
+        return []
+
+
+def _desktop_device_name_sort_key(device_name: str) -> Tuple[int, str]:
+    text = str(device_name or "").strip().upper()
+    match = re.search(r"DISPLAY(\d+)$", text)
+    if match:
+        try:
+            return (int(match.group(1)), text)
+        except Exception:
+            pass
+    return (1 << 30, text)
+
+
+def _desktop_target_device_name(target: Optional[Dict[str, Any]]) -> str:
+    return str((target or {}).get("device_name") or "").strip()
+
+
+def _desktop_current_display_mode(device_name: str) -> Optional[Dict[str, Any]]:
+    name = str(device_name or "").strip()
+    if os.name != "nt" or not name or not getattr(ctypes, "windll", None):
+        return None
+    try:
+        user32 = ctypes.windll.user32  # type: ignore[attr-defined]
+        EnumDisplaySettingsW = user32.EnumDisplaySettingsW
+        EnumDisplaySettingsW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, ctypes.POINTER(DEVMODEW)]
+        EnumDisplaySettingsW.restype = wintypes.BOOL
+        mode = DEVMODEW()
+        mode.dmSize = ctypes.sizeof(DEVMODEW)
+        if not EnumDisplaySettingsW(name, ENUM_CURRENT_SETTINGS, ctypes.byref(mode)):
+            return None
+        return {
+            "width": int(mode.dmPelsWidth or 0),
+            "height": int(mode.dmPelsHeight or 0),
+            "bits_per_pixel": int(mode.dmBitsPerPel or 0),
+            "display_frequency": int(mode.dmDisplayFrequency or 0),
+        }
+    except Exception:
+        return None
+
+
+def _desktop_supported_display_modes(device_name: str) -> List[Dict[str, Any]]:
+    name = str(device_name or "").strip()
+    if os.name != "nt" or not name or not getattr(ctypes, "windll", None):
+        return []
+    modes: List[Dict[str, Any]] = []
+    seen: Set[Tuple[int, int, int, int]] = set()
+    try:
+        user32 = ctypes.windll.user32  # type: ignore[attr-defined]
+        EnumDisplaySettingsW = user32.EnumDisplaySettingsW
+        EnumDisplaySettingsW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, ctypes.POINTER(DEVMODEW)]
+        EnumDisplaySettingsW.restype = wintypes.BOOL
+        index = 0
+        while True:
+            mode = DEVMODEW()
+            mode.dmSize = ctypes.sizeof(DEVMODEW)
+            if not EnumDisplaySettingsW(name, index, ctypes.byref(mode)):
+                break
+            index += 1
+            width = int(mode.dmPelsWidth or 0)
+            height = int(mode.dmPelsHeight or 0)
+            bits = int(mode.dmBitsPerPel or 0)
+            freq = int(mode.dmDisplayFrequency or 0)
+            if width <= 0 or height <= 0:
+                continue
+            key = (width, height, bits, freq)
+            if key in seen:
+                continue
+            seen.add(key)
+            modes.append({
+                "width": width,
+                "height": height,
+                "bits_per_pixel": bits,
+                "display_frequency": freq,
+            })
+    except Exception:
+        return []
+    modes.sort(key=lambda item: (int(item.get("width") or 0), int(item.get("height") or 0), int(item.get("display_frequency") or 0)))
+    return modes
+
+
+def _desktop_select_display_mode(
+    device_name: str,
+    desired_width: int,
+    desired_height: int,
+    *,
+    current_mode: Optional[Dict[str, Any]] = None,
+    downshift_only: bool = False,
+) -> Optional[Dict[str, Any]]:
+    desired_width = max(1, int(desired_width or 0))
+    desired_height = max(1, int(desired_height or 0))
+    current = dict(current_mode or _desktop_current_display_mode(device_name) or {})
+    supported = list(_desktop_supported_display_modes(device_name) or [])
+    if not supported:
+        return None
+
+    current_width = int(current.get("width") or 0)
+    current_height = int(current.get("height") or 0)
+    current_bits = int(current.get("bits_per_pixel") or 0)
+    current_freq = int(current.get("display_frequency") or 0)
+
+    candidates = list(supported)
+    if downshift_only and current_width > 0 and current_height > 0:
+        smaller = [
+            dict(item)
+            for item in candidates
+            if int(item.get("width") or 0) <= current_width and int(item.get("height") or 0) <= current_height
+        ]
+        if smaller:
+            candidates = smaller
+
+    exact = [
+        dict(item)
+        for item in candidates
+        if int(item.get("width") or 0) == desired_width and int(item.get("height") or 0) == desired_height
+    ]
+    if exact:
+        exact.sort(
+            key=lambda item: (
+                abs(int(item.get("bits_per_pixel") or 0) - current_bits),
+                abs(int(item.get("display_frequency") or 0) - current_freq),
+            )
+        )
+        return dict(exact[0])
+
+    desired_aspect = float(desired_width) / float(max(1, desired_height))
+
+    def _candidate_score(item: Dict[str, Any]) -> Tuple[float, int, int, int]:
+        width = int(item.get("width") or 0)
+        height = int(item.get("height") or 0)
+        aspect = float(width) / float(max(1, height))
+        return (
+            abs(aspect - desired_aspect),
+            abs(width - desired_width) + abs(height - desired_height),
+            abs(int(item.get("bits_per_pixel") or 0) - current_bits),
+            abs(int(item.get("display_frequency") or 0) - current_freq),
+        )
+
+    candidates.sort(key=_candidate_score)
+    return dict(candidates[0]) if candidates else None
+
+
+def _desktop_apply_display_mode(device_name: str, mode: Dict[str, Any]) -> Dict[str, Any]:
+    name = str(device_name or "").strip()
+    if os.name != "nt" or not name or not getattr(ctypes, "windll", None):
+        return {"ok": False, "detail": "display_mode_unavailable"}
+    try:
+        user32 = ctypes.windll.user32  # type: ignore[attr-defined]
+        EnumDisplaySettingsW = user32.EnumDisplaySettingsW
+        EnumDisplaySettingsW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, ctypes.POINTER(DEVMODEW)]
+        EnumDisplaySettingsW.restype = wintypes.BOOL
+        ChangeDisplaySettingsExW = user32.ChangeDisplaySettingsExW
+        ChangeDisplaySettingsExW.argtypes = [
+            wintypes.LPCWSTR,
+            ctypes.POINTER(DEVMODEW),
+            wintypes.HWND,
+            wintypes.DWORD,
+            ctypes.c_void_p,
+        ]
+        ChangeDisplaySettingsExW.restype = wintypes.LONG
+        devmode = DEVMODEW()
+        devmode.dmSize = ctypes.sizeof(DEVMODEW)
+        if not EnumDisplaySettingsW(name, ENUM_CURRENT_SETTINGS, ctypes.byref(devmode)):
+            return {"ok": False, "detail": "current_mode_unavailable"}
+        width = int(mode.get("width") or 0)
+        height = int(mode.get("height") or 0)
+        bits = int(mode.get("bits_per_pixel") or 0)
+        freq = int(mode.get("display_frequency") or 0)
+        if width <= 0 or height <= 0:
+            return {"ok": False, "detail": "invalid_target_mode"}
+        devmode.dmPelsWidth = width
+        devmode.dmPelsHeight = height
+        devmode.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT
+        if bits > 0:
+            devmode.dmBitsPerPel = bits
+            devmode.dmFields |= DM_BITSPERPEL
+        if freq > 0:
+            devmode.dmDisplayFrequency = freq
+            devmode.dmFields |= DM_DISPLAYFREQUENCY
+        test_result = int(ChangeDisplaySettingsExW(name, ctypes.byref(devmode), None, CDS_TEST, None))
+        if test_result != DISP_CHANGE_SUCCESSFUL:
+            return {"ok": False, "detail": f"mode_test_failed:{test_result}"}
+        apply_result = int(ChangeDisplaySettingsExW(name, ctypes.byref(devmode), None, 0, None))
+        return {
+            "ok": apply_result == DISP_CHANGE_SUCCESSFUL,
+            "detail": "" if apply_result == DISP_CHANGE_SUCCESSFUL else f"mode_apply_failed:{apply_result}",
+        }
+    except Exception as exc:
+        return {"ok": False, "detail": f"{type(exc).__name__}: {exc}"}
+
+
+def _desktop_capture_display_layout(targets: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+    snapshot = list(targets or _desktop_target_items() or [])
+    items: List[Dict[str, Any]] = []
+    primary_device_name = ""
+    for item in snapshot:
+        if not isinstance(item, dict):
+            continue
+        device_name = _desktop_target_device_name(item)
+        if not device_name:
+            continue
+        record = {
+            "target_id": str(item.get("id") or "").strip().lower(),
+            "device_name": device_name,
+            "left": int(item.get("left") or 0),
+            "top": int(item.get("top") or 0),
+            "width": int(item.get("width") or 0),
+            "height": int(item.get("height") or 0),
+            "primary": bool(item.get("primary")),
+        }
+        if record["primary"] and not primary_device_name:
+            primary_device_name = device_name
+        items.append(record)
+    return {
+        "primary_device_name": primary_device_name,
+        "items": items,
+    }
+
+
+def _desktop_apply_display_layout(layout: Dict[str, Any], primary_device_name: str) -> Dict[str, Any]:
+    target_primary = str(primary_device_name or "").strip()
+    entries = list((layout or {}).get("items") or [])
+    if os.name != "nt" or not target_primary or not entries or not getattr(ctypes, "windll", None):
+        return {"ok": False, "detail": "display_layout_unavailable"}
+    baseline = next((dict(item) for item in entries if str(item.get("device_name") or "").strip() == target_primary), None)
+    if not baseline:
+        return {"ok": False, "detail": "primary_layout_missing"}
+    base_left = int(baseline.get("left") or 0)
+    base_top = int(baseline.get("top") or 0)
+    try:
+        user32 = ctypes.windll.user32  # type: ignore[attr-defined]
+        EnumDisplaySettingsW = user32.EnumDisplaySettingsW
+        EnumDisplaySettingsW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, ctypes.POINTER(DEVMODEW)]
+        EnumDisplaySettingsW.restype = wintypes.BOOL
+        ChangeDisplaySettingsExW = user32.ChangeDisplaySettingsExW
+        ChangeDisplaySettingsExW.argtypes = [
+            wintypes.LPCWSTR,
+            ctypes.POINTER(DEVMODEW),
+            wintypes.HWND,
+            wintypes.DWORD,
+            ctypes.c_void_p,
+        ]
+        ChangeDisplaySettingsExW.restype = wintypes.LONG
+        prepared: List[Tuple[str, DEVMODEW, int]] = []
+        for entry in entries:
+            device_name = str(entry.get("device_name") or "").strip()
+            if not device_name:
+                continue
+            devmode = DEVMODEW()
+            devmode.dmSize = ctypes.sizeof(DEVMODEW)
+            if not EnumDisplaySettingsW(device_name, ENUM_CURRENT_SETTINGS, ctypes.byref(devmode)):
+                return {"ok": False, "detail": f"current_mode_unavailable:{device_name}"}
+            devmode.dmPositionX = int(entry.get("left") or 0) - base_left
+            devmode.dmPositionY = int(entry.get("top") or 0) - base_top
+            devmode.dmFields |= DM_POSITION
+            flags = CDS_TEST
+            if device_name == target_primary:
+                flags |= CDS_SET_PRIMARY
+            test_result = int(ChangeDisplaySettingsExW(device_name, ctypes.byref(devmode), None, flags, None))
+            if test_result != DISP_CHANGE_SUCCESSFUL:
+                return {"ok": False, "detail": f"layout_test_failed:{device_name}:{test_result}"}
+            prepared.append((device_name, devmode, CDS_UPDATEREGISTRY | CDS_NORESET | (CDS_SET_PRIMARY if device_name == target_primary else 0)))
+        for device_name, devmode, flags in prepared:
+            apply_result = int(ChangeDisplaySettingsExW(device_name, ctypes.byref(devmode), None, flags, None))
+            if apply_result != DISP_CHANGE_SUCCESSFUL:
+                return {"ok": False, "detail": f"layout_stage_failed:{device_name}:{apply_result}"}
+        commit_result = int(ChangeDisplaySettingsExW(None, None, None, 0, None))
+        if commit_result != DISP_CHANGE_SUCCESSFUL:
+            return {"ok": False, "detail": f"layout_commit_failed:{commit_result}"}
+        time.sleep(0.6)
+        _desktop_clear_cached_capture_handles()
+        return {"ok": True, "detail": "", "primary_device_name": target_primary}
+    except Exception as exc:
+        return {"ok": False, "detail": f"{type(exc).__name__}: {exc}"}
+
+
+def _desktop_match_mss_monitor_index(
+    monitor_items: List[Dict[str, Any]],
+    *,
+    target_id: str = "",
+    target_left: Optional[int] = None,
+    target_top: Optional[int] = None,
+    target_width: Optional[int] = None,
+    target_height: Optional[int] = None,
+) -> int:
+    if not monitor_items:
+        raise HTTPException(status_code=500, detail="No desktop displays were detected.")
+    if target_left is not None and target_top is not None and target_width is not None and target_height is not None:
+        for index, mon in enumerate(monitor_items):
+            if (
+                int(mon.get("left", 0)) == int(target_left)
+                and int(mon.get("top", 0)) == int(target_top)
+                and int(mon.get("width", 0)) == int(target_width)
+                and int(mon.get("height", 0)) == int(target_height)
+            ):
+                return index
+    wanted = str(target_id or "").strip().lower()
+    match = re.fullmatch(r"display-(\d+)", wanted)
+    if match:
+        try:
+            legacy_index = max(0, int(match.group(1)) - 1)
+            if legacy_index < len(monitor_items):
+                return legacy_index
+        except Exception:
+            pass
+    return 0
+
+
 def _desktop_monitor() -> Dict[str, int]:
+    targets = _desktop_target_items()
+    selected_target = next((dict(item) for item in targets if item.get("selected")), dict(targets[0]) if targets else {})
     with mss() as sct:
-        mon = sct.monitors[1] if len(sct.monitors) > 1 else sct.monitors[0]
+        monitor_items = sct.monitors[1:] if len(sct.monitors) > 1 else sct.monitors
+        if not monitor_items:
+            raise HTTPException(status_code=500, detail="No desktop displays were detected.")
+        chosen = monitor_items[_desktop_match_mss_monitor_index(
+            monitor_items,
+            target_id=str(selected_target.get("id") or ""),
+            target_left=selected_target.get("left"),
+            target_top=selected_target.get("top"),
+            target_width=selected_target.get("width"),
+            target_height=selected_target.get("height"),
+        )]
+        mon = chosen
         return {
             "left": int(mon.get("left", 0)),
             "top": int(mon.get("top", 0)),
             "width": int(mon.get("width", 0)),
             "height": int(mon.get("height", 0)),
         }
+
+
+def _desktop_selected_output_index() -> Optional[int]:
+    targets = _desktop_target_items()
+    if not targets:
+        return None
+    selected_target = next((dict(item) for item in targets if item.get("selected")), dict(targets[0]))
+    with mss() as sct:
+        monitor_items = sct.monitors[1:] if len(sct.monitors) > 1 else sct.monitors
+        if not monitor_items:
+            return None
+        return _desktop_match_mss_monitor_index(
+            monitor_items,
+            target_id=str(selected_target.get("id") or ""),
+            target_left=selected_target.get("left"),
+            target_top=selected_target.get("top"),
+            target_width=selected_target.get("width"),
+            target_height=selected_target.get("height"),
+        )
+
+
+def _desktop_clear_current_thread_capture_handles() -> None:
+    sct = getattr(DESKTOP_CAPTURE_TLS, "sct", None)
+    if sct is not None:
+        try:
+            close_fn = getattr(sct, "close", None)
+            if callable(close_fn):
+                close_fn()
+        except Exception:
+            pass
+    setattr(DESKTOP_CAPTURE_TLS, "sct", None)
+    setattr(DESKTOP_CAPTURE_TLS, "dxcam_black_target_id", "")
+    setattr(DESKTOP_CAPTURE_TLS, "dxcam_black_until", 0.0)
+
+
+def _desktop_mark_dxcam_blacklisted_for_current_thread(target_id: str, ttl_s: float = 30.0) -> None:
+    normalized = str(target_id or "").strip().lower()
+    if not normalized:
+        return
+    setattr(DESKTOP_CAPTURE_TLS, "dxcam_black_target_id", normalized)
+    setattr(DESKTOP_CAPTURE_TLS, "dxcam_black_until", time.time() + max(float(ttl_s), 1.0))
+
+
+def _desktop_is_dxcam_blacklisted_for_current_thread(target_id: str) -> bool:
+    normalized = str(target_id or "").strip().lower()
+    if not normalized:
+        return False
+    blocked_target = str(getattr(DESKTOP_CAPTURE_TLS, "dxcam_black_target_id", "") or "").strip().lower()
+    blocked_until = float(getattr(DESKTOP_CAPTURE_TLS, "dxcam_black_until", 0.0) or 0.0)
+    if blocked_target != normalized or blocked_until <= time.time():
+        if blocked_target and blocked_until <= time.time():
+            setattr(DESKTOP_CAPTURE_TLS, "dxcam_black_target_id", "")
+            setattr(DESKTOP_CAPTURE_TLS, "dxcam_black_until", 0.0)
+        return False
+    return True
+
+
+def _desktop_dxcam_frame_looks_black(frame: Any) -> bool:
+    try:
+        shape = getattr(frame, "shape", None)
+        if shape is None or len(shape) < 2:
+            return False
+        height = int(shape[0] or 0)
+        width = int(shape[1] or 0)
+        if height <= 0 or width <= 0:
+            return False
+        row_stride = max(1, height // 64)
+        col_stride = max(1, width // 64)
+        sample = frame[::row_stride, ::col_stride]
+        sample_shape = getattr(sample, "shape", None)
+        if sample_shape is not None and len(sample_shape) >= 3 and int(sample_shape[2] or 0) >= 4:
+            sample = sample[:, :, :3]
+        max_level = int(sample.max())
+        if max_level > 6:
+            return False
+        mean_level = float(sample.mean())
+        return mean_level <= 1.5
+    except Exception:
+        return False
+
+
+def _desktop_clear_global_dxcam_handle() -> None:
+    global DESKTOP_DXCAM_CAMERA, DESKTOP_DXCAM_OUTPUT_IDX, DESKTOP_DXCAM_GENERATION
+    camera = DESKTOP_DXCAM_CAMERA
+    DESKTOP_DXCAM_CAMERA = None
+    DESKTOP_DXCAM_OUTPUT_IDX = None
+    DESKTOP_DXCAM_GENERATION = -1
+    if camera is not None:
+        try:
+            camera.release()
+        except Exception:
+            pass
+    if DXCAM_AVAILABLE and dxcam is not None:
+        try:
+            factory = getattr(dxcam, "__factory", None)
+            clean_up = getattr(factory, "clean_up", None)
+            if callable(clean_up):
+                clean_up()
+        except Exception:
+            pass
+    gc.collect()
+
+
+def _desktop_clear_cached_capture_handles() -> None:
+    with DESKTOP_TARGET_LOCK:
+        global DESKTOP_CAPTURE_GENERATION
+        DESKTOP_CAPTURE_GENERATION += 1
+        generation = DESKTOP_CAPTURE_GENERATION
+    with DESKTOP_DXCAM_LOCK:
+        _desktop_clear_global_dxcam_handle()
+    _desktop_clear_current_thread_capture_handles()
+    setattr(DESKTOP_CAPTURE_TLS, "capture_generation", generation)
+
+
+def _desktop_target_items() -> List[Dict[str, Any]]:
+    with DESKTOP_TARGET_LOCK:
+        selected_id = DESKTOP_TARGET_SELECTED_ID
+    targets: List[Dict[str, Any]] = []
+    windows_displays = _desktop_windows_display_info()
+    if windows_displays:
+        ordered_windows_displays = sorted(
+            list(windows_displays),
+            key=lambda item: _desktop_device_name_sort_key(str(item.get("device_name") or "")),
+        )
+        for index, mon in enumerate(ordered_windows_displays, start=1):
+            target_id = f"display-{index}"
+            device_name = str(mon.get("device_name") or "").strip().lower()
+            monitor_id = str(mon.get("monitor_id") or "").strip().lower()
+            is_primary = bool(mon.get("primary")) if index != 1 else bool(mon.get("primary", True))
+            is_virtual = bool(mon.get("virtual"))
+            if DESKTOP_TARGET_VIRTUAL_HINT:
+                hint = DESKTOP_TARGET_VIRTUAL_HINT
+                if hint in {target_id, device_name, monitor_id}:
+                    is_virtual = True
+            targets.append({
+                "id": target_id,
+                "label": f"{'Primary' if is_primary else 'Display'} {index}",
+                "kind": "virtual" if is_virtual else "physical",
+                "virtual": is_virtual,
+                "physical": not is_virtual,
+                "primary": is_primary,
+                "selected": target_id == selected_id if selected_id else is_primary,
+                "device_name": str(mon.get("device_name") or "").strip(),
+                "adapter_name": str(mon.get("adapter_name") or "").strip(),
+                "adapter_id": str(mon.get("adapter_id") or "").strip(),
+                "monitor_name": str(mon.get("monitor_name") or "").strip(),
+                "monitor_id": str(mon.get("monitor_id") or "").strip(),
+                "left": int(mon.get("left", 0)),
+                "top": int(mon.get("top", 0)),
+                "width": int(mon.get("width", 0)),
+                "height": int(mon.get("height", 0)),
+            })
+        if targets:
+            return targets
+    with mss() as sct:
+        monitor_items = sct.monitors[1:] if len(sct.monitors) > 1 else sct.monitors
+        for index, mon in enumerate(monitor_items, start=1):
+            target_id = f"display-{index}"
+            is_primary = index == 1
+            is_virtual = bool(DESKTOP_TARGET_VIRTUAL_HINT and target_id == DESKTOP_TARGET_VIRTUAL_HINT)
+            targets.append({
+                "id": target_id,
+                "label": f"{'Primary' if is_primary else 'Display'} {index}",
+                "kind": "virtual" if is_virtual else "physical",
+                "virtual": is_virtual,
+                "physical": not is_virtual,
+                "primary": is_primary,
+                "selected": target_id == selected_id if selected_id else is_primary,
+                "left": int(mon.get("left", 0)),
+                "top": int(mon.get("top", 0)),
+                "width": int(mon.get("width", 0)),
+                "height": int(mon.get("height", 0)),
+            })
+    return targets
+
+
+def _desktop_selected_target_item(targets: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+    snapshot = targets if targets is not None else _desktop_target_items()
+    if not snapshot:
+        return {}
+    return next((dict(item) for item in snapshot if item.get("selected")), dict(snapshot[0]))
+
+
+def _desktop_sync_capture_handles_for_current_thread() -> None:
+    with DESKTOP_TARGET_LOCK:
+        generation = int(DESKTOP_CAPTURE_GENERATION)
+    if int(getattr(DESKTOP_CAPTURE_TLS, "capture_generation", -1) or -1) == generation:
+        return
+    _desktop_clear_current_thread_capture_handles()
+    setattr(DESKTOP_CAPTURE_TLS, "capture_generation", generation)
+
+
+def _desktop_targets_payload() -> Dict[str, Any]:
+    targets = _desktop_target_items()
+    if not targets:
+        raise HTTPException(status_code=500, detail="No desktop displays were detected.")
+    active = _desktop_selected_target_item(targets)
+    virtual_target = next((dict(item) for item in targets if item.get("virtual")), None)
+    return {
+        "ok": True,
+        "targets": targets,
+        "active_target": active,
+        "virtual_supported": bool(virtual_target),
+        "virtual_enabled": bool(virtual_target and active.get("id") == virtual_target.get("id")),
+        "detail": (
+            ""
+            if virtual_target
+            else "No existing IDD or virtual display target is configured on this host."
+        ),
+    }
+
+
+def _desktop_find_target_item(target_id: str, targets: Optional[List[Dict[str, Any]]] = None) -> Optional[Dict[str, Any]]:
+    wanted = str(target_id or "").strip().lower()
+    if not wanted:
+        return None
+    snapshot = targets if targets is not None else _desktop_target_items()
+    return next((dict(item) for item in snapshot if str(item.get("id") or "").strip().lower() == wanted), None)
+
+
+def _desktop_virtual_target_item(targets: Optional[List[Dict[str, Any]]] = None) -> Optional[Dict[str, Any]]:
+    snapshot = targets if targets is not None else _desktop_target_items()
+    return next((dict(item) for item in snapshot if bool(item.get("virtual"))), None)
+
+
+def _desktop_first_physical_target_item(targets: Optional[List[Dict[str, Any]]] = None) -> Optional[Dict[str, Any]]:
+    snapshot = targets if targets is not None else _desktop_target_items()
+    return next((dict(item) for item in snapshot if bool(item.get("physical", not bool(item.get("virtual"))))), None)
+
+def _desktop_select_target(target_id: str) -> Dict[str, Any]:
+    selected = str(target_id or "").strip().lower()
+    if not selected:
+        raise HTTPException(status_code=400, detail="target_id is required.")
+    targets = _desktop_target_items()
+    ids = {str(item.get("id") or "").strip().lower() for item in targets}
+    if selected not in ids:
+        raise HTTPException(status_code=404, detail=f"Desktop target '{selected}' was not found.")
+    with DESKTOP_TARGET_LOCK:
+        global DESKTOP_TARGET_SELECTED_ID
+        changed = DESKTOP_TARGET_SELECTED_ID != selected
+        DESKTOP_TARGET_SELECTED_ID = selected
+    if changed:
+        _desktop_clear_cached_capture_handles()
+    return _desktop_targets_payload()
+
+
+def _desktop_capture_backend() -> str:
+    candidate = DESKTOP_CAPTURE_BACKEND_DEFAULT
+    if candidate in {"dxcam", "auto"} and DXCAM_AVAILABLE and os.name == "nt":
+        return "dxcam"
+    return "mss"
+
+
+def _desktop_dxcam() -> Any:
+    global DESKTOP_DXCAM_CAMERA, DESKTOP_DXCAM_OUTPUT_IDX, DESKTOP_DXCAM_GENERATION
+    if not DXCAM_AVAILABLE or dxcam is None or os.name != "nt":
+        raise RuntimeError("dxcam desktop capture is not available on this host.")
+    output_idx = _desktop_selected_output_index()
+    generation = int(DESKTOP_CAPTURE_GENERATION)
+    camera = DESKTOP_DXCAM_CAMERA
+    cached_output_idx = DESKTOP_DXCAM_OUTPUT_IDX
+    cached_generation = int(DESKTOP_DXCAM_GENERATION)
+    if camera is None or cached_output_idx != output_idx or cached_generation != generation:
+        _desktop_clear_global_dxcam_handle()
+        create_kwargs: Dict[str, Any] = {"processor_backend": "numpy"}
+        if output_idx is not None:
+            create_kwargs["output_idx"] = output_idx
+        camera = dxcam.create(**create_kwargs)  # type: ignore[call-arg]
+        DESKTOP_DXCAM_CAMERA = camera
+        DESKTOP_DXCAM_OUTPUT_IDX = output_idx
+        DESKTOP_DXCAM_GENERATION = generation
+    return camera
+
+
+def _desktop_dxcam_monitor() -> Dict[str, int]:
+    return _desktop_monitor()
 
 def _clamp(v: int, lo: int, hi: int) -> int:
     return max(lo, min(hi, v))
@@ -5385,6 +9659,25 @@ def _resize_rgb_to_target(
     return resized.tobytes(), (target_w, target_h)
 
 
+def _resize_rgb_to_fit_target(
+    rgb_bytes: bytes,
+    size: Tuple[int, int],
+    target_size: Optional[Tuple[int, int]],
+) -> Tuple[bytes, Tuple[int, int]]:
+    if not target_size:
+        return rgb_bytes, size
+    src_w, src_h = int(size[0]), int(size[1])
+    target_w, target_h = int(target_size[0]), int(target_size[1])
+    if src_w <= 0 or src_h <= 0 or target_w <= 0 or target_h <= 0:
+        return rgb_bytes, size
+    scale = min(target_w / float(src_w), target_h / float(src_h))
+    resized_w = max(1, int(round(src_w * scale)))
+    resized_h = max(1, int(round(src_h * scale)))
+    if resized_w == src_w and resized_h == src_h:
+        return rgb_bytes, size
+    return _resize_rgb_to_target(rgb_bytes, size, (resized_w, resized_h))
+
+
 def _desktop_capture_rgb(
     scale_factor: int = 1,
     grayscale: bool = False,
@@ -5393,19 +9686,25 @@ def _desktop_capture_rgb(
     layout_mode: str = "fit",
     target_size: Optional[Tuple[int, int]] = None,
 ) -> Tuple[bytes, Tuple[int, int]]:
-    def _capture(sct: Any) -> Tuple[bytes, Tuple[int, int]]:
-        mon = sct.monitors[1] if len(sct.monitors) > 1 else sct.monitors[0]
-        img = sct.grab(mon)
-        rgb = img.rgb
-        if SHOW_CURSOR_OVERLAY:
+    _host_keep_awake_pulse()
+    _desktop_sync_capture_handles_for_current_thread()
+    selected_target = _desktop_selected_target_item()
+    selected_target_id = str(selected_target.get("id") or "").strip().lower()
+    selected_target_virtual = bool(selected_target.get("virtual"))
+
+    def _process_capture(
+        rgb: bytes,
+        out_size: Tuple[int, int],
+        left: int,
+        top: int,
+        include_cursor_overlay: bool = True,
+    ) -> Tuple[bytes, Tuple[int, int]]:
+        if include_cursor_overlay and SHOW_CURSOR_OVERLAY:
             cur = _desktop_cursor_pos()
             if cur:
-                left = int(mon.get("left", 0))
-                top = int(mon.get("top", 0))
-                rel_x = int(cur[0]) - left
-                rel_y = int(cur[1]) - top
-                rgb = _overlay_cursor_rgb(rgb, img.size, rel_x, rel_y)
-        out_size = img.size
+                rel_x = int(cur[0]) - int(left)
+                rel_y = int(cur[1]) - int(top)
+                rgb = _overlay_cursor_rgb(rgb, out_size, rel_x, rel_y)
         mode = _parse_stream_layout_mode(layout_mode)
         if mode == "stretch" and target_size:
             rgb, out_size = _resize_rgb_to_target(rgb, out_size, target_size)
@@ -5414,9 +9713,72 @@ def _desktop_capture_rgb(
             rgb, out_size = _crop_rgb_to_aspect(rgb, out_size, crop_aspect)
             if scale_factor > 1:
                 rgb, out_size = _downsample_rgb_nearest(rgb, out_size, scale_factor)
+            rgb, out_size = _resize_rgb_to_fit_target(rgb, out_size, target_size)
         if grayscale:
             rgb = _rgb_to_grayscale(rgb)
         return rgb, out_size
+
+    def _capture(sct: Any) -> Tuple[bytes, Tuple[int, int]]:
+        mon = _desktop_monitor()
+        img = sct.grab(mon)
+        return _process_capture(
+            img.rgb,
+            img.size,
+            int(mon.get("left", 0)),
+            int(mon.get("top", 0)),
+        )
+
+    def _capture_dxcam() -> Tuple[bytes, Tuple[int, int]]:
+        with DESKTOP_DXCAM_LOCK:
+            camera = _desktop_dxcam()
+            frame = camera.grab(new_frame_only=False)
+            if frame is None:
+                time.sleep(0.01)
+                frame = camera.grab(new_frame_only=False)
+            if frame is None:
+                raise HTTPException(status_code=503, detail="Desktop capture unavailable.")
+            if len(frame.shape) >= 3 and int(frame.shape[2]) >= 4:
+                frame = frame[:, :, :3]
+            if _desktop_dxcam_frame_looks_black(frame):
+                _desktop_mark_dxcam_blacklisted_for_current_thread(selected_target_id)
+                raise HTTPException(status_code=503, detail="Desktop capture returned a black frame.")
+            out_size = (int(frame.shape[1]), int(frame.shape[0]))
+            monitor = _desktop_dxcam_monitor()
+            return _process_capture(
+                frame.tobytes(),
+                out_size,
+                int(monitor.get("left", 0)),
+                int(monitor.get("top", 0)),
+                include_cursor_overlay=False,
+            )
+
+    # Prefer DXCAM when available for physical outputs, but skip it entirely for
+    # virtual displays where this host's IDD path is known to require MSS.
+    use_dxcam = (
+        _desktop_capture_backend() == "dxcam"
+        and not selected_target_virtual
+        and not _desktop_is_dxcam_blacklisted_for_current_thread(selected_target_id)
+    )
+    if use_dxcam:
+        try:
+            return _capture_dxcam()
+        except HTTPException as exc:
+            print(
+                "Desktop capture DXCAM fallback"
+                f" target={selected_target_id or 'unknown'}"
+                f" virtual={selected_target_virtual}"
+                f" reason=http_{int(exc.status_code)}:{exc.detail}",
+                flush=True,
+            )
+        except Exception as exc:
+            print(
+                "Desktop capture DXCAM fallback"
+                f" target={selected_target_id or 'unknown'}"
+                f" virtual={selected_target_virtual}"
+                f" reason={type(exc).__name__}: {exc}",
+                flush=True,
+            )
+            traceback.print_exc()
 
     if sct_instance is not None:
         return _capture(sct_instance)
@@ -5523,16 +9885,6 @@ if AIORTC_AVAILABLE:
             frame.pts = pts
             frame.time_base = time_base
             self._frames_sent += 1
-            if self._frames_sent in {1, 10} or self._frames_sent % 60 == 0:
-                print(
-                    "Desktop WebRTC track produced frame"
-                    f" {self._frames_sent} at {int(out_size[0])}x{int(out_size[1])}"
-                    f" fps={self._fps:.1f} scale={self._scale_factor}"
-                    f" bw={self._grayscale} aspect={self._aspect_ratio or 0:.4f}"
-                    f" mode={self._layout_mode} target={self._target_size}"
-                    f" capture_ms={capture_ms:.1f}",
-                    flush=True,
-                )
             return frame
 
         def stop(self) -> None:
@@ -5561,34 +9913,305 @@ def _desktop_move_abs(x: int, y: int) -> None:
     user32 = _win_user32()
     user32.SetCursorPos(int(x), int(y))
 
-def _desktop_click(button: str = "left", double: bool = False, action: str = "click") -> None:
-    user32 = _win_user32()
+
+def _desktop_click_hover_delay_s(screen_x: int, screen_y: int) -> float:
+    return 0.03
+
+
+def _desktop_click_at(
+    x: int,
+    y: int,
+    button: str = "left",
+    double: bool = False,
+    action: str = "click",
+    extra_info: int = REMOTE_MOUSE_EXTRA_INFO,
+) -> None:
+    _desktop_move_abs(int(x), int(y))
+    time.sleep(_desktop_click_hover_delay_s(int(x), int(y)))
+    _desktop_click_sendinput(button=button, double=double, action=action, extra_info=extra_info)
+
+def _desktop_click(
+    button: str = "left",
+    double: bool = False,
+    action: str = "click",
+    extra_info: int = REMOTE_MOUSE_EXTRA_INFO,
+) -> None:
+    _desktop_click_sendinput(button=button, double=double, action=action, extra_info=extra_info)
+
+
+def _desktop_click_sendinput(
+    button: str = "left",
+    double: bool = False,
+    action: str = "click",
+    extra_info: int = REMOTE_MOUSE_EXTRA_INFO,
+) -> None:
     btn = (button or "left").strip().lower()
     click_action = (action or "click").strip().lower()
     mapping = {
-        "left": (0x0002, 0x0004),
-        "right": (0x0008, 0x0010),
-        "middle": (0x0020, 0x0040),
+        "left": (MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP),
+        "right": (MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP),
+        "middle": (MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP),
     }
     if btn not in mapping:
         raise HTTPException(status_code=400, detail="Unsupported mouse button.")
     if click_action not in {"click", "down", "up"}:
         raise HTTPException(status_code=400, detail="Unsupported mouse action.")
     down, up = mapping[btn]
+
+    def _mouse_input(flags: int) -> INPUT:
+        return INPUT(
+            type=INPUT_MOUSE,
+            union=INPUT_UNION(
+                mi=MOUSEINPUT(
+                    dx=0,
+                    dy=0,
+                    mouseData=0,
+                    dwFlags=int(flags),
+                    time=0,
+                    dwExtraInfo=ULONG_PTR(int(extra_info or 0)),
+                )
+            ),
+        )
+
     if click_action == "down":
-        user32.mouse_event(down, 0, 0, 0, 0)
+        _send_inputs([_mouse_input(down)])
         return
     if click_action == "up":
-        user32.mouse_event(up, 0, 0, 0, 0)
+        _send_inputs([_mouse_input(up)])
         return
+
     times = 2 if double else 1
+    inputs = []
     for _ in range(times):
-        user32.mouse_event(down, 0, 0, 0, 0)
-        user32.mouse_event(up, 0, 0, 0, 0)
+        inputs.append(_mouse_input(down))
+        inputs.append(_mouse_input(up))
+    _send_inputs(inputs)
+
 
 def _desktop_scroll(delta: int) -> None:
+    _send_inputs([
+        INPUT(
+            type=INPUT_MOUSE,
+            union=INPUT_UNION(
+                mi=MOUSEINPUT(
+                    dx=0,
+                    dy=0,
+                    mouseData=int(delta),
+                    dwFlags=MOUSEEVENTF_WHEEL,
+                    time=0,
+                    dwExtraInfo=REMOTE_MOUSE_EXTRA_INFO,
+                )
+            ),
+        )
+    ])
+
+
+class _POINT(ctypes.Structure):
+    _fields_ = [
+        ("x", wintypes.LONG),
+        ("y", wintypes.LONG),
+    ]
+
+
+def _win_window_from_point() -> Any:
+    _ensure_windows_host()
     user32 = _win_user32()
-    user32.mouse_event(0x0800, 0, 0, int(delta), 0)
+    if not hasattr(_win_window_from_point, "_configured"):
+        user32.WindowFromPoint.argtypes = [_POINT]
+        user32.WindowFromPoint.restype = wintypes.HWND
+        _win_window_from_point._configured = True  # type: ignore[attr-defined]
+    return user32.WindowFromPoint
+
+
+def _win_get_foreground_window() -> Any:
+    _ensure_windows_host()
+    user32 = _win_user32()
+    if not hasattr(_win_get_foreground_window, "_configured"):
+        user32.GetForegroundWindow.argtypes = []
+        user32.GetForegroundWindow.restype = wintypes.HWND
+        _win_get_foreground_window._configured = True  # type: ignore[attr-defined]
+    return user32.GetForegroundWindow
+
+
+def _win_enum_windows() -> Any:
+    _ensure_windows_host()
+    user32 = _win_user32()
+    if not hasattr(_win_enum_windows, "_configured"):
+        _win_enum_windows._callback_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)  # type: ignore[attr-defined]
+        user32.EnumWindows.argtypes = [_win_enum_windows._callback_type, wintypes.LPARAM]  # type: ignore[attr-defined]
+        user32.EnumWindows.restype = wintypes.BOOL
+        _win_enum_windows._configured = True  # type: ignore[attr-defined]
+    return user32.EnumWindows
+
+
+def _win_get_ancestor() -> Any:
+    _ensure_windows_host()
+    user32 = _win_user32()
+    if not hasattr(_win_get_ancestor, "_configured"):
+        user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
+        user32.GetAncestor.restype = wintypes.HWND
+        _win_get_ancestor._configured = True  # type: ignore[attr-defined]
+    return user32.GetAncestor
+
+
+def _win_is_window_visible() -> Any:
+    _ensure_windows_host()
+    user32 = _win_user32()
+    if not hasattr(_win_is_window_visible, "_configured"):
+        user32.IsWindowVisible.argtypes = [wintypes.HWND]
+        user32.IsWindowVisible.restype = wintypes.BOOL
+        _win_is_window_visible._configured = True  # type: ignore[attr-defined]
+    return user32.IsWindowVisible
+
+
+def _win_get_window_rect() -> Any:
+    _ensure_windows_host()
+    user32 = _win_user32()
+    if not hasattr(_win_get_window_rect, "_configured"):
+        user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(RECT)]
+        user32.GetWindowRect.restype = wintypes.BOOL
+        _win_get_window_rect._configured = True  # type: ignore[attr-defined]
+    return user32.GetWindowRect
+
+
+def _win_get_dpi_for_window() -> Any:
+    _ensure_windows_host()
+    user32 = _win_user32()
+    if not hasattr(_win_get_dpi_for_window, "_configured"):
+        user32.GetDpiForWindow.argtypes = [wintypes.HWND]
+        user32.GetDpiForWindow.restype = wintypes.UINT
+        _win_get_dpi_for_window._configured = True  # type: ignore[attr-defined]
+    return user32.GetDpiForWindow
+
+
+def _win_dwm_get_window_attribute() -> Any:
+    _ensure_windows_host()
+    dwmapi = ctypes.windll.dwmapi
+    if not hasattr(_win_dwm_get_window_attribute, "_configured"):
+        dwmapi.DwmGetWindowAttribute.argtypes = [wintypes.HWND, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD]
+        dwmapi.DwmGetWindowAttribute.restype = ctypes.c_long
+        _win_dwm_get_window_attribute._configured = True  # type: ignore[attr-defined]
+    return dwmapi.DwmGetWindowAttribute
+
+
+def _win_send_message() -> Any:
+    _ensure_windows_host()
+    user32 = _win_user32()
+    if not hasattr(_win_send_message, "_configured"):
+        user32.SendMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+        user32.SendMessageW.restype = wintypes.LPARAM
+        _win_send_message._configured = True  # type: ignore[attr-defined]
+    return user32.SendMessageW
+
+
+def _win_is_zoomed() -> Any:
+    _ensure_windows_host()
+    user32 = _win_user32()
+    if not hasattr(_win_is_zoomed, "_configured"):
+        user32.IsZoomed.argtypes = [wintypes.HWND]
+        user32.IsZoomed.restype = wintypes.BOOL
+        _win_is_zoomed._configured = True  # type: ignore[attr-defined]
+    return user32.IsZoomed
+
+
+def _make_lparam(x: int, y: int) -> int:
+    return ((int(y) & 0xFFFF) << 16) | (int(x) & 0xFFFF)
+
+
+def _win_is_window_cloaked(hwnd: wintypes.HWND) -> bool:
+    cloaked = wintypes.DWORD(0)
+    try:
+        hr = int(_win_dwm_get_window_attribute()(hwnd, DWMWA_CLOAKED, ctypes.byref(cloaked), ctypes.sizeof(cloaked)))
+        return hr == 0 and bool(cloaked.value)
+    except Exception:
+        return False
+
+
+def _window_point_for_hit_test(hwnd: wintypes.HWND, x: int, y: int) -> Tuple[int, int]:
+    try:
+        dpi = int(_win_get_dpi_for_window()(hwnd))
+    except Exception:
+        dpi = 96
+    scale = max(1.0, float(dpi or 96) / 96.0)
+    return (int(round(float(x) * scale)), int(round(float(y) * scale)))
+
+
+def _iter_top_level_windows() -> List[int]:
+    windows: List[int] = []
+    seen: Set[int] = set()
+    enum_windows = _win_enum_windows()
+    callback_type = _win_enum_windows._callback_type  # type: ignore[attr-defined]
+
+    @callback_type
+    def _collector(hwnd: wintypes.HWND, lparam: wintypes.LPARAM) -> wintypes.BOOL:
+        handle_value = int(hwnd)
+        if handle_value not in seen:
+            seen.add(handle_value)
+            windows.append(handle_value)
+        return True
+
+    enum_windows(_collector, 0)
+    return windows
+
+
+def _desktop_caption_syscommand_at(x: int, y: int) -> Optional[str]:
+    point = _POINT(int(x), int(y))
+    candidates: List[int] = []
+
+    foreground = _win_get_foreground_window()()
+    if foreground:
+        foreground_root = _win_get_ancestor()(foreground, GA_ROOT) or foreground
+        candidates.append(int(foreground_root))
+
+    hwnd = _win_window_from_point()(point)
+    if hwnd:
+        point_root = _win_get_ancestor()(hwnd, GA_ROOT) or hwnd
+        point_root_value = int(point_root)
+        if point_root_value not in candidates:
+            candidates.append(point_root_value)
+
+    for handle_value in _iter_top_level_windows():
+        if handle_value in candidates:
+            continue
+        hwnd_candidate = wintypes.HWND(handle_value)
+        if not bool(_win_is_window_visible()(hwnd_candidate)):
+            continue
+        if _win_is_window_cloaked(hwnd_candidate):
+            continue
+        test_x, test_y = _window_point_for_hit_test(hwnd_candidate, int(x), int(y))
+        rect = RECT()
+        if not bool(_win_get_window_rect()(hwnd_candidate, ctypes.byref(rect))):
+            continue
+        if not (rect.left <= test_x <= rect.right and rect.top <= test_y <= rect.bottom):
+            continue
+        candidates.append(handle_value)
+
+    for candidate in candidates:
+        root = wintypes.HWND(candidate)
+        test_x, test_y = _window_point_for_hit_test(root, int(x), int(y))
+        hit = int(_win_send_message()(root, WM_NCHITTEST, 0, _make_lparam(test_x, test_y)))
+        command = None
+        command_name = None
+        if hit == HTMINBUTTON:
+            command = SC_MINIMIZE
+            command_name = "minimize"
+        elif hit == HTMAXBUTTON:
+            command = SC_RESTORE if bool(_win_is_zoomed()(root)) else SC_MAXIMIZE
+            command_name = "restore" if command == SC_RESTORE else "maximize"
+        elif hit == HTCLOSE:
+            command = SC_CLOSE
+            command_name = "close"
+        if command is not None:
+            _win_send_message()(root, WM_SYSCOMMAND, int(command), 0)
+            return command_name
+    return None
+
+
+
+
+
+
+
 
 def _ps_single_quote(value: str) -> str:
     # PowerShell single-quoted literals escape apostrophes by doubling them.
@@ -5647,53 +10270,6 @@ def _spawn_windows_background_process(args: List[str], *, detached: bool = True)
         return {"ok": True, "pid": int(getattr(proc, "pid", 0) or 0)}
     except Exception as e:
         return {"ok": False, "detail": f"{type(e).__name__}: {e}"}
-
-
-def _launch_privacy_lock_helper(lock_id: str, callback_token: str, controller_port: int) -> subprocess.Popen[str]:
-    helper_path = _privacy_lock_launcher_exe_path()
-    if not os.path.isfile(helper_path):
-        raise HTTPException(status_code=503, detail="Privacy lock helper is missing. Rebuild the launcher first.")
-    creationflags = int(getattr(subprocess, "CREATE_NO_WINDOW", 0) or 0)
-    return subprocess.Popen(
-        [
-            helper_path,
-            "--privacy-lock-helper",
-            "--runtime-dir",
-            CODEX_RUNTIME_DIR,
-            "--state-file",
-            PRIVACY_LOCK_STATE_FILE,
-            "--config-file",
-            PRIVACY_LOCK_CONFIG_FILE,
-            "--lock-id",
-            str(lock_id or "").strip(),
-            "--callback-token",
-            str(callback_token or "").strip(),
-            "--controller-port",
-            str(int(controller_port or 0)),
-        ],
-        cwd=os.path.dirname(helper_path),
-        close_fds=True,
-        creationflags=creationflags,
-    )
-
-
-def _wait_for_privacy_lock_helper_ready(lock_id: str, process: subprocess.Popen[str]) -> Dict[str, Any]:
-    deadline = time.time() + max(PRIVACY_LOCK_HELPER_START_TIMEOUT_S, 1.0)
-    while time.time() < deadline:
-        with PRIVACY_LOCK_LOCK:
-            _load_privacy_lock_state_unlocked()
-            state = dict(PRIVACY_LOCK_STATE_DATA)
-        if str(state.get("lock_id") or "").strip() != str(lock_id or "").strip():
-            raise HTTPException(status_code=409, detail="Privacy lock state changed during helper startup.")
-        if bool(state.get("helper_ready")):
-            return state
-        helper_error = str(state.get("helper_error") or "").strip()
-        if helper_error:
-            raise HTTPException(status_code=503, detail=helper_error)
-        if process.poll() is not None:
-            raise HTTPException(status_code=503, detail="Privacy lock helper exited before it became ready.")
-        time.sleep(0.12)
-    raise HTTPException(status_code=504, detail="Privacy lock helper did not become ready in time.")
 
 
 def _create_power_confirmation(action: str) -> Dict[str, Any]:
@@ -5805,6 +10381,8 @@ def _desktop_paste_target_family(process_name: str, window_title: str) -> str:
         return "word"
     if proc in {"onenote"}:
         return "onenote"
+    if proc in {"mspaint"}:
+        return "paint"
     if proc in {"wps", "wpp"}:
         if any(token in title for token in {"presentation", ".ppt", ".pptx", "slides"}):
             return "wps_presentation"
@@ -5821,6 +10399,8 @@ def _desktop_paste_target_label(target_family: str, process_name: str, window_ti
         return "Word"
     if family == "onenote":
         return "OneNote"
+    if family == "paint":
+        return "Paint"
     if family == "wps_presentation":
         return "WPS Presentation"
     if family == "wps_document":
@@ -5934,6 +10514,446 @@ def _desktop_restore_foreground_window(hwnd: int) -> bool:
         return False
 
 
+def _desktop_window_handoff_powershell_helpers() -> str:
+    return r"""
+if (-not ('CodrexDesktopWindowNative' -as [type])) {
+  Add-Type @"
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+using System.Text;
+public struct RECT {
+  public int Left;
+  public int Top;
+  public int Right;
+  public int Bottom;
+}
+public struct POINT {
+  public int X;
+  public int Y;
+}
+public struct WINDOWPLACEMENT {
+  public int length;
+  public int flags;
+  public int showCmd;
+  public POINT ptMinPosition;
+  public POINT ptMaxPosition;
+  public RECT rcNormalPosition;
+}
+public class DesktopWindowSnapshot {
+  public long Hwnd { get; set; }
+  public int Left { get; set; }
+  public int Top { get; set; }
+  public int Width { get; set; }
+  public int Height { get; set; }
+  public int ShowCmd { get; set; }
+  public string Title { get; set; }
+  public string ClassName { get; set; }
+}
+public static class CodrexDesktopWindowNative {
+  public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+  [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+  [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+  [DllImport("user32.dll")] public static extern IntPtr GetShellWindow();
+  [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr hWnd);
+  [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
+  [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hWnd);
+  [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
+  [DllImport("user32.dll")] public static extern bool GetWindowPlacement(IntPtr hWnd, ref WINDOWPLACEMENT placement);
+  [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
+  [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+  [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
+  [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetWindowTextLengthW(IntPtr hWnd);
+  [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetWindowTextW(IntPtr hWnd, StringBuilder lpString, int nMaxCount);
+  [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetClassNameW(IntPtr hWnd, StringBuilder lpClassName, int nMaxCount);
+
+  public static string ReadWindowTitle(IntPtr hWnd) {
+    int length = Math.Max(0, GetWindowTextLengthW(hWnd));
+    if (length <= 0) {
+      return string.Empty;
+    }
+    var builder = new StringBuilder(length + 1);
+    GetWindowTextW(hWnd, builder, builder.Capacity);
+    return builder.ToString();
+  }
+
+  public static string ReadWindowClass(IntPtr hWnd) {
+    var builder = new StringBuilder(260);
+    GetClassNameW(hWnd, builder, builder.Capacity);
+    return builder.ToString();
+  }
+
+  public static DesktopWindowSnapshot[] EnumerateTopLevelWindows() {
+    var windows = new List<DesktopWindowSnapshot>();
+    IntPtr shellWindow = GetShellWindow();
+    EnumWindows(delegate (IntPtr hWnd, IntPtr lParam) {
+      if (hWnd == IntPtr.Zero || hWnd == shellWindow || !IsWindow(hWnd) || !IsWindowVisible(hWnd)) {
+        return true;
+      }
+      RECT rect;
+      if (!GetWindowRect(hWnd, out rect)) {
+        return true;
+      }
+      int width = Math.Max(0, rect.Right - rect.Left);
+      int height = Math.Max(0, rect.Bottom - rect.Top);
+      var placement = new WINDOWPLACEMENT();
+      placement.length = Marshal.SizeOf(typeof(WINDOWPLACEMENT));
+      GetWindowPlacement(hWnd, ref placement);
+      windows.Add(new DesktopWindowSnapshot {
+        Hwnd = hWnd.ToInt64(),
+        Left = rect.Left,
+        Top = rect.Top,
+        Width = width,
+        Height = height,
+        ShowCmd = placement.showCmd,
+        Title = ReadWindowTitle(hWnd),
+        ClassName = ReadWindowClass(hWnd),
+      });
+      return true;
+    }, IntPtr.Zero);
+    return windows.ToArray();
+  }
+}
+"@
+}
+"""
+
+
+def _desktop_move_foreground_window_to_target(
+    source_target: Dict[str, Any],
+    destination_target: Dict[str, Any],
+) -> Dict[str, Any]:
+    src_left = int(source_target.get("left") or 0)
+    src_top = int(source_target.get("top") or 0)
+    src_width = max(1, int(source_target.get("width") or 0))
+    src_height = max(1, int(source_target.get("height") or 0))
+    dst_left = int(destination_target.get("left") or 0)
+    dst_top = int(destination_target.get("top") or 0)
+    dst_width = max(1, int(destination_target.get("width") or 0))
+    dst_height = max(1, int(destination_target.get("height") or 0))
+    script = _desktop_window_handoff_powershell_helpers() + f"""
+$srcLeft = {src_left}
+$srcTop = {src_top}
+$srcWidth = {src_width}
+$srcHeight = {src_height}
+$dstLeft = {dst_left}
+$dstTop = {dst_top}
+$dstWidth = {dst_width}
+$dstHeight = {dst_height}
+$hwnd = [CodrexDesktopWindowNative]::GetForegroundWindow()
+if ($hwnd -eq [IntPtr]::Zero -or -not [CodrexDesktopWindowNative]::IsWindow($hwnd)) {{
+  @{{ ok = $false; detail = 'no_foreground_window' }} | ConvertTo-Json -Compress
+  exit 0
+}}
+$rect = New-Object RECT
+if (-not [CodrexDesktopWindowNative]::GetWindowRect($hwnd, [ref]$rect)) {{
+  @{{ ok = $false; detail = 'get_window_rect_failed' }} | ConvertTo-Json -Compress
+  exit 0
+}}
+$placement = New-Object WINDOWPLACEMENT
+$placement.length = [System.Runtime.InteropServices.Marshal]::SizeOf([type][WINDOWPLACEMENT])
+[void][CodrexDesktopWindowNative]::GetWindowPlacement($hwnd, [ref]$placement)
+$showCmd = [int]$placement.showCmd
+$width = [Math]::Max(200, $rect.Right - $rect.Left)
+$height = [Math]::Max(120, $rect.Bottom - $rect.Top)
+$relLeft = $rect.Left - $srcLeft
+$relTop = $rect.Top - $srcTop
+$newWidth = [Math]::Min($width, $dstWidth)
+$newHeight = [Math]::Min($height, $dstHeight)
+$newLeft = [Math]::Max($dstLeft, [Math]::Min($dstLeft + $dstWidth - $newWidth, $dstLeft + $relLeft))
+$newTop = [Math]::Max($dstTop, [Math]::Min($dstTop + $dstHeight - $newHeight, $dstTop + $relTop))
+if ($showCmd -eq 3) {{
+  [void][CodrexDesktopWindowNative]::ShowWindow($hwnd, 9)
+  Start-Sleep -Milliseconds 60
+}}
+[void][CodrexDesktopWindowNative]::SetWindowPos($hwnd, [IntPtr]::Zero, $newLeft, $newTop, $newWidth, $newHeight, 0x0014)
+if ($showCmd -eq 3) {{
+  [void][CodrexDesktopWindowNative]::ShowWindow($hwnd, 3)
+}} else {{
+  [void][CodrexDesktopWindowNative]::ShowWindow($hwnd, 5)
+}}
+[void][CodrexDesktopWindowNative]::SetForegroundWindow($hwnd)
+@{{
+  ok = $true
+  hwnd = [Int64]$hwnd
+  show_cmd = $showCmd
+  restore_rect = @{{
+    left = $rect.Left
+    top = $rect.Top
+    width = [Math]::Max(1, $rect.Right - $rect.Left)
+    height = [Math]::Max(1, $rect.Bottom - $rect.Top)
+  }}
+}} | ConvertTo-Json -Compress -Depth 4
+"""
+    result = _run_powershell(script, timeout_s=8, sta=True)
+    raw = str(result.get("stdout") or "").strip()
+    if result.get("exit_code") != 0:
+        print(f"Virtual-display window handoff failed: {result.get('stderr') or raw or 'unknown_error'}", flush=True)
+        return {}
+    try:
+        payload = json.loads(raw) if raw else {}
+    except Exception:
+        payload = {}
+    if not isinstance(payload, dict) or not payload.get("ok"):
+        return {}
+    restore_rect = payload.get("restore_rect") or {}
+    return {
+        "hwnd": int(payload.get("hwnd") or 0),
+        "show_cmd": int(payload.get("show_cmd") or 0),
+        "restore_rect": {
+            "left": int(restore_rect.get("left") or 0),
+            "top": int(restore_rect.get("top") or 0),
+            "width": max(1, int(restore_rect.get("width") or 0)),
+            "height": max(1, int(restore_rect.get("height") or 0)),
+        },
+        "source_target_id": str(source_target.get("id") or "").strip().lower(),
+        "destination_target_id": str(destination_target.get("id") or "").strip().lower(),
+    }
+
+
+def _desktop_move_workspace_to_target(
+    source_target: Dict[str, Any],
+    destination_target: Dict[str, Any],
+    *,
+    allow_foreground_fallback: bool = True,
+) -> List[Dict[str, Any]]:
+    src_left = int(source_target.get("left") or 0)
+    src_top = int(source_target.get("top") or 0)
+    src_width = max(1, int(source_target.get("width") or 0))
+    src_height = max(1, int(source_target.get("height") or 0))
+    dst_left = int(destination_target.get("left") or 0)
+    dst_top = int(destination_target.get("top") or 0)
+    dst_width = max(1, int(destination_target.get("width") or 0))
+    dst_height = max(1, int(destination_target.get("height") or 0))
+    script = _desktop_window_handoff_powershell_helpers() + f"""
+$srcLeft = {src_left}
+$srcTop = {src_top}
+$srcWidth = {src_width}
+$srcHeight = {src_height}
+$dstLeft = {dst_left}
+$dstTop = {dst_top}
+$dstWidth = {dst_width}
+$dstHeight = {dst_height}
+$excludeClasses = @('Progman', 'WorkerW', 'Shell_TrayWnd', 'Shell_SecondaryTrayWnd')
+$foreground = [int64][CodrexDesktopWindowNative]::GetForegroundWindow()
+$windows = @()
+foreach ($window in [CodrexDesktopWindowNative]::EnumerateTopLevelWindows()) {{
+  if (-not $window) {{ continue }}
+  $className = [string]$window.ClassName
+  $title = [string]$window.Title
+  if ($excludeClasses -contains $className) {{ continue }}
+  if ([string]::IsNullOrWhiteSpace($className) -and [string]::IsNullOrWhiteSpace($title)) {{ continue }}
+  if ([int]$window.Width -lt 140 -or [int]$window.Height -lt 90) {{ continue }}
+  $intersects = (([int]$window.Left + [int]$window.Width) -gt $srcLeft) -and ([int]$window.Left -lt ($srcLeft + $srcWidth)) -and (([int]$window.Top + [int]$window.Height) -gt $srcTop) -and ([int]$window.Top -lt ($srcTop + $srcHeight))
+  if (-not $intersects) {{ continue }}
+  $showCmd = [int]$window.ShowCmd
+  $hwnd = [IntPtr]::new([int64]$window.Hwnd)
+  if ($hwnd -eq [IntPtr]::Zero -or -not [CodrexDesktopWindowNative]::IsWindow($hwnd)) {{ continue }}
+  $width = [Math]::Max(220, [int]$window.Width)
+  $height = [Math]::Max(120, [int]$window.Height)
+  $newWidth = [Math]::Min($width, $dstWidth)
+  $newHeight = [Math]::Min($height, $dstHeight)
+  $relLeft = [int]$window.Left - $srcLeft
+  $relTop = [int]$window.Top - $srcTop
+  $newLeft = [Math]::Max($dstLeft, [Math]::Min($dstLeft + $dstWidth - $newWidth, $dstLeft + $relLeft))
+  $newTop = [Math]::Max($dstTop, [Math]::Min($dstTop + $dstHeight - $newHeight, $dstTop + $relTop))
+  if ($showCmd -eq 3) {{
+    [void][CodrexDesktopWindowNative]::ShowWindow($hwnd, 9)
+    Start-Sleep -Milliseconds 40
+    $newLeft = $dstLeft
+    $newTop = $dstTop
+    $newWidth = $dstWidth
+    $newHeight = $dstHeight
+  }}
+  [void][CodrexDesktopWindowNative]::SetWindowPos($hwnd, [IntPtr]::Zero, $newLeft, $newTop, $newWidth, $newHeight, 0x0014)
+  if ($showCmd -eq 3) {{
+    [void][CodrexDesktopWindowNative]::ShowWindow($hwnd, 3)
+  }} else {{
+    [void][CodrexDesktopWindowNative]::ShowWindow($hwnd, 5)
+  }}
+  $windows += @{{
+    hwnd = [int64]$window.Hwnd
+    show_cmd = $showCmd
+    title = $title
+    class_name = $className
+    restore_rect = @{{
+      left = [int]$window.Left
+      top = [int]$window.Top
+      width = [Math]::Max(1, [int]$window.Width)
+      height = [Math]::Max(1, [int]$window.Height)
+    }}
+  }}
+}}
+if ($windows.Count -gt 0) {{
+  $focusWindow = $windows | Where-Object {{ [int64]$_.hwnd -eq $foreground }} | Select-Object -First 1
+  if (-not $focusWindow) {{
+    $focusWindow = $windows | Select-Object -First 1
+  }}
+  if ($focusWindow) {{
+    [void][CodrexDesktopWindowNative]::SetForegroundWindow([IntPtr]::new([int64]$focusWindow.hwnd))
+  }}
+}}
+@{{
+  ok = ($windows.Count -gt 0)
+  windows = $windows
+}} | ConvertTo-Json -Compress -Depth 6
+"""
+    result = _run_powershell(script, timeout_s=12, sta=True)
+    raw = str(result.get("stdout") or "").strip()
+    if result.get("exit_code") != 0:
+        print(f"Virtual-display workspace handoff failed: {result.get('stderr') or raw or 'unknown_error'}", flush=True)
+        return []
+    try:
+        payload = json.loads(raw) if raw else {}
+    except Exception:
+        payload = {}
+    windows = payload.get("windows") if isinstance(payload, dict) else []
+    moved: List[Dict[str, Any]] = []
+    for item in list(windows or []):
+        if not isinstance(item, dict):
+            continue
+        restore_rect = dict(item.get("restore_rect") or {})
+        moved.append({
+            "hwnd": int(item.get("hwnd") or 0),
+            "show_cmd": int(item.get("show_cmd") or 0),
+            "title": str(item.get("title") or "").strip(),
+            "class_name": str(item.get("class_name") or "").strip(),
+            "restore_rect": {
+                "left": int(restore_rect.get("left") or 0),
+                "top": int(restore_rect.get("top") or 0),
+                "width": max(1, int(restore_rect.get("width") or 0)),
+                "height": max(1, int(restore_rect.get("height") or 0)),
+            },
+            "source_target_id": str(source_target.get("id") or "").strip().lower(),
+            "destination_target_id": str(destination_target.get("id") or "").strip().lower(),
+        })
+    if moved:
+        return moved
+    if not allow_foreground_fallback:
+        return []
+    fallback = _desktop_move_foreground_window_to_target(source_target, destination_target)
+    return [fallback] if fallback else []
+
+
+def _desktop_clamp_restore_rect_to_target(
+    restore_rect: Dict[str, Any],
+    target: Optional[Dict[str, Any]],
+) -> Dict[str, int]:
+    rect = dict(restore_rect or {})
+    left = int(rect.get("left") or 0)
+    top = int(rect.get("top") or 0)
+    width = max(1, int(rect.get("width") or 0))
+    height = max(1, int(rect.get("height") or 0))
+    target_payload = dict(target or {})
+    target_width = int(target_payload.get("width") or 0)
+    target_height = int(target_payload.get("height") or 0)
+    if target_width <= 0 or target_height <= 0:
+        return {
+            "left": left,
+            "top": top,
+            "width": width,
+            "height": height,
+        }
+    target_left = int(target_payload.get("left") or 0)
+    target_top = int(target_payload.get("top") or 0)
+    clamped_width = min(width, max(1, target_width))
+    clamped_height = min(height, max(1, target_height))
+    clamped_left = max(target_left, min(target_left + target_width - clamped_width, left))
+    clamped_top = max(target_top, min(target_top + target_height - clamped_height, top))
+    return {
+        "left": clamped_left,
+        "top": clamped_top,
+        "width": clamped_width,
+        "height": clamped_height,
+    }
+
+
+def _desktop_repatriate_virtual_workspace(
+    previous_target_id: str,
+    virtual_target_id: str,
+) -> int:
+    previous_id = str(previous_target_id or "").strip().lower()
+    virtual_id = str(virtual_target_id or "").strip().lower()
+    if not previous_id or not virtual_id or previous_id == virtual_id:
+        return 0
+    targets_payload = _desktop_targets_payload()
+    current_targets = list(targets_payload.get("targets") or [])
+    source_target = _desktop_find_target_item(virtual_id, current_targets)
+    destination_target = _desktop_find_target_item(previous_id, current_targets)
+    if not source_target or not destination_target:
+        return 0
+    moved = _desktop_move_workspace_to_target(
+        source_target,
+        destination_target,
+        allow_foreground_fallback=False,
+    )
+    return len(list(moved or []))
+
+
+def _desktop_restore_window_handoff(handoff: Optional[Dict[str, Any]]) -> bool:
+    payload = dict(handoff or {})
+    hwnd = int(payload.get("hwnd") or 0)
+    restore_rect = dict(payload.get("restore_rect") or {})
+    if hwnd <= 0 or not restore_rect:
+        return False
+    source_target_id = str(payload.get("source_target_id") or "").strip().lower()
+    destination_target_id = str(payload.get("destination_target_id") or "").strip().lower()
+    targets_payload = _desktop_targets_payload()
+    current_targets = list(targets_payload.get("targets") or [])
+    target = _desktop_find_target_item(source_target_id, current_targets)
+    if not target and destination_target_id:
+        target = _desktop_find_target_item(destination_target_id, current_targets)
+    if not target:
+        target = _desktop_first_physical_target_item(current_targets) or dict(targets_payload.get("active_target") or {})
+    clamped_rect = _desktop_clamp_restore_rect_to_target(restore_rect, target)
+    left = int(clamped_rect.get("left") or 0)
+    top = int(clamped_rect.get("top") or 0)
+    width = max(1, int(clamped_rect.get("width") or 0))
+    height = max(1, int(clamped_rect.get("height") or 0))
+    show_cmd = int(payload.get("show_cmd") or 0)
+    script = _desktop_window_handoff_powershell_helpers() + f"""
+$hwnd = [IntPtr]::new({hwnd})
+if ($hwnd -eq [IntPtr]::Zero -or -not [CodrexDesktopWindowNative]::IsWindow($hwnd)) {{
+  @{{ ok = $false; detail = 'window_missing' }} | ConvertTo-Json -Compress
+  exit 0
+}}
+$showCmd = {show_cmd}
+if ($showCmd -eq 3) {{
+  [void][CodrexDesktopWindowNative]::ShowWindow($hwnd, 9)
+  Start-Sleep -Milliseconds 60
+}}
+[void][CodrexDesktopWindowNative]::SetWindowPos($hwnd, [IntPtr]::Zero, {left}, {top}, {width}, {height}, 0x0014)
+if ($showCmd -eq 3) {{
+  [void][CodrexDesktopWindowNative]::ShowWindow($hwnd, 3)
+}} else {{
+  [void][CodrexDesktopWindowNative]::ShowWindow($hwnd, 5)
+}}
+[void][CodrexDesktopWindowNative]::SetForegroundWindow($hwnd)
+@{{ ok = $true }} | ConvertTo-Json -Compress
+"""
+    result = _run_powershell(script, timeout_s=8, sta=True)
+    raw = str(result.get("stdout") or "").strip()
+    if result.get("exit_code") != 0:
+        print(f"Virtual-display window restore failed: {result.get('stderr') or raw or 'unknown_error'}", flush=True)
+        return False
+    try:
+        restored = json.loads(raw) if raw else {}
+    except Exception:
+        restored = {}
+    return bool(isinstance(restored, dict) and restored.get("ok"))
+
+
+def _desktop_restore_window_handoffs(handoffs: Optional[List[Dict[str, Any]]]) -> int:
+    restored = 0
+    for handoff in list(handoffs or []):
+        try:
+            if _desktop_restore_window_handoff(handoff):
+                restored += 1
+        except Exception:
+            pass
+    return restored
+
+
 def _desktop_foreground_process_name() -> str:
     info = _desktop_foreground_target_info()
     return str(info.get("process_name") or "").strip().lower()
@@ -5955,36 +10975,54 @@ def _desktop_prepare_clipboard_image_file(path_for_windows: str) -> str:
     return prepared_path
 
 
-def _desktop_clipboard_set_image_file(path_for_windows: str) -> Dict[str, Any]:
+def _desktop_clipboard_set_image_file(path_for_windows: str, target_family: str = "") -> Dict[str, Any]:
     prepared_path = _desktop_prepare_clipboard_image_file(path_for_windows)
     quoted_path = _ps_single_quote(prepared_path)
-    script = (
-        "Add-Type -AssemblyName System.Windows.Forms; "
-        "Add-Type -AssemblyName System.Drawing; "
-        "$path = " + quoted_path + "; "
-        "if (!(Test-Path -LiteralPath $path)) { throw 'image_not_found' }; "
-        "$source = New-Object System.Drawing.Bitmap $path; "
-        "try { "
-        "$bmp = New-Object System.Drawing.Bitmap $source; "
-        "$pngStream = New-Object System.IO.MemoryStream; "
-        "try { "
-        "$bmp.Save($pngStream, [System.Drawing.Imaging.ImageFormat]::Png); "
-        "$pngBytes = $pngStream.ToArray(); "
-        "$pngData = New-Object System.IO.MemoryStream(,$pngBytes); "
-        "try { "
-        "$files = New-Object System.Collections.Specialized.StringCollection; "
-        "[void]$files.Add($path); "
-        "$data = New-Object System.Windows.Forms.DataObject; "
-        "$data.SetData([System.Windows.Forms.DataFormats]::Bitmap, $true, $bmp); "
-        "$data.SetData('PNG', $false, $pngData); "
-        "$data.SetFileDropList($files); "
-        "[System.Windows.Forms.Clipboard]::Clear(); "
-        "[System.Windows.Forms.Clipboard]::SetDataObject($data, $true, 8, 120); "
-        "Start-Sleep -Milliseconds 140 "
-        "} finally { $pngData.Dispose() } "
-        "} finally { $pngStream.Dispose(); $bmp.Dispose() } "
-        "} finally { $source.Dispose() }"
-    )
+    family = str(target_family or "").strip().lower()
+    if family == "paint":
+        script = (
+            "Add-Type -AssemblyName System.Windows.Forms; "
+            "Add-Type -AssemblyName System.Drawing; "
+            "$path = " + quoted_path + "; "
+            "if (!(Test-Path -LiteralPath $path)) { throw 'image_not_found' }; "
+            "$source = New-Object System.Drawing.Bitmap $path; "
+            "try { "
+            "$bmp = New-Object System.Drawing.Bitmap $source; "
+            "try { "
+            "[System.Windows.Forms.Clipboard]::Clear(); "
+            "[System.Windows.Forms.Clipboard]::SetImage($bmp); "
+            "Start-Sleep -Milliseconds 140 "
+            "} finally { $bmp.Dispose() } "
+            "} finally { $source.Dispose() }"
+        )
+    else:
+        script = (
+            "Add-Type -AssemblyName System.Windows.Forms; "
+            "Add-Type -AssemblyName System.Drawing; "
+            "$path = " + quoted_path + "; "
+            "if (!(Test-Path -LiteralPath $path)) { throw 'image_not_found' }; "
+            "$source = New-Object System.Drawing.Bitmap $path; "
+            "try { "
+            "$bmp = New-Object System.Drawing.Bitmap $source; "
+            "$pngStream = New-Object System.IO.MemoryStream; "
+            "try { "
+            "$bmp.Save($pngStream, [System.Drawing.Imaging.ImageFormat]::Png); "
+            "$pngBytes = $pngStream.ToArray(); "
+            "$pngData = New-Object System.IO.MemoryStream(,$pngBytes); "
+            "try { "
+            "$files = New-Object System.Collections.Specialized.StringCollection; "
+            "[void]$files.Add($path); "
+            "$data = New-Object System.Windows.Forms.DataObject; "
+            "$data.SetData([System.Windows.Forms.DataFormats]::Bitmap, $true, $bmp); "
+            "$data.SetData('PNG', $false, $pngData); "
+            "$data.SetFileDropList($files); "
+            "[System.Windows.Forms.Clipboard]::Clear(); "
+            "[System.Windows.Forms.Clipboard]::SetDataObject($data, $true, 8, 120); "
+            "Start-Sleep -Milliseconds 140 "
+            "} finally { $pngData.Dispose() } "
+            "} finally { $pngStream.Dispose(); $bmp.Dispose() } "
+            "} finally { $source.Dispose() }"
+        )
     return _run_powershell(script, timeout_s=12, sta=True)
 
 
@@ -6061,19 +11099,42 @@ exit 3
     return result
 
 
+def _desktop_try_window_message_image_paste(target_info: Dict[str, Any], mode_name: str) -> Dict[str, Any]:
+    hwnd = int((target_info or {}).get("hwnd") or 0)
+    if hwnd <= 0:
+        return {"exit_code": 3, "stdout": "", "stderr": "window_message_paste_unavailable"}
+    try:
+        _win_send_message()(wintypes.HWND(hwnd), 0x0302, wintypes.WPARAM(0), wintypes.LPARAM(0))
+        return {"exit_code": 0, "stdout": "", "stderr": "", "mode": mode_name}
+    except Exception as exc:
+        return {
+            "exit_code": 3,
+            "stdout": "",
+            "stderr": f"window_message_paste_failed: {type(exc).__name__}: {exc}",
+            "mode": mode_name,
+        }
+
+
 def _desktop_try_sendkeys_image_paste(target_info: Dict[str, Any], mode_name: str) -> Dict[str, Any]:
+    pid = int((target_info or {}).get("pid") or 0)
     window_title = str((target_info or {}).get("window_title") or "").strip()
-    if not window_title:
+    if pid <= 0 and not window_title:
         return {"exit_code": 3, "stdout": "", "stderr": "window_sendkeys_paste_unavailable"}
     quoted_title = _ps_single_quote(window_title)
     quoted_mode = _ps_single_quote(mode_name)
     script = (
         "Add-Type -AssemblyName System.Windows.Forms; "
         "$wshell = New-Object -ComObject WScript.Shell; "
+        f"$pid = {pid}; "
         f"$title = {quoted_title}; "
         f"$mode = {quoted_mode}; "
         "$ok = $false; "
-        "try { $ok = [bool]$wshell.AppActivate($title) } catch { $ok = $false }; "
+        "if ($pid -gt 0) { "
+        "try { $ok = [bool]$wshell.AppActivate($pid) } catch { $ok = $false } "
+        "} "
+        "if (-not $ok -and -not [string]::IsNullOrWhiteSpace($title)) { "
+        "try { $ok = [bool]$wshell.AppActivate($title) } catch { $ok = $false } "
+        "} "
         "if ($ok) { "
         "Start-Sleep -Milliseconds 180; "
         "try { [System.Windows.Forms.SendKeys]::SendWait('^v'); $ok = $true } catch { $ok = $false } "
@@ -6101,15 +11162,23 @@ def _desktop_try_sendkeys_image_paste(target_info: Dict[str, Any], mode_name: st
 def _desktop_paste_image_file(path_for_windows: str) -> Dict[str, Any]:
     target_info = _desktop_foreground_target_info()
     target_process = str(target_info.get("process_name") or "").strip().lower()
-    result = _desktop_clipboard_set_image_file(path_for_windows)
+    target_family = str(target_info.get("target_family") or "").strip()
+    result = _desktop_clipboard_set_image_file(path_for_windows, target_family=target_family)
     result["target_process"] = target_process
-    result["target_family"] = str(target_info.get("target_family") or "").strip()
+    result["target_family"] = target_family
     result["target_label"] = str(target_info.get("target_label") or "").strip()
     if result.get("exit_code") != 0:
         return result
     _desktop_restore_foreground_window(int(target_info.get("hwnd") or 0))
     _desktop_release_alt_if_held()
     time.sleep(0.18)
+    if str(target_info.get("target_family") or "") == "paint":
+        message_result = _desktop_try_window_message_image_paste(target_info, "paint_window_message_paste")
+        message_result["target_process"] = target_process
+        message_result["target_family"] = str(target_info.get("target_family") or "").strip()
+        message_result["target_label"] = str(target_info.get("target_label") or "").strip()
+        if message_result.get("exit_code") == 0:
+            return message_result
     if str(target_info.get("target_family") or "") in {"powerpoint", "word"}:
         office_result = _desktop_try_office_image_paste(target_info)
         office_result["target_process"] = target_process
@@ -6117,8 +11186,9 @@ def _desktop_paste_image_file(path_for_windows: str) -> Dict[str, Any]:
         office_result["target_label"] = str(target_info.get("target_label") or "").strip()
         if office_result.get("exit_code") == 0:
             return office_result
-    if str(target_info.get("target_family") or "") in {"wps_presentation", "wps_document", "onenote"}:
+    if str(target_info.get("target_family") or "") in {"paint", "wps_presentation", "wps_document", "onenote"}:
         sendkeys_mode = {
+            "paint": "paint_sendkeys_paste",
             "wps_presentation": "wps_sendkeys_paste",
             "wps_document": "wps_sendkeys_paste",
             "onenote": "onenote_sendkeys_paste",
@@ -6131,10 +11201,19 @@ def _desktop_paste_image_file(path_for_windows: str) -> Dict[str, Any]:
             return sendkeys_result
         _desktop_restore_foreground_window(int(target_info.get("hwnd") or 0))
         time.sleep(0.12)
-    _send_vk_combo([VK_CONTROL], 0x56)
-    time.sleep(0.1)
-    result["mode"] = "clipboard_native_paste"
-    return result
+    try:
+        _send_vk_combo([VK_CONTROL], 0x56)
+        time.sleep(0.1)
+        result["mode"] = "clipboard_native_paste"
+        return result
+    except HTTPException:
+        sendkeys_result = _desktop_try_sendkeys_image_paste(target_info, "window_sendkeys_paste")
+        sendkeys_result["target_process"] = target_process
+        sendkeys_result["target_family"] = str(target_info.get("target_family") or "").strip()
+        sendkeys_result["target_label"] = str(target_info.get("target_label") or "").strip()
+        if sendkeys_result.get("exit_code") == 0:
+            return sendkeys_result
+        raise
 
 
 def _desktop_pick_shareable_host_file() -> str:
@@ -9895,6 +14974,42 @@ def auth_device_resume(request: Request, payload: Dict[str, Any] = Body(...)):
     return resp
 
 
+@app.post("/auth/device/refresh")
+def auth_device_refresh(request: Request, payload: Dict[str, Any] = Body(...)):
+    if not CODEX_AUTH_REQUIRED:
+        return {"ok": True, "auth_required": False}
+
+    _require_authenticated_request(request)
+    current_origin = (
+        str(getattr(request.url, "scheme", "http") or "http")
+        + "://"
+        + str(getattr(request.url, "hostname", "") or "").strip()
+        + (f":{int(getattr(request.url, 'port', 0) or 0)}" if int(getattr(request.url, "port", 0) or 0) else "")
+    )
+    refreshed = _reissue_trusted_device(
+        device_id=str(payload.get("device_id") or "").strip(),
+        name=str(payload.get("device_name") or payload.get("device_label") or "").strip(),
+        platform=str(payload.get("device_platform") or "android").strip(),
+        current_origin=current_origin,
+    )
+    resp = JSONResponse(
+        {
+            "ok": True,
+            "auth_required": CODEX_AUTH_REQUIRED,
+            **refreshed,
+        }
+    )
+    resp.set_cookie(
+        key=CODEX_AUTH_COOKIE,
+        value=CODEX_AUTH_TOKEN,
+        httponly=True,
+        secure=_cookie_secure_for_request(request),
+        samesite="lax",
+        max_age=60 * 60 * 24 * 30,
+    )
+    return resp
+
+
 @app.get("/auth/pair/consume")
 def auth_pair_consume(request: Request, code: str = "", pair: str = "", direct: str = ""):
     """
@@ -10132,8 +15247,33 @@ def desktop_info(request: Request):
         "perf_mode_enabled": _desktop_perf_snapshot().get("enabled", False),
         "perf_mode_active": _desktop_perf_snapshot().get("active", False),
         **_desktop_stream_transport_payload(),
+        "active_target_id": str(_desktop_targets_payload().get("active_target", {}).get("id") or ""),
         **mon,
     }
+
+
+@app.get("/desktop/targets")
+def desktop_targets(request: Request):
+    _ensure_windows_host()
+    _require_authenticated_request(request)
+    return _desktop_targets_payload()
+
+
+@app.post("/desktop/targets/select")
+def desktop_targets_select(request: Request, payload: Dict[str, Any] = Body(...)):
+    _ensure_windows_host()
+    _require_authenticated_request(request)
+    return _desktop_select_target(payload.get("target_id"))
+
+
+@app.post("/desktop/targets/virtual")
+def desktop_targets_virtual(request: Request, payload: Dict[str, Any] = Body(...)):
+    _ensure_windows_host()
+    _require_authenticated_request(request)
+    raise HTTPException(
+        status_code=410,
+        detail="Virtual display targeting is not available in this build.",
+    )
 
 
 @app.get("/desktop/stream/capabilities")
@@ -10174,19 +15314,34 @@ def desktop_shot(
     aspect_ratio = _parse_stream_aspect(aspect)
     resolved_layout_mode = _parse_stream_layout_mode(layout_mode)
     target_size = _parse_stream_target_size(target_width, target_height)
-    rgb, out_size = _desktop_capture_rgb(
-        scale_factor=scale_factor,
-        grayscale=grayscale,
-        aspect_ratio=aspect_ratio,
-        layout_mode=resolved_layout_mode,
-        target_size=target_size,
-    )
-    frame_bytes, media_type = _desktop_encode_frame(rgb, out_size, stream_format, png_level, jpeg_quality)
-    return Response(
-        content=frame_bytes,
-        media_type=media_type,
-        headers={"Cache-Control": "no-store"},
-    )
+    try:
+        rgb, out_size = _desktop_capture_rgb(
+            scale_factor=scale_factor,
+            grayscale=grayscale,
+            aspect_ratio=aspect_ratio,
+            layout_mode=resolved_layout_mode,
+            target_size=target_size,
+        )
+        frame_bytes, media_type = _desktop_encode_frame(rgb, out_size, stream_format, png_level, jpeg_quality)
+        return Response(
+            content=frame_bytes,
+            media_type=media_type,
+            headers={"Cache-Control": "no-store"},
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        selected_target = _desktop_selected_target_item()
+        print(
+            "Desktop shot failed"
+            f" target={str(selected_target.get('id') or '').strip().lower() or 'unknown'}"
+            f" virtual={bool(selected_target.get('virtual'))}"
+            f" backend={_desktop_capture_backend()}"
+            f" error={type(exc).__name__}: {exc}",
+            flush=True,
+        )
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"desktop_shot_failed: {type(exc).__name__}: {exc}")
 
 @app.get("/desktop/stream")
 async def desktop_stream(
@@ -10265,156 +15420,6 @@ async def desktop_stream(
     )
 
 
-@app.get("/desktop/privacy-lock/status")
-def desktop_privacy_lock_status(request: Request):
-    _require_authenticated_request(request)
-    with PRIVACY_LOCK_LOCK:
-        payload = _privacy_lock_status_payload_unlocked()
-    return payload
-
-
-@app.post("/desktop/privacy-lock/config")
-def desktop_privacy_lock_config(request: Request, payload: Dict[str, Any] = Body(...)):
-    _ensure_windows_host()
-    _require_authenticated_request(request)
-    _require_local_client_request(request)
-    current_pin = str(payload.get("current_pin") or "").strip()
-    new_pin = str(payload.get("new_pin") or "").strip()
-    clear = _truthy_flag(payload.get("clear"))
-    with PRIVACY_LOCK_LOCK:
-        _load_privacy_lock_config_unlocked()
-        _load_privacy_lock_state_unlocked()
-        support = _privacy_lock_support_snapshot_unlocked()
-        if not bool(support.get("supported")):
-            raise HTTPException(status_code=503, detail=str(support.get("detail") or "Privacy lock is unavailable."))
-        pin_configured = bool(PRIVACY_LOCK_CONFIG_DATA.get("pin_configured"))
-        if clear:
-            if pin_configured and not _privacy_lock_verify_pin_unlocked(current_pin):
-                raise HTTPException(status_code=403, detail="Current PIN is incorrect.")
-            _privacy_lock_clear_pin_unlocked()
-            detail = "Privacy PIN cleared."
-        else:
-            if not new_pin:
-                raise HTTPException(status_code=400, detail="new_pin is required unless clear=true.")
-            if pin_configured and not _privacy_lock_verify_pin_unlocked(current_pin):
-                raise HTTPException(status_code=403, detail="Current PIN is incorrect.")
-            _privacy_lock_set_pin_unlocked(new_pin)
-            detail = "Privacy PIN saved."
-        status = _privacy_lock_status_payload_unlocked()
-    return {**status, "ok": True, "detail": detail}
-
-
-@app.post("/desktop/privacy-lock/lock")
-def desktop_privacy_lock_lock(request: Request, payload: Dict[str, Any] = Body(...)):
-    _ensure_windows_host()
-    trusted = _privacy_lock_require_trusted_device(request, payload)
-    lock_id = uuid.uuid4().hex
-    callback_token = secrets.token_urlsafe(24)
-    controller_port = int(getattr(request.url, "port", 0) or 48787)
-    with PRIVACY_LOCK_LOCK:
-        _load_privacy_lock_config_unlocked()
-        _load_privacy_lock_state_unlocked()
-        _privacy_lock_reconcile_unlocked()
-        support = _privacy_lock_support_snapshot_unlocked()
-        if not bool(support.get("supported")):
-            raise HTTPException(status_code=503, detail=str(support.get("detail") or "Privacy lock is unavailable."))
-        if not bool(PRIVACY_LOCK_CONFIG_DATA.get("pin_configured")):
-            raise HTTPException(status_code=400, detail="pin_not_configured")
-        if bool(PRIVACY_LOCK_STATE_DATA.get("active")):
-            owner_device_id = str(PRIVACY_LOCK_STATE_DATA.get("owner_device_id") or "").strip()
-            if owner_device_id and owner_device_id != str(trusted.get("id") or "").strip():
-                raise HTTPException(status_code=409, detail="Privacy lock is already owned by another device.")
-            return {
-                "ok": True,
-                "detail": "Privacy lock is already active.",
-                **_privacy_lock_status_payload_unlocked(),
-            }
-        PRIVACY_LOCK_STATE_DATA.update({
-            "active": True,
-            "mode": "hard",
-            "display_scope": "all",
-            "owner_device_id": str(trusted.get("id") or "").strip(),
-            "owner_device_name": str(trusted.get("name") or "").strip(),
-            "locked_at": time.time(),
-            "updated_at": time.time(),
-            "lock_id": lock_id,
-            "callback_token": callback_token,
-            "controller_port": controller_port,
-            "helper_pid": 0,
-            "helper_ready": False,
-            "helper_error": "",
-            "last_unlock_source": "",
-        })
-        _persist_privacy_lock_state_unlocked()
-    try:
-        helper_process = _launch_privacy_lock_helper(lock_id, callback_token, controller_port)
-    except Exception:
-        with PRIVACY_LOCK_LOCK:
-            _load_privacy_lock_state_unlocked()
-            if str(PRIVACY_LOCK_STATE_DATA.get("lock_id") or "").strip() == lock_id:
-                _privacy_lock_mark_unlocked_unlocked("helper_start_failed")
-        raise
-    with PRIVACY_LOCK_LOCK:
-        _load_privacy_lock_state_unlocked()
-        if str(PRIVACY_LOCK_STATE_DATA.get("lock_id") or "").strip() == lock_id:
-            PRIVACY_LOCK_STATE_DATA["helper_pid"] = int(getattr(helper_process, "pid", 0) or 0)
-            PRIVACY_LOCK_STATE_DATA["updated_at"] = time.time()
-            _persist_privacy_lock_state_unlocked()
-    try:
-        _wait_for_privacy_lock_helper_ready(lock_id, helper_process)
-    except Exception:
-        with PRIVACY_LOCK_LOCK:
-            _load_privacy_lock_state_unlocked()
-            if str(PRIVACY_LOCK_STATE_DATA.get("lock_id") or "").strip() == lock_id:
-                _privacy_lock_mark_unlocked_unlocked("helper_start_failed")
-        raise
-    with PRIVACY_LOCK_LOCK:
-        status = _privacy_lock_status_payload_unlocked()
-    return {**status, "ok": True, "detail": "Privacy lock enabled."}
-
-
-@app.post("/desktop/privacy-lock/unlock")
-def desktop_privacy_lock_unlock(request: Request, payload: Dict[str, Any] = Body(...)):
-    _ensure_windows_host()
-    trusted = _privacy_lock_require_trusted_device(request, payload)
-    with PRIVACY_LOCK_LOCK:
-        _load_privacy_lock_state_unlocked()
-        _load_privacy_lock_config_unlocked()
-        _privacy_lock_reconcile_unlocked()
-        if not bool(PRIVACY_LOCK_STATE_DATA.get("active")):
-            return {"ok": True, "detail": "Privacy lock is already inactive.", **_privacy_lock_status_payload_unlocked()}
-        owner_device_id = str(PRIVACY_LOCK_STATE_DATA.get("owner_device_id") or "").strip()
-        if owner_device_id and owner_device_id != str(trusted.get("id") or "").strip():
-            raise HTTPException(status_code=403, detail="Only the device that locked the laptop can unlock it remotely.")
-        _privacy_lock_mark_unlocked_unlocked("remote")
-        status = _privacy_lock_status_payload_unlocked()
-    return {**status, "ok": True, "detail": "Privacy lock disabled."}
-
-
-@app.post("/desktop/privacy-lock/internal/release")
-def desktop_privacy_lock_internal_release(request: Request, payload: Dict[str, Any] = Body(...)):
-    _ensure_windows_host()
-    _require_local_client_request(request)
-    lock_id = str(payload.get("lock_id") or "").strip()
-    callback_token = str(payload.get("callback_token") or "").strip()
-    source = str(payload.get("source") or "local_pin").strip()
-    with PRIVACY_LOCK_LOCK:
-        _load_privacy_lock_state_unlocked()
-        _load_privacy_lock_config_unlocked()
-        _privacy_lock_reconcile_unlocked()
-        if not bool(PRIVACY_LOCK_STATE_DATA.get("active")):
-            status = _privacy_lock_status_payload_unlocked()
-            return {**status, "ok": True, "detail": "Privacy lock is already inactive."}
-        if lock_id and str(PRIVACY_LOCK_STATE_DATA.get("lock_id") or "").strip() != lock_id:
-            raise HTTPException(status_code=403, detail="Lock id mismatch.")
-        expected_token = str(PRIVACY_LOCK_STATE_DATA.get("callback_token") or "").strip()
-        if not expected_token or not callback_token or not secrets.compare_digest(callback_token, expected_token):
-            raise HTTPException(status_code=403, detail="Invalid privacy lock callback token.")
-        _privacy_lock_mark_unlocked_unlocked(source or "local_pin")
-        status = _privacy_lock_status_payload_unlocked()
-    return {**status, "ok": True, "detail": "Privacy lock released locally."}
-
-
 @app.post("/desktop/mode")
 def desktop_mode(request: Request, payload: Dict[str, Any] = Body(...)):
     enabled = _set_desktop_global_enabled(_truthy_flag(payload.get("enabled")))
@@ -10447,6 +15452,7 @@ def desktop_perf_mode(payload: Dict[str, Any] = Body(...)):
 def desktop_input_move(request: Request, payload: Dict[str, Any] = Body(...)):
     _ensure_windows_host()
     _require_desktop_enabled(request)
+    _host_keep_awake_pulse(force=True)
     x = int(payload.get("x", 0))
     y = int(payload.get("y", 0))
     p = _desktop_point(x, y)
@@ -10457,24 +15463,49 @@ def desktop_input_move(request: Request, payload: Dict[str, Any] = Body(...)):
 def desktop_input_click(request: Request, payload: Dict[str, Any] = Body(...)):
     _ensure_windows_host()
     _require_desktop_enabled(request)
+    _host_keep_awake_pulse(force=True)
     alt_held_before_click = _desktop_alt_held()
     x = payload.get("x")
     y = payload.get("y")
     button = (payload.get("button") or "left").strip().lower()
     double = bool(payload.get("double", False))
     action = (payload.get("action") or "click").strip().lower()
+    screen_x = None
+    screen_y = None
+    via = "desktop"
     if x is not None and y is not None:
         p = _desktop_point(int(x), int(y))
-        _desktop_move_abs(p["x"], p["y"])
-    _desktop_click(button=button, double=double, action=action)
+        screen_x = int(p["x"])
+        screen_y = int(p["y"])
+    if screen_x is not None and screen_y is not None:
+        caption_command = None
+        if button == "left" and not double and action == "click":
+            caption_command = _desktop_caption_syscommand_at(screen_x, screen_y)
+        if caption_command:
+            via = f"desktop_caption_{caption_command}"
+        else:
+            _desktop_click_at(screen_x, screen_y, button=button, double=double, action=action)
+    else:
+        _desktop_click(button=button, double=double, action=action)
+    logging.info(
+        "desktop_input_click x=%s y=%s screen_x=%s screen_y=%s button=%s action=%s via=%s",
+        x,
+        y,
+        screen_x,
+        screen_y,
+        button,
+        action,
+        via,
+    )
     if alt_held_before_click:
         _desktop_release_alt_if_held()
-    return {"ok": True, "button": button, "double": double, "action": action, "alt_held": _desktop_alt_held()}
+    return {"ok": True, "button": button, "double": double, "action": action, "via": via, "alt_held": _desktop_alt_held()}
 
 @app.post("/desktop/input/scroll")
 def desktop_input_scroll(request: Request, payload: Dict[str, Any] = Body(...)):
     _ensure_windows_host()
     _require_desktop_enabled(request)
+    _host_keep_awake_pulse(force=True)
     _desktop_release_alt_if_held()
     delta = int(payload.get("delta", 0))
     if delta == 0:
@@ -10486,6 +15517,7 @@ def desktop_input_scroll(request: Request, payload: Dict[str, Any] = Body(...)):
 def desktop_input_type(request: Request, payload: Dict[str, Any] = Body(...)):
     _ensure_windows_host()
     _require_desktop_enabled(request)
+    _host_keep_awake_pulse(force=True)
     _desktop_release_alt_if_held()
     text = (payload.get("text") or "")
     if not text:
@@ -10502,6 +15534,7 @@ def desktop_input_text(request: Request, payload: Dict[str, Any] = Body(...)):
     """
     _ensure_windows_host()
     _require_desktop_enabled(request)
+    _host_keep_awake_pulse(force=True)
     _desktop_release_alt_if_held()
     text = payload.get("text")
     if not isinstance(text, str):
@@ -10510,7 +15543,7 @@ def desktop_input_text(request: Request, payload: Dict[str, Any] = Body(...)):
         return {"ok": True, "sent": 0, "alt_held": _desktop_alt_held()}
     if len(text) > 20000:
         raise HTTPException(status_code=400, detail="text too long (max 20000).")
-    sent = _send_unicode_text_chunked(text, chunk_size=240)
+    sent = _send_text_native_first(text, unicode_chunk_size=240)
     return {"ok": True, "sent": sent, "alt_held": _desktop_alt_held()}
 
 @app.post("/desktop/input/edit")
@@ -10522,6 +15555,7 @@ def desktop_input_edit(request: Request, payload: Dict[str, Any] = Body(...)):
     """
     _ensure_windows_host()
     _require_desktop_enabled(request)
+    _host_keep_awake_pulse(force=True)
     _desktop_release_alt_if_held()
     backspace = int(payload.get("backspace", 0) or 0)
     text = payload.get("text") or ""
@@ -10533,17 +15567,21 @@ def desktop_input_edit(request: Request, payload: Dict[str, Any] = Body(...)):
         raise HTTPException(status_code=400, detail="backspace too large (max 200).")
     if len(text) > 500:
         raise HTTPException(status_code=400, detail="text too long (max 500).")
+    def _apply_edit() -> int:
+        if backspace:
+            _send_vk_repeat(VK_BACK, backspace)
+        if text:
+            return _send_text_native_first(text, unicode_chunk_size=240)
+        return 0
 
-    if backspace:
-        _send_vk_repeat(VK_BACK, backspace)
-    if text:
-        _send_unicode_text(text)
-    return {"ok": True, "backspace": backspace, "sent": len(text), "alt_held": _desktop_alt_held()}
+    sent = _apply_edit()
+    return {"ok": True, "backspace": backspace, "sent": sent, "alt_held": _desktop_alt_held()}
 
 @app.post("/desktop/input/key")
 def desktop_input_key(request: Request, payload: Dict[str, Any] = Body(...)):
     _ensure_windows_host()
     _require_desktop_enabled(request)
+    _host_keep_awake_pulse(force=True)
     key = (payload.get("key") or "").strip()
     if not key:
         raise HTTPException(status_code=400, detail="key is required.")
@@ -10578,6 +15616,7 @@ async def desktop_webrtc_offer(request: Request, payload: Optional[Dict[str, Any
     transport = _desktop_stream_transport_payload()
     if not transport["desktop_webrtc_enabled"]:
         raise HTTPException(status_code=503, detail=transport["desktop_webrtc_detail"])
+    await _desktop_webrtc_evict_stale_sessions_for_new_offer()
     if len(DESKTOP_WEBRTC_SESSIONS) >= DESKTOP_WEBRTC_MAX_SESSIONS:
         raise HTTPException(status_code=429, detail="Too many active WebRTC desktop sessions.")
 
@@ -10721,6 +15760,11 @@ async def desktop_webrtc_local_ice(session_id: str):
     }
 
 
+@app.get("/desktop/webrtc/ice/{session_id}")
+async def desktop_webrtc_local_ice_legacy(session_id: str):
+    return await desktop_webrtc_local_ice(session_id)
+
+
 @app.post("/desktop/webrtc/ice")
 async def desktop_webrtc_ice(payload: Optional[Dict[str, Any]] = Body(default=None)):
     _ensure_windows_host()
@@ -10748,6 +15792,13 @@ async def desktop_webrtc_close(session_id: str):
     cleaned = _desktop_webrtc_payload_session_id(session_id)
     await _desktop_webrtc_close_session(cleaned)
     return {"ok": True, "session_id": cleaned}
+
+
+@app.delete("/desktop/webrtc/sessions")
+async def desktop_webrtc_close_all():
+    _ensure_windows_host()
+    closed = await _desktop_webrtc_close_all_sessions()
+    return {"ok": True, "closed": closed}
 
 
 @app.get("/power/status")
@@ -10897,6 +15948,542 @@ def thread_add_message(thread_id: str, payload: Dict[str, Any] = Body(...)):
         thread["updated_at"] = max(int(thread.get("updated_at") or 0), at, _now_ms())
         _persist_threads_store_unlocked()
     return {"ok": True, "message": message}
+
+
+@app.get("/windows/runtime/status")
+def windows_runtime_status():
+    return {"ok": True, **_windows_runtime_status_payload()}
+
+
+@app.post("/windows/runtime/start")
+def windows_runtime_start():
+    if not _windows_runtime_supported():
+        return {"ok": False, **_windows_runtime_status_payload()}
+    with WINDOWS_RUNTIME_LOCK:
+        global WINDOWS_RUNTIME_ACTIVE
+        WINDOWS_RUNTIME_ACTIVE = True
+    return {"ok": True, **_windows_runtime_status_payload()}
+
+
+@app.post("/windows/runtime/stop")
+def windows_runtime_stop():
+    if not _windows_runtime_supported():
+        return {"ok": False, **_windows_runtime_status_payload()}
+    _windows_runtime_stop_all_sessions("stopped")
+    with WINDOWS_RUNTIME_LOCK:
+        global WINDOWS_RUNTIME_ACTIVE
+        WINDOWS_RUNTIME_ACTIVE = False
+    return {"ok": True, **_windows_runtime_status_payload()}
+
+
+@app.get("/windows/sessions")
+def windows_sessions_live():
+    _host_keep_awake_pulse()
+    with WINDOWS_SESSIONS_LOCK:
+        live = [
+            _windows_session_public_record(entry)
+            for entry in WINDOWS_SESSIONS.values()
+        ]
+        recent_closed = [dict(item) for item in WINDOWS_RECENT_CLOSED]
+    live.sort(key=lambda item: str(item.get("session") or ""))
+    return {
+        "ok": True,
+        "sessions": live,
+        "recent_closed": recent_closed,
+        "meta": {
+            "total_sessions": len(live),
+            "total_recent_closed": len(recent_closed),
+            "background_mode": WINDOWS_SESSION_BACKGROUND_MODE,
+            "summary_updated_at": time.time(),
+        },
+    }
+
+
+@app.post("/windows/session")
+def windows_session_create(payload: Optional[Dict[str, Any]] = Body(default=None)):
+    payload = payload or {}
+    status = _windows_runtime_status_payload()
+    if not _windows_runtime_supported():
+        return {"ok": False, **status}
+    if status.get("state") != "running":
+        raise HTTPException(status_code=409, detail="Windows runtime is stopped. Start it before creating SSH sessions.")
+
+    name_raw = str(payload.get("name") or "").strip()
+    if name_raw:
+        name = _safe_name(name_raw)
+        if not name.startswith("win_"):
+            name = f"win_{name}"
+    else:
+        name = f"win_{uuid.uuid4().hex[:8]}"
+    name = _validate_session_name(name)
+    profile = _windows_session_profile(payload.get("profile"))
+    cwd = _windows_normalize_cwd(payload.get("cwd"))
+    model = _normalize_codex_model(payload.get("model")) if profile == "codex" else profile
+    reasoning_effort = (
+        _normalize_reasoning_effort(
+            payload.get("reasoning_effort") or payload.get("model_reasoning_effort"),
+            model=model,
+        )
+        if profile == "codex"
+        else ""
+    )
+    argv = _windows_session_spawn_argv(profile, model if profile == "codex" else "", reasoning_effort)
+    try:
+        process = PtyProcess.spawn(
+            argv,
+            cwd=cwd,
+            env=os.environ.copy(),
+            dimensions=(32, 120),
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Could not start Windows session: {type(exc).__name__}: {exc}")
+
+    now = time.time()
+    entry = {
+        "session": name,
+        "pane_id": "winpty",
+        "current_command": _windows_session_command_label(profile),
+        "cwd": cwd,
+        "state": "starting",
+        "updated_at": now,
+        "last_seen_at": now,
+        "snippet": "",
+        "last_text": "",
+        "profile": profile,
+        "model": model,
+        "reasoning_effort": reasoning_effort,
+        "process": process,
+        "io_lock": threading.Lock(),
+    }
+    with WINDOWS_SESSIONS_LOCK:
+        if name in WINDOWS_SESSIONS:
+            try:
+                process.terminate(force=True)
+            except Exception:
+                pass
+            return {"ok": False, "error": "session_exists", "detail": f"Windows session '{name}' already exists."}
+        WINDOWS_SESSIONS[name] = entry
+    reader = threading.Thread(target=_windows_session_reader, args=(name,), name=f"codrex-winpty-{name}", daemon=True)
+    with WINDOWS_SESSIONS_LOCK:
+        current = WINDOWS_SESSIONS.get(name)
+        if current is not None:
+            current["reader_thread"] = reader
+    reader.start()
+    return {
+        "ok": True,
+        "session": name,
+        "cwd": cwd,
+        "model": model,
+        "reasoning_effort": reasoning_effort,
+        "profile": profile,
+    }
+
+
+@app.delete("/windows/session/{session}")
+def windows_session_close(session: str):
+    session_id = _validate_session_name(session)
+    entry = _windows_session_entry(session_id)
+    process = entry.get("process")
+    try:
+        if process is not None:
+            process.terminate(force=True)
+    except Exception:
+        pass
+    closed = _windows_session_finalize(session_id, "closed")
+    if not closed:
+        # The reader thread can finalize the session immediately after terminate().
+        # Treat that race as a successful close rather than surfacing a false error.
+        return {"ok": True, "session": session_id, "detail": "Windows session closed."}
+    return {"ok": True, "session": session_id}
+
+
+@app.post("/windows/session/{session}/send")
+def windows_session_send(session: str, body: str = Body(..., media_type="text/plain")):
+    session_id = _validate_session_name(session)
+    text = str(body or "").replace("\r\n", "\n")
+    if not text.strip():
+        raise HTTPException(status_code=400, detail="Prompt text is required.")
+    entry = _windows_session_entry(session_id)
+    profile = str(entry.get("profile") or "codex")
+    _host_keep_awake_pulse(force=True)
+    _windows_session_write(session_id, text)
+    _windows_session_write(session_id, "\r\n\r\n" if profile == "codex" else "\r\n")
+    if profile == "codex":
+        _telegram_windows_mirror_send_prompt(
+            session_id,
+            text,
+            current_command=str(entry.get("current_command") or "codex"),
+        )
+    return {"ok": True, "session": session_id}
+
+
+@app.post("/windows/session/{session}/enter")
+def windows_session_enter(session: str):
+    session_id = _validate_session_name(session)
+    _host_keep_awake_pulse(force=True)
+    _windows_session_write(session_id, "\r\n")
+    return {"ok": True, "session": session_id}
+
+
+@app.post("/windows/session/{session}/key")
+def windows_session_key(session: str, payload: Dict[str, Any] = Body(...)):
+    session_id = _validate_session_name(session)
+    raw_key = str((payload or {}).get("key") or "").strip().lower()
+    key_map = {
+        "up": "\x1b[A",
+        "down": "\x1b[B",
+        "left": "\x1b[D",
+        "right": "\x1b[C",
+        "arrowup": "\x1b[A",
+        "arrowdown": "\x1b[B",
+        "arrowleft": "\x1b[D",
+        "arrowright": "\x1b[C",
+        "backspace": "\b",
+    }
+    value = key_map.get(raw_key)
+    if not value:
+        raise HTTPException(status_code=400, detail="Unsupported key. Use: up, down, left, right, backspace.")
+    _host_keep_awake_pulse(force=True)
+    _windows_session_write(session_id, value)
+    return {"ok": True, "session": session_id, "key": raw_key}
+
+
+@app.post("/windows/session/{session}/ctrlc")
+def windows_session_ctrlc(session: str):
+    session_id = _validate_session_name(session)
+    entry = _windows_session_entry(session_id)
+    process = entry.get("process")
+    if process is None:
+        raise HTTPException(status_code=409, detail=f"Windows session '{session_id}' is not writable.")
+    _host_keep_awake_pulse(force=True)
+    io_lock = entry.get("io_lock")
+    with io_lock:
+        try:
+            process.sendcontrol("c")
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"Could not send Ctrl+C: {type(exc).__name__}: {exc}")
+    return {"ok": True, "session": session_id}
+
+
+@app.post("/windows/session/{session}/interrupt")
+def windows_session_interrupt(session: str):
+    session_id = _validate_session_name(session)
+    _host_keep_awake_pulse(force=True)
+    _windows_session_write(session_id, "\x1b")
+    return {"ok": True, "session": session_id}
+
+
+@app.get("/windows/session/{session}/screen")
+def windows_session_screen(session: str):
+    session_id = _validate_session_name(session)
+    _host_keep_awake_pulse(force=True)
+    entry = _windows_session_entry(session_id)
+    text = str(entry.get("last_text") or "")
+    current_command = str(entry.get("current_command") or "")
+    state = (
+        _infer_progress_state(text, current_command)
+        if str(entry.get("profile") or "") == "codex"
+        else ("running" if text or entry.get("process") else "starting")
+    )
+    with WINDOWS_SESSIONS_LOCK:
+        live_entry = WINDOWS_SESSIONS.get(session_id)
+        if live_entry is not None:
+            live_entry.update({
+                "state": state,
+                "updated_at": time.time(),
+                "last_seen_at": time.time(),
+                "snippet": _windows_session_snippet(text),
+            })
+    _publish_windows_session_stream_snapshot(
+        session_id,
+        text,
+        screen_state=state,
+        current_command=current_command,
+    )
+    return {
+        "ok": True,
+        "session": session_id,
+        "pane_id": "winpty",
+        "current_command": current_command,
+        "state": state,
+        "text": text,
+    }
+
+
+@app.websocket("/windows/session/{session}/ws")
+async def windows_session_stream(websocket: WebSocket, session: str):
+    session_id = str(session or "").strip()
+    try:
+        session_id = _validate_session_name(session_id)
+    except HTTPException as exc:
+        await websocket.accept()
+        await websocket.send_json({"ok": False, "type": "error", "detail": exc.detail})
+        await websocket.close(code=4400)
+        return
+
+    await websocket.accept()
+    if not _is_valid_auth_token(_auth_token_from_websocket(websocket)):
+        await websocket.send_json({"ok": False, "type": "error", "detail": "Login required."})
+        await websocket.close(code=4401)
+        return
+
+    selected_profile = str(websocket.query_params.get("profile") or "balanced").strip().lower()
+    if selected_profile not in {"fast", "balanced", "battery"}:
+        selected_profile = "balanced"
+    try:
+        since_seq = int(str(websocket.query_params.get("since_seq") or "0").strip() or "0")
+    except Exception:
+        since_seq = 0
+    interval_ms = _session_stream_interval_ms(selected_profile)
+    last_keepalive = 0.0
+
+    try:
+        _host_keep_awake_pulse(force=True)
+        with WINDOWS_SESSION_STREAM_LOCK:
+            state = _windows_session_stream_state_unlocked(session_id)
+            hello_payload = _windows_session_stream_event_payload(
+                session=session_id,
+                seq=int(state.get("seq") or 0),
+                event_type="hello",
+                text="",
+                profile=selected_profile,
+                detail="connected",
+            )
+        await websocket.send_json({"ok": True, **hello_payload})
+
+        replay_events, replay_snapshot = _windows_session_stream_replay(session_id, since_seq)
+        for event in replay_events:
+            await websocket.send_json({"ok": True, **event})
+        if replay_snapshot:
+            await websocket.send_json({"ok": True, **replay_snapshot})
+
+        if not replay_events and not replay_snapshot:
+            try:
+                entry = _windows_session_entry(session_id)
+            except HTTPException:
+                entry = None
+            if entry is not None:
+                text = str(entry.get("last_text") or "")
+                current_command = str(entry.get("current_command") or "")
+                state_value = str(entry.get("state") or "starting")
+                event = await asyncio.to_thread(
+                    _publish_windows_session_stream_snapshot,
+                    session_id,
+                    text,
+                    screen_state=state_value,
+                    current_command=current_command,
+                )
+                if event:
+                    await websocket.send_json({"ok": True, **event, "profile": selected_profile})
+
+        while True:
+            _host_keep_awake_pulse()
+            pending: List[Dict[str, Any]] = []
+            with WINDOWS_SESSION_STREAM_LOCK:
+                stream_state = _windows_session_stream_state_unlocked(session_id)
+                for event in stream_state.get("events") or []:
+                    if int(event.get("seq") or 0) > since_seq:
+                        pending.append(dict(event))
+            if pending:
+                for event in pending:
+                    since_seq = max(since_seq, int(event.get("seq") or 0))
+                    await websocket.send_json({"ok": True, **event})
+                last_keepalive = time.time()
+            elif time.time() - last_keepalive > 10:
+                entry = None
+                try:
+                    entry = _windows_session_entry(session_id)
+                except HTTPException:
+                    entry = None
+                await websocket.send_json(
+                    {
+                        "ok": True,
+                        **_windows_session_stream_event_payload(
+                            session=session_id,
+                            seq=since_seq,
+                            event_type="keepalive",
+                            text="",
+                            profile=selected_profile,
+                            detail="idle",
+                            state=str((entry or {}).get("state") or "done"),
+                            current_command=str((entry or {}).get("current_command") or ""),
+                        ),
+                    }
+                )
+                last_keepalive = time.time()
+            await asyncio.sleep(interval_ms / 1000.0)
+    except WebSocketDisconnect:
+        return
+
+
+@app.get("/desktop-codex/runtime/status")
+def desktop_codex_runtime_status():
+    return _desktop_codex_runtime_status_payload()
+
+
+@app.get("/desktop-codex/sessions")
+def desktop_codex_sessions():
+    _host_keep_awake_pulse()
+    sessions = _desktop_codex_fetch_sessions()
+    return {
+        "ok": True,
+        "sessions": sessions,
+        "recent_closed": [],
+        "meta": {
+            "total_sessions": len(sessions),
+            "total_recent_closed": 0,
+            "background_mode": "selected_only",
+            "summary_updated_at": time.time(),
+        },
+        "detail": _desktop_codex_sessions_detail(),
+    }
+
+
+@app.get("/desktop-codex/session/{session}/screen")
+def desktop_codex_session_screen(session: str):
+    session_entry = _desktop_codex_session_entry(session)
+    transcript = _desktop_codex_render_transcript(str(session_entry.get("rollout_path") or ""))
+    active_job = _desktop_codex_job_snapshot(str(session_entry.get("session") or ""))
+    state = transcript.get("state") or session_entry.get("state") or "idle"
+    if _desktop_codex_is_job_active(active_job):
+        state = "busy"
+    return {
+        "ok": True,
+        "session": session_entry.get("session"),
+        "pane_id": session_entry.get("pane_id"),
+        "current_command": session_entry.get("current_command"),
+        "state": state,
+        "text": transcript.get("text") or "",
+        "detail": (
+            "Attached to the shared Codex Desktop thread transcript. Sends go through the private Windows app-server."
+            if _desktop_codex_write_supported()
+            else "Read-only mirror of the shared Codex Desktop thread transcript."
+        ),
+        "title": session_entry.get("title") or session_entry.get("session"),
+        "read_only": not _desktop_codex_write_supported(),
+    }
+
+
+@app.post("/desktop-codex/session/{session}/send")
+def desktop_codex_session_send(session: str, text: str = Body(..., media_type="text/plain")):
+    _host_keep_awake_pulse()
+    session_entry = _desktop_codex_session_entry(session)
+    started = _desktop_codex_start_app_server_resume(session_entry, text)
+    return {
+        "ok": True,
+        "session": session_entry.get("session"),
+        "detail": "Desktop Codex app-server turn started.",
+        "started_at": started.get("started_at"),
+        "turn_id": started.get("turn_id"),
+    }
+
+
+@app.post("/desktop-codex/session/{session}/interrupt")
+def desktop_codex_session_interrupt(session: str):
+    session_id = _validate_session_name(session)
+    stopped = _desktop_codex_interrupt_sidecar_resume(session_id)
+    if not stopped:
+        return {
+            "ok": False,
+            "error": "not_running",
+            "detail": "No active Desktop Codex app-server turn is running for this thread.",
+        }
+    return {
+        "ok": True,
+        "session": session_id,
+        "detail": "Desktop Codex app-server turn interrupted.",
+    }
+
+
+@app.post("/desktop-codex/session/{session}/open")
+def desktop_codex_session_open(session: str):
+    session_id = _validate_session_name(session)
+    _desktop_codex_open_thread(session_id)
+    return {
+        "ok": True,
+        "session": session_id,
+        "detail": "Opened the desktop Codex app on this thread.",
+    }
+
+
+@app.post("/desktop-codex/session/{session}/refresh")
+def desktop_codex_session_refresh(session: str):
+    session_id = _validate_session_name(session)
+    _desktop_codex_refresh_thread(session_id)
+    return {
+        "ok": True,
+        "session": session_id,
+        "detail": "Requested a desktop Codex thread refresh.",
+    }
+
+
+@app.websocket("/desktop-codex/session/{session}/ws")
+async def desktop_codex_session_stream(websocket: WebSocket, session: str):
+    session_id = str(session or "").strip()
+    try:
+        session_entry = _desktop_codex_session_entry(session_id)
+    except HTTPException as exc:
+        await websocket.accept()
+        await websocket.send_json({"ok": False, "type": "error", "detail": exc.detail})
+        await websocket.close(code=4404)
+        return
+
+    await websocket.accept()
+    if not _is_valid_auth_token(_auth_token_from_websocket(websocket)):
+        await websocket.send_json({"ok": False, "type": "error", "detail": "Login required."})
+        await websocket.close(code=4401)
+        return
+
+    rollout_path = str(session_entry.get("rollout_path") or "")
+    seq = 0
+    last_text = ""
+    last_state = ""
+    last_keepalive = 0.0
+
+    try:
+        while True:
+            _host_keep_awake_pulse()
+            transcript = await asyncio.to_thread(_desktop_codex_render_transcript, rollout_path)
+            next_text = str(transcript.get("text") or "")
+            next_state = str(transcript.get("state") or session_entry.get("state") or "idle")
+            if next_text != last_text or next_state != last_state:
+                seq += 1
+                await websocket.send_json(
+                    {
+                        "ok": True,
+                        "session": session_id,
+                        "pane_id": session_id,
+                        "seq": seq,
+                        "type": "snapshot" if seq == 1 else "replace",
+                        "text": next_text,
+                        "state": next_state,
+                        "current_command": str(session_entry.get("current_command") or "Codex Desktop"),
+                        "detail": "read_only",
+                        "ts": time.time(),
+                    }
+                )
+                last_text = next_text
+                last_state = next_state
+                last_keepalive = time.time()
+            elif time.time() - last_keepalive > 10.0:
+                await websocket.send_json(
+                    {
+                        "ok": True,
+                        "session": session_id,
+                        "pane_id": session_id,
+                        "seq": seq,
+                        "type": "keepalive",
+                        "text": "",
+                        "state": next_state or "idle",
+                        "current_command": str(session_entry.get("current_command") or "Codex Desktop"),
+                        "detail": "idle",
+                        "ts": time.time(),
+                    }
+                )
+                last_keepalive = time.time()
+            await asyncio.sleep(DESKTOP_CODEX_STREAM_POLL_SECONDS)
+    except WebSocketDisconnect:
+        return
 
 
 @app.get("/codex/options")
@@ -11401,6 +16988,14 @@ def codex_session_send(session: str, text: str = Body(..., media_type="text/plai
                 "active": True,
             },
         )
+    with LOOP_CONTROL_LOCK:
+        _load_loop_control_unlocked()
+        state = _get_loop_session_unlocked(session)
+        state["awaiting_reply"] = False
+        state["last_prompt_at"] = _now_ms()
+        state["last_handled_fingerprint"] = ""
+        _loop_commit_session_state_unlocked(session, state)
+        _persist_loop_control_unlocked()
     out: Dict[str, Any] = {"ok": True, "session": session}
     if repair_applied:
         out["profile_repaired"] = True
@@ -11533,6 +17128,7 @@ def codex_session_key(session: str, payload: Dict[str, Any] = Body(...)):
 @app.get("/codex/session/{session}/screen")
 def codex_session_screen(session: str):
     session = _validate_session_name(session)
+    _host_keep_awake_pulse(force=True)
     pane = _session_pane(session)
     if not pane:
         with SESSIONS_LOCK:
@@ -11643,6 +17239,7 @@ async def codex_session_stream(websocket: WebSocket, session: str):
     waiting_for_pane = False
 
     try:
+        _host_keep_awake_pulse(force=True)
         with SESSION_STREAM_LOCK:
             state = _session_stream_state_unlocked(session_id)
             hello_payload = _session_stream_event_payload(
@@ -11681,6 +17278,7 @@ async def codex_session_stream(websocket: WebSocket, session: str):
                         await websocket.send_json({"ok": True, **event, "profile": selected_profile})
 
         while True:
+            _host_keep_awake_pulse()
             pane = _session_pane(session_id)
             if not pane:
                 if not waiting_for_pane:
@@ -11779,6 +17377,7 @@ async def codex_session_stream(websocket: WebSocket, session: str):
 
 @app.get("/codex/sessions")
 def codex_sessions_live():
+    _host_keep_awake_pulse()
     panes = _tmux_list_panes()
     live: List[Dict[str, Any]] = []
     now = time.time()
@@ -11811,6 +17410,8 @@ def codex_sessions_live():
         resume_id = _resolve_session_resume_id(session, prev)
         if resume_id:
             item["resume_id"] = resume_id
+        with LOOP_CONTROL_LOCK:
+            item["loop"] = _public_loop_session_state_unlocked(session)
         live.append(item)
         with SESSIONS_LOCK:
             SESSIONS[session] = {**prev, **item}
@@ -11869,6 +17470,8 @@ def codex_sessions_live():
         resume_id = _resolve_session_resume_id(session, prev)
         if resume_id:
             fallback_item["resume_id"] = resume_id
+        with LOOP_CONTROL_LOCK:
+            fallback_item["loop"] = _public_loop_session_state_unlocked(session)
         live.append(fallback_item)
         with SESSION_HISTORY_LOCK:
             _upsert_session_history_unlocked(
@@ -11894,7 +17497,10 @@ def codex_sessions_live():
                 resume_id = _resolve_session_resume_id(session, item)
                 if resume_id:
                     item["resume_id"] = resume_id
-            recent_closed.append(_public_session_record(item))
+            public_item = _public_session_record(item)
+            with LOOP_CONTROL_LOCK:
+                public_item["loop"] = _public_loop_session_state_unlocked(session)
+            recent_closed.append(public_item)
     return {
         "ok": True,
         "sessions": live,
@@ -12060,6 +17666,8 @@ async def desktop_paste_image(
 ):
     _ensure_windows_host()
     _require_desktop_enabled(request)
+    _host_keep_awake_pulse(force=True)
+    _desktop_release_alt_if_held()
     os.makedirs(CODEX_HOST_PASTE_CACHE_DIR, exist_ok=True)
     file_name = file.filename or "image.png"
     target_path = _host_unique_target_path(CODEX_HOST_PASTE_CACHE_DIR, file_name)
@@ -12077,7 +17685,11 @@ async def desktop_paste_image(
         except Exception:
             pass
         raise HTTPException(status_code=500, detail=f"Failed to stage desktop image paste: {type(exc).__name__}: {exc}")
-    pasted = _desktop_paste_image_file(target_path)
+    pasted, paste_diag = _desktop_run_remote_action(
+        "desktop_paste_image",
+        lambda: _desktop_paste_image_file(target_path),
+        capture_probe=True,
+    )
     if pasted.get("exit_code") != 0:
         return {
             "ok": False,
@@ -12089,6 +17701,7 @@ async def desktop_paste_image(
             "target_family": str(pasted.get("target_family") or "").strip(),
             "target_label": str(pasted.get("target_label") or "").strip(),
             "paste_strategy": str(pasted.get("mode") or "").strip(),
+            "diagnostics": paste_diag,
         }
     target_process = str(pasted.get("target_process") or "").strip()
     target_family = str(pasted.get("target_family") or "").strip().lower()
@@ -12121,6 +17734,7 @@ async def desktop_paste_image(
         "target_family": target_family,
         "target_label": target_label,
         "paste_strategy": paste_strategy,
+        "diagnostics": paste_diag,
     }
 
 
@@ -12639,7 +18253,7 @@ def legacy_codex_screen(session: str = ""):
 @app.get("/shot")
 def shot():
     with mss() as sct:
-        mon = sct.monitors[1]
+        mon = _desktop_monitor()
         img = sct.grab(mon)
         png_bytes = to_png(img.rgb, img.size)
         return Response(
@@ -12978,6 +18592,92 @@ def telegram_send_text(payload: Optional[Dict[str, Any]] = Body(default=None)):
             else (telegram_result.get("detail") or telegram_result.get("error") or "Telegram send failed.")
         ),
     }
+
+
+@app.get("/loop/status")
+def loop_status():
+    _ensure_loop_control_worker()
+    with LOOP_CONTROL_LOCK:
+        _load_loop_control_unlocked()
+        settings = _public_loop_settings_unlocked()
+        worker = dict(LOOP_CONTROL_DATA.get("worker") or {})
+    return {
+        "ok": True,
+        "settings": settings,
+        "worker": {
+            "alive": bool(worker.get("alive")),
+            "last_cycle_at": int(worker.get("last_cycle_at") or 0),
+            "last_telegram_poll_at": int(worker.get("last_telegram_poll_at") or 0),
+            "last_error": str(worker.get("last_error") or ""),
+            "last_error_at": int(worker.get("last_error_at") or 0),
+        },
+    }
+
+
+@app.post("/loop/settings")
+def loop_settings_update(payload: Optional[Dict[str, Any]] = Body(default=None)):
+    payload = payload or {}
+    default_prompt = payload.get("default_prompt")
+    global_preset = payload.get("global_preset")
+    completion_checks = payload.get("completion_checks")
+    telegram_windows_mirror_enabled = payload.get("telegram_windows_mirror_enabled")
+    with LOOP_CONTROL_LOCK:
+        _load_loop_control_unlocked()
+        settings = _get_loop_settings_unlocked()
+        dirty = False
+        if default_prompt is not None:
+            next_prompt = str(default_prompt or "").strip()
+            settings["default_prompt"] = next_prompt or LOOP_CONTROL_DEFAULT_PROMPT
+            settings["updated_at"] = _now_ms()
+            dirty = True
+        if global_preset is not None:
+            normalized_preset = _normalize_loop_preset(global_preset)
+            _loop_set_global_preset_unlocked(normalized_preset)
+            settings = _get_loop_settings_unlocked()
+            dirty = False
+        if completion_checks is not None:
+            next_commands: List[str]
+            if isinstance(completion_checks, list):
+                next_commands = _normalize_loop_commands(completion_checks)
+            else:
+                next_commands = _normalize_loop_commands(str(completion_checks or "").splitlines())
+            settings["completion_checks"] = next_commands
+            settings["updated_at"] = _now_ms()
+            dirty = True
+        if telegram_windows_mirror_enabled is not None:
+            settings["telegram_windows_mirror_enabled"] = bool(telegram_windows_mirror_enabled)
+            settings["updated_at"] = _now_ms()
+            dirty = True
+        if dirty:
+            _persist_loop_control_unlocked()
+        public_settings = _public_loop_settings_unlocked()
+        worker = dict(LOOP_CONTROL_DATA.get("worker") or {})
+    return {
+        "ok": True,
+        "settings": public_settings,
+        "worker": {
+            "alive": bool(worker.get("alive")),
+            "last_cycle_at": int(worker.get("last_cycle_at") or 0),
+            "last_telegram_poll_at": int(worker.get("last_telegram_poll_at") or 0),
+            "last_error": str(worker.get("last_error") or ""),
+            "last_error_at": int(worker.get("last_error_at") or 0),
+        },
+    }
+
+
+@app.post("/loop/session/{session}/mode")
+def loop_session_mode_update(session: str, payload: Optional[Dict[str, Any]] = Body(default=None)):
+    session = _validate_session_name(session)
+    payload = payload or {}
+    raw_override_mode = str(payload.get("override_mode") or "").strip().lower()
+    if raw_override_mode not in LOOP_OVERRIDE_MODE_VALUES:
+        raise HTTPException(status_code=400, detail="Invalid loop override mode.")
+    override_mode = _normalize_loop_override_mode(raw_override_mode)
+    with LOOP_CONTROL_LOCK:
+        _load_loop_control_unlocked()
+        _loop_set_session_override_unlocked(session, override_mode)
+        public_state = _public_loop_session_state_unlocked(session)
+    return {"ok": True, "session": session, "loop": public_state}
 
 
 @app.post("/shares")
@@ -13322,3 +19022,6 @@ def codex_runs():
                 "prompt": rr.get("prompt", ""),
             })
         return {"ok": True, "runs": items}
+
+
+_ensure_loop_control_worker()

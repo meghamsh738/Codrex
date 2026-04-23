@@ -1,5 +1,6 @@
-import { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Suspense, lazy, startTransition, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { flushSync } from "react-dom";
+import codrexLogoHero from "./assets/codrex-logo-hero.png";
 import {
   addThreadRecordMessage,
   appendLatestSessionNotes,
@@ -31,16 +32,18 @@ import {
   exchangePairCode,
   enterSession,
   sendSessionKey,
-  getAppRuntime,
-  getDesktopInfo,
-  getAuthStatus,
+    getDesktopTargets,
+    getAppRuntime,
+    getDesktopInfo,
+    getAuthStatus,
   getCodexOptions,
   getCodexRuntimeStatus,
   getCodexRun,
   getCodexRuns,
-  getNetInfo,
-  getPowerStatus,
-  getTelegramStatus,
+    getNetInfo,
+    getLoopStatus,
+    getPowerStatus,
+    getTelegramStatus,
   getThreadStore,
   getTmuxHealth,
   getTmuxPaneScreen,
@@ -67,10 +70,13 @@ import {
   sendToSession,
   setDesktopMode,
   setDesktopPerfMode,
+  selectDesktopTarget,
   setIpcObserver,
   startCodexRuntime,
   startCodexExec,
   stopCodexRuntime,
+  updateLoopSettings,
+  updateSessionLoopMode,
   updateThreadRecord,
   uploadHostFile,
   uploadWslFile,
@@ -81,9 +87,13 @@ import type {
   CodexRunDetail,
   CodexRuntimeStatusResult,
   CodexRunSummary,
-  DesktopInfoResult,
-  DesktopWebrtcSessionDescription,
-  NetInfo,
+    DesktopInfoResult,
+    DesktopTargetInfo,
+    DesktopWebrtcSessionDescription,
+    LoopPreset,
+    LoopStatusResult,
+    LoopOverrideMode,
+    NetInfo,
   PowerStatusResult,
   SessionInfo,
   SessionNoteInfo,
@@ -95,7 +105,6 @@ import type {
 } from "./types";
 import type { IpcEvent } from "./api";
 import {
-  DESKTOP_PROFILE_STREAM,
   resolveDesktopStreamParams,
 } from "./desktopStream";
 import type { DesktopStreamProfile } from "./desktopStream";
@@ -110,15 +119,17 @@ const SettingsTab = lazy(() => import("./tabs/SettingsTab"));
 const DebugTab = lazy(() => import("./tabs/DebugTab"));
 
 declare global {
-  interface Window {
-    CodrexAndroidBridge?: {
-      readClipboardText?: () => string;
-      writeClipboardText?: (text: string) => boolean;
-      openDownloads?: () => boolean;
-      setShellMode?: (mode: string) => boolean | void;
-      openNativeRemote?: (origin: string) => boolean | void;
-      canUseNativeRemote?: () => boolean | void;
-    };
+interface Window {
+  CodrexAndroidBridge?: {
+    readClipboardText?: () => string;
+    writeClipboardText?: (text: string) => boolean;
+    openDownloads?: () => boolean;
+    reportShellTabReady?: (tab: MainTab) => boolean | void;
+    setShellMode?: (mode: string) => boolean | void;
+    openNativeRemote?: (origin: string) => boolean | void;
+    canUseNativeRemote?: () => boolean | void;
+    postDesktopCodexPrompt?: (session: string, prompt: string) => string;
+  };
     CodrexNative?: {
       setShellMode?: (mode: string) => boolean | void;
     };
@@ -162,6 +173,31 @@ function buildTelegramSessionPrompt(): string {
     "Do not search for Telegram bot keys or secret files.",
     "After sending, tell me exactly which paths you sent.",
   ].join(" ");
+}
+
+function parseLoopPreset(value: string): "" | LoopPreset {
+  if (
+    value === "infinite"
+    || value === "await-reply"
+    || value === "completion-checks"
+    || value === "max-turns-1"
+    || value === "max-turns-2"
+    || value === "max-turns-3"
+  ) {
+    return value;
+  }
+  return "";
+}
+
+function formatCompletionChecks(commands: string[] | undefined): string {
+  return (commands || []).join("\n");
+}
+
+function parseCompletionChecks(text: string): string[] {
+  return text
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
 }
 
 function waitForNextPaint(): Promise<void> {
@@ -234,7 +270,8 @@ interface TranscriptChunk {
   text: string;
 }
 
-const TAB_ORDER: MainTab[] = ["home", "sessions", "remote", "pair", "settings", "threads", "debug"];
+const TAB_ORDER: MainTab[] = ["home", "sessions", "threads", "settings", "remote", "pair", "debug"];
+const SHELL_SECTION_SWITCH_MS = 250;
 
 const CONTROLLER_BASE_STORAGE = "codrex.ui.controller_base.v1";
 const REASONING_EFFORT_STORAGE = "codrex.ui.reasoning_effort.v1";
@@ -367,7 +404,7 @@ function isLocalHostName(hostname: string): boolean {
 
 function parseInitialTab(): MainTab {
   if (typeof window === "undefined") {
-    return "home";
+    return "remote";
   }
   try {
     const url = new URL(window.location.href);
@@ -376,11 +413,14 @@ function parseInitialTab(): MainTab {
       return raw;
     }
   } catch {}
-  return "home";
+  return "remote";
 }
 
 function normalizeMainTab(value: string): MainTab | null {
   const raw = value.trim().toLowerCase();
+  if (raw === "ssh") {
+    return "sessions";
+  }
   if (raw === "home" || raw === "sessions" || raw === "threads" || raw === "remote" || raw === "pair" || raw === "settings" || raw === "debug") {
     return raw;
   }
@@ -746,7 +786,15 @@ function appendTranscriptChunks(chunks: TranscriptChunk[], text: string): Transc
 export default function App() {
   const [activeTab, setActiveTab] = useState<MainTab>(() => parseInitialTab());
   const [tabTransitionClass, setTabTransitionClass] = useState<TabTransitionClass>("tab-still");
-  const previousTabRef = useRef<MainTab>("home");
+  const [isSectionSwitching, setIsSectionSwitching] = useState(false);
+  const previousTabRef = useRef<MainTab>("remote");
+  const hasTabTransitionInitializedRef = useRef(false);
+  const sectionSwitchTimerRef = useRef<number | null>(null);
+  const activateTab = useCallback((nextTab: MainTab) => {
+    startTransition(() => {
+      setActiveTab((current) => (current === nextTab ? current : nextTab));
+    });
+  }, []);
 
   const [auth, setAuth] = useState<AuthStatus | null>(null);
   const [authLoading, setAuthLoading] = useState(true);
@@ -804,6 +852,12 @@ export default function App() {
   const [sessionNotesBusy, setSessionNotesBusy] = useState(false);
   const [, setTelegramConfigured] = useState(false);
   const [composerTelegramBusy, setComposerTelegramBusy] = useState(false);
+  const [loopStatus, setLoopStatus] = useState<LoopStatusResult | null>(null);
+  const [loopSettingsBusy, setLoopSettingsBusy] = useState(false);
+  const [loopDefaultPrompt, setLoopDefaultPrompt] = useState("");
+  const [loopChecksText, setLoopChecksText] = useState("");
+  const [loopGlobalPreset, setLoopGlobalPreset] = useState<"" | LoopPreset>("");
+  const [sessionLoopBusy, setSessionLoopBusy] = useState(false);
   const [pageVisible, setPageVisible] = useState(() =>
     typeof document === "undefined" ? true : !document.hidden,
   );
@@ -850,15 +904,18 @@ export default function App() {
   const [showLegacyThreadTools, setShowLegacyThreadTools] = useState(false);
 
   const [desktopInfo, setDesktopInfo] = useState<DesktopInfoResult | null>(null);
+  const [desktopTargets, setDesktopTargets] = useState<DesktopTargetInfo[]>([]);
+  const [desktopTargetsDetail, setDesktopTargetsDetail] = useState("");
+  const [desktopTargetsBusy, setDesktopTargetsBusy] = useState(false);
   const [desktopEnabled, setDesktopEnabled] = useState(false);
-  const [desktopProfile, setDesktopProfile] = useState<DesktopStreamProfile>("responsive");
-  const [desktopAdaptiveStream, setDesktopAdaptiveStream] = useState<boolean>(() => {
+  const [desktopProfile] = useState<DesktopStreamProfile>("responsive");
+  const [desktopAdaptiveStream] = useState<boolean>(() => {
     const stored = parseStoredToggle(safeStorageGet(DESKTOP_ADAPTIVE_STREAM_STORAGE));
     return stored == null ? true : stored;
   });
   const [desktopKeyInput, setDesktopKeyInput] = useState("enter");
   const [desktopTextInput, setDesktopTextInput] = useState("");
-  const [desktopStatus, setDesktopStatus] = useState("");
+  const [, setDesktopStatus] = useState("");
   const [desktopFocusPoint, setDesktopFocusPoint] = useState<{ x: number; y: number } | null>(null);
   const [desktopSelectedPath, setDesktopSelectedPath] = useState("");
   const [desktopAltHeld, setDesktopAltHeld] = useState(false);
@@ -1054,13 +1111,11 @@ export default function App() {
     }
     return filteredIpcHistory.find((item) => item.id === selectedIpcId) || null;
   }, [filteredIpcHistory, selectedIpcId]);
-  const desktopBaseStreamSummary = `${DESKTOP_PROFILE_STREAM[desktopProfile].fps}fps / scale x${DESKTOP_PROFILE_STREAM[desktopProfile].scale}${DESKTOP_PROFILE_STREAM[desktopProfile].bw ? " / grayscale" : ""}`;
-  const desktopEffectiveStreamSummary = `${desktopStreamParams.fps}fps / scale x${desktopStreamParams.scale}${desktopStreamParams.bw ? " / grayscale" : ""}`;
-  const desktopAdaptiveSummary = desktopAdaptiveStream
-    ? desktopEffectiveStreamSummary === desktopBaseStreamSummary
-      ? "Adaptive stream is ready. Fullscreen boosts speed automatically."
-      : `Adaptive stream active: ${desktopEffectiveStreamSummary}`
-    : "Adaptive stream is off. Manual profile stays fixed.";
+  const activeDesktopTargetId =
+    desktopInfo?.active_target_id
+    || desktopTargets.find((target) => target.selected)?.id
+    || desktopTargets[0]?.id
+    || "";
 
   const addEvent = useCallback((level: AppEventLevel, message: string) => {
     const trimmed = message.trim();
@@ -1368,7 +1423,7 @@ export default function App() {
       const detail = (error as Error).message || "";
       const lowered = detail.toLowerCase();
       if (lowered.includes("login required") || lowered.includes("unauthorized")) {
-        setActiveTab("settings");
+        activateTab("settings");
         setStatus("Login required. Open Settings and sign in with your token.");
       } else {
         setError(`Could not read sessions: ${detail}`);
@@ -1378,6 +1433,70 @@ export default function App() {
       setSessionsLoading(false);
     }
   }, [setError, setStatus]);
+
+  const refreshLoopStatus = useCallback(async () => {
+    try {
+      const response = await getLoopStatus();
+      if (!response.ok) {
+        throw new Error(response.detail || response.error || "Failed to read loop status.");
+      }
+      setLoopStatus(response);
+      setLoopDefaultPrompt(response.settings?.default_prompt || "");
+      setLoopChecksText(formatCompletionChecks(response.settings?.completion_checks));
+      setLoopGlobalPreset(parseLoopPreset(response.settings?.global_preset || ""));
+    } catch (error) {
+      addEvent("error", `Could not read loop status: ${(error as Error).message}`);
+    }
+  }, [addEvent]);
+
+  const onSaveLoopSettings = useCallback(async () => {
+    setLoopSettingsBusy(true);
+    try {
+      const response = await updateLoopSettings({
+        default_prompt: loopDefaultPrompt,
+        global_preset: loopGlobalPreset,
+        completion_checks: parseCompletionChecks(loopChecksText),
+      });
+      if (!response.ok) {
+        throw new Error(response.detail || response.error || "Could not save loop settings.");
+      }
+      setLoopStatus(response);
+      setLoopDefaultPrompt(response.settings?.default_prompt || "");
+      setLoopChecksText(formatCompletionChecks(response.settings?.completion_checks));
+      setLoopGlobalPreset(parseLoopPreset(response.settings?.global_preset || ""));
+      setStatus("Loop settings saved.");
+    } catch (error) {
+      setError(`Could not save loop settings: ${(error as Error).message}`);
+    } finally {
+      setLoopSettingsBusy(false);
+    }
+  }, [loopChecksText, loopDefaultPrompt, loopGlobalPreset, setError, setStatus]);
+
+  const onSessionLoopModeChange = useCallback(async (session: string, overrideMode: LoopOverrideMode) => {
+    setSessionLoopBusy(true);
+    try {
+      const response = await updateSessionLoopMode(session, overrideMode);
+      if (!response.ok) {
+        throw new Error(response.detail || response.error || "Could not update loop mode.");
+      }
+      await refreshSessions();
+      setStatus(`Loop mode updated for ${session}.`);
+    } catch (error) {
+      setError(`Could not update loop mode: ${(error as Error).message}`);
+    } finally {
+      setSessionLoopBusy(false);
+    }
+  }, [refreshSessions, setError, setStatus]);
+
+  useEffect(() => {
+    void refreshLoopStatus();
+  }, [refreshLoopStatus]);
+
+  useEffect(() => {
+    if (activeTab === "settings") {
+      void refreshLoopStatus();
+    }
+  }, [activeTab, refreshLoopStatus]);
 
   const onStartSessionsRuntime = useCallback(async () => {
     setSessionsRuntimeBusy(true);
@@ -1389,13 +1508,13 @@ export default function App() {
       setSessionsRuntime(response);
       await refreshSessions();
       setStatus("Ubuntu runtime started.");
-      setActiveTab("sessions");
+      activateTab("sessions");
     } catch (error) {
       setError(`Could not start sessions runtime: ${(error as Error).message}`);
     } finally {
       setSessionsRuntimeBusy(false);
     }
-  }, [refreshSessions, setError, setStatus]);
+  }, [activateTab, refreshSessions, setError, setStatus]);
 
   const onStopSessionsRuntime = useCallback(async () => {
     setSessionsRuntimeBusy(true);
@@ -1546,7 +1665,7 @@ export default function App() {
       const detail = (error as Error).message || "";
       const lowered = detail.toLowerCase();
       if (lowered.includes("login required") || lowered.includes("unauthorized")) {
-        setActiveTab("settings");
+        activateTab("settings");
         setStatus("Login required. Open Settings and sign in with your token.");
       } else {
         setError(`Could not read run history: ${detail}`);
@@ -1626,6 +1745,46 @@ export default function App() {
       setDesktopStatus(`Desktop unavailable: ${(error as Error).message}`);
     }
   }, []);
+
+  const refreshDesktopTargets = useCallback(async () => {
+    setDesktopTargetsBusy(true);
+    try {
+      const response = await getDesktopTargets();
+      if (!response.ok) {
+        throw new Error(response.detail || response.error || "Desktop targets unavailable.");
+      }
+      setDesktopTargets(response.targets || []);
+      setDesktopTargetsDetail(response.detail || "");
+    } catch (error) {
+      setDesktopTargets([]);
+      setDesktopTargetsDetail(`Desktop targets unavailable: ${(error as Error).message}`);
+    } finally {
+      setDesktopTargetsBusy(false);
+    }
+  }, []);
+
+  const onSelectDesktopTarget = useCallback(async (targetId: string) => {
+    const nextTarget = targetId.trim();
+    if (!nextTarget) {
+      setError("Choose a desktop target first.");
+      return;
+    }
+    setDesktopTargetsBusy(true);
+    try {
+      const response = await selectDesktopTarget(nextTarget);
+      if (!response.ok) {
+        throw new Error(response.detail || response.error || "Could not switch desktop target.");
+      }
+      setDesktopTargets(response.targets || []);
+      setDesktopTargetsDetail(response.detail || "");
+      await Promise.all([refreshDesktopState()]);
+      setStatus(`Desktop target switched to ${response.active_target?.label || nextTarget}.`);
+    } catch (error) {
+      setError(`Desktop target switch failed: ${(error as Error).message}`);
+    } finally {
+      setDesktopTargetsBusy(false);
+    }
+  }, [refreshDesktopState, setError, setStatus]);
 
   const waitForDesktopIceGathering = useCallback((pc: RTCPeerConnection): Promise<void> => {
     if (pc.iceGatheringState === "complete") {
@@ -1957,10 +2116,11 @@ export default function App() {
         refreshSharedFiles(),
         refreshTelegramStatus(),
         refreshDesktopState(),
+        refreshDesktopTargets(),
       ]);
       setStatus("Connected. Ready.");
     })();
-  }, [refreshAppRuntime, refreshAuth, refreshCodexOptions, refreshDesktopState, refreshNet, refreshPowerStatus, refreshSessionsRuntime, refreshSharedFiles, refreshTelegramStatus, setStatus]);
+  }, [refreshAppRuntime, refreshAuth, refreshCodexOptions, refreshDesktopState, refreshDesktopTargets, refreshNet, refreshPowerStatus, refreshSessionsRuntime, refreshSharedFiles, refreshTelegramStatus, setStatus]);
 
   useEffect(() => {
     if (activeTab === "sessions") {
@@ -1984,7 +2144,10 @@ export default function App() {
     if (activeTab === "debug") {
       void refreshDebugRuns();
     }
-  }, [activeTab, refreshDebugRuns, refreshSessions, refreshSessionsRuntime, refreshThreads, refreshTmuxState]);
+    if (activeTab === "remote" || activeTab === "settings") {
+      void refreshDesktopTargets();
+    }
+  }, [activeTab, refreshDebugRuns, refreshDesktopTargets, refreshSessions, refreshSessionsRuntime, refreshThreads, refreshTmuxState]);
 
   useEffect(() => {
     if (typeof window === "undefined") {
@@ -2153,17 +2316,55 @@ export default function App() {
     const previousTab = previousTabRef.current;
     const previousIndex = TAB_ORDER.indexOf(previousTab);
     const currentIndex = TAB_ORDER.indexOf(activeTab);
+    const didSwitch = previousTab !== activeTab;
+    let nextTransition: TabTransitionClass = "tab-still";
+    const shouldAnimateTransition = hasTabTransitionInitializedRef.current;
     if (previousIndex >= 0 && currentIndex >= 0) {
       if (currentIndex > previousIndex) {
-        setTabTransitionClass("tab-slide-left");
+        nextTransition = "tab-slide-left";
       } else if (currentIndex < previousIndex) {
-        setTabTransitionClass("tab-slide-right");
-      } else {
-        setTabTransitionClass("tab-still");
+        nextTransition = "tab-slide-right";
       }
     }
     previousTabRef.current = activeTab;
+
+    if (!didSwitch || !shouldAnimateTransition) {
+      if (sectionSwitchTimerRef.current != null) {
+        window.clearTimeout(sectionSwitchTimerRef.current);
+        sectionSwitchTimerRef.current = null;
+      }
+      setIsSectionSwitching(false);
+      setTabTransitionClass("tab-still");
+      hasTabTransitionInitializedRef.current = true;
+      return;
+    }
+
+    setIsSectionSwitching(true);
+    if (sectionSwitchTimerRef.current != null) {
+      window.clearTimeout(sectionSwitchTimerRef.current);
+    }
+    setTabTransitionClass(nextTransition);
+    sectionSwitchTimerRef.current = window.setTimeout(() => {
+      setIsSectionSwitching(false);
+      setTabTransitionClass("tab-still");
+      sectionSwitchTimerRef.current = null;
+    }, SHELL_SECTION_SWITCH_MS);
+
+    return () => {
+      if (sectionSwitchTimerRef.current != null) {
+        window.clearTimeout(sectionSwitchTimerRef.current);
+        sectionSwitchTimerRef.current = null;
+      }
+    };
   }, [activeTab]);
+
+  useEffect(() => {
+    return () => {
+      if (sectionSwitchTimerRef.current != null) {
+        window.clearTimeout(sectionSwitchTimerRef.current);
+      }
+    };
+  }, []);
 
   useEffect(() => {
     if (typeof window === "undefined") {
@@ -2172,7 +2373,7 @@ export default function App() {
 
     const requestedTab = normalizeMainTab(window.__codrexRequestedTab || "");
     if (requestedTab && requestedTab !== activeTab) {
-      setActiveTab(requestedTab);
+      activateTab(requestedTab);
     }
     window.__codrexRequestedTab = "";
 
@@ -2182,7 +2383,7 @@ export default function App() {
       if (!nextTab) {
         return;
       }
-      setActiveTab(nextTab);
+      activateTab(nextTab);
       window.__codrexRequestedTab = "";
     };
 
@@ -2190,7 +2391,7 @@ export default function App() {
     return () => {
       window.removeEventListener("codrex:set-tab", handleRequestedTab as EventListener);
     };
-  }, [activeTab]);
+  }, [activeTab, activateTab]);
 
   useEffect(() => {
     if (typeof window === "undefined") {
@@ -2205,6 +2406,38 @@ export default function App() {
       url.searchParams.set("tab", activeTab);
       window.history.replaceState(window.history.state, "", url.toString());
     } catch {}
+  }, [activeTab]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+    let cancelled = false;
+    const timeoutHandles: number[] = [];
+    const reportReady = () => {
+      if (cancelled) {
+        return;
+      }
+      const reporter = window.CodrexAndroidBridge?.reportShellTabReady;
+      if (typeof reporter === "function") {
+        reporter(activeTab);
+      }
+    };
+    const scheduleAttempt = (delayMs: number) => {
+      const handle = window.setTimeout(() => reportReady(), delayMs);
+      timeoutHandles.push(handle);
+    };
+    if (typeof window.requestAnimationFrame === "function") {
+      const frameHandle = window.requestAnimationFrame(() => reportReady());
+      timeoutHandles.push(window.setTimeout(() => window.cancelAnimationFrame(frameHandle), 4000));
+    } else {
+      reportReady();
+    }
+    [120, 320, 650, 1100, 1700].forEach((delayMs) => scheduleAttempt(delayMs));
+    return () => {
+      cancelled = true;
+      timeoutHandles.forEach((handle) => window.clearTimeout(handle));
+    };
   }, [activeTab]);
 
   useEffect(() => {
@@ -2280,7 +2513,7 @@ export default function App() {
       const direction: 1 | -1 = deltaX < 0 ? 1 : -1;
       const nextTab = getAdjacentTab(activeTab, direction);
       if (nextTab !== activeTab) {
-        setActiveTab(nextTab);
+        activateTab(nextTab);
         setShowSwipeHint(false);
         addEvent("info", `Switched to ${nextTab} tab via swipe.`);
       }
@@ -2383,6 +2616,7 @@ export default function App() {
       }
       if (activeTab === "remote") {
         void refreshDesktopState();
+        void refreshDesktopTargets();
       }
     }, intervalMs);
     return () => window.clearInterval(interval);
@@ -2404,6 +2638,7 @@ export default function App() {
     streamEnabled,
     streamProfile,
     pageVisible,
+    refreshDesktopTargets,
   ]);
 
   useEffect(() => {
@@ -2779,7 +3014,6 @@ export default function App() {
         ? "Authenticated"
         : "Login required"
       : "Auth disabled";
-  const networkSummary = `LAN ${netInfo?.lan_ip || "n/a"} | Tailscale ${netInfo?.tailscale_ip || "n/a"}`;
   const powerWakeInstruction = (powerStatus?.wake_instruction || `${powerStatus?.wake_command || "/wake"} laptop`).trim();
   const powerRelayBadge = powerStatus?.relay_reachable
     ? "relay: reachable"
@@ -2848,11 +3082,6 @@ export default function App() {
   const desktopFocusSummary = desktopFocusPoint
     ? `Focused target: ${desktopFocusPoint.x}, ${desktopFocusPoint.y}`
     : "No desktop target focused yet. Tap the remote desktop once first.";
-  const desktopPerfSummary = desktopPerfEnabled
-    ? desktopPerfActive
-      ? "Boost host: active"
-      : "Boost host: armed"
-    : "Boost host: off";
   const desktopTransportSource = desktopInfo || appRuntime;
   const desktopPrefersWebrtc = desktopTransportSource?.desktop_stream_transport === "webrtc";
   const desktopTransportSummary = desktopPrefersWebrtc
@@ -2954,9 +3183,12 @@ export default function App() {
         : "No usable private route is detected yet. Pairing may still work on LAN.";
   const isAndroidShell = typeof window !== "undefined" && Boolean(window.CodrexAndroidBridge);
   const isRemoteWorkspace = activeTab === "remote";
-  const hideShellChrome = isAndroidShell && !isRemoteWorkspace;
+  const isLeanShellChrome = isAndroidShell && !isRemoteWorkspace;
+  const hideShellChrome = isLeanShellChrome;
+  const quietShellChrome = hideShellChrome;
   const screenCardClassName = `card screen-card ${tabTransitionClass}${isRemoteWorkspace ? " remote-screen-card" : ""}`;
-  const appShellClassName = `app-shell${compactTranscript ? " compact-transcript" : ""}${touchComfortMode ? " touch-comfort" : ""}${isRemoteWorkspace ? " remote-app-mode" : ""}${hideShellChrome ? " android-shell" : ""}`;
+  const appShellClassName = `app-shell editorial-shell shell-editorial-premium${compactTranscript ? " compact-transcript" : ""}${touchComfortMode ? " touch-comfort" : ""}${isRemoteWorkspace ? " remote-app-mode" : ""}${hideShellChrome ? " android-shell" : ""}${isSectionSwitching ? " shell-switching" : ""}${isLeanShellChrome ? " shell-lean" : ""} shell-tab-${activeTab} shell-stage-${activeTab}`;
+  const screenShellClassName = `screen-shell shell-stage-${activeTab}${isSectionSwitching ? " shell-switching" : ""} ${tabTransitionClass}`;
 
   const closeRemotePanels = useCallback(() => {
     setRemoteKeyboardPanelOpen(false);
@@ -2983,6 +3215,7 @@ export default function App() {
       refreshSharedFiles(),
       refreshTelegramStatus(),
       refreshDesktopState(),
+      refreshDesktopTargets(),
       ...(runtime?.state === "running" ? [refreshSessions()] : []),
       ...(activeTab === "threads" ? [refreshThreads(), refreshTmuxState()] : []),
       ...(activeTab === "debug" ? [refreshDebugRuns()] : []),
@@ -2998,7 +3231,7 @@ export default function App() {
       await refreshRunDetail(selectedRunId);
     }
     setStatus("Synced.");
-  }, [activeTab, refreshAppRuntime, refreshAuth, refreshCodexOptions, refreshDebugRuns, refreshDesktopState, refreshNet, refreshPowerStatus, refreshRunDetail, refreshScreen, refreshSessionNotes, refreshSessions, refreshSessionsRuntime, refreshSharedFiles, refreshTelegramStatus, refreshThreads, refreshTmuxScreen, refreshTmuxState, selectedRunId, selectedSession, selectedTmuxPane, setStatus]);
+  }, [activeTab, refreshAppRuntime, refreshAuth, refreshCodexOptions, refreshDebugRuns, refreshDesktopState, refreshDesktopTargets, refreshNet, refreshPowerStatus, refreshRunDetail, refreshScreen, refreshSessionNotes, refreshSessions, refreshSessionsRuntime, refreshSharedFiles, refreshTelegramStatus, refreshThreads, refreshTmuxScreen, refreshTmuxState, selectedRunId, selectedSession, selectedTmuxPane, setStatus]);
 
   const onLogin = useCallback(async () => {
     if (!tokenInput.trim()) {
@@ -3020,16 +3253,17 @@ export default function App() {
         refreshDebugRuns(),
         refreshTmuxState(),
         refreshDesktopState(),
+        refreshDesktopTargets(),
         refreshPowerStatus(),
       ]);
       setStatus("Logged in.");
-      setActiveTab("sessions");
+      activateTab("sessions");
     } catch (error) {
       setError(`Login failed: ${(error as Error).message}`);
     } finally {
       setAuthBusy(false);
     }
-  }, [refreshAuth, refreshDebugRuns, refreshDesktopState, refreshPowerStatus, refreshSessions, refreshTelegramStatus, refreshThreads, refreshTmuxState, setError, setStatus, tokenInput]);
+  }, [activateTab, refreshAuth, refreshDebugRuns, refreshDesktopState, refreshDesktopTargets, refreshPowerStatus, refreshSessions, refreshTelegramStatus, refreshThreads, refreshTmuxState, setError, setStatus, tokenInput]);
 
   const onBootstrapLocalAuth = useCallback(async () => {
     setAuthBusy(true);
@@ -3046,16 +3280,17 @@ export default function App() {
         refreshDebugRuns(),
         refreshTmuxState(),
         refreshDesktopState(),
+        refreshDesktopTargets(),
         refreshPowerStatus(),
       ]);
       setStatus("Local laptop authentication is active.");
-      setActiveTab("sessions");
+      activateTab("sessions");
     } catch (error) {
       setError(`Local auth failed: ${(error as Error).message}`);
     } finally {
       setAuthBusy(false);
     }
-  }, [refreshAuth, refreshDebugRuns, refreshDesktopState, refreshPowerStatus, refreshSessions, refreshTelegramStatus, refreshThreads, refreshTmuxState, setError, setStatus]);
+  }, [activateTab, refreshAuth, refreshDebugRuns, refreshDesktopState, refreshDesktopTargets, refreshPowerStatus, refreshSessions, refreshTelegramStatus, refreshThreads, refreshTmuxState, setError, setStatus]);
 
   const onLogout = useCallback(async () => {
     setAuthBusy(true);
@@ -3064,13 +3299,13 @@ export default function App() {
       await refreshAuth();
       setTelegramConfigured(false);
       setStatus("Logged out.");
-      setActiveTab("settings");
+      activateTab("settings");
     } catch (error) {
       setError(`Logout failed: ${(error as Error).message}`);
     } finally {
       setAuthBusy(false);
     }
-  }, [refreshAuth, setError, setStatus]);
+  }, [activateTab, refreshAuth, setError, setStatus]);
 
   useEffect(() => {
     if (authLoading || !auth?.auth_required || auth.authenticated) {
@@ -3201,7 +3436,7 @@ export default function App() {
       setStreamEnabled(true);
       setOutputFeedState("polling");
       scheduleSessionsRefresh(250);
-      setActiveTab("sessions");
+      activateTab("sessions");
       setStatus(`Created ${response.session} (${response.reasoning_effort || createReasoningEffort}).`);
     } catch (error) {
       setError(`Create session failed: ${(error as Error).message}`);
@@ -3209,6 +3444,7 @@ export default function App() {
       setSessionBusy(false);
     }
   }, [
+    activateTab,
     newSessionCwd,
     newSessionName,
     reasoningEffortOptions,
@@ -3237,7 +3473,7 @@ export default function App() {
       setStreamEnabled(true);
       setOutputFeedState("polling");
       scheduleSessionsRefresh(250);
-      setActiveTab("sessions");
+      activateTab("sessions");
       setStatus(`Started ${response.session} in resume-last mode.`);
     } catch (error) {
       setError(`Resume last failed: ${(error as Error).message}`);
@@ -3245,6 +3481,7 @@ export default function App() {
       setSessionBusy(false);
     }
   }, [
+    activateTab,
     newSessionCwd,
     newSessionName,
     reasoningEffortOptions,
@@ -4091,27 +4328,6 @@ export default function App() {
     }
   }, [desktopEnabled, refreshDesktopState, setError]);
 
-  const onToggleDesktopPerfMode = useCallback(async () => {
-    try {
-      const response = await setDesktopPerfMode(!desktopPerfEnabled);
-      if (!response.ok) {
-        throw new Error(response.detail || response.error || "Desktop performance mode request failed.");
-      }
-      setDesktopPerfEnabled(Boolean(response.perf_mode_enabled));
-      setDesktopPerfActive(Boolean(response.perf_mode_active));
-      setDesktopAltHeld(Boolean(response.alt_held));
-      setDesktopStatus(
-        response.perf_mode_enabled
-          ? response.perf_mode_active
-            ? "Boost host performance enabled."
-            : "Boost host performance armed for the next desktop-control session."
-          : "Boost host performance disabled.",
-      );
-    } catch (error) {
-      setError(`Boost host performance failed: ${(error as Error).message}`);
-    }
-  }, [desktopPerfEnabled, setError]);
-
   const onDesktopClick = useCallback(async (button: "left" | "right", double = false) => {
     if (!desktopEnabled) {
       setError("Desktop control is disabled. Enable Desktop first.");
@@ -4947,11 +5163,12 @@ export default function App() {
       }
       const shellBridge = window.CodrexAndroidBridge;
       const nativeBridge = window.CodrexNative;
-      const setShellMode =
-        shellBridge?.setShellMode ??
-        nativeBridge?.setShellMode;
-      if (setShellMode) {
-        setShellMode(shellMode);
+      if (shellBridge?.setShellMode) {
+        shellBridge.setShellMode(shellMode);
+        return;
+      }
+      if (nativeBridge?.setShellMode) {
+        nativeBridge.setShellMode(shellMode);
         return;
       }
       if (attempts >= 8) {
@@ -4963,10 +5180,11 @@ export default function App() {
     applyShellMode();
     return () => {
       cancelled = true;
-      const resetShellMode =
-        window.CodrexAndroidBridge?.setShellMode ??
-        window.CodrexNative?.setShellMode;
-      resetShellMode?.("standard");
+      if (window.CodrexAndroidBridge?.setShellMode) {
+        window.CodrexAndroidBridge.setShellMode("standard");
+        return;
+      }
+      window.CodrexNative?.setShellMode?.("standard");
     };
   }, [activeTab]);
 
@@ -5083,7 +5301,7 @@ export default function App() {
       }
       setExecPrompt("");
       setSelectedRunId(response.id);
-      setActiveTab("debug");
+      activateTab("debug");
       setStatus(`Started codex exec run ${response.id}.`);
       await refreshDebugRuns();
     } catch (error) {
@@ -5091,7 +5309,7 @@ export default function App() {
     } finally {
       setExecBusy(false);
     }
-  }, [execPrompt, refreshDebugRuns, setError, setStatus]);
+    }, [activateTab, execPrompt, refreshDebugRuns, setError, setStatus]);
 
   const onDownloadWslFile = useCallback(() => {
     const path = wslDownloadPath.trim();
@@ -5330,14 +5548,14 @@ export default function App() {
       setOutputFeedState("polling");
       setRecentClosedSessions((current) => current.filter((item) => item.session !== sessionInfo.session));
       scheduleSessionsRefresh(250);
-      setActiveTab("sessions");
+      activateTab("sessions");
       setStatus(`Resumed ${response.session}.`);
     } catch (error) {
       setError(`Resume session failed: ${(error as Error).message}`);
     } finally {
       setSessionBusy(false);
     }
-  }, [createSessionWithOptions, scheduleSessionsRefresh, sessionBusy, setError, setStatus]);
+  }, [activateTab, createSessionWithOptions, scheduleSessionsRefresh, sessionBusy, setError, setStatus]);
 
   const onReopenClosedSession = useCallback(async (sessionInfo: SessionInfo) => {
     if (sessionBusy) {
@@ -5359,14 +5577,14 @@ export default function App() {
       setOutputFeedState("polling");
       setRecentClosedSessions((current) => current.filter((item) => item.session !== sessionInfo.session));
       scheduleSessionsRefresh(250);
-      setActiveTab("sessions");
+      activateTab("sessions");
       setStatus(`Reopened ${response.session}.`);
     } catch (error) {
       setError(`Reopen session failed: ${(error as Error).message}`);
     } finally {
       setSessionBusy(false);
     }
-  }, [createSessionWithOptions, scheduleSessionsRefresh, sessionBusy, setError, setStatus]);
+  }, [activateTab, createSessionWithOptions, scheduleSessionsRefresh, sessionBusy, setError, setStatus]);
 
   const renderNavIcon = useCallback((tab: MainTab) => {
     if (tab === "home") {
@@ -5511,13 +5729,16 @@ export default function App() {
   const primaryActions =
     activeTab === "home" ? (
       <>
-        <button type="button" className="button compact" onClick={() => setActiveTab("remote")}>
+        <button type="button" className="button compact" onClick={() => activateTab("remote")}>
           Open Remote
         </button>
-        <button type="button" className="button soft compact" onClick={() => setActiveTab("sessions")}>
+        <button type="button" className="button soft compact" onClick={() => activateTab("sessions")}>
           Open Sessions
         </button>
-        <button type="button" className="button soft compact" onClick={() => setActiveTab("pair")}>
+        <button type="button" className="button soft compact" onClick={() => activateTab("threads")}>
+          Open Threads
+        </button>
+        <button type="button" className="button soft compact" onClick={() => activateTab("pair")}>
           Pair Device
         </button>
       </>
@@ -5594,113 +5815,180 @@ export default function App() {
         </button>
       </>
     );
+  const isMoreContextActive = activeTab === "settings" || activeTab === "pair" || activeTab === "remote" || activeTab === "debug";
+  const shellNavItems = [
+    { tab: "home" as const, label: "Home", testId: "tab-home" },
+    { tab: "sessions" as const, label: "Sessions", testId: "tab-sessions" },
+    { tab: "threads" as const, label: "Threads", testId: "tab-threads" },
+    { tab: "settings" as const, label: "More", testId: "tab-settings" },
+  ];
+  const shellMastheadEyebrow =
+    activeTab === "sessions"
+      ? "Codex runtime"
+      : activeTab === "threads"
+        ? "Conversation archive"
+        : activeTab === "settings"
+          ? "System operations"
+          : activeTab === "pair"
+            ? "Device pairing"
+            : activeTab === "debug"
+              ? "Controller diagnostics"
+              : "Codrex control surface";
+  const shellMastheadTitle =
+    activeTab === "sessions"
+      ? "Sessions"
+      : activeTab === "threads"
+        ? "Threads"
+        : activeTab === "settings"
+          ? "Settings"
+          : activeTab === "pair"
+            ? "Pair Devices"
+            : activeTab === "debug"
+              ? "Debug"
+              : "Remote Control";
+  const shellMastheadDetail =
+    activeTab === "sessions"
+      ? sessionsRuntimeDetail
+      : activeTab === "threads"
+        ? "Review thread state, transcripts, and latest session context without leaving the shell."
+        : activeTab === "settings"
+          ? "Keep auth, routing, display targets, and loop settings on one operational surface."
+          : activeTab === "pair"
+            ? "Bring another device onto the current controller origin without losing context."
+            : activeTab === "debug"
+              ? "Inspect runtime state, active runs, and controller health from one place."
+              : "Operate desktop, sessions, transfers, and recovery flows without breaking context.";
+  const shellSummaryCards = [
+    {
+      label: "Connection",
+      value: homeRouteHeadline,
+      note: controllerRouteAdvice,
+      tone: "connection",
+    },
+    {
+      label: "Origin",
+      value: preferredOrigin || "not ready",
+      note: `Route hint: ${prettyRouteLabel(routeHint)}`,
+      tone: "origin",
+    },
+    {
+      label: "Runtime",
+      value: sessionsRuntimeState,
+      note: `${sessionCountLabel} sessions`,
+      tone: "runtime",
+    },
+    {
+      label: "Remote",
+      value: desktopTransportSource?.desktop_stream_transport || "fallback",
+      note: remoteControlSummary,
+      tone: "remote",
+    },
+    {
+      label: "Build",
+      value: appVersionLabel,
+      note: appModeLabel,
+      tone: "build",
+    },
+  ];
 
   return (
     <div className={appShellClassName}>
       <div className="app-bg" aria-hidden="true" />
 
-      {!isRemoteWorkspace && !hideShellChrome ? (
-      <header className="app-topbar">
-        <div className="brand-cluster">
-          <div className="brand-mark" aria-hidden="true">
-            <img src="/icon.svg" alt="" />
+      {!isRemoteWorkspace && !quietShellChrome ? (
+      <header className="app-topbar shell-masthead">
+        <div className="shell-masthead-copy">
+          <p className="eyebrow shell-masthead-eyebrow">{shellMastheadEyebrow}</p>
+          <div className="shell-masthead-title-row">
+            <div className="brand-cluster shell-brand-cluster">
+              <div className="brand-lockup shell-brand-lockup">
+                <img className="brand-logo-image" src={codrexLogoHero} alt="Codrex" />
+                <div className="shell-brand-copy">
+                  <h1>{shellMastheadTitle}</h1>
+                  <p className="subtitle brand-support">{shellMastheadDetail}</p>
+                </div>
+              </div>
+            </div>
+
+            <div className="shell-health-cluster" aria-live="polite">
+              <span className={`status-pill shell-status-pill ${errorMessage ? "error" : ""}`}>{errorMessage || statusMessage}</span>
+              <span className="status-pill subtle shell-status-pill">{connectivitySummary} | {outputFeedSummary}</span>
+            </div>
           </div>
-          <div>
-            <p className="eyebrow">Codrex Remote</p>
-            <h1>Codrex</h1>
-            <p className="subtitle">Remote control for your laptop, sessions, and transfers.</p>
+
+          <div className="shell-summary-grid" data-testid={`shell-summary-${activeTab}`}>
+            {shellSummaryCards.map((item) => (
+              <article key={item.label} className={`shell-summary-card shell-summary-card-${item.tone}`}>
+                <span className="shell-summary-label">{item.label}</span>
+                <strong className="shell-summary-value">{item.value}</strong>
+                <span className="shell-summary-note">{item.note}</span>
+              </article>
+            ))}
           </div>
         </div>
 
-        <div className="row top-actions">
-          <button type="button" className="button soft compact" onClick={() => void onHardRefresh()}>
-            Refresh
-          </button>
-          <button
-            type="button"
-            className="button soft compact"
-            data-testid="install-app-button"
-            onClick={() => void onInstallCta()}
-            disabled={installState === "installed" || installState === "prompting"}
-          >
-            {installButtonLabel}
-          </button>
-          <button type="button" className="button ghost" onClick={() => setActiveTab("settings")}>
-            Settings
-          </button>
-        </div>
-        {showInstallGuide ? (
-          <div className="install-guide" data-testid="install-guide">
-            <strong>Install on Android</strong>
-            <p>Open this page in Chrome, then tap menu and choose Add to Home screen or Install app.</p>
-            <p className="small">If install is unavailable, use your Tailscale URL and refresh once.</p>
+        <div className="shell-masthead-actions">
+          <div className="row top-actions">
+            <button type="button" className="button soft compact" onClick={() => void onHardRefresh()}>
+              Refresh
+            </button>
+            <button
+              type="button"
+              className="button soft compact"
+              data-testid="install-app-button"
+              onClick={() => void onInstallCta()}
+              disabled={installState === "installed" || installState === "prompting"}
+            >
+              {installButtonLabel}
+            </button>
+            <button
+              type="button"
+              className={`button soft compact ${activeTab === "settings" ? "active" : ""}`}
+              onClick={() => activateTab("settings")}
+            >
+              Settings
+            </button>
           </div>
-        ) : null}
+
+          <details className="meta-details shell-summary-details">
+            <summary>System Snapshot</summary>
+            <div className="meta-strip secondary">
+              <div className="meta-chip">
+                <span>Status</span>
+                <strong>{statusSnapshotSummary}</strong>
+              </div>
+              <div className="meta-chip">
+                <span>Auth</span>
+                <strong>{authSummary}</strong>
+              </div>
+              <div className="meta-chip">
+                <span>Output</span>
+                <strong>{outputFeedSummary}</strong>
+              </div>
+              <div className="meta-chip">
+                <span>Debug</span>
+                <strong>{runningRuns} running | {totalEvents} events</strong>
+              </div>
+              <div className="meta-chip">
+                <span>Connectivity</span>
+                <strong>{connectivitySummary} | {installSummary}</strong>
+              </div>
+            </div>
+          </details>
+
+          {showInstallGuide ? (
+            <div className="install-guide" data-testid="install-guide">
+              <strong>Install on Android</strong>
+              <p>Open this page in Chrome, then tap menu and choose Add to Home screen or Install app.</p>
+              <p className="small">If install is unavailable, use your Tailscale URL and refresh once.</p>
+            </div>
+          ) : null}
+        </div>
       </header>
       ) : null}
 
-      {!isRemoteWorkspace && !hideShellChrome ? (
-      <section className="meta-strip primary">
-        <div className="meta-chip important">
-          <span>Connection</span>
-          <strong>{homeRouteHeadline}</strong>
-        </div>
-        <div className="meta-chip important">
-          <span>Origin</span>
-          <strong>{preferredOrigin || "not ready"}</strong>
-        </div>
-        <div className="meta-chip important">
-          <span>Sessions</span>
-          <strong>{sessionsRuntimeState}</strong>
-        </div>
-        <div className="meta-chip important">
-          <span>Remote</span>
-          <strong>{desktopTransportSource?.desktop_stream_transport || "fallback"}</strong>
-        </div>
-        <div className="meta-chip important">
-          <span>Build</span>
-          <strong>{appVersionLabel} / {appModeLabel}</strong>
-        </div>
-      </section>
-      ) : null}
-
-      {!isRemoteWorkspace && !hideShellChrome ? (
-      <details className="meta-details">
-        <summary>System Snapshot</summary>
-        <div className="meta-strip secondary">
-          <div className="meta-chip">
-            <span>Status</span>
-            <strong>{statusSnapshotSummary}</strong>
-          </div>
-          <div className="meta-chip">
-            <span>Auth</span>
-            <strong>{authSummary}</strong>
-          </div>
-          <div className="meta-chip">
-            <span>Output</span>
-            <strong>{outputFeedSummary}</strong>
-          </div>
-          <div className="meta-chip">
-            <span>Debug</span>
-            <strong>{runningRuns} running | {totalEvents} events</strong>
-          </div>
-          <div className="meta-chip">
-            <span>Connectivity</span>
-            <strong>{connectivitySummary} | {installSummary}</strong>
-          </div>
-        </div>
-      </details>
-      ) : null}
-
-      {!isRemoteWorkspace && (!hideShellChrome || Boolean(errorMessage)) ? (
-      <section className="status-strip" aria-live="polite">
-        <span className={`status-pill ${errorMessage ? "error" : ""}`}>{errorMessage || statusMessage}</span>
-        {!hideShellChrome ? <span className="status-pill subtle">{connectivitySummary} | {outputFeedSummary}</span> : null}
-      </section>
-      ) : null}
-
-      <main className="screen-shell" ref={screenShellRef} data-testid="screen-shell">
-        {!isRemoteWorkspace && !hideShellChrome && activeTab !== "home" ? (
+      <main className={screenShellClassName} ref={screenShellRef} data-testid="screen-shell" aria-busy={isSectionSwitching || undefined}>
+        {!isRemoteWorkspace && !quietShellChrome && activeTab !== "home" ? (
         <section className="action-strip" data-testid={`primary-actions-${activeTab}`}>
           <div className="action-strip-head">
             <strong>Actions</strong>
@@ -5709,7 +5997,7 @@ export default function App() {
           <div className="action-strip-grid">{primaryActions}</div>
         </section>
         ) : null}
-        {showSwipeHint && !isRemoteWorkspace && !hideShellChrome ? (
+        {showSwipeHint && !isRemoteWorkspace && !quietShellChrome ? (
           <div className="swipe-hint" data-testid="swipe-hint">
             <p>
               Tip: Swipe left or right anywhere in the content area to move between tabs.
@@ -5762,14 +6050,14 @@ export default function App() {
                     onRevealHostPath={(path) => void onRevealHostTransferPath(path)}
                   />
                 )}
-                onOpenRemote={() => setActiveTab("remote")}
-                onOpenSessions={() => setActiveTab("sessions")}
+                onOpenRemote={() => activateTab("remote")}
+                onOpenSessions={() => activateTab("sessions")}
                 onStartSessions={() => void onStartSessionsRuntime()}
               onStopSessions={() => void onStopSessionsRuntime()}
-              onOpenPair={() => setActiveTab("pair")}
-                onOpenSettings={() => setActiveTab("settings")}
-                onOpenThreads={() => setActiveTab("threads")}
-                onOpenDebug={() => setActiveTab("debug")}
+              onOpenPair={() => activateTab("pair")}
+                onOpenSettings={() => activateTab("settings")}
+                onOpenThreads={() => activateTab("threads")}
+                onOpenDebug={() => activateTab("debug")}
                 onOpenLegacy={() => window.open("/legacy", "_blank", "noopener,noreferrer")}
               />
             </Suspense>
@@ -5995,6 +6283,8 @@ export default function App() {
                     sessionNotes={sessionNotes}
                     onSessionNotesChange={onSessionNotesChange}
                     latestSessionResponseSnapshot={latestSessionResponseSnapshot}
+                    sessionLoopBusy={sessionLoopBusy}
+                    onSessionLoopModeChange={(value) => void onSessionLoopModeChange(selectedSessionInfo.session, value)}
                   />
                 )}
               </div>
@@ -6238,7 +6528,7 @@ export default function App() {
                     onClick={() => {
                       if (activeThread?.session) {
                         setSelectedSession(activeThread.session);
-                        setActiveTab("sessions");
+                        activateTab("sessions");
                       }
                     }}
                     disabled={!activeThread}
@@ -6351,7 +6641,7 @@ export default function App() {
                           if (activeThread.session) {
                             setSelectedSession(activeThread.session);
                           }
-                          setActiveTab("sessions");
+                          activateTab("sessions");
                         }}
                         disabled={!activeThread.session}
                       >
@@ -6392,11 +6682,11 @@ export default function App() {
                 </div>
               </div>
               <div className="remote-session-nav" role="toolbar" aria-label="Remote workspace actions">
-                <button type="button" className="button ghost compact remote-rail-button" onClick={() => setActiveTab("home")}>
+                <button type="button" className="button ghost compact remote-rail-button" onClick={() => activateTab("home")}>
                   <span className="remote-rail-icon" aria-hidden="true">{renderNavIcon("home")}</span>
                   <span className="btn-text">Home</span>
                 </button>
-                <button type="button" className="button ghost compact remote-rail-button" onClick={() => setActiveTab("sessions")}>
+                <button type="button" className="button ghost compact remote-rail-button" onClick={() => activateTab("sessions")}>
                   <span className="remote-rail-icon" aria-hidden="true">{renderNavIcon("sessions")}</span>
                   <span className="btn-text">Sessions</span>
                 </button>
@@ -7061,6 +7351,23 @@ export default function App() {
               prettyRouteLabel={prettyRouteLabel}
               netInfo={netInfo}
               refreshNet={() => void refreshNet()}
+              desktopTargets={desktopTargets}
+              activeDesktopTargetId={activeDesktopTargetId}
+              desktopTargetsBusy={desktopTargetsBusy}
+              desktopTargetsDetail={desktopTargetsDetail}
+              refreshDesktopTargets={() => void refreshDesktopTargets()}
+              onSelectDesktopTarget={(targetId) => void onSelectDesktopTarget(targetId)}
+              loopSettingsBusy={loopSettingsBusy}
+              loopDefaultPrompt={loopDefaultPrompt}
+              setLoopDefaultPrompt={setLoopDefaultPrompt}
+              loopChecksText={loopChecksText}
+              setLoopChecksText={setLoopChecksText}
+              loopGlobalPreset={loopGlobalPreset}
+              setLoopGlobalPreset={setLoopGlobalPreset}
+              loopTelegramConfigured={Boolean(loopStatus?.settings?.telegram_configured)}
+              loopWorker={loopStatus?.worker || null}
+              onRefreshLoopStatus={() => void refreshLoopStatus()}
+              onSaveLoopSettings={() => void onSaveLoopSettings()}
             />
           </Suspense>
         ) : null}
@@ -7098,33 +7405,22 @@ export default function App() {
 
       {!isRemoteWorkspace ? (
       <nav className="bottom-nav" aria-label="Primary navigation">
-        <button
-          type="button"
-          data-testid="tab-home"
-          className={`nav-item ${activeTab === "home" ? "active" : ""}`}
-          onClick={() => setActiveTab("home")}
-        >
-          <span className="nav-icon">{renderNavIcon("home")}</span>
-          <span className="nav-label">Home</span>
-        </button>
-        <button
-          type="button"
-          data-testid="tab-sessions"
-          className={`nav-item ${activeTab === "sessions" ? "active" : ""}`}
-          onClick={() => setActiveTab("sessions")}
-        >
-          <span className="nav-icon">{renderNavIcon("sessions")}</span>
-          <span className="nav-label">Sessions</span>
-        </button>
-        <button
-          type="button"
-          data-testid="tab-remote"
-          className={`nav-item ${activeTab === "remote" ? "active" : ""}`}
-          onClick={() => setActiveTab("remote")}
-        >
-          <span className="nav-icon">{renderNavIcon("remote")}</span>
-          <span className="nav-label">Remote</span>
-        </button>
+        {shellNavItems.map((item) => {
+          const isActive = item.tab === "settings" ? isMoreContextActive : activeTab === item.tab;
+          const icon = renderNavIcon(item.tab);
+          return (
+            <button
+              type="button"
+              key={item.tab}
+              data-testid={item.testId}
+              className={`nav-item ${isActive ? "active" : ""}`}
+              onClick={() => activateTab(item.tab)}
+            >
+              <span className="nav-icon">{icon}</span>
+              <span className="nav-label">{item.label}</span>
+            </button>
+          );
+        })}
       </nav>
       ) : null}
     </div>

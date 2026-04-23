@@ -1,4 +1,38 @@
 export type SessionState = "starting" | "idle" | "busy" | "running" | "waiting" | "done" | "error" | "recovering";
+export type LoopPreset = "infinite" | "await-reply" | "completion-checks" | "max-turns-1" | "max-turns-2" | "max-turns-3";
+export type LoopOverrideMode = "inherit" | "off" | LoopPreset;
+
+export interface SessionLoopInfo {
+  override_mode: LoopOverrideMode;
+  effective_preset?: LoopPreset | null;
+  remaining_turns?: number | null;
+  awaiting_reply?: boolean;
+  last_terminal_state?: string;
+  last_terminal_at?: number;
+  last_action?: string;
+  last_action_detail?: string;
+  last_action_at?: number;
+  last_notification_at?: number;
+  last_continue_at?: number;
+  last_reply_at?: number;
+  last_prompt_at?: number;
+  last_snapshot?: string;
+}
+
+export interface LoopSettingsInfo {
+  default_prompt: string;
+  global_preset?: LoopPreset | null;
+  completion_checks?: string[];
+  telegram_configured?: boolean;
+}
+
+export interface LoopWorkerInfo {
+  alive?: boolean;
+  last_cycle_at?: number;
+  last_telegram_poll_at?: number;
+  last_error?: string;
+  last_error_at?: number;
+}
 
 export interface AuthStatus {
   ok: boolean;
@@ -120,6 +154,10 @@ export interface CodexRuntimeStatusResult extends BasicResult {
   distro?: string;
   can_start?: boolean;
   can_stop?: boolean;
+  profiles?: string[];
+  default_profile?: string;
+  cwd?: string;
+  read_only?: boolean;
 }
 
 export interface PairCreateResult extends BasicResult {
@@ -133,6 +171,7 @@ export interface SessionInfo {
   current_command: string;
   cwd: string;
   state: SessionState;
+  busy_source?: "idle" | "desktop" | "sidecar";
   updated_at: number;
   last_seen_at?: number;
   snippet: string;
@@ -142,6 +181,35 @@ export interface SessionInfo {
   closed_at?: number;
   can_resume?: boolean;
   resume_id?: string;
+  title?: string;
+  raw_title?: string;
+  raw_snippet?: string;
+  source?: string;
+  read_only?: boolean;
+  loop?: SessionLoopInfo;
+  desktop_codex_meta?: {
+    kind?: "project" | "chat";
+    source_label?: string;
+    group_id?: string;
+    group_label?: string;
+    group_hint?: string;
+    workspace_label?: string;
+    workspace_hint?: string;
+    workspace_path?: string;
+    display_title?: string;
+    full_title?: string;
+    preview?: string;
+    details?: string;
+    git_branch?: string;
+    git_origin_url?: string;
+    agent_nickname?: string;
+    agent_role?: string;
+    launch_issue?: {
+      active?: boolean;
+      path?: string;
+      path_label?: string;
+    };
+  };
 }
 
 export interface SessionsMeta {
@@ -155,6 +223,11 @@ export interface SessionsResult extends BasicResult {
   sessions?: SessionInfo[];
   recent_closed?: SessionInfo[];
   meta?: SessionsMeta;
+}
+
+export interface LoopStatusResult extends BasicResult {
+  settings?: LoopSettingsInfo;
+  worker?: LoopWorkerInfo;
 }
 
 export interface SessionCreateResult extends BasicResult {
@@ -208,6 +281,8 @@ export interface SessionScreenResult extends BasicResult {
   current_command?: string;
   state?: SessionState;
   text?: string;
+  title?: string;
+  read_only?: boolean;
 }
 
 export interface TmuxHealthResult extends BasicResult {
@@ -246,6 +321,7 @@ export interface DesktopInfoResult extends BasicResult {
   top?: number;
   width?: number;
   height?: number;
+  active_target_id?: string;
   alt_held?: boolean;
   perf_mode_enabled?: boolean;
   perf_mode_active?: boolean;
@@ -254,6 +330,50 @@ export interface DesktopInfoResult extends BasicResult {
   desktop_webrtc_available?: boolean;
   desktop_webrtc_enabled?: boolean;
   desktop_webrtc_detail?: string;
+}
+
+export interface DesktopTargetInfo {
+  id: string;
+  label: string;
+  kind?: string;
+  virtual?: boolean;
+  physical?: boolean;
+  privacy_compatible?: boolean;
+  selected?: boolean;
+  left?: number;
+  top?: number;
+  width?: number;
+  height?: number;
+}
+
+export interface DesktopTargetsResult extends BasicResult {
+  targets?: DesktopTargetInfo[];
+  active_target?: DesktopTargetInfo | null;
+  virtual_supported?: boolean;
+  virtual_enabled?: boolean;
+  detail?: string;
+}
+
+export interface PrivacyLockStatusResult extends BasicResult {
+  supported?: boolean;
+  detail?: string;
+  default_mode?: string;
+  pin_configured?: boolean;
+  active?: boolean;
+  mode?: string;
+  display_scope?: string;
+  owner_device_id?: string;
+  owner_device_name?: string;
+  locked_at?: number;
+  updated_at?: number;
+  helper_ready?: boolean;
+  helper_error?: string;
+  last_unlock_source?: string;
+  soft_reveal_until?: number;
+  virtual_target_available?: boolean;
+  previous_target_id?: string;
+  active_target_id?: string;
+  virtual_target_id?: string;
 }
 
 export interface DesktopStreamCapabilitiesResult extends BasicResult {

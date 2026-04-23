@@ -37,6 +37,39 @@ interface SessionCardProps {
   onReopenSession?: (session: SessionInfo) => void;
 }
 
+function formatLoopLabel(session: SessionInfo): string {
+  const loop = session.loop;
+  if (!loop) {
+    return "";
+  }
+  if (loop.awaiting_reply) {
+    return "awaiting reply";
+  }
+  const preset = loop.effective_preset || null;
+  if (preset === "await-reply") {
+    return "await";
+  }
+  if (preset === "completion-checks") {
+    return "checks";
+  }
+  if (preset === "max-turns-1") {
+    return "max 1";
+  }
+  if (preset === "max-turns-2") {
+    return "max 2";
+  }
+  if (preset === "max-turns-3") {
+    return "max 3";
+  }
+  if (preset === "infinite") {
+    return "infinite";
+  }
+  if (loop.override_mode === "off") {
+    return "loop off";
+  }
+  return "";
+}
+
 const SessionCard = memo(function SessionCard({
   session,
   selected,
@@ -53,6 +86,7 @@ const SessionCard = memo(function SessionCard({
   };
   const isClosed = mode === "closed";
   const statusLabel = isClosed ? "closed" : session.state;
+  const loopLabel = formatLoopLabel(session);
 
   return (
     <div
@@ -116,6 +150,7 @@ const SessionCard = memo(function SessionCard({
         <span>{project}</span>
         <span>{session.model || "default model"}</span>
         <span>{session.reasoning_effort || "default reasoning"}</span>
+        {loopLabel ? <span>{loopLabel}</span> : null}
       </small>
       <small className="session-cwd">{session.cwd || "Unknown cwd"}</small>
     </div>

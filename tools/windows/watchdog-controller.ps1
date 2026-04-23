@@ -60,6 +60,7 @@ $logsDir = Join-Path $runtimeDir "logs"
 $logPath = Join-Path $logsDir "watchdog.log"
 $startupLogPath = Join-Path $logsDir "startup-bootstrap.log"
 $controllerStartupStatePath = Join-Path $stateDir "controller.starting.json"
+$watchdogStatePath = Join-Path $stateDir "watchdog-controller.state.json"
 
 if (-not (Test-Path $startScript)) {
   throw "Missing start script at $startScript"
@@ -68,6 +69,43 @@ if (-not (Test-Path $logsDir)) {
   New-Item -Path $logsDir -ItemType Directory -Force | Out-Null
 }
 Write-WatchdogBreadcrumb ("invoked on port {0}" -f $Port)
+
+function Get-WatchdogFailureCount {
+  if (-not (Test-Path $watchdogStatePath)) {
+    return 0
+  }
+  try {
+    $raw = Get-Content -Path $watchdogStatePath -Raw | ConvertFrom-Json
+    $count = [int]($raw.failure_count)
+    $lastFailureText = [string]$raw.last_failure_at
+    if ($lastFailureText) {
+      $ageSeconds = ((Get-Date) - (Get-Date $lastFailureText)).TotalSeconds
+      if ($ageSeconds -gt 300) {
+        return 0
+      }
+    }
+    return [Math]::Max(0, $count)
+  } catch {
+    return 0
+  }
+}
+
+function Set-WatchdogFailureCount {
+  param(
+    [int]$Count
+  )
+  try {
+    if ($Count -le 0) {
+      Remove-Item -Path $watchdogStatePath -Force -ErrorAction SilentlyContinue
+      return
+    }
+    $payload = [ordered]@{
+      failure_count = [int]$Count
+      last_failure_at = (Get-Date).ToString("o")
+    }
+    $payload | ConvertTo-Json -Depth 3 | Set-Content -Path $watchdogStatePath -Encoding UTF8
+  } catch {}
+}
 
 if (Test-Path $configPath) {
   try {
@@ -80,13 +118,14 @@ if (Test-Path $configPath) {
 
 $healthy = $false
 try {
-  $resp = Invoke-WebRequest -UseBasicParsing "http://127.0.0.1:$Port/auth/status" -TimeoutSec 2
+  $resp = Invoke-WebRequest -UseBasicParsing "http://127.0.0.1:$Port/auth/status" -TimeoutSec 4
   if ($resp.StatusCode -eq 200) {
     $healthy = $true
   }
 } catch {}
 
 if ($healthy) {
+  Set-WatchdogFailureCount -Count 0
   Write-WatchdogBreadcrumb ("health check ok on port {0}" -f $Port)
   exit 0
 }
@@ -95,9 +134,18 @@ if (Test-RecentControllerStartup) {
   exit 0
 }
 
+$failureCount = (Get-WatchdogFailureCount) + 1
+Set-WatchdogFailureCount -Count $failureCount
+if ($failureCount -lt 3) {
+  Write-WatchdogBreadcrumb ("health check failed on port {0}; failure_count={1}/3, deferring restart" -f $Port, $failureCount)
+  exit 0
+}
+
+Set-WatchdogFailureCount -Count 0
+
 $stamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
 Add-Content -Path $logPath -Value "$stamp unhealthy on port $Port, restarting"
-Write-WatchdogBreadcrumb ("health check failed on port {0}; launching restart" -f $Port)
+Write-WatchdogBreadcrumb ("health check failed on port {0}; failure_count={1}/3, launching restart" -f $Port, $failureCount)
 
 try {
   $proc = Start-Process -FilePath "powershell.exe" -ArgumentList @(

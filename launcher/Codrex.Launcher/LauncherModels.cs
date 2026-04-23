@@ -156,42 +156,6 @@ public sealed class ControllerConfigData
     public string Token { get; set; } = "";
 }
 
-public sealed class LauncherPrivacyLockStatus
-{
-    [JsonPropertyName("ok")]
-    public bool Ok { get; set; }
-
-    [JsonPropertyName("supported")]
-    public bool Supported { get; set; }
-
-    [JsonPropertyName("detail")]
-    public string Detail { get; set; } = "";
-
-    [JsonPropertyName("pin_configured")]
-    public bool PinConfigured { get; set; }
-
-    [JsonPropertyName("active")]
-    public bool Active { get; set; }
-
-    [JsonPropertyName("mode")]
-    public string Mode { get; set; } = "";
-
-    [JsonPropertyName("display_scope")]
-    public string DisplayScope { get; set; } = "";
-
-    [JsonPropertyName("owner_device_name")]
-    public string OwnerDeviceName { get; set; } = "";
-
-    [JsonPropertyName("helper_ready")]
-    public bool HelperReady { get; set; }
-
-    [JsonPropertyName("helper_error")]
-    public string HelperError { get; set; } = "";
-
-    [JsonPropertyName("last_unlock_source")]
-    public string LastUnlockSource { get; set; } = "";
-}
-
 public sealed class LauncherAccountAuthProfile
 {
     [JsonPropertyName("account_id")]

@@ -26,7 +26,6 @@ public partial class MainWindow : Window
     private PairingResult? _currentPairing;
     private NetInfoPayload? _lastNetInfo;
     private LauncherAccountsPayload? _lastAccounts;
-    private LauncherPrivacyLockStatus? _lastPrivacyLock;
     private bool _webReady;
     private bool _actionBusy;
     private long _actionGeneration;
@@ -236,20 +235,6 @@ public partial class MainWindow : Window
                     break;
                 case "toggleStartup":
                     await ToggleStartupAsync();
-                    break;
-                case "privacySetPin":
-                    if (root.TryGetProperty("newPin", out var newPinProperty))
-                    {
-                        await SavePrivacyPinAsync(newPinProperty.GetString() ?? string.Empty, string.Empty);
-                    }
-                    break;
-                case "privacyChangePin":
-                    await SavePrivacyPinAsync(
-                        root.TryGetProperty("newPin", out var changedPinProperty) ? changedPinProperty.GetString() ?? string.Empty : string.Empty,
-                        root.TryGetProperty("currentPin", out var currentPinProperty) ? currentPinProperty.GetString() ?? string.Empty : string.Empty);
-                    break;
-                case "privacyClearPin":
-                    await ClearPrivacyPinAsync(root.TryGetProperty("currentPin", out var clearCurrentPinProperty) ? clearCurrentPinProperty.GetString() ?? string.Empty : string.Empty);
                     break;
                 case "toggleMinimizeToTray":
                     _preferences.MinimizeToTray = !_preferences.MinimizeToTray;
@@ -500,40 +485,6 @@ public partial class MainWindow : Window
         await PublishStateAsync();
     }
 
-    private async Task SavePrivacyPinAsync(string newPin, string currentPin)
-    {
-        if (_lastRuntime is null || !_lastRuntime.Ok || !_lastRuntime.Status.Equals("running", StringComparison.OrdinalIgnoreCase))
-        {
-            _errorDetail = "Start Codrex before managing the privacy PIN.";
-            await PublishStateAsync();
-            return;
-        }
-
-        var config = _runtimeService.ReadControllerConfig();
-        _lastPrivacyLock = await _runtimeService.SavePrivacyPinAsync(_lastRuntime.ControllerPort, config.Token, newPin, currentPin);
-        _statusDetail = "Privacy PIN saved.";
-        _errorDetail = "";
-        RecordActionEvent("privacy", "privacy pin saved");
-        await PublishStateAsync();
-    }
-
-    private async Task ClearPrivacyPinAsync(string currentPin)
-    {
-        if (_lastRuntime is null || !_lastRuntime.Ok || !_lastRuntime.Status.Equals("running", StringComparison.OrdinalIgnoreCase))
-        {
-            _errorDetail = "Start Codrex before managing the privacy PIN.";
-            await PublishStateAsync();
-            return;
-        }
-
-        var config = _runtimeService.ReadControllerConfig();
-        _lastPrivacyLock = await _runtimeService.ClearPrivacyPinAsync(_lastRuntime.ControllerPort, config.Token, currentPin);
-        _statusDetail = "Privacy PIN cleared.";
-        _errorDetail = "";
-        RecordActionEvent("privacy", "privacy pin cleared");
-        await PublishStateAsync();
-    }
-
     private async Task RefreshStateAsync()
     {
         if (_refreshInFlight)
@@ -589,23 +540,10 @@ public partial class MainWindow : Window
                         }
                     }
 
-                    try
-                    {
-                        var config = _runtimeService.ReadControllerConfig();
-                        _lastPrivacyLock = await _runtimeService.GetPrivacyLockStatusAsync(_lastRuntime.ControllerPort, config.Token);
-                    }
-                    catch (Exception ex)
-                    {
-                        if (_lastPrivacyLock is null)
-                        {
-                            RecordActionEvent("privacy", $"privacy status unavailable -> {ex.Message}");
-                        }
-                    }
                 }
                 else
                 {
                     _lastNetInfo = null;
-                    _lastPrivacyLock = null;
                     _lastNetInfoRefreshUtc = DateTime.MinValue;
                     _routeNotice = "";
                 }
@@ -736,13 +674,6 @@ public partial class MainWindow : Window
             qrImageUrl = _currentPairing?.QrImageUrl ?? "",
             qrVisible = !string.IsNullOrWhiteSpace(_currentPairing?.QrImageUrl),
             pairDetail = _currentPairing?.Detail ?? "",
-            privacySupported = _lastPrivacyLock?.Supported ?? false,
-            privacyPinConfigured = _lastPrivacyLock?.PinConfigured ?? false,
-            privacyActive = _lastPrivacyLock?.Active ?? false,
-            privacyDetail = _lastPrivacyLock?.Detail ?? "",
-            privacyOwner = _lastPrivacyLock?.OwnerDeviceName ?? "",
-            privacyHelperReady = _lastPrivacyLock?.HelperReady ?? false,
-            privacyHelperError = _lastPrivacyLock?.HelperError ?? "",
             logsDir = _stateStore.LogsDir,
             advancedVisible = _preferences.AdvancedVisible,
             minimizeToTray = _preferences.MinimizeToTray,

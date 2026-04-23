@@ -1,4 +1,5 @@
 import type { ReactNode } from "react";
+import codrexLogoHero from "../assets/codrex-logo-hero.png";
 
 interface HomeTabProps {
   screenCardClassName: string;
@@ -120,14 +121,13 @@ export default function HomeTab({
 }: HomeTabProps) {
   if (compactMode) {
     return (
-      <section className={`${screenCardClassName} home-screen compact-home-screen compact-home-menu-screen`} data-testid="tab-panel-home">
+      <section className={`${screenCardClassName} home-screen home-shell-screen compact-home-screen compact-home-menu-screen`} data-testid="tab-panel-home">
         <div className="home-compact-header">
-          <p className="home-kicker">Codrex</p>
-          <h2>Your laptop, in reach.</h2>
+            <img className="home-compact-logo" src={codrexLogoHero} alt="Codrex" />
           <p className="home-header-copy">Remote, sessions, and transfers.</p>
         </div>
 
-        <div className="home-menu-board">
+        <div className="home-menu-board home-compact-board home-shell-menu-board">
         <div className="home-menu-stack">
           <button type="button" className="home-menu-item home-menu-item-primary" onClick={onOpenRemote}>
             <span className="home-menu-icon" aria-hidden="true"><HomeIcon kind="remote" /></span>
@@ -187,7 +187,7 @@ export default function HomeTab({
           </button>
         </div>
 
-        <details className="home-advanced">
+        <details className="home-advanced home-shell-advanced">
           <summary>Advanced</summary>
           <div className="home-advanced-facts">
             <div className="home-fact">
@@ -227,8 +227,8 @@ export default function HomeTab({
   }
 
   return (
-    <section className={`${screenCardClassName} home-screen`} data-testid="tab-panel-home">
-      <div className="home-header-strip">
+    <section className={`${screenCardClassName} home-screen home-shell-screen`} data-testid="tab-panel-home">
+      <div className="home-header-strip home-shell-header">
         <div>
           <p className="home-kicker">Codrex</p>
           <h2>Remote Control</h2>
@@ -240,8 +240,8 @@ export default function HomeTab({
         </div>
       </div>
 
-      <div className="home-grid">
-        <section className="home-hero">
+      <div className="home-grid home-command-grid home-shell-command-grid">
+        <section className="home-hero home-shell-hero">
           <div className="home-hero-copywrap">
             <span className="home-hero-icon" aria-hidden="true"><HomeIcon kind="route" /></span>
             <div>
@@ -252,7 +252,7 @@ export default function HomeTab({
             </div>
           </div>
           <div className="home-hero-actions">
-            <button type="button" className="button" onClick={onOpenRemote}>
+            <button type="button" className="button button-shell-primary home-shell-cta" onClick={onOpenRemote}>
               <span className="btn-glyph" aria-hidden="true"><HomeIcon kind="remote" /></span>
               Resume Remote
             </button>
@@ -268,7 +268,7 @@ export default function HomeTab({
           </div>
         </section>
 
-        <section className="home-card home-command-card">
+        <section className="home-card home-command-card home-shell-card">
           <div className="home-card-head">
             <div className="home-card-heading">
               <span className="home-card-icon remote" aria-hidden="true"><HomeIcon kind="remote" /></span>
@@ -289,7 +289,7 @@ export default function HomeTab({
           </div>
         </section>
 
-        <section className="home-card home-command-card">
+        <section className="home-card home-command-card home-shell-card">
           <div className="home-card-head">
             <div className="home-card-heading">
               <span className="home-card-icon sessions" aria-hidden="true"><HomeIcon kind="sessions" /></span>
@@ -320,12 +320,12 @@ export default function HomeTab({
           </div>
         </section>
 
-        <section className="home-card home-transfer-card">
+        <section className="home-card home-transfer-card home-shell-transfer">
           {transferWorkspace}
         </section>
       </div>
 
-      <details className="home-advanced">
+      <details className="home-advanced home-shell-advanced">
         <summary>Advanced</summary>
         <div className="home-advanced-facts">
           <div className="home-fact">

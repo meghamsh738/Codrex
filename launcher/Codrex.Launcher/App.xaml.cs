@@ -13,16 +13,13 @@ public partial class App : System.Windows.Application
     private EventWaitHandle? _activateEvent;
     private CancellationTokenSource? _activateCts;
     private Task? _activateTask;
-    private PrivacyLockHelperSession? _privacyLockHelper;
-
     protected override void OnStartup(StartupEventArgs e)
     {
-        if (PrivacyLockHelperOptions.TryParse(e.Args, out var helperOptions) && helperOptions is not null)
+        if (RemoteClickCommand.TryParse(e.Args, out var remoteClickOptions) && remoteClickOptions is not null)
         {
             ShutdownMode = ShutdownMode.OnExplicitShutdown;
-            _privacyLockHelper = new PrivacyLockHelperSession(helperOptions);
-            _privacyLockHelper.Start();
-            base.OnStartup(e);
+            Environment.ExitCode = RemoteClickCommand.Execute(remoteClickOptions);
+            Shutdown();
             return;
         }
 

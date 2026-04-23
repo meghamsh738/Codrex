@@ -9,17 +9,22 @@ import type {
   CodexRunDetail,
   CodexRunsResult,
   DesktopStreamCapabilitiesResult,
+  DesktopTargetsResult,
   DesktopWebrtcOfferResult,
   DesktopInfoResult,
   DesktopInputResult,
   DesktopPasteImageResult,
   DesktopModeResult,
   HostTransferResult,
+  LoopOverrideMode,
+  LoopPreset,
+  LoopStatusResult,
   NetInfo,
   OpenPathResult,
   PairCreateResult,
   PowerActionResult,
   PowerStatusResult,
+  PrivacyLockStatusResult,
   SessionCreateResult,
   SessionFilesResult,
   SessionProfileApplyResult,
@@ -142,11 +147,22 @@ async function parseJson<T>(res: Response): Promise<T | string> {
   }
 }
 
-async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
+interface RequestJsonInit extends RequestInit {
+  timeoutMs?: number;
+}
+
+async function requestJson<T>(path: string, init?: RequestJsonInit): Promise<T> {
   const method = (init?.method || "GET").toUpperCase();
   const startedAt = Date.now();
   const bodyPreview = safePreview(init?.body);
   let didReceiveResponse = false;
+  const timeoutMs = typeof init?.timeoutMs === "number" && init.timeoutMs > 0 ? init.timeoutMs : 0;
+  const timeoutController = timeoutMs > 0 ? new AbortController() : null;
+  const timeoutHandle = timeoutController
+    ? window.setTimeout(() => {
+      timeoutController.abort(new Error(`Request timed out after ${timeoutMs}ms`));
+    }, timeoutMs)
+    : null;
 
   emitIpcEvent({
     channel: "http",
@@ -157,9 +173,11 @@ async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
   });
 
   try {
+    const { timeoutMs: _timeoutMs, ...requestInit } = init || {};
     const response = await fetch(path, {
       credentials: "include",
-      ...init,
+      ...requestInit,
+      signal: timeoutController?.signal || requestInit.signal,
     });
     didReceiveResponse = true;
 
@@ -200,6 +218,10 @@ async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
       });
     }
     throw error;
+  } finally {
+    if (timeoutHandle != null) {
+      window.clearTimeout(timeoutHandle);
+    }
   }
 }
 
@@ -490,6 +512,243 @@ export function buildSessionStreamUrl(
   return url.toString();
 }
 
+export function getWindowsRuntimeStatus(): Promise<CodexRuntimeStatusResult> {
+  return requestJson<CodexRuntimeStatusResult>("/windows/runtime/status");
+}
+
+export function startWindowsRuntime(): Promise<CodexRuntimeStatusResult> {
+  return requestJson<CodexRuntimeStatusResult>("/windows/runtime/start", {
+    method: "POST",
+    headers: JSON_HEADERS,
+    body: JSON.stringify({}),
+  });
+}
+
+export function stopWindowsRuntime(): Promise<CodexRuntimeStatusResult> {
+  return requestJson<CodexRuntimeStatusResult>("/windows/runtime/stop", {
+    method: "POST",
+    headers: JSON_HEADERS,
+    body: JSON.stringify({}),
+  });
+}
+
+export function getWindowsSessions(): Promise<SessionsResult> {
+  return requestJson<SessionsResult>("/windows/sessions");
+}
+
+export function createWindowsSessionWithOptions(options: {
+  name?: string;
+  cwd?: string;
+  model?: string;
+  reasoning_effort?: string;
+  profile?: "codex" | "powershell" | "cmd";
+}): Promise<SessionCreateResult> {
+  const payload: Record<string, string> = {};
+  if (options.name && options.name.trim()) {
+    payload.name = options.name.trim();
+  }
+  if (options.cwd && options.cwd.trim()) {
+    payload.cwd = options.cwd.trim();
+  }
+  if (options.model && options.model.trim()) {
+    payload.model = options.model.trim();
+  }
+  if (options.reasoning_effort && options.reasoning_effort.trim()) {
+    payload.reasoning_effort = options.reasoning_effort.trim();
+  }
+  if (options.profile && options.profile.trim()) {
+    payload.profile = options.profile.trim();
+  }
+  return requestJson<SessionCreateResult>("/windows/session", {
+    method: "POST",
+    headers: JSON_HEADERS,
+    body: JSON.stringify(payload),
+  });
+}
+
+export function closeWindowsSession(session: string): Promise<SessionCloseResult> {
+  return requestJson<SessionCloseResult>(`/windows/session/${encodeURIComponent(session)}`, {
+    method: "DELETE",
+  });
+}
+
+export function sendToWindowsSession(session: string, prompt: string): Promise<BasicResult> {
+  return requestJson<BasicResult>(`/windows/session/${encodeURIComponent(session)}/send`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "text/plain",
+    },
+    body: prompt,
+  });
+}
+
+export function interruptWindowsSession(session: string): Promise<BasicResult> {
+  return requestJson<BasicResult>(`/windows/session/${encodeURIComponent(session)}/interrupt`, {
+    method: "POST",
+    headers: JSON_HEADERS,
+    body: JSON.stringify({}),
+  });
+}
+
+export function enterWindowsSession(session: string): Promise<BasicResult> {
+  return requestJson<BasicResult>(`/windows/session/${encodeURIComponent(session)}/enter`, {
+    method: "POST",
+    headers: JSON_HEADERS,
+    body: JSON.stringify({}),
+  });
+}
+
+export function sendWindowsSessionKey(session: string, key: "up" | "down" | "left" | "right" | "backspace"): Promise<BasicResult> {
+  return requestJson<BasicResult>(`/windows/session/${encodeURIComponent(session)}/key`, {
+    method: "POST",
+    headers: JSON_HEADERS,
+    body: JSON.stringify({ key }),
+  });
+}
+
+export function ctrlcWindowsSession(session: string): Promise<BasicResult> {
+  return requestJson<BasicResult>(`/windows/session/${encodeURIComponent(session)}/ctrlc`, {
+    method: "POST",
+    headers: JSON_HEADERS,
+    body: JSON.stringify({}),
+  });
+}
+
+export function getWindowsSessionScreen(session: string): Promise<SessionScreenResult> {
+  return requestJson<SessionScreenResult>(`/windows/session/${encodeURIComponent(session)}/screen`);
+}
+
+export function buildWindowsSessionStreamUrl(
+  session: string,
+  options?: { profile?: "fast" | "balanced" | "battery"; since_seq?: number },
+): string {
+  const base =
+    typeof window !== "undefined" && window.location
+      ? `${window.location.protocol === "https:" ? "wss:" : "ws:"}//${window.location.host}`
+      : "ws://127.0.0.1";
+  const url = new URL(`/windows/session/${encodeURIComponent(session)}/ws`, base);
+  if (options?.profile) {
+    url.searchParams.set("profile", options.profile);
+  }
+  if (typeof options?.since_seq === "number" && Number.isFinite(options.since_seq) && options.since_seq > 0) {
+    url.searchParams.set("since_seq", String(options.since_seq));
+  }
+  return url.toString();
+}
+
+export function getDesktopCodexRuntimeStatus(): Promise<CodexRuntimeStatusResult> {
+  return requestJson<CodexRuntimeStatusResult>("/desktop-codex/runtime/status");
+}
+
+export function getDesktopCodexSessions(): Promise<SessionsResult> {
+  return requestJson<SessionsResult>("/desktop-codex/sessions");
+}
+
+export function getDesktopCodexSessionScreen(session: string): Promise<SessionScreenResult> {
+  return requestJson<SessionScreenResult>(`/desktop-codex/session/${encodeURIComponent(session)}/screen`);
+}
+
+export function sendToDesktopCodexSession(session: string, prompt: string): Promise<BasicResult> {
+  if (window.CodrexAndroidBridge?.postDesktopCodexPrompt) {
+    try {
+      const raw = window.CodrexAndroidBridge.postDesktopCodexPrompt(session, prompt);
+      const payload = raw ? JSON.parse(raw) as BasicResult : ({ ok: false, detail: "Empty native response." } as BasicResult);
+      return Promise.resolve(payload);
+    } catch (error) {
+      return Promise.reject(new Error(`Android shell send failed: ${(error as Error).message}`));
+    }
+  }
+  return requestJson<BasicResult>(`/desktop-codex/session/${encodeURIComponent(session)}/send`, {
+    method: "POST",
+    timeoutMs: 60000,
+    headers: {
+      "Content-Type": "text/plain",
+    },
+    body: prompt,
+  });
+}
+
+export function interruptDesktopCodexSession(session: string): Promise<BasicResult> {
+  return requestJson<BasicResult>(`/desktop-codex/session/${encodeURIComponent(session)}/interrupt`, {
+    method: "POST",
+    headers: JSON_HEADERS,
+    body: JSON.stringify({}),
+  });
+}
+
+export function openDesktopCodexSession(session: string): Promise<BasicResult> {
+  return requestJson<BasicResult>(`/desktop-codex/session/${encodeURIComponent(session)}/open`, {
+    method: "POST",
+    headers: JSON_HEADERS,
+    body: JSON.stringify({}),
+  });
+}
+
+export function refreshDesktopCodexSession(session: string): Promise<BasicResult> {
+  return requestJson<BasicResult>(`/desktop-codex/session/${encodeURIComponent(session)}/refresh`, {
+    method: "POST",
+    headers: JSON_HEADERS,
+    body: JSON.stringify({}),
+  });
+}
+
+export function buildDesktopCodexSessionStreamUrl(
+  session: string,
+  options?: { profile?: "fast" | "balanced" | "battery"; since_seq?: number },
+): string {
+  const base =
+    typeof window !== "undefined" && window.location
+      ? `${window.location.protocol === "https:" ? "wss:" : "ws:"}//${window.location.host}`
+      : "ws://127.0.0.1";
+  const url = new URL(`/desktop-codex/session/${encodeURIComponent(session)}/ws`, base);
+  if (options?.profile) {
+    url.searchParams.set("profile", options.profile);
+  }
+  if (typeof options?.since_seq === "number" && Number.isFinite(options.since_seq) && options.since_seq > 0) {
+    url.searchParams.set("since_seq", String(options.since_seq));
+  }
+  return url.toString();
+}
+
+export function getDesktopTargets(): Promise<DesktopTargetsResult> {
+  return requestJson<DesktopTargetsResult>("/desktop/targets");
+}
+
+export function selectDesktopTarget(targetId: string): Promise<DesktopTargetsResult> {
+  return requestJson<DesktopTargetsResult>("/desktop/targets/select", {
+    method: "POST",
+    headers: JSON_HEADERS,
+    body: JSON.stringify({ target_id: targetId }),
+  });
+}
+
+export function setVirtualDesktopTarget(enabled: boolean): Promise<DesktopTargetsResult> {
+  return requestJson<DesktopTargetsResult>("/desktop/targets/virtual", {
+    method: "POST",
+    headers: JSON_HEADERS,
+    body: JSON.stringify({ enabled }),
+  });
+}
+
+export function getDesktopPrivacyLockStatus(): Promise<PrivacyLockStatusResult> {
+  return requestJson<PrivacyLockStatusResult>("/desktop/privacy-lock/status");
+}
+
+export function updateDesktopPrivacyLockConfig(
+  payload: {
+    mode?: string;
+    current_pin?: string;
+    new_pin?: string;
+    clear?: boolean;
+  },
+): Promise<PrivacyLockStatusResult> {
+  return requestJson<PrivacyLockStatusResult>("/desktop/privacy-lock/config", {
+    method: "POST",
+    headers: JSON_HEADERS,
+    body: JSON.stringify(payload),
+  });
+}
+
 export function sendSessionImage(
   session: string,
   file: File,
@@ -626,6 +885,30 @@ export function sendTelegramText(text: string): Promise<BasicResult> {
     method: "POST",
     headers: JSON_HEADERS,
     body: JSON.stringify({ text }),
+  });
+}
+
+export function getLoopStatus(): Promise<LoopStatusResult> {
+  return requestJson<LoopStatusResult>("/loop/status");
+}
+
+export function updateLoopSettings(payload: {
+  default_prompt?: string;
+  global_preset?: "" | LoopPreset;
+  completion_checks?: string[];
+}): Promise<LoopStatusResult> {
+  return requestJson<LoopStatusResult>("/loop/settings", {
+    method: "POST",
+    headers: JSON_HEADERS,
+    body: JSON.stringify(payload),
+  });
+}
+
+export function updateSessionLoopMode(session: string, override_mode: LoopOverrideMode): Promise<BasicResult> {
+  return requestJson<BasicResult>(`/loop/session/${encodeURIComponent(session)}/mode`, {
+    method: "POST",
+    headers: JSON_HEADERS,
+    body: JSON.stringify({ override_mode }),
   });
 }
 

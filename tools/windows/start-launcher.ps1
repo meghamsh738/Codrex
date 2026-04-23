@@ -53,7 +53,11 @@ if (Test-Path $launcherCurrentExe) {
   $arguments = @()
   if ($trayArg) { $arguments += $trayArg }
   Write-StartupBreadcrumb ("launching current exe -> {0} {1}" -f $launcherCurrentExe, ($arguments -join ' '))
-  Start-Process -FilePath $launcherCurrentExe -ArgumentList $arguments | Out-Null
+  if ($arguments.Count -gt 0) {
+    Start-Process -FilePath $launcherCurrentExe -ArgumentList $arguments | Out-Null
+  } else {
+    Start-Process -FilePath $launcherCurrentExe | Out-Null
+  }
   return
 }
 
@@ -61,7 +65,11 @@ if (Test-Path $launcherCurrentDll) {
   $arguments = @($launcherCurrentDll)
   if ($trayArg) { $arguments += $trayArg }
   Write-StartupBreadcrumb ("launching current dll via dotnet -> {0} {1}" -f $launcherCurrentDll, ($arguments -join ' '))
-  Start-Process -FilePath "dotnet" -ArgumentList $arguments | Out-Null
+  if ($arguments.Count -gt 0) {
+    Start-Process -FilePath "dotnet" -ArgumentList $arguments | Out-Null
+  } else {
+    Start-Process -FilePath "dotnet" | Out-Null
+  }
   return
 }
 
@@ -70,7 +78,11 @@ foreach ($candidate in @($launcherReleaseExe, $launcherPublishExe, $launcherDebu
     $arguments = @()
     if ($trayArg) { $arguments += $trayArg }
     Write-StartupBreadcrumb ("launching fallback exe -> {0} {1}" -f $candidate, ($arguments -join ' '))
-    Start-Process -FilePath $candidate -ArgumentList $arguments | Out-Null
+    if ($arguments.Count -gt 0) {
+      Start-Process -FilePath $candidate -ArgumentList $arguments | Out-Null
+    } else {
+      Start-Process -FilePath $candidate | Out-Null
+    }
     return
   }
 }

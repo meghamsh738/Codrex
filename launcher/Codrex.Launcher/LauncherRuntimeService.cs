@@ -109,36 +109,6 @@ public sealed class LauncherRuntimeService
         return JsonSerializer.Deserialize<NetInfoPayload>(payload, JsonOptions);
     }
 
-    public async Task<LauncherPrivacyLockStatus?> GetPrivacyLockStatusAsync(int controllerPort, string token, CancellationToken cancellationToken = default)
-    {
-        if (controllerPort <= 0)
-        {
-            return null;
-        }
-
-        using var client = BuildHttpClient(token, TimeSpan.FromSeconds(8));
-        using var response = await client.GetAsync($"http://127.0.0.1:{controllerPort}/desktop/privacy-lock/status", cancellationToken);
-        response.EnsureSuccessStatusCode();
-        var payload = await response.Content.ReadAsStringAsync(cancellationToken);
-        return JsonSerializer.Deserialize<LauncherPrivacyLockStatus>(payload, JsonOptions);
-    }
-
-    public Task<LauncherPrivacyLockStatus?> SavePrivacyPinAsync(int controllerPort, string token, string newPin, string currentPin = "", CancellationToken cancellationToken = default) =>
-        PostJsonAsync<LauncherPrivacyLockStatus>(
-            controllerPort,
-            token,
-            "/desktop/privacy-lock/config",
-            new { current_pin = currentPin ?? string.Empty, new_pin = newPin ?? string.Empty },
-            cancellationToken);
-
-    public Task<LauncherPrivacyLockStatus?> ClearPrivacyPinAsync(int controllerPort, string token, string currentPin = "", CancellationToken cancellationToken = default) =>
-        PostJsonAsync<LauncherPrivacyLockStatus>(
-            controllerPort,
-            token,
-            "/desktop/privacy-lock/config",
-            new { current_pin = currentPin ?? string.Empty, clear = true },
-            cancellationToken);
-
     public async Task<PairingResult> CreatePairingAsync(RuntimeActionResult runtime, string route, CancellationToken cancellationToken = default)
     {
         if (!runtime.Ok || runtime.ControllerPort <= 0)

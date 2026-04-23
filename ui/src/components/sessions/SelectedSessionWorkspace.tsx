@@ -1,5 +1,5 @@
 import { memo, type RefObject } from "react";
-import type { SessionInfo, SessionNoteInfo } from "../../types";
+import type { LoopOverrideMode, SessionInfo, SessionNoteInfo } from "../../types";
 
 type StreamProfile = "fast" | "balanced" | "battery";
 type OutputFeedState = "off" | "polling" | "connecting" | "live" | "error";
@@ -11,6 +11,7 @@ interface TranscriptChunkLike {
 
 interface SelectedSessionWorkspaceProps {
   selectedSessionInfo: SessionInfo;
+  showNotes?: boolean;
   outputFeedState: OutputFeedState;
   streamEnabled: boolean;
   streamProfile: StreamProfile;
@@ -57,6 +58,8 @@ interface SelectedSessionWorkspaceProps {
   sessionNotes: string;
   onSessionNotesChange: (value: string) => void;
   latestSessionResponseSnapshot: string;
+  sessionLoopBusy: boolean;
+  onSessionLoopModeChange: (value: LoopOverrideMode) => void;
 }
 
 interface SessionTranscriptPanelProps {
@@ -446,8 +449,93 @@ const SessionNotesPanel = memo(function SessionNotesPanel({
   );
 });
 
+function formatLoopModeLabel(value: string | null | undefined): string {
+  if (value === "await-reply") {
+    return "Await Reply";
+  }
+  if (value === "completion-checks") {
+    return "Completion Checks";
+  }
+  if (value === "max-turns-1") {
+    return "Max Turns 1";
+  }
+  if (value === "max-turns-2") {
+    return "Max Turns 2";
+  }
+  if (value === "max-turns-3") {
+    return "Max Turns 3";
+  }
+  if (value === "infinite") {
+    return "Infinite";
+  }
+  if (value === "off") {
+    return "Off";
+  }
+  if (value === "inherit") {
+    return "Inherit";
+  }
+  return "Off";
+}
+
+interface SessionLoopPanelProps {
+  selectedSessionInfo: SessionInfo;
+  sessionLoopBusy: boolean;
+  onSessionLoopModeChange: (value: LoopOverrideMode) => void;
+}
+
+const SessionLoopPanel = memo(function SessionLoopPanel({
+  selectedSessionInfo,
+  sessionLoopBusy,
+  onSessionLoopModeChange,
+}: SessionLoopPanelProps) {
+  const loop = selectedSessionInfo.loop;
+  const overrideMode = loop?.override_mode || "inherit";
+  const effectivePreset = loop?.effective_preset || null;
+  const awaitingReply = Boolean(loop?.awaiting_reply);
+  const remainingTurns = typeof loop?.remaining_turns === "number" ? loop.remaining_turns : null;
+  const detail = loop?.last_action_detail || "";
+
+  return (
+    <div className="quick-open-card">
+      <div className="session-pane-head">
+        <div>
+          <h3>Loop Control</h3>
+          <p className="small">Loopndroll-style continuation using the existing Telegram bot and Codrex session controls.</p>
+        </div>
+        <span className={`mode-pill ${effectivePreset || awaitingReply ? "mode-ready" : "mode-muted"}`}>
+          {awaitingReply ? "awaiting reply" : formatLoopModeLabel(effectivePreset)}
+        </span>
+      </div>
+      <label className="field">
+        <span>Session Mode</span>
+        <select
+          value={overrideMode}
+          onChange={(event) => onSessionLoopModeChange(event.target.value as LoopOverrideMode)}
+          disabled={sessionLoopBusy}
+        >
+          <option value="inherit">Inherit Global</option>
+          <option value="off">Off</option>
+          <option value="infinite">Infinite</option>
+          <option value="await-reply">Await Reply</option>
+          <option value="completion-checks">Completion Checks</option>
+          <option value="max-turns-1">Max Turns 1</option>
+          <option value="max-turns-2">Max Turns 2</option>
+          <option value="max-turns-3">Max Turns 3</option>
+        </select>
+      </label>
+      <p className="small">
+        Effective mode: <strong>{formatLoopModeLabel(effectivePreset)}</strong>
+        {remainingTurns !== null ? <> | Remaining turns: <strong>{remainingTurns}</strong></> : null}
+      </p>
+      {detail ? <p className="small">{detail}</p> : null}
+      {loop?.last_snapshot ? <p className="small">Latest loop snapshot captured.</p> : null}
+    </div>
+  );
+});
+
 export const SelectedSessionWorkspace = memo(function SelectedSessionWorkspace({
   selectedSessionInfo,
+  showNotes = true,
   outputFeedState,
   streamEnabled,
   streamProfile,
@@ -494,6 +582,8 @@ export const SelectedSessionWorkspace = memo(function SelectedSessionWorkspace({
   sessionNotes,
   onSessionNotesChange,
   latestSessionResponseSnapshot,
+  sessionLoopBusy,
+  onSessionLoopModeChange,
 }: SelectedSessionWorkspaceProps) {
   return (
     <>
@@ -505,7 +595,7 @@ export const SelectedSessionWorkspace = memo(function SelectedSessionWorkspace({
           </p>
           <p className="small">
             Refresh updates pane output. Interrupt sends Esc (soft stop), Ctrl+C sends terminal interrupt,
-            and Close ends the tmux session.
+            and Close ends the active session.
           </p>
         </div>
       </div>
@@ -578,23 +668,31 @@ export const SelectedSessionWorkspace = memo(function SelectedSessionWorkspace({
             onCtrlC={onCtrlC}
             onCloseSession={onCloseSession}
           />
+
+          <SessionLoopPanel
+            selectedSessionInfo={selectedSessionInfo}
+            sessionLoopBusy={sessionLoopBusy}
+            onSessionLoopModeChange={onSessionLoopModeChange}
+          />
         </section>
 
-        <SessionNotesPanel
-          sessionNotesInfo={sessionNotesInfo}
-          sessionNotesSavedLabel={sessionNotesSavedLabel}
-          sessionNotesBusy={sessionNotesBusy}
-          sessionNotesLoading={sessionNotesLoading}
-          onSaveSessionNotes={onSaveSessionNotes}
-          onAppendLatestToSessionNotes={onAppendLatestToSessionNotes}
-          onCopyLatestSessionResponse={onCopyLatestSessionResponse}
-          hasLatestSessionResponse={hasLatestSessionResponse}
-          onCopySessionNotes={onCopySessionNotes}
-          onClearSessionNotes={onClearSessionNotes}
-          sessionNotes={sessionNotes}
-          onSessionNotesChange={onSessionNotesChange}
-          latestSessionResponseSnapshot={latestSessionResponseSnapshot}
-        />
+        {showNotes ? (
+          <SessionNotesPanel
+            sessionNotesInfo={sessionNotesInfo}
+            sessionNotesSavedLabel={sessionNotesSavedLabel}
+            sessionNotesBusy={sessionNotesBusy}
+            sessionNotesLoading={sessionNotesLoading}
+            onSaveSessionNotes={onSaveSessionNotes}
+            onAppendLatestToSessionNotes={onAppendLatestToSessionNotes}
+            onCopyLatestSessionResponse={onCopyLatestSessionResponse}
+            hasLatestSessionResponse={hasLatestSessionResponse}
+            onCopySessionNotes={onCopySessionNotes}
+            onClearSessionNotes={onClearSessionNotes}
+            sessionNotes={sessionNotes}
+            onSessionNotesChange={onSessionNotesChange}
+            latestSessionResponseSnapshot={latestSessionResponseSnapshot}
+          />
+        ) : null}
       </div>
     </>
   );
